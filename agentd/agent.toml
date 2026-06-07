@@ -1,0 +1,24 @@
+# AgentOS agent specification
+# Run:        cargo run -- agent.toml
+# Watch log:  tail -f flight.jsonl
+# Verbosity:  RUST_LOG=debug cargo run -- agent.toml
+
+[agent]
+id = "scout"                          # unique identifier for this agent
+task = "List the project directory, read Cargo.toml, and summarize what you find."
+max_turns = 20                        # inference turns before max_turns_reached
+token_budget = 100_000                # cumulative token ceiling (input + output)
+
+[model]
+provider = "anthropic"                # inference backend (only "anthropic" in Phase 0)
+model = "claude-sonnet-4-6"           # model id passed to the provider API
+max_tokens = 4096                     # maximum tokens per inference response
+
+[tools]
+native = ["all"]                      # built-in tools: "all" or a list like ["read_file", "list_dir"]
+
+# Attach an MCP server over stdio (uncomment to enable):
+# [[tools.mcp_servers]]
+# name    = "filesystem"
+# command = "npx"
+# args    = ["-y", "@modelcontextprotocol/server-filesystem", "."]

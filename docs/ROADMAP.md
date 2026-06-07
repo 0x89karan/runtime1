@@ -47,7 +47,7 @@ Goal: prove the **agent-loop-as-process** model end to end. By the end of Phase
 0, one agent boots from a TOML spec and runs perceive → infer → act → observe
 to completion against a real model and real MCP tools, with everything logged.
 
-### ▢ p0.1 — Crate scaffold + config + flight recorder
+### ▣ p0.1 — Crate scaffold + config + flight recorder
 **Depends on:** nothing.
 **Goal:** A `cargo run` that loads a TOML config and writes a structured event to
 an append-only flight log. The plumbing layer, nothing more.
@@ -58,7 +58,7 @@ an append-only flight log. The plumbing layer, nothing more.
   `panic = "abort"`).
 - `agentd/src/main.rs`: `#[tokio::main]`, init `tracing` to stderr (`RUST_LOG`
   env filter, default `info`), load config from argv[1] (default `agent.toml`),
-  init the flight recorder, log a `started` event, exit 0.
+  init the flight recorder, log an `agent_spawned` event, exit 0.
 - `agentd/src/config.rs`: `Config` / `AgentConfig` / `ModelConfig` / `ToolsConfig`
   with serde defaults. Secrets are not in config — only env.
 - `agentd/src/flight_recorder.rs`: `FlightRecorder` over a `Mutex<File>`, append
@@ -71,7 +71,7 @@ an append-only flight log. The plumbing layer, nothing more.
 - Loading a missing/invalid config gives a single-line error and exits non-zero
   (no panic, no backtrace under normal `RUST_BACKTRACE`).
 
-### ▢ p0.2 — Inference gateway + Anthropic backend
+### ▣ p0.2 — Inference gateway + Anthropic backend
 **Depends on:** p0.1.
 **Goal:** A working call to the Anthropic Messages API behind a
 provider-agnostic trait. Cognition is remote — this is the door to it.
@@ -93,7 +93,7 @@ provider-agnostic trait. Cognition is remote — this is the door to it.
 - Missing key or 4xx/5xx becomes a recorded error and a clean exit, not a panic.
 - Tokens used are logged.
 
-### ▢ p0.3 — Tool ABI + native tools
+### ▣ p0.3 — Tool ABI + native tools
 **Depends on:** p0.2.
 **Goal:** A unified registry of tools advertised to the model, with built-in
 natives so the spike runs with zero external dependencies.
@@ -111,7 +111,7 @@ natives so the spike runs with zero external dependencies.
 - A unit test invokes `read_file` against `Cargo.toml` and asserts a non-empty result.
 - Invoking an unknown tool returns an `anyhow` error (never a panic).
 
-### ▢ p0.4 — The agent loop (perceive → infer → act → observe)
+### ▣ p0.4 — The agent loop (perceive → infer → act → observe)
 **Depends on:** p0.3.
 **Goal:** A complete single-agent run end to end using native tools. **This is
 the Phase 0 success criterion.**
@@ -133,7 +133,7 @@ the Phase 0 success criterion.**
 - A low `token_budget` triggers `budget_exceeded` cleanly; a tight `max_turns`
   triggers `max_turns_reached`.
 
-### ▢ p0.5 — Real MCP stdio client
+### ▣ p0.5 — Real MCP stdio client
 **Depends on:** p0.4.
 **Goal:** Real MCP servers can be plugged in over stdio as a source of tools.
 This is what makes "MCP is the tool ABI" concrete.

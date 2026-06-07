@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agentd
+
+      - name: Build (debug)
+        run: cargo build --verbose
+        working-directory: agentd
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+        working-directory: agentd
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+        working-directory: agentd
+
+      - name: Test
+        run: cargo test --verbose
+        working-directory: agentd
