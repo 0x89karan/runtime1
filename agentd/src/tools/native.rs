@@ -1,3 +1,5 @@
+// Path access is intentionally unrestricted in p0.3 (single-tenant system;
+// per-agent capability scoping lands in p1.4 — see CONVENTIONS.md).
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -26,7 +28,8 @@ impl Tool for ReadFile {
             "properties": {
                 "path": { "type": "string", "description": "Path to the file" }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         })
     }
 
@@ -60,7 +63,8 @@ impl Tool for WriteFile {
                 "path": { "type": "string", "description": "Path to write" },
                 "content": { "type": "string", "description": "Content to write" }
             },
-            "required": ["path", "content"]
+            "required": ["path", "content"],
+            "additionalProperties": false
         })
     }
 
@@ -74,7 +78,7 @@ impl Tool for WriteFile {
             }
         }
         std::fs::write(path, content).with_context(|| format!("writing {path}"))?;
-        Ok(format!("wrote {} bytes to {path}", content.len()))
+        Ok(format!("wrote {} chars to {path}", content.chars().count()))
     }
 }
 
@@ -94,7 +98,8 @@ impl Tool for ListDir {
             "properties": {
                 "path": { "type": "string", "description": "Path to the directory" }
             },
-            "required": ["path"]
+            "required": ["path"],
+            "additionalProperties": false
         })
     }
 
@@ -141,8 +146,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_returns_cargo_toml() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let result = ReadFile
-            .invoke(json!({"path": "Cargo.toml"}))
+            .invoke(json!({"path": path.to_str().unwrap()}))
             .await
             .unwrap();
         assert!(!result.is_empty());
@@ -203,6 +209,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_file_missing_path_errors() {
+        let err = WriteFile.invoke(json!({"content": "hi"})).await.unwrap_err();
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[tokio::test]
     async fn write_file_missing_content_errors() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("out.txt");
@@ -225,6 +237,22 @@ mod tests {
         assert!(result.contains("subdir/"), "dirs must end with /");
         assert!(result.contains("file.txt"));
         assert!(!result.contains("file.txt/"));
+    }
+
+    #[tokio::test]
+    async fn list_dir_missing_path_key_errors() {
+        let err = ListDir.invoke(json!({})).await.unwrap_err();
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[tokio::test]
+    async fn list_dir_empty_dir_returns_empty_string() {
+        let dir = TempDir::new().unwrap();
+        let result = ListDir
+            .invoke(json!({"path": dir.path().to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert_eq!(result, "");
     }
 
     #[tokio::test]

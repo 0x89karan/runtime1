@@ -30,7 +30,11 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        if self.tools.contains_key(&name) {
+            tracing::warn!(tool = %name, "tool already registered — overwriting");
+        }
+        self.tools.insert(name, tool);
     }
 
     #[allow(dead_code)]
