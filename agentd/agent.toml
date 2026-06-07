@@ -17,8 +17,8 @@ max_tokens = 4096                     # maximum tokens per inference response
 [tools]
 native = ["all"]                      # built-in tools: "all" or a list like ["read_file", "list_dir"]
 
-# Attach an MCP server over stdio (uncomment to enable — requires Phase 0.5):
+# Attach an MCP server over stdio (uncomment to enable):
 # [[tools.mcp_servers]]
-# name = "filesystem"
+# name    = "filesystem"
 # command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# args    = ["-y", "@modelcontextprotocol/server-filesystem", "."]

@@ -171,7 +171,7 @@ impl InferenceGateway for AnthropicGateway {
 
         Ok(InferenceResponse {
             blocks: resp.content.iter().filter_map(json_to_block).collect(),
-            stop_reason: StopReason::from_str(&resp.stop_reason),
+            stop_reason: StopReason::from_api_str(&resp.stop_reason),
             input_tokens: resp.usage.input_tokens,
             output_tokens: resp.usage.output_tokens,
         })

@@ -79,7 +79,7 @@ pub enum StopReason {
 }
 
 impl StopReason {
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_api_str(s: &str) -> Self {
         match s {
             "end_turn" => Self::EndTurn,
             "tool_use" => Self::ToolUse,
@@ -111,7 +111,7 @@ mod tests {
             ("stop_sequence", StopReason::Other("stop_sequence".to_string())),
         ];
         for (s, r) in cases {
-            assert_eq!(StopReason::from_str(s), r);
+            assert_eq!(StopReason::from_api_str(s), r);
             assert_eq!(r.as_str(), s);
         }
     }

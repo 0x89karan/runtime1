@@ -104,6 +104,9 @@ pub async fn run(
 
         match response.stop_reason {
             StopReason::EndTurn | StopReason::MaxTokens | StopReason::Other(_) => {
+                // TODO(p2): MaxTokens with no Text block produces an empty Ok("").
+                // Surface a warning or return BudgetExceeded so callers can distinguish
+                // a real answer from a mid-generation cut-off.
                 let answer = response
                     .blocks
                     .iter()
@@ -334,7 +337,7 @@ mod tests {
         ]);
 
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()]);
+        register_native(&mut reg, &["read_file".to_string()]).unwrap();
         let (rec, _tmp) = recorder();
 
         let answer = run(

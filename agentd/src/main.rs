@@ -1,16 +1,14 @@
-use std::{io::IsTerminal, path::PathBuf};
+use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-
-mod agent;
-mod config;
-mod flight_recorder;
-mod inference;
-mod tools;
-
-use flight_recorder::{EventKind, FlightRecorder};
-use inference::anthropic::AnthropicGateway;
-use tools::{native::register_native, ToolRegistry};
+use agentd::{agent, config};
+use agentd::flight_recorder::{EventKind, FlightRecorder};
+use agentd::inference::anthropic::AnthropicGateway;
+use agentd::tools::{
+    mcp::{McpClient, McpTool},
+    native::register_native,
+    ToolRegistry,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -66,9 +64,39 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     );
 
     let mut registry = ToolRegistry::new();
-    register_native(&mut registry, &cfg.tools.native);
-    let tool_names = registry.tool_names();
+    register_native(&mut registry, &cfg.tools.native)?;
 
+    // Spawn MCP servers and register their tools. McpTool holds an Arc<McpClient>,
+    // so the child processes remain alive as long as the registry does. We also
+    // collect the Arcs here so the clients are explicitly dropped after the agent
+    // run rather than at an arbitrary point during registry cleanup.
+    let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
+    for server in &cfg.tools.mcp_servers {
+        tracing::info!(
+            agent = %cfg.agent.id,
+            name = %server.name,
+            command = %server.command,
+            "spawning MCP server"
+        );
+        let (client, specs) = McpClient::spawn(&server.command, &server.args)
+            .await
+            .with_context(|| format!("spawning MCP server '{}'", server.name))?;
+        let n = specs.len();
+        for spec in specs {
+            registry
+                .register(Box::new(McpTool::new(Arc::clone(&client), spec)))
+                .with_context(|| format!("registering tools from MCP server '{}'", server.name))?;
+        }
+        tracing::info!(
+            agent = %cfg.agent.id,
+            name = %server.name,
+            tools = n,
+            "MCP server connected"
+        );
+        mcp_clients.push(client);
+    }
+
+    let tool_names = registry.tool_names();
     recorder.record(
         &cfg.agent.id,
         None,
@@ -121,7 +149,7 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
 }
 
 async fn run_probe(prompt: &str) -> anyhow::Result<()> {
-    use inference::{Block, InferenceGateway, InferenceRequest, Msg, Role};
+    use agentd::inference::{Block, InferenceGateway, InferenceRequest, Msg, Role};
 
     let model = "claude-sonnet-4-6";
     let recorder = FlightRecorder::open()?;

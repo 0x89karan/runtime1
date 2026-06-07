@@ -133,7 +133,7 @@ the Phase 0 success criterion.**
 - A low `token_budget` triggers `budget_exceeded` cleanly; a tight `max_turns`
   triggers `max_turns_reached`.
 
-### ▢ p0.5 — Real MCP stdio client
+### ▣ p0.5 — Real MCP stdio client
 **Depends on:** p0.4.
 **Goal:** Real MCP servers can be plugged in over stdio as a source of tools.
 This is what makes "MCP is the tool ABI" concrete.

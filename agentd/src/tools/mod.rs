@@ -1,3 +1,4 @@
+pub mod mcp;
 pub mod native;
 
 use anyhow::Result;
@@ -26,12 +27,18 @@ impl ToolRegistry {
         }
     }
 
-    pub fn register(&mut self, tool: Box<dyn Tool>) {
+    /// Register a tool. Returns an error if a tool with the same name is
+    /// already registered — callers must resolve the conflict explicitly.
+    pub fn register(&mut self, tool: Box<dyn Tool>) -> Result<()> {
         let name = tool.name().to_string();
         if self.tools.contains_key(&name) {
-            tracing::warn!(tool = %name, "tool already registered — overwriting");
+            return Err(anyhow::anyhow!(
+                "tool '{name}' is already registered; \
+                 use a different name or remove the conflicting registration"
+            ));
         }
         self.tools.insert(name, tool);
+        Ok(())
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -84,10 +91,19 @@ mod tests {
         assert!(err.to_string().contains("nonexistent"));
     }
 
+    #[test]
+    fn duplicate_registration_returns_error() {
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["read_file".to_string()]).unwrap();
+        let err = register_native(&mut reg, &["read_file".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("read_file"));
+        assert!(err.to_string().contains("already registered"));
+    }
+
     #[tokio::test]
     async fn registry_specs_and_names_are_sorted() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()]);
+        register_native(&mut reg, &["all".to_string()]).unwrap();
         let names = reg.tool_names();
         let mut sorted = names.clone();
         sorted.sort();

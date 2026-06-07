@@ -125,18 +125,20 @@ impl Tool for ListDir {
 
 /// Register native tools by name. Pass `["all"]` to register all of them,
 /// or a subset by name (e.g. `["read_file", "list_dir"]`).
-pub fn register_native(reg: &mut ToolRegistry, names: &[String]) {
+/// Returns an error if any name collides with an already-registered tool.
+pub fn register_native(reg: &mut ToolRegistry, names: &[String]) -> anyhow::Result<()> {
     let all = names.iter().any(|n| n == "all");
     let want = |name: &str| all || names.iter().any(|n| n == name);
     if want("read_file") {
-        reg.register(Box::new(ReadFile));
+        reg.register(Box::new(ReadFile))?;
     }
     if want("write_file") {
-        reg.register(Box::new(WriteFile));
+        reg.register(Box::new(WriteFile))?;
     }
     if want("list_dir") {
-        reg.register(Box::new(ListDir));
+        reg.register(Box::new(ListDir))?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -281,7 +283,7 @@ mod tests {
     #[test]
     fn register_native_all_registers_all_three() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()]);
+        register_native(&mut reg, &["all".to_string()]).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
@@ -291,7 +293,7 @@ mod tests {
     #[test]
     fn register_native_subset() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()]);
+        register_native(&mut reg, &["read_file".to_string()]).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
@@ -301,7 +303,7 @@ mod tests {
     #[test]
     fn register_native_empty_registers_nothing() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &[]);
+        register_native(&mut reg, &[]).unwrap();
         assert!(reg.tool_names().is_empty());
     }
 }
