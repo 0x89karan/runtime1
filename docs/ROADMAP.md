@@ -47,7 +47,7 @@ Goal: prove the **agent-loop-as-process** model end to end. By the end of Phase
 0, one agent boots from a TOML spec and runs perceive → infer → act → observe
 to completion against a real model and real MCP tools, with everything logged.
 
-### ▢ p0.1 — Crate scaffold + config + flight recorder
+### ▣ p0.1 — Crate scaffold + config + flight recorder
 **Depends on:** nothing.
 **Goal:** A `cargo run` that loads a TOML config and writes a structured event to
 an append-only flight log. The plumbing layer, nothing more.
