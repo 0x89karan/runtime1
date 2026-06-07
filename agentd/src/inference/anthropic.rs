@@ -21,8 +21,12 @@ impl AnthropicGateway {
             .context("ANTHROPIC_API_KEY not set")?;
         let base_url = std::env::var("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .context("building HTTP client")?;
         Ok(Self {
-            client: Client::new(),
+            client,
             api_key,
             base_url,
             model: model.into(),
@@ -247,6 +251,17 @@ mod tests {
     }
 
     #[test]
+    fn block_to_json_tool_result_not_error() {
+        let b = Block::ToolResult {
+            tool_use_id: "toolu_xyz".to_string(),
+            content: "ok".to_string(),
+            is_error: false,
+        };
+        let v = block_to_json(&b);
+        assert_eq!(v["is_error"], false);
+    }
+
+    #[test]
     fn msg_to_anthropic_role_mapping() {
         use super::super::{Block, Msg, Role};
         let msg = Msg {
@@ -258,5 +273,40 @@ mod tests {
         let wire = msg_to_anthropic(&msg);
         assert_eq!(wire.role, "user");
         assert_eq!(wire.content[0]["type"], "text");
+    }
+
+    #[test]
+    fn msg_to_anthropic_assistant_role() {
+        use super::super::{Block, Msg, Role};
+        let msg = Msg {
+            role: Role::Assistant,
+            blocks: vec![Block::Text {
+                text: "pong".to_string(),
+            }],
+        };
+        let wire = msg_to_anthropic(&msg);
+        assert_eq!(wire.role, "assistant");
+    }
+
+    #[test]
+    fn json_to_block_missing_type_returns_none() {
+        assert!(json_to_block(&serde_json::json!({})).is_none());
+        assert!(json_to_block(&serde_json::json!({"text": "hi"})).is_none());
+    }
+
+    #[test]
+    fn json_to_block_text_null_text_returns_none() {
+        assert!(json_to_block(&serde_json::json!({"type": "text", "text": null})).is_none());
+        assert!(json_to_block(&serde_json::json!({"type": "text"})).is_none());
+    }
+
+    #[test]
+    fn json_to_block_tool_use_missing_fields_returns_none() {
+        // missing id
+        assert!(json_to_block(&serde_json::json!({"type": "tool_use", "name": "foo", "input": {}})).is_none());
+        // missing name
+        assert!(json_to_block(&serde_json::json!({"type": "tool_use", "id": "toolu_1", "input": {}})).is_none());
+        // missing input
+        assert!(json_to_block(&serde_json::json!({"type": "tool_use", "id": "toolu_1", "name": "foo"})).is_none());
     }
 }
