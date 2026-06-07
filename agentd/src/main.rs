@@ -1,16 +1,15 @@
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf};
 
 use anyhow::Context;
 
+mod agent;
 mod config;
 mod flight_recorder;
 mod inference;
 mod tools;
 
 use flight_recorder::{EventKind, FlightRecorder};
-use inference::{
-    anthropic::AnthropicGateway, Block, InferenceGateway, InferenceRequest, Msg, Role,
-};
+use inference::anthropic::AnthropicGateway;
 use tools::{native::register_native, ToolRegistry};
 
 #[tokio::main]
@@ -83,10 +82,47 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         "tools registered"
     );
 
+    // Task: config field takes precedence; fall back to stdin when not a tty.
+    let task = if !cfg.agent.task.is_empty() {
+        cfg.agent.task.clone()
+    } else if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading task from stdin")?;
+        let trimmed = buf.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(anyhow::anyhow!("no task: stdin was empty"));
+        }
+        trimmed
+    } else {
+        return Err(anyhow::anyhow!(
+            "no task: set [agent].task in config or pipe text to stdin"
+        ));
+    };
+
+    let gateway = AnthropicGateway::from_env(&cfg.model.model)
+        .context("initializing Anthropic gateway")?;
+
+    let answer = agent::run(
+        &cfg.agent.id,
+        &task,
+        &cfg.agent,
+        &cfg.model,
+        &gateway,
+        &registry,
+        &recorder,
+    )
+    .await?;
+
+    println!("{answer}");
     Ok(())
 }
 
 async fn run_probe(prompt: &str) -> anyhow::Result<()> {
+    use inference::{Block, InferenceGateway, InferenceRequest, Msg, Role};
+
     let model = "claude-sonnet-4-6";
     let recorder = FlightRecorder::open()?;
 

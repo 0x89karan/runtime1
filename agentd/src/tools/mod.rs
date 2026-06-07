@@ -7,9 +7,6 @@ use std::collections::HashMap;
 
 use crate::inference::ToolSpec;
 
-// Methods below are called from the agent loop (p0.4); not all are reachable
-// from the binary's non-test entry points in p0.3.
-#[allow(dead_code)]
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
@@ -37,7 +34,6 @@ impl ToolRegistry {
         self.tools.insert(name, tool);
     }
 
-    #[allow(dead_code)]
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs: Vec<ToolSpec> = self
             .tools
@@ -58,7 +54,6 @@ impl ToolRegistry {
         names
     }
 
-    #[allow(dead_code)]
     pub async fn invoke(&self, name: &str, input: Value) -> Result<String> {
         let tool = self
             .tools

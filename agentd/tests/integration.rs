@@ -1,27 +1,35 @@
 use std::{io::Write, process::Command};
 use tempfile::TempDir;
 
-/// Invoking with no args should use the default `agent.toml` from CWD.
+/// Invoking with no args should use `agent.toml` from CWD.
+/// We verify this by checking the error refers to the API key (i.e. config WAS
+/// found and parsed) rather than to a missing file.
 #[test]
 fn no_args_uses_default_agent_toml() {
     let dir = TempDir::new().expect("tempdir");
     std::fs::write(
         dir.path().join("agent.toml"),
-        "[agent]\nid = \"default-test\"\n",
+        "[agent]\nid = \"default-test\"\ntask = \"smoke\"\n",
     )
     .unwrap();
 
     let bin = env!("CARGO_BIN_EXE_agentd");
     let output = Command::new(bin)
         .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
         .output()
         .expect("failed to spawn agentd");
 
+    // Without an API key the run fails — but the config was found and parsed,
+    // so the error must mention the missing key, not a missing file.
     assert!(
-        output.status.success(),
-        "expected exit 0 when default agent.toml exists, got: {:?}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "expected non-zero exit when ANTHROPIC_API_KEY is absent"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ANTHROPIC_API_KEY"),
+        "expected API-key error (confirming agent.toml was loaded), got stderr: {stderr}"
     );
 }
 
@@ -153,18 +161,16 @@ fn bad_config_path_exits_nonzero() {
     );
 }
 
+/// Startup events (agent_spawned + tools_registered) are written to the flight
+/// log before the API call is made — so they appear even when the run fails
+/// due to a missing API key. This test covers those events without network.
 #[test]
-fn happy_path_writes_flight_log() {
+fn startup_events_written_to_flight_log() {
     let dir = TempDir::new().expect("tempdir");
-
     let cfg_path = dir.path().join("agent.toml");
     std::fs::write(
         &cfg_path,
-        r#"
-[agent]
-id = "test-agent"
-task = "smoke test"
-"#,
+        "[agent]\nid = \"test-agent\"\ntask = \"smoke test\"\n",
     )
     .unwrap();
 
@@ -172,18 +178,18 @@ task = "smoke test"
     let output = Command::new(bin)
         .arg(&cfg_path)
         .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
         .output()
         .expect("failed to spawn agentd");
 
+    // Binary exits non-zero (no API key) but must still write the startup events.
     assert!(
-        output.status.success(),
-        "expected exit 0 for valid config, got: {:?}\nstderr: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
+        !output.status.success(),
+        "expected non-zero exit when ANTHROPIC_API_KEY is absent"
     );
 
     let flight_log = dir.path().join("flight.jsonl");
-    assert!(flight_log.exists(), "flight.jsonl was not created");
+    assert!(flight_log.exists(), "flight.jsonl must be created on startup");
 
     let content = std::fs::read_to_string(&flight_log).unwrap();
     let events: Vec<serde_json::Value> = content
@@ -206,11 +212,66 @@ task = "smoke test"
         .find(|e| e["kind"] == "tools_registered")
         .expect("tools_registered event missing");
     assert!(registered["data"]["tools"].is_array());
+}
+
+/// Live end-to-end agent run — skipped when ANTHROPIC_API_KEY is not set.
+#[test]
+fn live_agent_run_produces_final_answer() {
+    if std::env::var("ANTHROPIC_API_KEY").is_err() {
+        eprintln!("ANTHROPIC_API_KEY not set — skipping live agent test");
+        return;
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let cfg_path = dir.path().join("agent.toml");
+    // Minimal task: just answer directly, no tools required.
+    std::fs::write(
+        &cfg_path,
+        r#"
+[agent]
+id = "live-test"
+task = "Reply with exactly the single word DONE and nothing else."
+max_turns = 3
+token_budget = 10000
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn agentd");
 
     assert!(
-        output.stdout.is_empty(),
-        "stdout should be empty (final answer is only emitted by the agent loop)"
+        output.status.success(),
+        "expected exit 0 for live agent run, got: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
     );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.trim().is_empty(), "expected final answer on stdout");
+
+    let flight_log = dir.path().join("flight.jsonl");
+    let content = std::fs::read_to_string(&flight_log).unwrap();
+    let kinds: Vec<&str> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).ok()?;
+            v["kind"].as_str().map(|s| s.to_string()).map(|s| s.leak() as &str)
+        })
+        .collect();
+
+    for expected in &["agent_spawned", "tools_registered", "perceive",
+                      "inference_request", "inference_response", "agent_completed"] {
+        assert!(
+            kinds.contains(expected),
+            "missing flight event '{expected}' — got: {kinds:?}"
+        );
+    }
 }
 
 #[test]

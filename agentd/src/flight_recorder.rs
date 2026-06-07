@@ -12,9 +12,6 @@ const FLIGHT_LOG: &str = "flight.jsonl";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-// Variants beyond AgentSpawned are used from p0.4 onward; defined here to
-// establish the canonical taxonomy from CONVENTIONS.md from day one.
-#[allow(dead_code)]
 pub enum EventKind {
     AgentSpawned,
     ToolsRegistered,

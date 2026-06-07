@@ -111,7 +111,7 @@ natives so the spike runs with zero external dependencies.
 - A unit test invokes `read_file` against `Cargo.toml` and asserts a non-empty result.
 - Invoking an unknown tool returns an `anyhow` error (never a panic).
 
-### ▢ p0.4 — The agent loop (perceive → infer → act → observe)
+### ▣ p0.4 — The agent loop (perceive → infer → act → observe)
 **Depends on:** p0.3.
 **Goal:** A complete single-agent run end to end using native tools. **This is
 the Phase 0 success criterion.**
