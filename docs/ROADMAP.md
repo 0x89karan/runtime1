@@ -58,7 +58,7 @@ an append-only flight log. The plumbing layer, nothing more.
   `panic = "abort"`).
 - `agentd/src/main.rs`: `#[tokio::main]`, init `tracing` to stderr (`RUST_LOG`
   env filter, default `info`), load config from argv[1] (default `agent.toml`),
-  init the flight recorder, log a `started` event, exit 0.
+  init the flight recorder, log an `agent_spawned` event, exit 0.
 - `agentd/src/config.rs`: `Config` / `AgentConfig` / `ModelConfig` / `ToolsConfig`
   with serde defaults. Secrets are not in config — only env.
 - `agentd/src/flight_recorder.rs`: `FlightRecorder` over a `Mutex<File>`, append
