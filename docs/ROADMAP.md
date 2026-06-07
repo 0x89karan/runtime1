@@ -93,7 +93,7 @@ provider-agnostic trait. Cognition is remote — this is the door to it.
 - Missing key or 4xx/5xx becomes a recorded error and a clean exit, not a panic.
 - Tokens used are logged.
 
-### ▢ p0.3 — Tool ABI + native tools
+### ▣ p0.3 — Tool ABI + native tools
 **Depends on:** p0.2.
 **Goal:** A unified registry of tools advertised to the model, with built-in
 natives so the spike runs with zero external dependencies.

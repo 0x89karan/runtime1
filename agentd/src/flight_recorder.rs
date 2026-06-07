@@ -17,6 +17,7 @@ const FLIGHT_LOG: &str = "flight.jsonl";
 #[allow(dead_code)]
 pub enum EventKind {
     AgentSpawned,
+    ToolsRegistered,
     Perceive,
     InferenceRequest,
     InferenceResponse,

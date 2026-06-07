@@ -186,18 +186,30 @@ task = "smoke test"
     assert!(flight_log.exists(), "flight.jsonl was not created");
 
     let content = std::fs::read_to_string(&flight_log).unwrap();
-    let event: serde_json::Value = serde_json::from_str(content.trim())
-        .expect("flight.jsonl should contain valid JSONL");
+    let events: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each line must be valid JSON"))
+        .collect();
 
-    assert_eq!(event["kind"], "agent_spawned");
-    assert_eq!(event["agent"], "test-agent");
-    assert!(event["turn"].is_null());
-    assert!(event["ts"].is_string());
-    assert_eq!(event["data"]["model"], "claude-sonnet-4-6");
+    let spawned = events
+        .iter()
+        .find(|e| e["kind"] == "agent_spawned")
+        .expect("agent_spawned event missing");
+    assert_eq!(spawned["agent"], "test-agent");
+    assert!(spawned["turn"].is_null());
+    assert!(spawned["ts"].is_string());
+    assert_eq!(spawned["data"]["model"], "claude-sonnet-4-6");
+
+    let registered = events
+        .iter()
+        .find(|e| e["kind"] == "tools_registered")
+        .expect("tools_registered event missing");
+    assert!(registered["data"]["tools"].is_array());
 
     assert!(
         output.stdout.is_empty(),
-        "stdout should be empty in p0.1 (nothing written to stdout)"
+        "stdout should be empty (final answer is only emitted by the agent loop)"
     );
 }
 

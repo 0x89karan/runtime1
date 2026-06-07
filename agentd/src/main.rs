@@ -5,11 +5,13 @@ use anyhow::Context;
 mod config;
 mod flight_recorder;
 mod inference;
+mod tools;
 
 use flight_recorder::{EventKind, FlightRecorder};
 use inference::{
     anthropic::AnthropicGateway, Block, InferenceGateway, InferenceRequest, Msg, Role,
 };
+use tools::{native::register_native, ToolRegistry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -62,6 +64,23 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         agent = %cfg.agent.id,
         model = %cfg.model.model,
         "agent spawned"
+    );
+
+    let mut registry = ToolRegistry::new();
+    register_native(&mut registry, &cfg.tools.native);
+    let tool_names = registry.tool_names();
+
+    recorder.record(
+        &cfg.agent.id,
+        None,
+        EventKind::ToolsRegistered,
+        serde_json::json!({ "tools": tool_names }),
+    );
+
+    tracing::info!(
+        agent = %cfg.agent.id,
+        tools = ?tool_names,
+        "tools registered"
     );
 
     Ok(())
