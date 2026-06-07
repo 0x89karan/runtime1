@@ -127,6 +127,22 @@ mod tests {
     }
 
     #[test]
+    fn block_serde_tool_use_roundtrip() {
+        let block = Block::ToolUse {
+            id: "toolu_abc".to_string(),
+            name: "list_dir".to_string(),
+            input: serde_json::json!({"path": "."}),
+        };
+        let json = serde_json::to_value(&block).unwrap();
+        assert_eq!(json["type"], "tool_use");
+        assert_eq!(json["id"], "toolu_abc");
+        assert_eq!(json["name"], "list_dir");
+        // Verify it also deserializes back correctly.
+        let back: Block = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, Block::ToolUse { id, .. } if id == "toolu_abc"));
+    }
+
+    #[test]
     fn block_serde_tool_result_roundtrip() {
         let block = Block::ToolResult {
             tool_use_id: "toolu_123".to_string(),
@@ -137,5 +153,15 @@ mod tests {
         assert_eq!(json["type"], "tool_result");
         assert_eq!(json["tool_use_id"], "toolu_123");
         assert_eq!(json["is_error"], false);
+    }
+
+    #[test]
+    fn role_serde_roundtrip() {
+        let user = serde_json::to_value(&Role::User).unwrap();
+        assert_eq!(user, "user");
+        let assistant = serde_json::to_value(&Role::Assistant).unwrap();
+        assert_eq!(assistant, "assistant");
+        let back: Role = serde_json::from_value(user).unwrap();
+        assert_eq!(back, Role::User);
     }
 }

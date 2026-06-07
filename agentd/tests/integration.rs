@@ -1,6 +1,30 @@
 use std::{io::Write, process::Command};
 use tempfile::TempDir;
 
+/// Invoking with no args should use the default `agent.toml` from CWD.
+#[test]
+fn no_args_uses_default_agent_toml() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(
+        dir.path().join("agent.toml"),
+        "[agent]\nid = \"default-test\"\n",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(
+        output.status.success(),
+        "expected exit 0 when default agent.toml exists, got: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // ── Probe-mode tests ──────────────────────────────────────────────────────────
 
 #[test]
