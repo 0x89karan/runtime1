@@ -71,7 +71,7 @@ an append-only flight log. The plumbing layer, nothing more.
 - Loading a missing/invalid config gives a single-line error and exits non-zero
   (no panic, no backtrace under normal `RUST_BACKTRACE`).
 
-### ▢ p0.2 — Inference gateway + Anthropic backend
+### ▣ p0.2 — Inference gateway + Anthropic backend
 **Depends on:** p0.1.
 **Goal:** A working call to the Anthropic Messages API behind a
 provider-agnostic trait. Cognition is remote — this is the door to it.
