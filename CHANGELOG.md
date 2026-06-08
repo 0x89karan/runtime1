@@ -3,6 +3,31 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.0] - 2026-06-08
+
+### Added
+- **Metered scheduling & admission control** (`[scheduler]` TOML section): cap total
+  token spend across all agents with `global_token_budget` and limit how many model
+  calls can run concurrently with `max_concurrent_inferences`. Both default to `0`
+  (unlimited), preserving all prior behavior.
+- **Priority-based deferred queue**: each agent carries a `priority: u32` field
+  (default `0`). When the concurrency cap is full, the agent's inference is queued and
+  admitted in descending-priority order (FIFO within a band) when a slot opens.
+- **Admission-control flight events**: `agent_scheduled`, `agent_deferred`, and
+  `agent_admission_denied` appear in `flight.jsonl`, giving full observability into
+  scheduler decisions.
+
+### Fixed
+- `in_flight` underflow guards promoted from `debug_assert!` (compiled out in release)
+  to `assert!`, ensuring the invariant is enforced in production builds.
+
+### For contributors
+- `SchedulerConfig` struct in `config.rs` carries `global_token_budget` and
+  `max_concurrent_inferences`; wired into `Scheduler::new` via `main.rs`.
+- `DeferredInfer` type with a custom `Ord` drives the `BinaryHeap` deferred queue.
+- `drain_deferred` / `enqueue_or_defer` manage the admission lifecycle; both are
+  tagged with `TODO(p1.x)` noting a planned `SchedulerState` refactor.
+
 ## [0.2.0] - 2026-06-08
 
 ### Added
