@@ -73,6 +73,12 @@ impl AgentTask {
         self.cfg.priority
     }
 
+    /// Returns a clone of the agent's capability set for use in tool dispatch.
+    /// `None` = unrestricted; `Some([])` = deny all.
+    pub fn cap_set_cloned(&self) -> Option<Vec<crate::capability::Capability>> {
+        self.cfg.capabilities.clone()
+    }
+
     /// Advance the state machine by one step.
     ///
     /// In NeedInfer state: emits Perceive (turn 0 only), then InferenceRequest,
@@ -295,6 +301,7 @@ pub(crate) async fn run_tools_sequential(
     turn: u32,
     blocks: &[Block],
     registry: &ToolRegistry,
+    cap_set: Option<&[crate::capability::Capability]>,
     recorder: &FlightRecorder,
 ) -> Vec<Block> {
     let mut results: Vec<Block> = Vec::new();
@@ -310,7 +317,10 @@ pub(crate) async fn run_tools_sequential(
             json!({ "id": id, "name": name, "input": input }),
         );
 
-        let (content, is_error) = match registry.invoke(name, input.clone()).await {
+        let (content, is_error) = match registry
+            .invoke(name, input.clone(), agent_id, cap_set, recorder)
+            .await
+        {
             Ok(s) => {
                 recorder.record(
                     agent_id,
@@ -427,6 +437,7 @@ mod tests {
             max_turns,
             token_budget,
             priority: 0,
+            capabilities: None,
         }
     }
 
@@ -710,7 +721,7 @@ mod tests {
             },
         ];
 
-        let results = run_tools_sequential("agent", 0, &blocks, &registry, &rec).await;
+        let results = run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
 
         // Text block skipped; unknown tool returns an error result (not a panic)
         assert_eq!(results.len(), 1, "only the ToolUse block should produce a result");

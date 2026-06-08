@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::{
     agent::{run_tools_sequential, AgentEffect, AgentTask},
+    capability::Capability,
     config::{AgentConfig, ModelConfig, SchedulerConfig},
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse},
@@ -77,7 +78,6 @@ impl Scheduler {
         registry: Arc<ToolRegistry>,
         recorder: Arc<FlightRecorder>,
     ) -> anyhow::Result<Self> {
-        let specs = registry.specs();
         let mut agents = HashMap::with_capacity(agent_configs.len());
         for cfg in agent_configs {
             anyhow::ensure!(
@@ -85,7 +85,8 @@ impl Scheduler {
                 "duplicate agent id: {}",
                 cfg.id
             );
-            let task = AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs.clone());
+            let specs = registry.filtered_specs(cfg.capabilities.as_deref());
+            let task = AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs);
             agents.insert(cfg.id.clone(), task);
         }
         Ok(Self { agents, sched, gateway, registry, recorder })
@@ -107,13 +108,14 @@ impl Scheduler {
         let ids: Vec<String> = agents.keys().cloned().collect();
         for id in ids {
             let priority = agents[&id].priority();
+            let cap_set = agents[&id].cap_set_cloned();
             let (effect, turn) = {
                 let sm = agents.get_mut(&id).unwrap();
                 let t = sm.turn();
                 (sm.step(&recorder), t)
             };
             enqueue_or_defer(
-                effect, id, turn, priority,
+                effect, id, turn, priority, cap_set,
                 &mut outcomes, &mut deferred, &mut deferred_seq,
                 &mut in_flight, tokens_spent, &sched,
                 &gateway, &registry, &recorder, &mut pending,
@@ -158,6 +160,7 @@ impl Scheduler {
                         (sm.step(&recorder), t)
                     };
                     tokens_spent = tokens_spent.saturating_add(new_tokens);
+                    let cap_set = agents[&agent_id].cap_set_cloned();
                     // Drain deferred agents first (they were waiting for a slot to open),
                     // then re-enqueue the completing agent's next step. This gives queued
                     // agents priority over the agent that just ran — intentional fairness policy.
@@ -166,7 +169,7 @@ impl Scheduler {
                         &sched, &gateway, &recorder, &mut pending, &mut outcomes,
                     );
                     enqueue_or_defer(
-                        effect, agent_id, turn, priority,
+                        effect, agent_id, turn, priority, cap_set,
                         &mut outcomes, &mut deferred, &mut deferred_seq,
                         &mut in_flight, tokens_spent, &sched,
                         &gateway, &registry, &recorder, &mut pending,
@@ -174,6 +177,7 @@ impl Scheduler {
                 }
                 EffectResult::Tools { agent_id, results } => {
                     let priority = agents[&agent_id].priority();
+                    let cap_set = agents[&agent_id].cap_set_cloned();
                     let (effect, turn) = {
                         let sm = agents
                             .get_mut(&agent_id)
@@ -183,7 +187,7 @@ impl Scheduler {
                         (sm.step(&recorder), t)
                     };
                     enqueue_or_defer(
-                        effect, agent_id, turn, priority,
+                        effect, agent_id, turn, priority, cap_set,
                         &mut outcomes, &mut deferred, &mut deferred_seq,
                         &mut in_flight, tokens_spent, &sched,
                         &gateway, &registry, &recorder, &mut pending,
@@ -271,6 +275,7 @@ fn enqueue_or_defer(
     agent_id: String,
     turn: u32,
     priority: u32,
+    cap_set: Option<Vec<Capability>>,
     outcomes: &mut HashMap<String, anyhow::Result<String>>,
     deferred: &mut BinaryHeap<DeferredInfer>,
     deferred_seq: &mut u64,
@@ -329,7 +334,10 @@ fn enqueue_or_defer(
             let rec = Arc::clone(recorder);
             let id = agent_id;
             pending.push(Box::pin(async move {
-                let results = run_tools_sequential(&id, turn, &blocks, &reg, &rec).await;
+                let results = run_tools_sequential(
+                    &id, turn, &blocks, &reg, cap_set.as_deref(), &rec,
+                )
+                .await;
                 EffectResult::Tools { agent_id: id, results }
             }));
         }
@@ -404,6 +412,7 @@ mod tests {
             max_turns:    5,
             token_budget: 100_000,
             priority:     0,
+            capabilities: None,
         }
     }
 

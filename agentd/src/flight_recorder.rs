@@ -28,6 +28,7 @@ pub enum EventKind {
     AgentAdmissionDenied,
     BudgetExceeded,
     MaxTurnsReached,
+    CapabilityDenied,
     Error,
 }
 

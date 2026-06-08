@@ -3,6 +3,36 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.0] - 2026-06-08
+
+### Added
+- **Capability system** (`capabilities` TOML field on `[[agents]]`/`[agent]`):
+  least-privilege tool grants — `FsRead{prefix}`, `FsWrite{prefix}`, `Net{hosts}`,
+  `Mcp{server, tools}`, `Spawn`. Absent field = unrestricted (backward compat);
+  `capabilities = []` = deny all.
+- **Capability enforcement at `ToolRegistry::invoke`**: the single unbypassable
+  boundary; denials emit a `capability_denied` flight event with `{tool, required,
+  agent_id}` and return an `is_error` tool result to the agent.
+- **`filtered_specs`**: agents only receive the tool specs they are authorized to
+  call in their inference context — no wasted inference turns on inaccessible tools.
+- **`normalize_path`**: resolves `..` components without filesystem access before
+  prefix matching, blocking directory traversal (e.g. `/workspace/../etc/passwd`
+  is correctly denied against a `/workspace` prefix grant).
+- **`satisfies_type`**: type-level capability check used by `filtered_specs` —
+  "does this agent have any FsRead capability?" vs. "can they access this specific path?"
+- **`McpTool` server provenance**: `server_name` field on `McpTool` enables
+  `Mcp{server, tools}` capability gating on per-server MCP tool access.
+
+### For contributors
+- New `agentd/src/capability.rs`: `Capability` enum, `normalize_path`, `satisfies`,
+  `satisfies_type`. All capability logic lives here; no policy is embedded in tools.
+- `Tool` trait gains `fn required_capability_for(&self, input: &Value) -> Option<Capability>`
+  (default `None`). Path-based tools return the actual access path at invocation time.
+- `ToolRegistry::invoke` gains `(agent_id, cap_set, recorder)` params.
+- `run_tools_sequential` gains `cap_set: Option<&[Capability]>` param; threaded through
+  to `invoke`. Driver passes `None` (backward compat).
+- `Scheduler::new` calls `filtered_specs(cap_set)` per agent instead of shared `specs()`.
+
 ## [0.3.0] - 2026-06-08
 
 ### Added

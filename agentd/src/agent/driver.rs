@@ -44,7 +44,8 @@ pub async fn run(
 
             AgentEffect::CallTools(blocks) => {
                 let results =
-                    run_tools_sequential(agent_id, sm.turn(), &blocks, registry, recorder).await;
+                    run_tools_sequential(agent_id, sm.turn(), &blocks, registry, None, recorder)
+                        .await;
                 sm.provide_tool_results(results, recorder);
             }
 

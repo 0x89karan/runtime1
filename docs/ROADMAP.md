@@ -236,7 +236,7 @@ two agents are serialized; the second is deferred at seed, then denied when the 
 inference exhausts the budget; total spend never exceeds the ceiling; flight log shows
 `agent_scheduled`, `agent_deferred`, `agent_admission_denied`.
 
-### ▢ p1.4 — Capability system (least privilege)
+### ▣ p1.4 — Capability system (least privilege)
 **Depends on:** p1.3 *(logically independent of p1.3 — could run in parallel —
 but kept linear here for a simple single stack)*
 **Goal:** Tools become **scoped grants**, not ambient authority.

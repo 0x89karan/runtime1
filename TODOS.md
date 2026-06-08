@@ -10,11 +10,18 @@
 
 **~~P2 — ToolRegistry::register should error on collision (p0.5)~~** ✓ Done in p0.5.
 
-**P3 — Per-agent capability scoping for native file tools (p1.4)**
-- `read_file`, `write_file`, `list_dir` currently have unrestricted path access.
-  Intentional for p0.x (single-tenant, mutually trusting agents), but agents should
-  declare required capabilities (`FsRead{prefix}`, `FsWrite{prefix}`) per CONVENTIONS.md.
-- Action: implement capability gating in p1.4 when the capability registry lands.
+**~~P3 — Per-agent capability scoping for native file tools (p1.4)~~** ✓ Done in p1.4.
+
+**P3 — FsRead/FsWrite enforcement assumes absolute paths (p1.4)**
+- `normalize_path` handles `..` components but does not resolve symlinks or expand `~`.
+  Relative paths fail-safe to deny (no prefix match), but are not explicitly rejected.
+- Action: validate absolute paths at invocation, or document the assumption; symlink
+  traversal prevention requires Phase 4 sandbox.
+
+**P3 — Symlink traversal not blocked by capability prefix check (p1.4)**
+- A symlink inside a granted prefix can point outside it. `normalize_path` uses
+  `Path::components()` — no filesystem access, so symlinks are not resolved.
+- Action: Phase 4 sandbox (seccomp/namespaces) is the correct enforcement layer.
 
 **P3 — 2 MB binary target needs re-evaluation at p0.2**
 - `reqwest` + `native-tls` (arriving in p0.2) will significantly increase binary size.
@@ -32,7 +39,7 @@
 - `drain_deferred` and `enqueue_or_defer` in `scheduler.rs` take many arguments
   (`#[allow(clippy::too_many_arguments)]`). A `SchedulerState` struct should collect
   `in_flight`, `tokens_spent`, `deferred`, `deferred_seq`, and `outcomes` into one place.
-- Action: introduce `SchedulerState` at the next scheduler-touching increment (p1.4 or p1.5).
+- Action: introduce `SchedulerState` at p1.5 (p1.4 deferred — still deferred).
 
 **P3 — EventKind enum in flight_recorder.rs → events.rs at p0.4**
 - Once all 11 Phase-0 kinds are actively emitted, extract to its own module.

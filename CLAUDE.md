@@ -24,7 +24,7 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Phase 0 complete; Phase 1 in progress (p1.3 landed).** `agentd/` is a working
+**Phase 0 complete; Phase 1 in progress (p1.4 landed).** `agentd/` is a working
 Rust binary. Phase 0 (`p0.1`–`p0.5`) built the single-agent loop end to end:
 config, flight recorder, inference gateway (Anthropic), tool ABI, native tools,
 and a real MCP stdio client. Phase 1 is underway:
@@ -37,8 +37,12 @@ and a real MCP stdio client. Phase 1 is underway:
   section with `global_token_budget` and `max_concurrent_inferences`; per-agent
   `priority` field; deferred queue with `BinaryHeap`; `agent_scheduled`,
   `agent_deferred`, `agent_admission_denied` flight events.
+- **p1.4** (done): capability system — `capabilities` TOML field; `Capability` enum
+  (`FsRead`, `FsWrite`, `Net`, `Mcp`, `Spawn`); enforcement at `ToolRegistry::invoke`;
+  `filtered_specs` for model context; `normalize_path` for traversal-safe prefix checks;
+  `capability_denied` flight event.
 
-Next: `p1.4` capability system (least-privilege scoped tool grants). See `docs/ROADMAP.md`.
+Next: `p1.5` inter-agent bus + sub-agents (A2A/ACP). See `docs/ROADMAP.md`.
 
 ## How to work here
 

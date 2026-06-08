@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::capability::Capability;
+
 // deny_unknown_fields is intentionally omitted here to allow both [agent] and [[agents]]
 // forms to coexist in the schema without serde rejecting the other key.
 #[derive(Debug, Deserialize)]
@@ -57,6 +59,12 @@ pub struct AgentConfig {
     /// Scheduling priority. Higher value runs before lower. Default 0 (equal priority).
     #[serde(default)]
     pub priority: u32,
+    /// Tool capabilities granted to this agent.
+    /// `None` (field absent) = unrestricted access to all registered tools.
+    /// `Some([])` = deny all tool use.
+    /// `Some([...])` = allow only the listed capabilities.
+    #[serde(default)]
+    pub capabilities: Option<Vec<Capability>>,
 }
 
 fn default_max_turns() -> u32 {
@@ -303,5 +311,75 @@ task = "task"
         let cfgs = cfg.agent_configs().unwrap();
         assert_eq!(cfgs[0].priority, 10);
         assert_eq!(cfgs[1].priority, 0, "absent priority defaults to 0");
+    }
+
+    #[test]
+    fn capabilities_absent_defaults_to_none() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert!(cfgs[0].capabilities.is_none(), "absent capabilities = unrestricted");
+    }
+
+    #[test]
+    fn capabilities_empty_array_is_deny_all() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+capabilities = []
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert_eq!(cfgs[0].capabilities, Some(vec![]));
+    }
+
+    #[test]
+    fn capabilities_fs_read_round_trip() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+capabilities = [{ FsRead = { prefix = "/workspace" } }]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert_eq!(
+            cfgs[0].capabilities,
+            Some(vec![Capability::FsRead {
+                prefix: "/workspace".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn capabilities_multiple_variants_round_trip() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+capabilities = [
+  { FsRead = { prefix = "/workspace" } },
+  { FsWrite = { prefix = "/tmp" } },
+  { Mcp = { server = "echo", tools = ["echo_text"] } },
+]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        let caps = cfgs[0].capabilities.as_ref().unwrap();
+        assert_eq!(caps.len(), 3);
+        assert_eq!(caps[0], Capability::FsRead { prefix: "/workspace".to_string() });
+        assert_eq!(caps[1], Capability::FsWrite { prefix: "/tmp".to_string() });
+        assert_eq!(
+            caps[2],
+            Capability::Mcp {
+                server: "echo".to_string(),
+                tools: vec!["echo_text".to_string()]
+            }
+        );
     }
 }
