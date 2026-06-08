@@ -35,6 +35,25 @@
   agent first), not in config declaration order. Fine for p1.2; a flag or ordered output mode
   may be desirable in a future increment.
 
+**P3 — Net capability is advisory (p1.4 intentional)**
+- `satisfies()` returns `true` unconditionally for `Net{..}` regardless of the granted set.
+  This is intentional at p1.4 — no Net tools exist yet and Phase 4 network namespaces are
+  the correct enforcement layer. Documents as advisory in the enum docstring.
+- Action: wire real enforcement when the first Net tool lands, or in Phase 4.
+
+**P3 — `required_capability_for → None` tools are always visible (p1.4 design)**
+- Tools that return `None` from `required_capability_for` appear in `filtered_specs` even
+  when `cap_set = Some([])`. This is the documented contract ("tools that require no cap
+  gating"). All current tools (read_file, write_file, list_dir, MCP) do declare a cap.
+- Action: revisit if a tool with `None` should be hidden under deny-all; update the docstring
+  and `filtered_specs` comment to make the policy explicit.
+
+**P3 — Case-sensitive path prefix matching on case-insensitive filesystems (p1.4)**
+- `normalize_path` + `starts_with` are case-sensitive. On macOS (HFS+ case-insensitive)
+  a grant of `/Workspace` does not match `/workspace/file`. Production target is Linux
+  (case-sensitive ext4/btrfs) so this is a dev-environment edge case, not a security gap.
+- Action: document the Linux-only assumption or add a config flag for CI on macOS.
+
 **P3 — SchedulerState refactor (p1.3 deferred)**
 - `drain_deferred` and `enqueue_or_defer` in `scheduler.rs` take many arguments
   (`#[allow(clippy::too_many_arguments)]`). A `SchedulerState` struct should collect
@@ -125,3 +144,13 @@
 - `in_flight` underflow guards promoted from `debug_assert!` to `assert!`.
 - New config tests: `scheduler_config_explicit_values_parse`, `scheduler_config_defaults_to_unlimited`, `agent_priority_parses_from_toml`.
 - **Completed:** v0.3.0 (2026-06-08)
+
+**p1.4 — Capability system**
+- `Capability` enum (`FsRead{prefix}`, `FsWrite{prefix}`, `Net{hosts}`, `Mcp{server,tools}`, `Spawn`).
+- `normalize_path` + `satisfies` + `satisfies_type` in `capability.rs`.
+- `Tool::required_capability_for` + enforcement at `ToolRegistry::invoke`.
+- `filtered_specs(cap_set)` — per-agent model context filtering.
+- `CapabilityDenied` flight event; `capability_denied` in `flight.jsonl`.
+- `McpTool::server_name` for Mcp{} cap gating.
+- 130 tests pass (unit + integration + MCP + MCP client).
+- **Completed:** v0.4.0 (2026-06-08)

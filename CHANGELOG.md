@@ -11,8 +11,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `Mcp{server, tools}`, `Spawn`. Absent field = unrestricted (backward compat);
   `capabilities = []` = deny all.
 - **Capability enforcement at `ToolRegistry::invoke`**: the single unbypassable
-  boundary; denials emit a `capability_denied` flight event with `{tool, required,
-  agent_id}` and return an `is_error` tool result to the agent.
+  boundary; denials emit a `capability_denied` flight event with data `{tool, required}`
+  (the agent id is in the event's top-level `agent` field) and return an `is_error`
+  tool result to the agent.
 - **`filtered_specs`**: agents only receive the tool specs they are authorized to
   call in their inference context — no wasted inference turns on inaccessible tools.
 - **`normalize_path`**: resolves `..` components without filesystem access before
