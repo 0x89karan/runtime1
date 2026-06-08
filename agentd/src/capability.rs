@@ -86,7 +86,9 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
             granted.iter().any(|g| {
                 if let Capability::FsRead { prefix: g_prefix } = g {
                     let norm_granted = normalize_path(Path::new(g_prefix));
-                    norm_req.starts_with(&norm_granted)
+                    // An empty (non-absolute) granted prefix is not a valid grant —
+                    // it would match every path via starts_with semantics. Fail-safe to deny.
+                    !norm_granted.as_os_str().is_empty() && norm_req.starts_with(&norm_granted)
                 } else {
                     false
                 }
@@ -97,7 +99,8 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
             granted.iter().any(|g| {
                 if let Capability::FsWrite { prefix: g_prefix } = g {
                     let norm_granted = normalize_path(Path::new(g_prefix));
-                    norm_req.starts_with(&norm_granted)
+                    // An empty (non-absolute) granted prefix is not a valid grant — fail-safe.
+                    !norm_granted.as_os_str().is_empty() && norm_req.starts_with(&norm_granted)
                 } else {
                     false
                 }
@@ -225,6 +228,17 @@ mod tests {
                 prefix: "/workspace/x".to_string()
             }
         ));
+    }
+
+    #[test]
+    fn satisfies_empty_granted_prefix_denies_all_paths() {
+        // An empty-prefix granted capability must NOT match any path.
+        // Without this guard, Path::starts_with("") returns true for all paths.
+        let caps = vec![Capability::FsRead { prefix: "".to_string() }];
+        assert!(!satisfies(&caps, &Capability::FsRead { prefix: "/etc/passwd".to_string() }));
+        assert!(!satisfies(&caps, &Capability::FsRead { prefix: "/workspace/x".to_string() }));
+        let caps_write = vec![Capability::FsWrite { prefix: "".to_string() }];
+        assert!(!satisfies(&caps_write, &Capability::FsWrite { prefix: "/tmp/x".to_string() }));
     }
 
     #[test]

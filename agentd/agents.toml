@@ -30,6 +30,11 @@ task         = "List the agentd/src directory and describe every source file in 
 max_turns    = 10
 token_budget = 50_000
 priority     = 0
+# Optional: least-privilege tool grants (p1.4+). Absent = unrestricted.
+# capabilities = [{ FsRead = { prefix = "/workspace" } }]           # read-only under prefix
+# capabilities = [{ FsRead = { prefix = "/" } }, { FsWrite = { prefix = "/tmp" } }]
+# capabilities = [{ Mcp = { server = "mcp-server", tools = [] } }]  # all tools on server
+# capabilities = []                                                   # deny all tools
 
 [[agents]]
 id           = "analyst"

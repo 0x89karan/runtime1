@@ -1,3 +1,4 @@
+#[cfg(test)]
 pub mod driver;
 
 use serde_json::json;

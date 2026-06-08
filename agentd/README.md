@@ -57,6 +57,7 @@ Both forms share `[model]`, `[tools]`, and `[scheduler]` sections. See `agent.to
 | `[agent].max_turns` / `[[agents]].max_turns` | `20` | Turn limit before `max_turns_reached` event |
 | `[agent].token_budget` / `[[agents]].token_budget` | `100000` | Per-agent cumulative token ceiling (input + output) |
 | `[[agents]].priority` | `0` | Scheduling priority — higher runs before lower when the concurrency cap is full |
+| `[agent].capabilities` / `[[agents]].capabilities` | absent (unrestricted) | Least-privilege tool grants. Absent = all tools; `[]` = deny all; `[{FsRead={prefix="/workspace"}}]` = scoped access. Variants: `FsRead{prefix}`, `FsWrite{prefix}`, `Net{hosts}` (advisory), `Mcp{server,tools}`, `Spawn` (reserved). Prefix must be an absolute path. |
 | `model.provider` | `"anthropic"` | Inference backend |
 | `model.model` | `"claude-sonnet-4-6"` | Model identifier passed to the provider |
 | `model.max_tokens` | `4096` | Max tokens per inference response |

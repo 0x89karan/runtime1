@@ -133,8 +133,8 @@ impl ToolRegistry {
                         EventKind::CapabilityDenied,
                         serde_json::json!({
                             "tool": name,
-                            "required": format!("{required:?}"),
-                            "agent_id": agent_id,
+                            "required": serde_json::to_value(&required)
+                                .unwrap_or_else(|_| format!("{required:?}").into()),
                         }),
                     );
                     return Err(anyhow::anyhow!(
@@ -252,7 +252,9 @@ mod tests {
         let content = std::fs::read_to_string(tmp.path()).unwrap();
         let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(event["kind"], "capability_denied");
+        assert_eq!(event["agent"], "test-agent");
         assert_eq!(event["data"]["tool"], "write_file");
-        assert_eq!(event["data"]["agent_id"], "test-agent");
+        // `required` is serialized as structured JSON, not a debug string
+        assert_eq!(event["data"]["required"]["FsWrite"]["prefix"], "/tmp/x");
     }
 }
