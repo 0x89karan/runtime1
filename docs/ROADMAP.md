@@ -168,23 +168,37 @@ Goal: many agents under a **scheduler**, talking over an **inter-agent bus**, wi
 scheduling metered, GPU-scarce, non-CPU-bound cognitive work — so it gets the
 most detail.
 
-### ▢ p1.1 — Agent as a sans-IO state machine
+### ▣ p1.1 — Agent as a sans-IO state machine
 **Depends on:** p0.5
 **Goal:** Make the loop drivable one step at a time so a scheduler can own it and
 interpose on every inference call. The agent should *describe* what it needs next,
 not perform IO itself.
-**Scope:** `agentd/src/agent.rs` (refactor; consider splitting into `agentd/src/agent/`).
-- Introduce `AgentTask`: the agent config + working context (`Vec<Msg>`) + token
-  ledger + turn counter + status.
-- `step(&mut self) -> AgentEffect`, where `AgentEffect ∈ { Infer(InferenceRequest),
-  CallTools(Vec<ToolUse>), Completed(String), Failed(String) }`.
-- `provide_inference(InferenceResponse)` and `provide_tool_results(Vec<Block>)`
-  feed results back in.
-- Keep a thin `run()` driver that performs the IO inline so Phase 0 behavior is
-  **byte-for-byte identical** in the flight log.
-- Add a test-only `MockGateway` (returns canned responses) under `#[cfg(test)]`.
-**Acceptance:** demo unchanged; a unit test drives the state machine through a full
-text→tool→text cycle with no network.
+**Scope:** `agentd/src/agent.rs` → `agentd/src/agent/` (module split: `mod.rs` +
+`driver.rs`). `agentd/src/config.rs` (added `Clone` to `AgentConfig` + `ModelConfig`).
+- `AgentTask`: the agent config + working context (`Vec<Msg>`) + token ledger +
+  turn counter + internal `Option<InferenceResponse>` state discriminant.
+  **Deviation from this spec:** `AgentTask` carries no `AgentStatus` field. The
+  scheduler infers state from the last returned `AgentEffect`; an explicit status
+  field would duplicate state and require maintaining a redundant invariant.
+- `step(&mut self, recorder) -> AgentEffect`, where
+  `AgentEffect ∈ { Infer(InferenceRequest), CallTools(Vec<Block>), Completed(String), Failed(String) }`.
+  MaxTurnsReached fires in the `NeedInfer` branch **before** emitting InferenceRequest.
+- `provide_inference(response, recorder)` stores the response and accumulates
+  token counts (no events emitted here).
+- `provide_tool_results(results, recorder)` appends results to message history,
+  emits `Observe`, and advances the turn counter.
+- `pub fn turn(&self) -> u32` getter so the driver can record `EventKind::Error`
+  with the correct turn number on gateway failures.
+- Thin `driver::run()` that performs IO inline; emits ToolCall+ToolResult
+  interleaved per-tool (preserving `ToolCall₁→ToolResult₁→ToolCall₂→ToolResult₂`
+  order for byte-for-byte flight log parity with Phase 0).
+- `MockGateway` and all existing tests relocated to `agent/mod.rs` under `#[cfg(test)]`.
+**Acceptance:** demo unchanged; three new unit tests:
+  `step_machine_text_tool_text_cycle` (sync, no network),
+  `max_turns_fires_before_infer_request` (verifies D3 placement in flight log),
+  `provide_inference_on_terminal_task_is_noop` (no panic + error event emitted).
+All pass. `jq 'del(.ts)' flight.jsonl` produces identical output before and after
+for the same task.
 
 ### ▢ p1.2 — The scheduler (multi-agent, cooperative)
 **Depends on:** p1.1

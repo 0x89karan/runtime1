@@ -116,7 +116,9 @@ agentos/                   the repo root (run `claude` here)
       main.rs              boot: load config -> wire gateway + tools -> run agent
       config.rs            TOML agent spec (secrets via env)
       flight_recorder.rs   append-only JSONL event log
-      agent.rs             THE LOOP: perceive -> infer -> act -> observe (+ budget)
+      agent/
+        mod.rs             AgentTask state machine: step() → AgentEffect (p1.1+)
+        driver.rs          async IO driver: fulfils effects, runs the loop
       inference/
         mod.rs             InferenceGateway trait + neutral message/tool types
         anthropic.rs       remote backend (Anthropic Messages API)

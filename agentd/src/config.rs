@@ -10,7 +10,7 @@ pub struct Config {
     pub tools: ToolsConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub id: String,
@@ -30,7 +30,7 @@ fn default_token_budget() -> u64 {
     100_000
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     #[serde(default = "default_provider")]
