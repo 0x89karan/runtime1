@@ -158,6 +158,9 @@ impl Scheduler {
                         (sm.step(&recorder), t)
                     };
                     tokens_spent = tokens_spent.saturating_add(new_tokens);
+                    // Drain deferred agents first (they were waiting for a slot to open),
+                    // then re-enqueue the completing agent's next step. This gives queued
+                    // agents priority over the agent that just ran — intentional fairness policy.
                     drain_deferred(
                         &mut deferred, &mut in_flight, tokens_spent,
                         &sched, &gateway, &recorder, &mut pending, &mut outcomes,
@@ -209,6 +212,7 @@ impl Scheduler {
 
 /// Drain the deferred queue, admitting agents until the cap or budget is hit.
 /// Agents that can never be admitted (budget exhausted) are denied immediately.
+// TODO(p1.x): introduce a SchedulerState struct to reduce the argument count here and in enqueue_or_defer.
 #[allow(clippy::too_many_arguments)]
 fn drain_deferred(
     deferred: &mut BinaryHeap<DeferredInfer>,
@@ -261,7 +265,7 @@ fn drain_deferred(
 /// Dispatch an AgentEffect: immediately schedule inference if admission passes,
 /// defer it if the concurrency cap is full, deny it if the budget is exhausted,
 /// or record terminal effects (Completed/Failed) directly.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // TODO(p1.x): collapse into SchedulerState
 fn enqueue_or_defer(
     effect: AgentEffect,
     agent_id: String,
@@ -557,10 +561,11 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_budget_exhausted_denies_second_agent() {
-        // Setup: cap=1 forces agent "b" into the deferred queue at seed time.
-        // budget=10: agent "a" is admitted (tokens_spent=0 < 10). Its inference
-        // costs 10 tokens (8 input + 2 output). After completion tokens_spent=10,
-        // which fails budget_ok (10 < 10 is false), so drain_deferred denies "b".
+        // Setup: cap=1 forces one of the two agents into the deferred queue at seed
+        // time (HashMap iteration order is non-deterministic; either can be admitted).
+        // budget=10: the admitted agent gets a response costing 10 tokens (8+2).
+        // After completion tokens_spent=10, budget_ok(10) = (10 < 10) = false, so
+        // drain_deferred denies the still-deferred agent.
         let gw = MockGateway::new(vec![
             end_turn("winner", 8, 2),  // 10 tokens total
         ]);
@@ -586,9 +591,9 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_deferred_admitted_after_slot_opens() {
-        // cap=1: alpha and beta both try to infer at seed. Alpha gets admitted,
-        // beta is deferred. When alpha's inference completes, beta is drained
-        // from the deferred queue and admitted.
+        // cap=1: both agents try to infer at seed; one is admitted, the other deferred
+        // (HashMap order is non-deterministic). When the admitted agent's inference
+        // completes, drain_deferred admits the waiting one.
         let gw = MockGateway::new(vec![
             end_turn("alpha", 5, 5),
             end_turn("beta",  5, 5),

@@ -260,4 +260,48 @@ model = "claude-sonnet-4-6"
         assert!(result.is_err(), "expected Err when neither [agent] nor [[agents]] is set");
         assert!(result.unwrap_err().to_string().contains("no agents configured"));
     }
+
+    #[test]
+    fn scheduler_config_explicit_values_parse() {
+        let raw = r#"
+[agent]
+id = "a"
+
+[scheduler]
+global_token_budget = 1000
+max_concurrent_inferences = 4
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.scheduler.global_token_budget, 1000);
+        assert_eq!(cfg.scheduler.max_concurrent_inferences, 4);
+    }
+
+    #[test]
+    fn scheduler_config_defaults_to_unlimited() {
+        let raw = r#"
+[agent]
+id = "a"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.scheduler.global_token_budget, 0, "0 means unlimited");
+        assert_eq!(cfg.scheduler.max_concurrent_inferences, 0, "0 means unlimited");
+    }
+
+    #[test]
+    fn agent_priority_parses_from_toml() {
+        let raw = r#"
+[[agents]]
+id = "high"
+task = "task"
+priority = 10
+
+[[agents]]
+id = "low"
+task = "task"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert_eq!(cfgs[0].priority, 10);
+        assert_eq!(cfgs[1].priority, 0, "absent priority defaults to 0");
+    }
 }
