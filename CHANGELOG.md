@@ -3,6 +3,62 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.0] - 2026-06-08
+
+### Added
+- **Capability system** (`capabilities` TOML field on `[[agents]]`/`[agent]`):
+  least-privilege tool grants — `FsRead{prefix}`, `FsWrite{prefix}`, `Net{hosts}`,
+  `Mcp{server, tools}`, `Spawn`. Absent field = unrestricted (backward compat);
+  `capabilities = []` = deny all.
+- **Capability enforcement at `ToolRegistry::invoke`**: the single unbypassable
+  boundary; denials emit a `capability_denied` flight event with data `{tool, required}`
+  (the agent id is in the event's top-level `agent` field) and return an `is_error`
+  tool result to the agent.
+- **`filtered_specs`**: agents only receive the tool specs they are authorized to
+  call in their inference context — no wasted inference turns on inaccessible tools.
+- **`normalize_path`**: resolves `..` components without filesystem access before
+  prefix matching, blocking directory traversal (e.g. `/workspace/../etc/passwd`
+  is correctly denied against a `/workspace` prefix grant).
+- **`satisfies_type`**: type-level capability check used by `filtered_specs` —
+  "does this agent have any FsRead capability?" vs. "can they access this specific path?"
+- **`McpTool` server provenance**: `server_name` field on `McpTool` enables
+  `Mcp{server, tools}` capability gating on per-server MCP tool access.
+
+### For contributors
+- New `agentd/src/capability.rs`: `Capability` enum, `normalize_path`, `satisfies`,
+  `satisfies_type`. All capability logic lives here; no policy is embedded in tools.
+- `Tool` trait gains `fn required_capability_for(&self, input: &Value) -> Option<Capability>`
+  (default `None`). Path-based tools return the actual access path at invocation time.
+- `ToolRegistry::invoke` gains `(agent_id, cap_set, recorder)` params.
+- `run_tools_sequential` gains `cap_set: Option<&[Capability]>` param; threaded through
+  to `invoke`. Driver passes `None` (backward compat).
+- `Scheduler::new` calls `filtered_specs(cap_set)` per agent instead of shared `specs()`.
+
+## [0.3.0] - 2026-06-08
+
+### Added
+- **Metered scheduling & admission control** (`[scheduler]` TOML section): cap total
+  token spend across all agents with `global_token_budget` and limit how many model
+  calls can run concurrently with `max_concurrent_inferences`. Both default to `0`
+  (unlimited), preserving all prior behavior.
+- **Priority-based deferred queue**: each agent carries a `priority: u32` field
+  (default `0`). When the concurrency cap is full, the agent's inference is queued and
+  admitted in descending-priority order (FIFO within a band) when a slot opens.
+- **Admission-control flight events**: `agent_scheduled`, `agent_deferred`, and
+  `agent_admission_denied` appear in `flight.jsonl`, giving full observability into
+  scheduler decisions.
+
+### Fixed
+- `in_flight` underflow guards promoted from `debug_assert!` (compiled out in release)
+  to `assert!`, ensuring the invariant is enforced in production builds.
+
+### For contributors
+- `SchedulerConfig` struct in `config.rs` carries `global_token_budget` and
+  `max_concurrent_inferences`; wired into `Scheduler::new` via `main.rs`.
+- `DeferredInfer` type with a custom `Ord` drives the `BinaryHeap` deferred queue.
+- `drain_deferred` / `enqueue_or_defer` manage the admission lifecycle; both are
+  tagged with `TODO(p1.x)` noting a planned `SchedulerState` refactor.
+
 ## [0.2.0] - 2026-06-08
 
 ### Added

@@ -18,7 +18,9 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 Phase 0 landed a full single-agent loop (config, flight recorder, inference
 gateway, tools, MCP stdio client). Phase 1 is underway — p1.1 refactored the
 agent into a sans-IO state machine; p1.2 added a cooperative multi-agent
-scheduler. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
+scheduler; p1.3 added metered scheduling and admission control (`[scheduler]`
+token budget + concurrency cap with a priority-based deferred queue). See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
 

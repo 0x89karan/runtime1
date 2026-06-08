@@ -1,3 +1,4 @@
+#[cfg(test)]
 pub mod driver;
 
 use serde_json::json;
@@ -66,6 +67,17 @@ impl AgentTask {
     /// after a gateway failure, to preserve the correct turn number in the log.
     pub fn turn(&self) -> u32 {
         self.turn
+    }
+
+    /// Scheduling priority from config. Higher value = runs before lower.
+    pub fn priority(&self) -> u32 {
+        self.cfg.priority
+    }
+
+    /// Returns a clone of the agent's capability set for use in tool dispatch.
+    /// `None` = unrestricted; `Some([])` = deny all.
+    pub fn cap_set_cloned(&self) -> Option<Vec<crate::capability::Capability>> {
+        self.cfg.capabilities.clone()
     }
 
     /// Advance the state machine by one step.
@@ -290,6 +302,7 @@ pub(crate) async fn run_tools_sequential(
     turn: u32,
     blocks: &[Block],
     registry: &ToolRegistry,
+    cap_set: Option<&[crate::capability::Capability]>,
     recorder: &FlightRecorder,
 ) -> Vec<Block> {
     let mut results: Vec<Block> = Vec::new();
@@ -305,7 +318,10 @@ pub(crate) async fn run_tools_sequential(
             json!({ "id": id, "name": name, "input": input }),
         );
 
-        let (content, is_error) = match registry.invoke(name, input.clone()).await {
+        let (content, is_error) = match registry
+            .invoke(name, input.clone(), agent_id, cap_set, recorder)
+            .await
+        {
             Ok(s) => {
                 recorder.record(
                     agent_id,
@@ -421,6 +437,8 @@ mod tests {
             task: String::new(),
             max_turns,
             token_budget,
+            priority: 0,
+            capabilities: None,
         }
     }
 
@@ -689,6 +707,48 @@ mod tests {
         assert_eq!(has_error, 1, "expected one error event for terminal provide_inference");
     }
 
+    #[test]
+    fn step_on_terminal_task_returns_failed() {
+        let (rec, tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("term-test-step", "task", &cfg, &model_cfg(), vec![]);
+
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Infer(_)));
+        sm.provide_inference(end_turn("done"), &rec);
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Completed(_)));
+
+        // step() on a terminal task must return Failed, not panic
+        let eff = sm.step(&rec);
+        assert!(
+            matches!(&eff, AgentEffect::Failed(msg) if msg.contains("terminal")),
+            "expected Failed(terminal)"
+        );
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(log.lines().any(|l| l.contains("\"error\"") && l.contains("\"step\"")));
+    }
+
+    #[test]
+    fn provide_tool_results_on_terminal_task_is_noop() {
+        let (rec, tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("term-test-tools", "task", &cfg, &model_cfg(), vec![]);
+
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Infer(_)));
+        sm.provide_inference(end_turn("done"), &rec);
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Completed(_)));
+
+        let pre_turn = sm.turn();
+        sm.provide_tool_results(vec![], &rec);
+        assert_eq!(sm.turn(), pre_turn, "turn must not advance on terminal noop");
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(log.lines().any(|l| l.contains("\"error\"") && l.contains("provide_tool_results")));
+    }
+
     #[tokio::test]
     async fn run_tools_sequential_skips_non_tool_use_blocks() {
         let tmp = NamedTempFile::new().unwrap();
@@ -704,7 +764,7 @@ mod tests {
             },
         ];
 
-        let results = run_tools_sequential("agent", 0, &blocks, &registry, &rec).await;
+        let results = run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
 
         // Text block skipped; unknown tool returns an error result (not a panic)
         assert_eq!(results.len(), 1, "only the ToolUse block should produce a result");

@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::capability::{satisfies, satisfies_type, Capability};
+use crate::flight_recorder::{EventKind, FlightRecorder};
 use crate::inference::ToolSpec;
 
 #[async_trait]
@@ -14,6 +16,15 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> Value;
     async fn invoke(&self, input: Value) -> Result<String>;
+
+    /// The specific capability required to invoke this tool with the given
+    /// `input`. Called at invocation time so path-based tools can return the
+    /// actual access path (e.g. `FsRead { prefix: input["path"] }`).
+    ///
+    /// Returns `None` for tools that require no capability gating.
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        None
+    }
 }
 
 pub struct ToolRegistry {
@@ -55,17 +66,84 @@ impl ToolRegistry {
         specs
     }
 
+    /// Returns specs for only the tools this agent is allowed to see and use.
+    ///
+    /// `None` cap-set = unrestricted (all tools visible, backward compat).
+    /// `Some([])` = deny all (empty spec list sent to the model).
+    /// `Some([...])` = include only tools whose `required_capability_for` is
+    /// satisfied by at least one entry in `cap_set`, plus tools that declare
+    /// no required capability (`required_capability_for` returns `None`).
+    pub fn filtered_specs(&self, cap_set: Option<&[Capability]>) -> Vec<ToolSpec> {
+        let Some(caps) = cap_set else {
+            return self.specs();
+        };
+        let mut specs: Vec<ToolSpec> = self
+            .tools
+            .values()
+            .filter(|t| {
+                // Use Value::Null as a probe — path-based tools return an empty prefix,
+                // which satisfies_type treats as "has any FsRead/FsWrite cap?" (type-level).
+                // The actual path-specific check happens at invocation time in `invoke`.
+                match t.required_capability_for(&Value::Null) {
+                    None => true,
+                    Some(required) => satisfies_type(caps, &required),
+                }
+            })
+            .map(|t| ToolSpec {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+            })
+            .collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
+    }
+
     pub fn tool_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.tools.keys().cloned().collect();
         names.sort();
         names
     }
 
-    pub async fn invoke(&self, name: &str, input: Value) -> Result<String> {
+    /// Invoke a tool, enforcing the agent's capability set.
+    ///
+    /// `cap_set = None` bypasses capability checking (backward-compat single-
+    /// agent driver path). `cap_set = Some(caps)` checks the tool's required
+    /// capability against `caps`; on denial, records a `CapabilityDenied` event
+    /// and returns an error without calling the tool.
+    pub async fn invoke(
+        &self,
+        name: &str,
+        input: Value,
+        agent_id: &str,
+        cap_set: Option<&[Capability]>,
+        recorder: &FlightRecorder,
+    ) -> Result<String> {
         let tool = self
             .tools
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("unknown tool: {name}"))?;
+
+        if let Some(caps) = cap_set {
+            if let Some(required) = tool.required_capability_for(&input) {
+                if !satisfies(caps, &required) {
+                    recorder.record(
+                        agent_id,
+                        None,
+                        EventKind::CapabilityDenied,
+                        serde_json::json!({
+                            "tool": name,
+                            "required": serde_json::to_value(&required)
+                                .unwrap_or_else(|_| format!("{required:?}").into()),
+                        }),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "capability denied: tool '{name}' requires {required:?}"
+                    ));
+                }
+            }
+        }
+
         tool.invoke(input).await
     }
 }
@@ -80,12 +158,20 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
     use crate::tools::native::register_native;
+    use tempfile::NamedTempFile;
+
+    fn recorder() -> (FlightRecorder, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = FlightRecorder::new(tmp.path()).unwrap();
+        (rec, tmp)
+    }
 
     #[tokio::test]
     async fn unknown_tool_returns_error() {
         let reg = ToolRegistry::new();
+        let (rec, _tmp) = recorder();
         let err = reg
-            .invoke("nonexistent", serde_json::json!({}))
+            .invoke("nonexistent", serde_json::json!({}), "a", None, &rec)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nonexistent"));
@@ -113,5 +199,85 @@ mod tests {
         assert!(spec_names.contains(&"read_file"));
         assert!(spec_names.contains(&"write_file"));
         assert!(spec_names.contains(&"list_dir"));
+    }
+
+    #[test]
+    fn filtered_specs_none_cap_set_returns_all() {
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["all".to_string()]).unwrap();
+        assert_eq!(reg.filtered_specs(None).len(), reg.specs().len());
+    }
+
+    #[test]
+    fn filtered_specs_empty_cap_set_returns_none() {
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["all".to_string()]).unwrap();
+        assert_eq!(reg.filtered_specs(Some(&[])).len(), 0);
+    }
+
+    #[test]
+    fn filtered_specs_fs_read_only_excludes_write() {
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["all".to_string()]).unwrap();
+        let caps = [Capability::FsRead { prefix: "/".to_string() }];
+        let specs = reg.filtered_specs(Some(&caps));
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"read_file"), "read_file should be visible");
+        assert!(names.contains(&"list_dir"), "list_dir should be visible");
+        assert!(!names.contains(&"write_file"), "write_file should be hidden");
+    }
+
+    #[tokio::test]
+    async fn capability_denied_event_emitted_and_error_returned() {
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["write_file".to_string()]).unwrap();
+        let (rec, tmp) = recorder();
+
+        // Grant only FsRead — write_file requires FsWrite, so it should be denied.
+        let caps = [Capability::FsRead { prefix: "/".to_string() }];
+        let err = reg
+            .invoke(
+                "write_file",
+                serde_json::json!({"path": "/tmp/x", "content": "hi"}),
+                "test-agent",
+                Some(&caps),
+                &rec,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("capability denied"));
+
+        // Verify the flight event was recorded.
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["kind"], "capability_denied");
+        assert_eq!(event["agent"], "test-agent");
+        assert_eq!(event["data"]["tool"], "write_file");
+        // `required` is serialized as structured JSON, not a debug string
+        assert_eq!(event["data"]["required"]["FsWrite"]["prefix"], "/tmp/x");
+    }
+
+    #[tokio::test]
+    async fn capability_granted_invoke_succeeds() {
+        // An agent with the matching FsWrite cap MUST be able to invoke write_file.
+        // This is the "granted agent succeeds" half of the p1.4 acceptance criterion.
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["write_file".to_string()]).unwrap();
+        let (rec, _tmp) = recorder();
+        let tmp_dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let path = tmp_dir.path().join("test.txt").to_string_lossy().to_string();
+
+        let caps = [Capability::FsWrite { prefix: "/tmp".to_string() }];
+        let result = reg
+            .invoke(
+                "write_file",
+                serde_json::json!({"path": path, "content": "hello"}),
+                "test-agent",
+                Some(&caps),
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "granted cap should allow write_file: {result:?}");
     }
 }

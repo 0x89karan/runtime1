@@ -11,8 +11,10 @@ use crate::{
 use super::{run_tools_sequential, AgentEffect, AgentTask};
 
 /// Single-agent backward-compat shim. The scheduler is the primary execution engine
-/// from p1.2 onward; this function is kept for tests and direct CLI use via the shim path.
-pub async fn run(
+/// from p1.2 onward; this function is kept for tests only. It bypasses capability
+/// enforcement (passes `None` cap_set) — callers with capability-scoped agents must
+/// use the Scheduler.
+pub(crate) async fn run(
     agent_id: &str,
     task: &str,
     cfg: &AgentConfig,
@@ -44,7 +46,8 @@ pub async fn run(
 
             AgentEffect::CallTools(blocks) => {
                 let results =
-                    run_tools_sequential(agent_id, sm.turn(), &blocks, registry, recorder).await;
+                    run_tools_sequential(agent_id, sm.turn(), &blocks, registry, None, recorder)
+                        .await;
                 sm.provide_tool_results(results, recorder);
             }
 

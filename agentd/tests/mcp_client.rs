@@ -16,7 +16,7 @@ async fn mcp_tool_invoke_returns_text() {
         .await
         .expect("failed to spawn echo-mcp");
     assert_eq!(specs.len(), 1, "echo-mcp must expose exactly one tool");
-    let tool = McpTool::new(client, specs.into_iter().next().unwrap());
+    let tool = McpTool::new(client, specs.into_iter().next().unwrap(), "echo-mcp".to_string());
     let result = tool.invoke(json!({"text": "hello world"})).await.unwrap();
     assert_eq!(result, "hello world");
 }
@@ -27,7 +27,7 @@ async fn mcp_tool_invoke_is_error_with_text_propagates_error() {
     let (client, specs) = McpClient::spawn(echo_mcp_path(), &[])
         .await
         .expect("failed to spawn echo-mcp");
-    let tool = McpTool::new(client, specs.into_iter().next().unwrap());
+    let tool = McpTool::new(client, specs.into_iter().next().unwrap(), "echo-mcp".to_string());
     let err = tool
         .invoke(json!({"text": "TRIGGER_ERROR"}))
         .await
@@ -45,7 +45,7 @@ async fn mcp_tool_invoke_is_error_no_content_uses_fallback() {
     let (client, specs) = McpClient::spawn(echo_mcp_path(), &[])
         .await
         .expect("failed to spawn echo-mcp");
-    let tool = McpTool::new(client, specs.into_iter().next().unwrap());
+    let tool = McpTool::new(client, specs.into_iter().next().unwrap(), "echo-mcp".to_string());
     let err = tool
         .invoke(json!({"text": "TRIGGER_ERROR_NO_CONTENT"}))
         .await

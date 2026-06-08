@@ -1,9 +1,8 @@
-// Path access is intentionally unrestricted in p0.3 (single-tenant system;
-// per-agent capability scoping lands in p1.4 — see CONVENTIONS.md).
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::capability::Capability;
 use super::{Tool, ToolRegistry};
 
 const READ_FILE_MAX: usize = 100_000;
@@ -31,6 +30,11 @@ impl Tool for ReadFile {
             "required": ["path"],
             "additionalProperties": false
         })
+    }
+
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        let path = input["path"].as_str().unwrap_or("").to_string();
+        Some(Capability::FsRead { prefix: path })
     }
 
     async fn invoke(&self, input: Value) -> Result<String> {
@@ -68,6 +72,11 @@ impl Tool for WriteFile {
         })
     }
 
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        let path = input["path"].as_str().unwrap_or("").to_string();
+        Some(Capability::FsWrite { prefix: path })
+    }
+
     async fn invoke(&self, input: Value) -> Result<String> {
         let path = input["path"].as_str().context("path must be a string")?;
         let content = input["content"].as_str().context("content must be a string")?;
@@ -101,6 +110,11 @@ impl Tool for ListDir {
             "required": ["path"],
             "additionalProperties": false
         })
+    }
+
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        let path = input["path"].as_str().unwrap_or("").to_string();
+        Some(Capability::FsRead { prefix: path })
     }
 
     async fn invoke(&self, input: Value) -> Result<String> {

@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use crate::capability::Capability;
+
 // deny_unknown_fields is intentionally omitted here to allow both [agent] and [[agents]]
 // forms to coexist in the schema without serde rejecting the other key.
 #[derive(Debug, Deserialize)]
@@ -11,6 +13,8 @@ pub struct Config {
     pub model: ModelConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 impl Config {
@@ -31,6 +35,17 @@ impl Config {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerConfig {
+    /// Global token ceiling across all agents. 0 = unlimited.
+    #[serde(default)]
+    pub global_token_budget: u64,
+    /// Maximum number of in-flight inference calls at once. 0 = unlimited.
+    #[serde(default)]
+    pub max_concurrent_inferences: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -41,6 +56,15 @@ pub struct AgentConfig {
     pub max_turns: u32,
     #[serde(default = "default_token_budget")]
     pub token_budget: u64,
+    /// Scheduling priority. Higher value runs before lower. Default 0 (equal priority).
+    #[serde(default)]
+    pub priority: u32,
+    /// Tool capabilities granted to this agent.
+    /// `None` (field absent) = unrestricted access to all registered tools.
+    /// `Some([])` = deny all tool use.
+    /// `Some([...])` = allow only the listed capabilities.
+    #[serde(default)]
+    pub capabilities: Option<Vec<Capability>>,
 }
 
 fn default_max_turns() -> u32 {
@@ -243,5 +267,119 @@ model = "claude-sonnet-4-6"
         let result = cfg.agent_configs();
         assert!(result.is_err(), "expected Err when neither [agent] nor [[agents]] is set");
         assert!(result.unwrap_err().to_string().contains("no agents configured"));
+    }
+
+    #[test]
+    fn scheduler_config_explicit_values_parse() {
+        let raw = r#"
+[agent]
+id = "a"
+
+[scheduler]
+global_token_budget = 1000
+max_concurrent_inferences = 4
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.scheduler.global_token_budget, 1000);
+        assert_eq!(cfg.scheduler.max_concurrent_inferences, 4);
+    }
+
+    #[test]
+    fn scheduler_config_defaults_to_unlimited() {
+        let raw = r#"
+[agent]
+id = "a"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.scheduler.global_token_budget, 0, "0 means unlimited");
+        assert_eq!(cfg.scheduler.max_concurrent_inferences, 0, "0 means unlimited");
+    }
+
+    #[test]
+    fn agent_priority_parses_from_toml() {
+        let raw = r#"
+[[agents]]
+id = "high"
+task = "task"
+priority = 10
+
+[[agents]]
+id = "low"
+task = "task"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert_eq!(cfgs[0].priority, 10);
+        assert_eq!(cfgs[1].priority, 0, "absent priority defaults to 0");
+    }
+
+    #[test]
+    fn capabilities_absent_defaults_to_none() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert!(cfgs[0].capabilities.is_none(), "absent capabilities = unrestricted");
+    }
+
+    #[test]
+    fn capabilities_empty_array_is_deny_all() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+capabilities = []
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert_eq!(cfgs[0].capabilities, Some(vec![]));
+    }
+
+    #[test]
+    fn capabilities_fs_read_round_trip() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+capabilities = [{ FsRead = { prefix = "/workspace" } }]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert_eq!(
+            cfgs[0].capabilities,
+            Some(vec![Capability::FsRead {
+                prefix: "/workspace".to_string()
+            }])
+        );
+    }
+
+    #[test]
+    fn capabilities_multiple_variants_round_trip() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "task"
+capabilities = [
+  { FsRead = { prefix = "/workspace" } },
+  { FsWrite = { prefix = "/tmp" } },
+  { Mcp = { server = "echo", tools = ["echo_text"] } },
+]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        let caps = cfgs[0].capabilities.as_ref().unwrap();
+        assert_eq!(caps.len(), 3);
+        assert_eq!(caps[0], Capability::FsRead { prefix: "/workspace".to_string() });
+        assert_eq!(caps[1], Capability::FsWrite { prefix: "/tmp".to_string() });
+        assert_eq!(
+            caps[2],
+            Capability::Mcp {
+                server: "echo".to_string(),
+                tools: vec!["echo_text".to_string()]
+            }
+        );
     }
 }

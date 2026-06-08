@@ -28,6 +28,7 @@ const MAX_DESC_CHARS: usize = 1024;
 const MAX_NAME_LEN: usize = 64;
 
 use super::Tool;
+use crate::capability::Capability;
 use crate::inference::ToolSpec;
 
 struct Transport {
@@ -343,11 +344,12 @@ fn parse_tool_list(result: &Value) -> Result<Vec<ToolSpec>> {
 pub struct McpTool {
     client: Arc<McpClient>,
     spec: ToolSpec,
+    server_name: String,
 }
 
 impl McpTool {
-    pub fn new(client: Arc<McpClient>, spec: ToolSpec) -> Self {
-        Self { client, spec }
+    pub fn new(client: Arc<McpClient>, spec: ToolSpec, server_name: String) -> Self {
+        Self { client, spec, server_name }
     }
 }
 
@@ -363,6 +365,13 @@ impl Tool for McpTool {
 
     fn input_schema(&self) -> Value {
         self.spec.input_schema.clone()
+    }
+
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        Some(Capability::Mcp {
+            server: self.server_name.clone(),
+            tools: vec![self.spec.name.clone()],
+        })
     }
 
     async fn invoke(&self, input: Value) -> Result<String> {

@@ -97,7 +97,7 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         let n = specs.len();
         for spec in specs {
             registry
-                .register(Box::new(McpTool::new(Arc::clone(&client), spec)))
+                .register(Box::new(McpTool::new(Arc::clone(&client), spec, server.name.clone())))
                 .with_context(|| format!("registering tools from MCP server '{}'", server.name))?;
         }
         tracing::info!(name = %server.name, tools = n, "MCP server connected");
@@ -142,6 +142,7 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     let scheduler = Scheduler::new(
         agent_cfgs,
         &cfg.model,
+        cfg.scheduler,
         gateway,
         registry,
         Arc::clone(&recorder),

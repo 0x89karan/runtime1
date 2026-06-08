@@ -23,8 +23,12 @@ pub enum EventKind {
     Observe,
     AgentCompleted,
     AgentFailed,
+    AgentScheduled,
+    AgentDeferred,
+    AgentAdmissionDenied,
     BudgetExceeded,
     MaxTurnsReached,
+    CapabilityDenied,
     Error,
 }
 
