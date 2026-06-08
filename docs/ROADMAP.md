@@ -200,7 +200,7 @@ not perform IO itself.
 All pass. `jq 'del(.ts)' flight.jsonl` produces identical output before and after
 for the same task.
 
-### ▢ p1.2 — The scheduler (multi-agent, cooperative)
+### ▣ p1.2 — The scheduler (multi-agent, cooperative)
 **Depends on:** p1.1
 **Goal:** Run many agents concurrently; the scheduler drives each agent's effects
 and performs the IO (inference + tools).
@@ -209,6 +209,11 @@ and performs the IO (inference + tools).
   registry. Loop: pick a ready agent → `step` → fulfill the effect (await
   inference / invoke tools, concurrently across agents) → feed back → repeat.
 - Config grows to multiple agents; keep single-agent config accepted (back-compat).
+  **Deviation:** `AgentSpawned` is emitted in `main.rs` before gateway init (not in
+  `Scheduler::run()`) to preserve the invariant that startup events are always written
+  even when gateway initialization fails. Scheduler otherwise owns the drive loop.
+  `run_tools_sequential` extracted as `pub(crate)` in `agent/mod.rs`, shared by
+  `driver::run` (single-agent shim) and `Scheduler::run`.
 **Acceptance:** boot 2+ agents on independent tasks; they run concurrently to
 completion; flight events are interleaved and tagged by agent id.
 

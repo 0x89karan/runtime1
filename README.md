@@ -14,11 +14,11 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Starting from scratch.** This repo currently contains only the design, the
-build plan, and the conventions for what to build. The first work is **Phase 0**
-— bringing up the `agentd` runtime from a fresh Cargo crate to a working
-single-agent loop. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the increments
-(`p0.1` … `p0.5`), then Phase 1 from there.
+**Phase 0 complete; Phase 1 in progress.** `agentd` is a working Rust binary.
+Phase 0 landed a full single-agent loop (config, flight recorder, inference
+gateway, tools, MCP stdio client). Phase 1 is underway — p1.1 refactored the
+agent into a sans-IO state machine; p1.2 added a cooperative multi-agent
+scheduler. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
 
@@ -26,11 +26,14 @@ single-agent loop. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the increments
 agentos/                   ← run `claude` here
 ├── README.md              this file
 ├── CLAUDE.md              project memory for Claude Code
+├── CHANGELOG.md           notable changes per release
 ├── docs/
 │   ├── DESIGN.md          full design & research — the why
 │   ├── ROADMAP.md         the staged build plan — the what
 │   └── CONVENTIONS.md     how to extend the codebase — the how
-└── (agentd/ will be created in p0.1)
+└── agentd/                the runtime (Rust crate)
+    ├── agent.toml         single-agent example
+    └── agents.toml        multi-agent example (p1.2+)
 ```
 
 Future phases add siblings next to `agentd/`: `distro/` (Phase 2: Buildroot +
@@ -39,10 +42,10 @@ profiles). The repo is a single monorepo across phases, not a per-phase split.
 
 ## Quickstart
 
-In Claude Code, after p0.1 lands:
-
 ```bash
 cd agentd
 export ANTHROPIC_API_KEY=sk-...
-cargo run -- agent.toml
+cargo run -- agent.toml           # single agent
+cargo run -- agents.toml          # multiple agents concurrently (p1.2+)
+tail -f flight.jsonl              # watch the flight log
 ```

@@ -24,14 +24,17 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Nothing built yet.** This repo currently holds only docs. The first work is
-**Phase 0**: bring up the `agentd` runtime from a fresh Cargo crate (`p0.1`)
-through to a working single-agent perceive → infer → act → observe loop talking
-real MCP over stdio (`p0.5`). See `docs/ROADMAP.md`. Phase 1 (scheduler +
-inter-agent bus + capabilities) follows once Phase 0's exit criteria are met.
+**Phase 0 complete; Phase 1 in progress (p1.2 landed).** `agentd/` is a working
+Rust binary. Phase 0 (`p0.1`–`p0.5`) built the single-agent loop end to end:
+config, flight recorder, inference gateway (Anthropic), tool ABI, native tools,
+and a real MCP stdio client. Phase 1 is underway:
 
-The "Repo layout" and "Commands" sections below describe the **target state**
-after Phase 0 lands. Until `p0.1` is done, the `agentd/` directory doesn't exist.
+- **p1.1** (done): `AgentTask` sans-IO state machine — `step()` → `AgentEffect`.
+- **p1.2** (done): cooperative multi-agent scheduler — `Scheduler` drives many
+  agents concurrently via `FuturesUnordered`; `[[agents]]` TOML form; `agents.toml`
+  example.
+
+Next: `p1.3` metered scheduling & admission control. See `docs/ROADMAP.md`.
 
 ## How to work here
 
@@ -90,7 +93,8 @@ cargo test
 
 # Run an agent (logs to stderr; final answer to stdout; events to flight.jsonl)
 export ANTHROPIC_API_KEY=sk-...
-cargo run -- agent.toml
+cargo run -- agent.toml          # single agent
+cargo run -- agents.toml         # multiple agents concurrently (p1.2+)
 tail -f flight.jsonl             # watch it think
 ```
 
@@ -110,15 +114,17 @@ agentos/                   the repo root (run `claude` here)
     CONVENTIONS.md         how to extend the codebase consistently
   agentd/                  the Phase 0 / Phase 1 runtime (Rust crate)
     Cargo.toml             manifest (size-optimized release profile)
-    agent.toml             example agent spec
+    agent.toml             single-agent example spec
+    agents.toml            multi-agent example spec (p1.2+)
     README.md              runtime-specific quickstart
     src/
-      main.rs              boot: load config -> wire gateway + tools -> run agent
-      config.rs            TOML agent spec (secrets via env)
+      main.rs              boot: load config -> wire gateway + tools -> run scheduler
+      config.rs            TOML agent spec (single [agent] + multi [[agents]] forms)
       flight_recorder.rs   append-only JSONL event log
+      scheduler.rs         cooperative multi-agent scheduler (p1.2+)
       agent/
         mod.rs             AgentTask state machine: step() → AgentEffect (p1.1+)
-        driver.rs          async IO driver: fulfils effects, runs the loop
+        driver.rs          single-agent backward-compat shim
       inference/
         mod.rs             InferenceGateway trait + neutral message/tool types
         anthropic.rs       remote backend (Anthropic Messages API)

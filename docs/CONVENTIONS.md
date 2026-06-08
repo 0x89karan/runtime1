@@ -64,6 +64,7 @@ Phase 0 kinds (canonical — do not rename):
 | `agent_completed` | terminal: produced a final answer |
 | `budget_exceeded` | terminal: token budget blown |
 | `max_turns_reached` | terminal: hit the turn cap |
+| `agent_failed` | terminal: inference error terminated the agent (p1.2+) |
 | `error` | a stage failed (stage, error) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a

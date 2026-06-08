@@ -21,11 +21,12 @@
 - Consider `rustls` instead of `native-tls`, or a size audit, before p2.1.
 - Tracked: known from autoplan review of p0.1.
 
-**P3 — flight.jsonl CWD footgun for multi-agent (p1.2)**
-- A shared `flight.jsonl` in CWD won't work for concurrent multi-agent runs.
-- Needs a per-agent path strategy or shared recorder with agent tagging.
-- CONVENTIONS.md already mandates agent tagging per event; path strategy is the open question.
-- Action: design at p1.2 when the scheduler is introduced.
+**~~P3 — flight.jsonl CWD footgun for multi-agent (p1.2)~~** ✓ Resolved in p1.2.
+- Resolution: single shared `flight.jsonl` + per-event `agent` field (CONVENTIONS.md invariant).
+  All events emitted by `Scheduler::run()` carry the agent_id. Consumers filter by `agent` key.
+- **P3 — stdout ordering for multi-agent answers**: answers are printed in completion order (fastest
+  agent first), not in config declaration order. Fine for p1.2; a flag or ordered output mode
+  may be desirable in a future increment.
 
 **P3 — EventKind enum in flight_recorder.rs → events.rs at p0.4**
 - Once all 11 Phase-0 kinds are actively emitted, extract to its own module.
@@ -70,6 +71,13 @@
 - All acceptance criteria met.
 - **Completed:** 2026-06-07
 
+**p0.4 — The agent loop (perceive → infer → act → observe)**
+- `agent::run()`: full perceive → infer → act → observe loop with flight events.
+  Token budget guard, max-turns guard, tool errors as `is_error` blocks.
+- `main.rs`: stdin fallback for task, final answer on stdout.
+- All Phase 0 flight events emitted.
+- **Completed:** 2026-06-07
+
 **p0.5 — Real MCP stdio client**
 - `McpClient`: newline-delimited JSON-RPC 2.0 over tokio::process::Child (kill_on_drop).
   Handshake: initialize → notifications/initialized → tools/list. `tools/call` for invocation.
@@ -78,3 +86,20 @@
 - `echo-mcp` fixture binary + integration tests for MCP startup, coexistence, missing-server.
 - Release binary: 1.4 MB on macOS.
 - **Completed:** 2026-06-07
+
+**p1.1 — Agent as a sans-IO state machine**
+- `AgentTask` + `AgentEffect` (`#[must_use]`) + `step()` + `provide_inference()` + `provide_tool_results()`.
+- Terminal guard on all `provide_*` and `step()` calls; MaxTurns fires before InferenceRequest.
+- `agent/mod.rs` + `agent/driver.rs` split; driver is backward-compat shim.
+- Unit tests: `step_machine_text_tool_text_cycle`, `max_turns_fires_before_infer_request`, `provide_inference_on_terminal_task_is_noop`.
+- **Completed:** 2026-06-08
+
+**p1.2 — The scheduler (multi-agent, cooperative)**
+- `Scheduler` in `agentd/src/scheduler.rs`: `HashMap<String, AgentTask>` + `FuturesUnordered` drive loop.
+  `Scheduler::new()` validates duplicate IDs. `Scheduler::run()` owns all IO concurrently.
+- `config.rs`: `[[agents]]` multi-agent form + `agent_configs()` + backward-compat `[agent]` single form.
+- `run_tools_sequential` extracted as `pub(crate)` in `agent/mod.rs`, shared by driver and scheduler.
+- `agents.toml`: example two-agent config.
+- `main.rs`: uses Scheduler for all runs; exit non-zero if any agent fails; stdin fallback preserved for single form.
+- 4 scheduler tests + 8 config tests. All 74 unit + 16 integration tests pass.
+- **Completed:** 2026-06-08

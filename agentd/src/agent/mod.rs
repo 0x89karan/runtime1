@@ -1,13 +1,14 @@
 pub mod driver;
 
-pub use driver::run;
-
 use serde_json::json;
+
+const PREVIEW_CHARS: usize = 200;
 
 use crate::{
     config::{AgentConfig, ModelConfig},
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceRequest, InferenceResponse, Msg, Role, StopReason, ToolSpec},
+    tools::ToolRegistry,
 };
 
 #[must_use = "AgentEffect names the IO the scheduler must perform; ignoring it stalls the agent"]
@@ -159,7 +160,7 @@ impl AgentTask {
                 .and_then(|m| m.blocks.first())
                 .and_then(|b| {
                     if let Block::Text { text } = b {
-                        Some(truncate(text, 200))
+                        Some(truncate(text, PREVIEW_CHARS))
                     } else {
                         None
                     }
@@ -240,7 +241,7 @@ impl AgentTask {
                     json!({
                         "turns":          self.turn + 1,
                         "total_tokens":   total,
-                        "answer_preview": truncate(&answer, 200),
+                        "answer_preview": truncate(&answer, PREVIEW_CHARS),
                     }),
                 );
                 self.terminal = true;
@@ -268,10 +269,79 @@ impl AgentTask {
                     .filter(|b| matches!(b, Block::ToolUse { .. }))
                     .collect();
 
+                if call_blocks.is_empty() {
+                    self.terminal = true;
+                    return AgentEffect::Failed(
+                        "model returned stop_reason=tool_use with no ToolUse blocks".to_string(),
+                    );
+                }
+
                 AgentEffect::CallTools(call_blocks)
             }
         }
     }
+}
+
+/// Run `blocks` sequentially, emitting ToolCall + ToolResult events inline.
+/// Shared by `driver::run` (single-agent shim) and `Scheduler::run` (multi-agent).
+/// Per-tool errors become `Block::ToolResult { is_error: true }` — no top-level Err.
+pub(crate) async fn run_tools_sequential(
+    agent_id: &str,
+    turn: u32,
+    blocks: &[Block],
+    registry: &ToolRegistry,
+    recorder: &FlightRecorder,
+) -> Vec<Block> {
+    let mut results: Vec<Block> = Vec::new();
+    for block in blocks {
+        let Block::ToolUse { id, name, input } = block else {
+            continue;
+        };
+
+        recorder.record(
+            agent_id,
+            Some(turn),
+            EventKind::ToolCall,
+            json!({ "id": id, "name": name, "input": input }),
+        );
+
+        let (content, is_error) = match registry.invoke(name, input.clone()).await {
+            Ok(s) => {
+                recorder.record(
+                    agent_id,
+                    Some(turn),
+                    EventKind::ToolResult,
+                    json!({
+                        "id": id, "name": name,
+                        "is_error": false,
+                        "preview": truncate(&s, PREVIEW_CHARS),
+                    }),
+                );
+                (s, false)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                recorder.record(
+                    agent_id,
+                    Some(turn),
+                    EventKind::ToolResult,
+                    json!({
+                        "id": id, "name": name,
+                        "is_error": true,
+                        "error": msg,
+                    }),
+                );
+                (msg, true)
+            }
+        };
+
+        results.push(Block::ToolResult {
+            tool_use_id: id.clone(),
+            content,
+            is_error,
+        });
+    }
+    results
 }
 
 fn truncate(s: &str, max_chars: usize) -> String {
@@ -287,6 +357,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::driver::run;
     use crate::config::{AgentConfig, ModelConfig};
     use crate::inference::{InferenceGateway, InferenceRequest, InferenceResponse, StopReason};
     use std::sync::{Arc, Mutex};
@@ -616,5 +687,31 @@ mod tests {
             })
             .count();
         assert_eq!(has_error, 1, "expected one error event for terminal provide_inference");
+    }
+
+    #[tokio::test]
+    async fn run_tools_sequential_skips_non_tool_use_blocks() {
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap();
+        let registry = crate::tools::ToolRegistry::new();
+
+        let blocks = vec![
+            Block::Text { text: "some text".to_string() },
+            Block::ToolUse {
+                id:    "call_1".to_string(),
+                name:  "unknown_tool".to_string(),
+                input: serde_json::json!({}),
+            },
+        ];
+
+        let results = run_tools_sequential("agent", 0, &blocks, &registry, &rec).await;
+
+        // Text block skipped; unknown tool returns an error result (not a panic)
+        assert_eq!(results.len(), 1, "only the ToolUse block should produce a result");
+        let Block::ToolResult { tool_use_id, is_error, .. } = &results[0] else {
+            panic!("expected ToolResult");
+        };
+        assert_eq!(tool_use_id, "call_1");
+        assert!(is_error, "unknown tool should produce is_error=true result");
     }
 }

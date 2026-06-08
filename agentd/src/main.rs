@@ -1,7 +1,7 @@
 use std::{io::IsTerminal, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use agentd::{agent, config};
+use agentd::{config, scheduler::Scheduler};
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
 use agentd::tools::{
@@ -21,7 +21,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+    let result = match args.next().as_deref() {
         Some("--probe") => {
             let prompt = args
                 .next()
@@ -30,7 +30,14 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(path) => run_agent(PathBuf::from(path)).await,
         None => run_agent(PathBuf::from("agent.toml")).await,
+    };
+
+    if let Err(e) = result {
+        // Use {e:#} to emit the full anyhow error chain (not just the outermost context).
+        tracing::error!("agentd exited with error: {e:#}");
+        std::process::exit(1);
     }
+    Ok(())
 }
 
 async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
@@ -39,41 +46,47 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     let cfg: config::Config =
         toml::from_str(&raw).with_context(|| format!("parsing config from {path:?}"))?;
 
-    let recorder = FlightRecorder::open()?;
+    let recorder = Arc::new(FlightRecorder::open()?);
 
-    recorder.record(
-        &cfg.agent.id,
-        None,
-        EventKind::AgentSpawned,
-        serde_json::json!({
-            "model": cfg.model.model,
-            "provider": cfg.model.provider,
-            "max_tokens": cfg.model.max_tokens,
-            "max_turns": cfg.agent.max_turns,
-            "token_budget": cfg.agent.token_budget,
-            "task": cfg.agent.task,
-            "native_tools": cfg.tools.native,
-            "mcp_servers": cfg.tools.mcp_servers.len(),
-        }),
-    );
+    let mut agent_cfgs = cfg.agent_configs()?;
 
-    tracing::info!(
-        agent = %cfg.agent.id,
-        model = %cfg.model.model,
-        "agent spawned"
-    );
+    // stdin fallback: only for the single [agent] form with an empty task
+    if cfg.agent.is_some() {
+        let ac = &mut agent_cfgs[0];
+        if ac.task.is_empty() {
+            if !std::io::stdin().is_terminal() {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .context("reading task from stdin")?;
+                let trimmed = buf.trim().to_string();
+                anyhow::ensure!(!trimmed.is_empty(), "no task: stdin was empty");
+                ac.task = trimmed;
+            } else {
+                anyhow::bail!("no task: set [agent].task in config or pipe text to stdin");
+            }
+        }
+    } else {
+        // [[agents]] form: every agent must have a task in config
+        for ac in &agent_cfgs {
+            anyhow::ensure!(
+                !ac.task.is_empty(),
+                "agent '{}' has no task; set task in [[agents]]",
+                ac.id
+            );
+        }
+    }
 
     let mut registry = ToolRegistry::new();
     register_native(&mut registry, &cfg.tools.native)?;
 
-    // Spawn MCP servers and register their tools. McpTool holds an Arc<McpClient>,
-    // so the child processes remain alive as long as the registry does. We also
-    // collect the Arcs here so the clients are explicitly dropped after the agent
-    // run rather than at an arbitrary point during registry cleanup.
+    // Held for Drop: keeps MCP child processes alive until run_agent returns.
+    // std::process::exit() bypasses Drop, so we must return Err instead of
+    // calling exit() while mcp_clients is still in scope.
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
     for server in &cfg.tools.mcp_servers {
         tracing::info!(
-            agent = %cfg.agent.id,
             name = %server.name,
             command = %server.command,
             "spawning MCP server"
@@ -87,64 +100,71 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
                 .register(Box::new(McpTool::new(Arc::clone(&client), spec)))
                 .with_context(|| format!("registering tools from MCP server '{}'", server.name))?;
         }
-        tracing::info!(
-            agent = %cfg.agent.id,
-            name = %server.name,
-            tools = n,
-            "MCP server connected"
-        );
+        tracing::info!(name = %server.name, tools = n, "MCP server connected");
         mcp_clients.push(client);
     }
 
     let tool_names = registry.tool_names();
     recorder.record(
-        &cfg.agent.id,
+        "agentd",
         None,
         EventKind::ToolsRegistered,
         serde_json::json!({ "tools": tool_names }),
     );
+    tracing::info!(tools = ?tool_names, "tools registered");
 
-    tracing::info!(
-        agent = %cfg.agent.id,
-        tools = ?tool_names,
-        "tools registered"
+    // Emit AgentSpawned per agent before any API calls so startup events are
+    // always present in the flight log even if gateway init fails.
+    for ac in &agent_cfgs {
+        recorder.record(
+            &ac.id,
+            None,
+            EventKind::AgentSpawned,
+            serde_json::json!({
+                "model":        cfg.model.model,
+                "provider":     cfg.model.provider,
+                "max_tokens":   cfg.model.max_tokens,
+                "max_turns":    ac.max_turns,
+                "token_budget": ac.token_budget,
+                "task":         ac.task,
+                "native_tools": cfg.tools.native,
+                "mcp_servers":  cfg.tools.mcp_servers.len(),
+            }),
+        );
+        tracing::info!(agent = %ac.id, model = %cfg.model.model, "agent spawned");
+    }
+
+    let gateway = Arc::new(
+        AnthropicGateway::from_env(&cfg.model.model).context("initializing Anthropic gateway")?,
     );
+    let registry = Arc::new(registry);
 
-    // Task: config field takes precedence; fall back to stdin when not a tty.
-    let task = if !cfg.agent.task.is_empty() {
-        cfg.agent.task.clone()
-    } else if !std::io::stdin().is_terminal() {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .context("reading task from stdin")?;
-        let trimmed = buf.trim().to_string();
-        if trimmed.is_empty() {
-            return Err(anyhow::anyhow!("no task: stdin was empty"));
-        }
-        trimmed
-    } else {
-        return Err(anyhow::anyhow!(
-            "no task: set [agent].task in config or pipe text to stdin"
-        ));
-    };
-
-    let gateway = AnthropicGateway::from_env(&cfg.model.model)
-        .context("initializing Anthropic gateway")?;
-
-    let answer = agent::run(
-        &cfg.agent.id,
-        &task,
-        &cfg.agent,
+    let scheduler = Scheduler::new(
+        agent_cfgs,
         &cfg.model,
-        &gateway,
-        &registry,
-        &recorder,
-    )
-    .await?;
+        gateway,
+        registry,
+        Arc::clone(&recorder),
+    )?;
 
-    println!("{answer}");
+    let outcomes = scheduler.run().await;
+
+    let mut any_failed = false;
+    for (id, result) in &outcomes {
+        match result {
+            Ok(answer) => println!("{answer}"),
+            Err(e) => {
+                tracing::error!(agent = %id, error = %e, "agent failed");
+                any_failed = true;
+            }
+        }
+    }
+
+    if any_failed {
+        // Return Err so main() calls exit() after run_agent has returned and
+        // mcp_clients has been dropped — process::exit skips destructors.
+        anyhow::bail!("one or more agents failed");
+    }
     Ok(())
 }
 

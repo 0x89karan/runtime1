@@ -22,6 +22,7 @@ pub enum EventKind {
     ToolResult,
     Observe,
     AgentCompleted,
+    AgentFailed,
     BudgetExceeded,
     MaxTurnsReached,
     Error,

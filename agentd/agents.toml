@@ -1,0 +1,27 @@
+# AgentOS multi-agent specification (p1.2+)
+# Run:        cargo run -- agents.toml
+# Watch log:  tail -f flight.jsonl
+# Verbosity:  RUST_LOG=debug cargo run -- agents.toml
+#
+# All agents share the [model] config and [tools] config.
+# Each [[agents]] entry runs concurrently; answers print in completion order.
+
+[model]
+provider = "anthropic"
+model    = "claude-sonnet-4-6"
+max_tokens = 4096
+
+[tools]
+native = ["read_file", "list_dir"]
+
+[[agents]]
+id           = "surveyor"
+task         = "List the agentd/src directory and describe every source file in one sentence each."
+max_turns    = 10
+token_budget = 50_000
+
+[[agents]]
+id           = "analyst"
+task         = "Read agentd/Cargo.toml and explain what each dependency is used for."
+max_turns    = 10
+token_budget = 50_000
