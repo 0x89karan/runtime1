@@ -16,7 +16,9 @@ max_tokens = 4096
 native = ["read_file", "list_dir"]
 
 # Optional: admission control (p1.3+).
-# global_token_budget = 0        # 0 = unlimited; >0 = hard ceiling across all agents
+# global_token_budget = 0        # 0 = unlimited; >0 = stop-admission threshold (no new
+#                                 #   inferences once this many tokens have been spent;
+#                                 #   a single inference may spend past it if it runs over)
 # max_concurrent_inferences = 0  # 0 = unlimited; >0 = max in-flight inference calls
 [scheduler]
 global_token_budget        = 0

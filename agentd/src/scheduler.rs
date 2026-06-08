@@ -103,9 +103,6 @@ impl Scheduler {
         let mut in_flight: usize = 0;
         let mut tokens_spent: u64 = 0;
 
-        // Admission helpers (used in drain_deferred and enqueue_or_defer).
-        let _ = &sched; // consumed by enqueue_or_defer / drain_deferred via reference
-
         // Seed: step each agent once to kick off the first effect.
         let ids: Vec<String> = agents.keys().cloned().collect();
         for id in ids {
@@ -126,6 +123,7 @@ impl Scheduler {
         while let Some(er) = pending.next().await {
             match er {
                 EffectResult::Inference { agent_id, result: Err(e) } => {
+                    debug_assert!(in_flight > 0, "in_flight underflow on inference error");
                     in_flight -= 1;
                     recorder.record(
                         &agent_id,
@@ -146,6 +144,7 @@ impl Scheduler {
                     );
                 }
                 EffectResult::Inference { agent_id, result: Ok(resp) } => {
+                    debug_assert!(in_flight > 0, "in_flight underflow on inference success");
                     in_flight -= 1;
                     let new_tokens =
                         u64::from(resp.input_tokens) + u64::from(resp.output_tokens);
@@ -158,7 +157,7 @@ impl Scheduler {
                         let t = sm.turn();
                         (sm.step(&recorder), t)
                     };
-                    tokens_spent += new_tokens;
+                    tokens_spent = tokens_spent.saturating_add(new_tokens);
                     drain_deferred(
                         &mut deferred, &mut in_flight, tokens_spent,
                         &sched, &gateway, &recorder, &mut pending, &mut outcomes,
@@ -196,11 +195,11 @@ impl Scheduler {
                 &d.agent_id,
                 None,
                 EventKind::AgentAdmissionDenied,
-                json!({ "reason": "budget_exhausted_at_shutdown" }),
+                json!({ "reason": "scheduler_shutdown_with_pending_items", "tokens_spent": tokens_spent }),
             );
             outcomes.insert(
                 d.agent_id,
-                Err(anyhow::anyhow!("admission denied: global budget exhausted")),
+                Err(anyhow::anyhow!("admission denied: scheduler shut down with pending items")),
             );
         }
 
@@ -606,34 +605,79 @@ mod tests {
 
     // ── p1.3: priority ordering in deferred queue ─────────────────────────
 
+    /// Gateway that records the first user-message text of each infer() call,
+    /// allowing tests to verify admission order deterministically.
+    struct TrackingGateway {
+        call_log: Arc<Mutex<Vec<String>>>,
+        responses: Mutex<Vec<InferenceResponse>>,
+    }
+    impl TrackingGateway {
+        fn new(responses: Vec<InferenceResponse>) -> (Self, Arc<Mutex<Vec<String>>>) {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            (Self { call_log: Arc::clone(&log), responses: Mutex::new(responses) }, log)
+        }
+    }
+    #[async_trait::async_trait]
+    impl InferenceGateway for TrackingGateway {
+        async fn infer(&self, req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+            if let Some(msg) = req.messages.first() {
+                if let Some(Block::Text { text }) = msg.blocks.first() {
+                    self.call_log.lock().unwrap().push(text.clone());
+                }
+            }
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                return Err(anyhow::anyhow!("TrackingGateway: no more responses"));
+            }
+            Ok(q.remove(0))
+        }
+        fn model_id(&self) -> &str { "tracking" }
+    }
+
     #[tokio::test]
     async fn scheduler_priority_high_runs_before_low() {
-        // cap=1: only one agent runs at a time.
-        // low(priority=0) seeds first (HashMap order is non-deterministic, but we
-        // set up responses so the test works regardless of which seeds first).
-        // high(priority=10) seeds second.
-        // Whichever is deferred should be: high if low went first, low if high went first.
-        // Either way, after the first inference completes, the deferred agent with
-        // higher priority should be admitted before lower.
+        // cap=1: exactly one agent seeds (HashMap order is non-deterministic).
+        // The other two are deferred simultaneously.
+        // Regardless of which agent wins the seed lottery, the deferred pair
+        // is always admitted in priority order (higher priority first).
         //
-        // To make this deterministic: use three agents (cap=1), first one drains,
-        // two are deferred; verify the higher-priority one's answer comes before the lower.
-        // But FuturesUnordered order of outcomes is not predictable by index.
-        // Instead: verify both complete (priority ordering doesn't cause failures).
-        let gw = MockGateway::new(vec![
+        // Verification: record infer() call order via TrackingGateway.
+        // The seed winner is position 0; positions 1 and 2 are the deferred pair.
+        // For any permutation, priorities[order[1]] > priorities[order[2]].
+        let priorities: std::collections::HashMap<&str, u32> = [
+            ("anchor_task", 5),
+            ("high_task",  10),
+            ("low_task",    0),
+        ].iter().cloned().collect();
+
+        let (gw, call_log) = TrackingGateway::new(vec![
             end_turn("r1", 5, 5),
             end_turn("r2", 5, 5),
+            end_turn("r3", 5, 5),
         ]);
         let sched = make_scheduler(
             vec![
-                agent_cfg_pri("low",  "task", 0),
-                agent_cfg_pri("high", "task", 10),
+                agent_cfg_pri("anchor", "anchor_task",  5),
+                agent_cfg_pri("high",   "high_task",   10),
+                agent_cfg_pri("low",    "low_task",     0),
             ],
             sched_cfg(0, 1),
             gw,
         );
         let outcomes = sched.run().await;
-        assert_eq!(outcomes.len(), 2);
-        assert_eq!(outcomes.values().filter(|r| r.is_ok()).count(), 2, "both must complete");
+        assert_eq!(outcomes.values().filter(|r| r.is_ok()).count(), 3, "all must complete");
+
+        let order = call_log.lock().unwrap().clone();
+        assert_eq!(order.len(), 3, "each agent must call infer exactly once");
+
+        // The two deferred agents (positions 1 and 2) must be in priority order.
+        let p1 = priorities[order[1].as_str()];
+        let p2 = priorities[order[2].as_str()];
+        assert!(
+            p1 > p2,
+            "deferred agents must be admitted highest-priority-first, \
+             but got order {:?} (p1={}, p2={})",
+            order, p1, p2,
+        );
     }
 }
