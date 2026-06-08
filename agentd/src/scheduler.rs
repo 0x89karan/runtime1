@@ -694,4 +694,67 @@ mod tests {
             order, p1, p2,
         );
     }
+
+    // ── p1.4: scheduler end-to-end capability enforcement ────────────────────
+
+    #[tokio::test]
+    async fn scheduler_capability_denied_bubbles_to_agent_as_tool_error() {
+        // End-to-end: an agent configured with FsRead-only capabilities attempts a
+        // write_file call. The scheduler must pass the cap_set through to invoke(),
+        // get a capability_denied error, and return it as an is_error tool result
+        // block so the agent can handle it. The agent then completes normally.
+        use crate::{
+            capability::Capability,
+            tools::native::register_native,
+        };
+
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["write_file".to_string()]).unwrap();
+
+        // First inference: model tries to call write_file (denied by cap_set)
+        // Second inference: model sees the capability_denied error result and answers
+        let gw = MockGateway::new(vec![
+            InferenceResponse {
+                blocks: vec![Block::ToolUse {
+                    id:    "call_cap_test".to_string(),
+                    name:  "write_file".to_string(),
+                    input: serde_json::json!({"path": "/etc/passwd", "content": "evil"}),
+                }],
+                stop_reason:   StopReason::ToolUse,
+                input_tokens:  10,
+                output_tokens: 5,
+            },
+            end_turn("capability denied, I'll stop", 10, 5),
+        ]);
+
+        let (rec, _tmp) = recorder();
+        let agent = AgentConfig {
+            capabilities: Some(vec![Capability::FsRead { prefix: "/".to_string() }]),
+            ..agent_cfg("cap-test", "try to write a file")
+        };
+
+        let sched = Scheduler::new(
+            vec![agent],
+            &model_cfg(),
+            unlimited(),
+            std::sync::Arc::new(gw),
+            std::sync::Arc::new(registry),
+            rec,
+        )
+        .unwrap();
+
+        let outcomes = sched.run().await;
+        // The agent must complete (not panic or hang) — capability denial is surfaced
+        // as an error tool result, not an unrecoverable failure.
+        assert!(
+            outcomes.contains_key("cap-test"),
+            "cap-test agent must produce an outcome"
+        );
+        // The outcome is Ok (agent reached end_turn after seeing the denial)
+        assert!(
+            outcomes["cap-test"].is_ok(),
+            "agent should complete normally after capability denial: {:?}",
+            outcomes["cap-test"]
+        );
+    }
 }

@@ -316,4 +316,37 @@ mod tests {
             }
         ));
     }
+
+    // ── satisfies_type direct tests ──────────────────────────────────────────
+
+    #[test]
+    fn satisfies_type_fs_read_empty_prefix_matches_any_fs_read_grant() {
+        // satisfies_type is the type-level visibility check used by filtered_specs.
+        // Required with empty prefix = "has any FsRead cap?"
+        let caps = [Capability::FsRead { prefix: "/workspace".to_string() }];
+        assert!(satisfies_type(&caps, &Capability::FsRead { prefix: "".to_string() }));
+    }
+
+    #[test]
+    fn satisfies_type_fs_write_empty_prefix_matches_any_fs_write_grant() {
+        let caps = [Capability::FsWrite { prefix: "/tmp".to_string() }];
+        assert!(satisfies_type(&caps, &Capability::FsWrite { prefix: "".to_string() }));
+    }
+
+    #[test]
+    fn satisfies_type_fs_read_empty_prefix_no_grant_returns_false() {
+        // No FsRead in the cap set → type check returns false.
+        let caps = [Capability::FsWrite { prefix: "/tmp".to_string() }];
+        assert!(!satisfies_type(&caps, &Capability::FsRead { prefix: "".to_string() }));
+    }
+
+    #[test]
+    fn satisfies_type_non_fs_delegates_to_satisfies() {
+        // For non-empty prefixes, satisfies_type delegates to satisfies.
+        let caps = [Capability::FsRead { prefix: "/workspace".to_string() }];
+        // Matching non-empty prefix → true
+        assert!(satisfies_type(&caps, &Capability::FsRead { prefix: "/workspace/file.rs".to_string() }));
+        // Non-matching non-empty prefix → false
+        assert!(!satisfies_type(&caps, &Capability::FsRead { prefix: "/etc/passwd".to_string() }));
+    }
 }

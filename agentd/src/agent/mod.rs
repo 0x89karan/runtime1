@@ -707,6 +707,48 @@ mod tests {
         assert_eq!(has_error, 1, "expected one error event for terminal provide_inference");
     }
 
+    #[test]
+    fn step_on_terminal_task_returns_failed() {
+        let (rec, tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("term-test-step", "task", &cfg, &model_cfg(), vec![]);
+
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Infer(_)));
+        sm.provide_inference(end_turn("done"), &rec);
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Completed(_)));
+
+        // step() on a terminal task must return Failed, not panic
+        let eff = sm.step(&rec);
+        assert!(
+            matches!(&eff, AgentEffect::Failed(msg) if msg.contains("terminal")),
+            "expected Failed(terminal)"
+        );
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(log.lines().any(|l| l.contains("\"error\"") && l.contains("\"step\"")));
+    }
+
+    #[test]
+    fn provide_tool_results_on_terminal_task_is_noop() {
+        let (rec, tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("term-test-tools", "task", &cfg, &model_cfg(), vec![]);
+
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Infer(_)));
+        sm.provide_inference(end_turn("done"), &rec);
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Completed(_)));
+
+        let pre_turn = sm.turn();
+        sm.provide_tool_results(vec![], &rec);
+        assert_eq!(sm.turn(), pre_turn, "turn must not advance on terminal noop");
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(log.lines().any(|l| l.contains("\"error\"") && l.contains("provide_tool_results")));
+    }
+
     #[tokio::test]
     async fn run_tools_sequential_skips_non_tool_use_blocks() {
         let tmp = NamedTempFile::new().unwrap();
