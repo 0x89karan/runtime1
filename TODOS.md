@@ -28,6 +28,12 @@
   agent first), not in config declaration order. Fine for p1.2; a flag or ordered output mode
   may be desirable in a future increment.
 
+**P3 — SchedulerState refactor (p1.3 deferred)**
+- `drain_deferred` and `enqueue_or_defer` in `scheduler.rs` take many arguments
+  (`#[allow(clippy::too_many_arguments)]`). A `SchedulerState` struct should collect
+  `in_flight`, `tokens_spent`, `deferred`, `deferred_seq`, and `outcomes` into one place.
+- Action: introduce `SchedulerState` at the next scheduler-touching increment (p1.4 or p1.5).
+
 **P3 — EventKind enum in flight_recorder.rs → events.rs at p0.4**
 - Once all 11 Phase-0 kinds are actively emitted, extract to its own module.
 - Keeps `flight_recorder.rs` focused on I/O, not taxonomy.
@@ -103,3 +109,12 @@
 - `main.rs`: uses Scheduler for all runs; exit non-zero if any agent fails; stdin fallback preserved for single form.
 - 4 scheduler tests + 8 config tests. All 74 unit + 16 integration tests pass.
 - **Completed:** 2026-06-08
+
+**p1.3 — Metered scheduling & admission control**
+- `SchedulerConfig` in `config.rs`: `global_token_budget` (u64) + `max_concurrent_inferences` (usize); wired into `Scheduler::new`.
+- Per-agent `priority: u32` field (default 0); `BinaryHeap<DeferredInfer>` keyed by `(priority desc, seq asc)`.
+- `enqueue_or_defer` / `drain_deferred` manage the admission lifecycle in `scheduler.rs`.
+- Flight events: `agent_scheduled`, `agent_deferred`, `agent_admission_denied`.
+- `in_flight` underflow guards promoted from `debug_assert!` to `assert!`.
+- New config tests: `scheduler_config_explicit_values_parse`, `scheduler_config_defaults_to_unlimited`, `agent_priority_parses_from_toml`.
+- **Completed:** v0.3.0 (2026-06-08)

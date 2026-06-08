@@ -24,7 +24,7 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Phase 0 complete; Phase 1 in progress (p1.2 landed).** `agentd/` is a working
+**Phase 0 complete; Phase 1 in progress (p1.3 landed).** `agentd/` is a working
 Rust binary. Phase 0 (`p0.1`–`p0.5`) built the single-agent loop end to end:
 config, flight recorder, inference gateway (Anthropic), tool ABI, native tools,
 and a real MCP stdio client. Phase 1 is underway:
@@ -33,8 +33,12 @@ and a real MCP stdio client. Phase 1 is underway:
 - **p1.2** (done): cooperative multi-agent scheduler — `Scheduler` drives many
   agents concurrently via `FuturesUnordered`; `[[agents]]` TOML form; `agents.toml`
   example.
+- **p1.3** (done): metered scheduling & admission control — `[scheduler]` TOML
+  section with `global_token_budget` and `max_concurrent_inferences`; per-agent
+  `priority` field; deferred queue with `BinaryHeap`; `agent_scheduled`,
+  `agent_deferred`, `agent_admission_denied` flight events.
 
-Next: `p1.3` metered scheduling & admission control. See `docs/ROADMAP.md`.
+Next: `p1.4` capability system (least-privilege scoped tool grants). See `docs/ROADMAP.md`.
 
 ## How to work here
 
@@ -108,6 +112,8 @@ preinstalled on macOS) because Phase 0 uses native-tls. Phase 2 switches the
 agentos/                   the repo root (run `claude` here)
   CLAUDE.md                this file
   README.md                project overview
+  CHANGELOG.md             notable changes per release
+  TODOS.md                 open technical-debt items and completed increments
   docs/
     DESIGN.md              full design & research (the "why")
     ROADMAP.md             the staged build plan (the work queue)

@@ -45,8 +45,8 @@ id   = "analyst"
 task = "Read Cargo.toml and explain each dependency."
 ```
 
-Both forms share `[model]` and `[tools]` sections. See `agent.toml` and `agents.toml` for
-annotated examples. Cannot mix both forms in one file.
+Both forms share `[model]`, `[tools]`, and `[scheduler]` sections. See `agent.toml` and
+`agents.toml` for annotated examples. Cannot mix both forms in one file.
 
 ### Config reference
 
@@ -55,11 +55,14 @@ annotated examples. Cannot mix both forms in one file.
 | `[agent].id` / `[[agents]].id` | *required* | Unique identifier for this agent |
 | `[agent].task` / `[[agents]].task` | `""` | The task to perform (single-agent form reads from stdin if empty) |
 | `[agent].max_turns` / `[[agents]].max_turns` | `20` | Turn limit before `max_turns_reached` event |
-| `[agent].token_budget` / `[[agents]].token_budget` | `100000` | Cumulative token ceiling (input + output) |
+| `[agent].token_budget` / `[[agents]].token_budget` | `100000` | Per-agent cumulative token ceiling (input + output) |
+| `[[agents]].priority` | `0` | Scheduling priority — higher runs before lower when the concurrency cap is full |
 | `model.provider` | `"anthropic"` | Inference backend |
 | `model.model` | `"claude-sonnet-4-6"` | Model identifier passed to the provider |
 | `model.max_tokens` | `4096` | Max tokens per inference response |
 | `tools.native` | `[]` | Native tools: `["all"]` or `["read_file", "write_file", "list_dir"]` |
+| `scheduler.global_token_budget` | `0` | Global token ceiling across all agents; `0` = unlimited |
+| `scheduler.max_concurrent_inferences` | `0` | Max in-flight model calls at once; `0` = unlimited |
 
 Secrets are **never** in config — read from environment only (`ANTHROPIC_API_KEY`).
 
