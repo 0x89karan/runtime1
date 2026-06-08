@@ -123,7 +123,7 @@ impl Scheduler {
         while let Some(er) = pending.next().await {
             match er {
                 EffectResult::Inference { agent_id, result: Err(e) } => {
-                    debug_assert!(in_flight > 0, "in_flight underflow on inference error");
+                    assert!(in_flight > 0, "in_flight underflow on inference error — every Inference result must be preceded by an admission");
                     in_flight -= 1;
                     recorder.record(
                         &agent_id,
@@ -144,7 +144,7 @@ impl Scheduler {
                     );
                 }
                 EffectResult::Inference { agent_id, result: Ok(resp) } => {
-                    debug_assert!(in_flight > 0, "in_flight underflow on inference success");
+                    assert!(in_flight > 0, "in_flight underflow on inference success — every Inference result must be preceded by an admission");
                     in_flight -= 1;
                     let new_tokens =
                         u64::from(resp.input_tokens) + u64::from(resp.output_tokens);
