@@ -68,6 +68,11 @@ impl AgentTask {
         self.turn
     }
 
+    /// Scheduling priority from config. Higher value = runs before lower.
+    pub fn priority(&self) -> u32 {
+        self.cfg.priority
+    }
+
     /// Advance the state machine by one step.
     ///
     /// In NeedInfer state: emits Perceive (turn 0 only), then InferenceRequest,
@@ -421,6 +426,7 @@ mod tests {
             task: String::new(),
             max_turns,
             token_budget,
+            priority: 0,
         }
     }
 

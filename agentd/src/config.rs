@@ -11,6 +11,8 @@ pub struct Config {
     pub model: ModelConfig,
     #[serde(default)]
     pub tools: ToolsConfig,
+    #[serde(default)]
+    pub scheduler: SchedulerConfig,
 }
 
 impl Config {
@@ -31,6 +33,17 @@ impl Config {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerConfig {
+    /// Global token ceiling across all agents. 0 = unlimited.
+    #[serde(default)]
+    pub global_token_budget: u64,
+    /// Maximum number of in-flight inference calls at once. 0 = unlimited.
+    #[serde(default)]
+    pub max_concurrent_inferences: usize,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -41,6 +54,9 @@ pub struct AgentConfig {
     pub max_turns: u32,
     #[serde(default = "default_token_budget")]
     pub token_budget: u64,
+    /// Scheduling priority. Higher value runs before lower. Default 0 (equal priority).
+    #[serde(default)]
+    pub priority: u32,
 }
 
 fn default_max_turns() -> u32 {

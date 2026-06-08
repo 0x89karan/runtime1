@@ -4,7 +4,8 @@
 # Verbosity:  RUST_LOG=debug cargo run -- agents.toml
 #
 # All agents share the [model] config and [tools] config.
-# Each [[agents]] entry runs concurrently; answers print in completion order.
+# Each [[agents]] entry runs concurrently subject to [scheduler] limits.
+# Answers print in completion order.
 
 [model]
 provider = "anthropic"
@@ -14,14 +15,23 @@ max_tokens = 4096
 [tools]
 native = ["read_file", "list_dir"]
 
+# Optional: admission control (p1.3+).
+# global_token_budget = 0        # 0 = unlimited; >0 = hard ceiling across all agents
+# max_concurrent_inferences = 0  # 0 = unlimited; >0 = max in-flight inference calls
+[scheduler]
+global_token_budget        = 0
+max_concurrent_inferences  = 0
+
 [[agents]]
 id           = "surveyor"
 task         = "List the agentd/src directory and describe every source file in one sentence each."
 max_turns    = 10
 token_budget = 50_000
+priority     = 0
 
 [[agents]]
 id           = "analyst"
 task         = "Read agentd/Cargo.toml and explain what each dependency is used for."
 max_turns    = 10
 token_budget = 50_000
+priority     = 0

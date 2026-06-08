@@ -142,6 +142,7 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     let scheduler = Scheduler::new(
         agent_cfgs,
         &cfg.model,
+        cfg.scheduler,
         gateway,
         registry,
         Arc::clone(&recorder),

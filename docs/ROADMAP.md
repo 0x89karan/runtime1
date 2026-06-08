@@ -217,18 +217,24 @@ and performs the IO (inference + tools).
 **Acceptance:** boot 2+ agents on independent tasks; they run concurrently to
 completion; flight events are interleaved and tagged by agent id.
 
-### ▢ p1.3 — Metered scheduling & admission control
+### ▣ p1.3 — Metered scheduling & admission control
 **Depends on:** p1.2
 **Goal:** Enforce a **global** cognition budget and concurrency under scarcity —
 defer rather than overspend. This is the core research problem; treat it as such.
-**Scope:** `agentd/src/scheduler.rs` (+ a small `agentd/src/budget.rs` if it helps).
-- Global token/$ ceiling across all agents (per-agent budgets still apply).
-- Max in-flight inference concurrency cap; optional token-rate limiter.
-- A policy: priority + fair-share; when the ceiling/cap is hit, agents enter a
-  waiting state and are admitted as budget/slots free.
-**Acceptance:** with a low global ceiling and concurrency cap of 1, two agents are
-serialized, one deferred until budget frees; total spend never exceeds the ceiling;
-scheduler logs `scheduled` / `deferred` / `admission_denied`.
+**Scope:** `agentd/src/scheduler.rs`; `agentd/src/config.rs`; `agentd/src/flight_recorder.rs`.
+- Global token ceiling across all agents (per-agent budgets still apply).
+- Max in-flight inference concurrency cap (`[scheduler]` TOML section; `0` = unlimited).
+- Priority + fair-share policy: `BinaryHeap<DeferredInfer>` keyed by `(priority desc,
+  seq asc)`; per-agent `priority: u32` field (default 0). When cap is full, agents
+  enter the deferred queue and are admitted as slots open.
+- Flight events: `agent_scheduled`, `agent_deferred`, `agent_admission_denied`.
+- **Deviation:** no token-rate limiter (roadmap says "optional"; acceptance criteria
+  does not test it; deferred to a later TODO). No `budget.rs` — budget state lives as
+  local variables in `Scheduler::run()`.
+**Acceptance:** with `global_token_budget = 10` and `max_concurrent_inferences = 1`,
+two agents are serialized; the second is deferred at seed, then denied when the first
+inference exhausts the budget; total spend never exceeds the ceiling; flight log shows
+`agent_scheduled`, `agent_deferred`, `agent_admission_denied`.
 
 ### ▢ p1.4 — Capability system (least privilege)
 **Depends on:** p1.3 *(logically independent of p1.3 — could run in parallel —

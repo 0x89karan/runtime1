@@ -62,16 +62,17 @@ Phase 0 kinds (canonical — do not rename):
 | `tool_result` | after (ok + preview, or error) |
 | `observe` | tool results folded back into context |
 | `agent_completed` | terminal: produced a final answer |
-| `budget_exceeded` | terminal: token budget blown |
+| `budget_exceeded` | terminal: per-agent token budget blown |
 | `max_turns_reached` | terminal: hit the turn cap |
 | `agent_failed` | terminal: inference error terminated the agent (p1.2+) |
+| `agent_scheduled` | scheduler admitted the agent's inference request (p1.3+) |
+| `agent_deferred` | inference deferred: concurrency cap full; includes priority + seq (p1.3+) |
+| `agent_admission_denied` | terminal: global token budget exhausted; agent cannot run (p1.3+) |
 | `error` | a stage failed (stage, error) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. Conventions for upcoming phases:
 
-- Scheduler (p1.3): `scheduled`, `deferred`, `admission_denied` (include agent id,
-  reason, budget/slot state).
 - Capabilities (p1.4): `capability_denied` (tool, required capability, agent id).
 - Bus (p1.5): `message_sent`, `message_received` (from, to); a spawned child emits its
   own `agent_spawned` under its own id, with a `parent` field.
