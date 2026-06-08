@@ -257,4 +257,27 @@ mod tests {
         // `required` is serialized as structured JSON, not a debug string
         assert_eq!(event["data"]["required"]["FsWrite"]["prefix"], "/tmp/x");
     }
+
+    #[tokio::test]
+    async fn capability_granted_invoke_succeeds() {
+        // An agent with the matching FsWrite cap MUST be able to invoke write_file.
+        // This is the "granted agent succeeds" half of the p1.4 acceptance criterion.
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["write_file".to_string()]).unwrap();
+        let (rec, _tmp) = recorder();
+        let tmp_dir = tempfile::TempDir::new_in("/tmp").unwrap();
+        let path = tmp_dir.path().join("test.txt").to_string_lossy().to_string();
+
+        let caps = [Capability::FsWrite { prefix: "/tmp".to_string() }];
+        let result = reg
+            .invoke(
+                "write_file",
+                serde_json::json!({"path": path, "content": "hello"}),
+                "test-agent",
+                Some(&caps),
+                &rec,
+            )
+            .await;
+        assert!(result.is_ok(), "granted cap should allow write_file: {result:?}");
+    }
 }
