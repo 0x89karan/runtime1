@@ -519,4 +519,69 @@ mod tests {
         };
         let _r2 = r.clone();
     }
+
+    #[test]
+    fn sandbox_rule_partial_eq() {
+        assert_eq!(SandboxRule::DenySpawn, SandboxRule::DenySpawn);
+        assert_eq!(
+            SandboxRule::AllowFsRead { prefix: "/a".into() },
+            SandboxRule::AllowFsRead { prefix: "/a".into() },
+        );
+        assert_ne!(
+            SandboxRule::AllowFsRead { prefix: "/a".into() },
+            SandboxRule::AllowFsRead { prefix: "/b".into() },
+        );
+        assert_ne!(
+            SandboxRule::AllowFsRead { prefix: "/a".into() },
+            SandboxRule::AllowFsWrite { prefix: "/a".into() },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allow_fs_write_tmp_builds_landlock() {
+        let rules = vec![SandboxRule::AllowFsWrite { prefix: "/tmp".to_string() }];
+        let compiled = compile(&rules).unwrap();
+        // Landlock fd present (>= 0) or BestEffort degradation (-1); either is valid.
+        assert!(compiled.inner.landlock_fd >= -1);
+        // No DenySpawn → no BPF filter.
+        assert!(compiled.inner.bpf.is_none(), "AllowFsWrite alone should not produce BPF");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allow_fs_write_and_deny_spawn_produces_landlock_and_bpf() {
+        let rules = vec![
+            SandboxRule::AllowFsWrite { prefix: "/tmp".to_string() },
+            SandboxRule::DenySpawn,
+        ];
+        let compiled = compile(&rules).unwrap();
+        assert!(compiled.inner.landlock_fd >= -1);
+        assert!(compiled.inner.bpf.is_some(), "DenySpawn must produce BPF");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn combined_fs_read_write_and_deny_spawn() {
+        let rules = vec![
+            SandboxRule::AllowFsRead { prefix: "/proc".to_string() },
+            SandboxRule::AllowFsWrite { prefix: "/tmp".to_string() },
+            SandboxRule::DenySpawn,
+        ];
+        let compiled = compile(&rules).expect("combined rules should compile");
+        assert!(compiled.inner.bpf.is_some());
+    }
+
+    // On x86_64 the filter has 10 instructions after we added vfork:
+    // load(1) + execve(2) + execveat(2) + fork(2) + vfork(2) + allow(1) = 10
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn deny_spawn_bpf_includes_vfork_on_x86_64() {
+        let rules = vec![SandboxRule::DenySpawn];
+        let compiled = compile(&rules).unwrap();
+        let bpf = compiled.inner.bpf.as_ref().unwrap();
+        assert_eq!(bpf.0.len(), 10,
+            "expected 10 BPF insns (load + execve + execveat + fork + vfork + allow), got {}",
+            bpf.0.len());
+    }
 }

@@ -507,6 +507,63 @@ capabilities = [
         );
     }
 
+    // ── p3.3: McpServerConfig capability field tests ─────────────────────────
+
+    #[test]
+    fn mcp_server_capabilities_absent_defaults_to_none() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.tools.mcp_servers.len(), 1);
+        assert!(cfg.tools.mcp_servers[0].capabilities.is_none(),
+            "absent capabilities field should default to None");
+    }
+
+    #[test]
+    fn mcp_server_capabilities_empty_array_is_deny_all() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+capabilities = []
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.tools.mcp_servers[0].capabilities, Some(vec![]));
+    }
+
+    #[test]
+    fn mcp_server_capabilities_with_fs_rules() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+capabilities = [
+  { FsRead = { prefix = "/workspace" } },
+  { FsWrite = { prefix = "/tmp" } },
+]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let caps = cfg.tools.mcp_servers[0].capabilities.as_ref().unwrap();
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0], Capability::FsRead { prefix: "/workspace".into() });
+        assert_eq!(caps[1], Capability::FsWrite { prefix: "/tmp".into() });
+    }
+
     // ── p1.6: AgentCard tests ─────────────────────────────────────────────────
 
     #[test]

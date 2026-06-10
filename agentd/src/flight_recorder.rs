@@ -199,6 +199,25 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_event_kinds_serialize_to_snake_case() {
+        let tmp = NamedTempFile::new().unwrap();
+        let recorder = FlightRecorder::new(tmp.path()).unwrap();
+
+        recorder.record("agentd", None, EventKind::SandboxApplied,
+            serde_json::json!({"server": "echo", "rules": ["DenySpawn"]}));
+        recorder.record("agentd", None, EventKind::SandboxSkipped,
+            serde_json::json!({"server": "echo"}));
+
+        let mut content = String::new();
+        File::open(tmp.path()).unwrap().read_to_string(&mut content).unwrap();
+        let lines: Vec<serde_json::Value> = content.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["kind"], "sandbox_applied");
+        assert_eq!(lines[1]["kind"], "sandbox_skipped");
+    }
+
+    #[test]
     #[ignore = "requires chmod 000 on path — not automatable in CI without root"]
     fn unwritable_path_returns_error() {
         // Manual test: create a file, chmod 000, verify FlightRecorder::new returns Err.
