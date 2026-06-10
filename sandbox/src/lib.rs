@@ -15,7 +15,7 @@
 use std::fmt;
 
 /// A rule describing what a sandboxed subprocess is permitted to do.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SandboxRule {
     /// Allow read access (ReadFile + ReadDir) to all paths beneath `prefix`.
     AllowFsRead { prefix: String },
@@ -130,6 +130,11 @@ mod linux {
 
     // Landlock ABI V1 access flags (include/uapi/linux/landlock.h)
     const ACCESS_FS_V1_ALL: u64 = 0x1FFF; // bits 0–12 (Execute..MakeSym)
+    // Execute (bit 0) is excluded from handled_access_fs: if we declare we control
+    // execute, Landlock denies execve for any path not in our rules — which would
+    // prevent the MCP binary itself from being loaded by exec() in the child.
+    // exec control is provided by the seccomp DenySpawn filter instead.
+    const ACCESS_FS_HANDLED: u64 = 0x1FFE; // V1 all except Execute (bit 0)
     const ACCESS_FS_READ_ONLY: u64 = 0x000C; // ReadFile(1<<2) | ReadDir(1<<3)
 
     // ── seccomp BPF opcodes (classic BPF ABI; stable since 1993) ──────────
@@ -148,7 +153,7 @@ mod linux {
     struct LandlockPathBeneathAttr {
         allowed_access: u64,
         parent_fd: i32,
-        _pad: i32,
+        _pad: i32, // C ABI: struct is 8 + 4 + 4 = 16 bytes on all arches
     }
 
     pub struct BpfProgram(pub Vec<libc::sock_filter>);
@@ -244,7 +249,7 @@ mod linux {
 
     fn build_landlock_ruleset(path_entries: &[(i32, bool)]) -> Result<i32, SandboxError> {
         let attr = LandlockRulesetAttr {
-            handled_access_fs: ACCESS_FS_V1_ALL,
+            handled_access_fs: ACCESS_FS_HANDLED,
         };
 
         let ruleset_fd = unsafe {
@@ -269,7 +274,7 @@ mod linux {
 
         for &(parent_fd, is_write) in path_entries {
             let allowed_access = if is_write {
-                ACCESS_FS_V1_ALL
+                ACCESS_FS_HANDLED // write grants all V1 flags except Execute
             } else {
                 ACCESS_FS_READ_ONLY
             };
@@ -338,9 +343,11 @@ mod linux {
             },
         ];
 
-        // fork(2) exists as a distinct syscall only on x86_64. On aarch64 and
-        // other modern arches, fork() is implemented via clone3/clone which we
-        // must NOT block (Tokio uses clone for thread creation).
+        // fork(2) and vfork(2) exist as distinct syscalls only on x86_64.
+        // On aarch64 and other modern arches, fork() is implemented via clone3/clone
+        // which we must NOT block (Tokio uses clone for thread creation).
+        // vfork (syscall 58) is also blocked: a vfork child shares the parent's fd
+        // table until exec(), so it can write to the stdout pipe back to agentd.
         #[cfg(target_arch = "x86_64")]
         {
             filter.push(libc::sock_filter {
@@ -348,6 +355,18 @@ mod linux {
                 jt: 0,
                 jf: 1,
                 k: libc::SYS_fork as u32,
+            });
+            filter.push(libc::sock_filter {
+                code: BPF_RET_K,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            });
+            filter.push(libc::sock_filter {
+                code: BPF_JMP_JEQ_K,
+                jt: 0,
+                jf: 1,
+                k: libc::SYS_vfork as u32,
             });
             filter.push(libc::sock_filter {
                 code: BPF_RET_K,

@@ -110,31 +110,17 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         let sandbox_rules: Option<Vec<SandboxRule>> =
             server.capabilities.as_deref().map(caps_to_rules);
 
-        match &sandbox_rules {
-            None => {
-                tracing::warn!(
-                    name = %server.name,
-                    "MCP server has no `capabilities` field — running unsandboxed"
-                );
-                recorder.record(
-                    "agentd",
-                    None,
-                    EventKind::SandboxSkipped,
-                    serde_json::json!({ "server": server.name }),
-                );
-            }
-            Some(rules) => {
-                let rule_descs: Vec<String> = rules.iter().map(|r| format!("{r:?}")).collect();
-                recorder.record(
-                    "agentd",
-                    None,
-                    EventKind::SandboxApplied,
-                    serde_json::json!({
-                        "server": server.name,
-                        "rules": rule_descs,
-                    }),
-                );
-            }
+        if sandbox_rules.is_none() {
+            tracing::warn!(
+                name = %server.name,
+                "MCP server has no `capabilities` field — running unsandboxed"
+            );
+            recorder.record(
+                "agentd",
+                None,
+                EventKind::SandboxSkipped,
+                serde_json::json!({ "server": server.name }),
+            );
         }
 
         tracing::info!(
@@ -150,6 +136,21 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         )
         .await
         .with_context(|| format!("spawning MCP server '{}'", server.name))?;
+
+        // Record SandboxApplied only after spawn succeeds — emit after the fact so
+        // the event is never present in the log for a server that failed to start.
+        if let Some(rules) = &sandbox_rules {
+            let rule_descs: Vec<String> = rules.iter().map(|r| format!("{r:?}")).collect();
+            recorder.record(
+                "agentd",
+                None,
+                EventKind::SandboxApplied,
+                serde_json::json!({
+                    "server": server.name,
+                    "rules": rule_descs,
+                }),
+            );
+        }
         let n = specs.len();
         for spec in specs {
             registry
@@ -337,6 +338,58 @@ fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
         }
     }
     rules
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentd::capability::Capability;
+    use sandbox::SandboxRule;
+
+    #[test]
+    fn caps_to_rules_empty_caps_yields_deny_spawn() {
+        let rules = caps_to_rules(&[]);
+        assert_eq!(rules, vec![SandboxRule::DenySpawn]);
+    }
+
+    #[test]
+    fn caps_to_rules_spawn_cap_removes_deny_spawn() {
+        let rules = caps_to_rules(&[Capability::Spawn]);
+        assert!(!rules.contains(&SandboxRule::DenySpawn));
+    }
+
+    #[test]
+    fn caps_to_rules_fs_read_maps_correctly() {
+        let rules = caps_to_rules(&[Capability::FsRead { prefix: "/workspace".into() }]);
+        assert!(rules.contains(&SandboxRule::AllowFsRead { prefix: "/workspace".into() }));
+        assert!(rules.contains(&SandboxRule::DenySpawn));
+    }
+
+    #[test]
+    fn caps_to_rules_fs_write_maps_correctly() {
+        let rules = caps_to_rules(&[Capability::FsWrite { prefix: "/tmp".into() }]);
+        assert!(rules.contains(&SandboxRule::AllowFsWrite { prefix: "/tmp".into() }));
+        assert!(rules.contains(&SandboxRule::DenySpawn));
+    }
+
+    #[test]
+    fn caps_to_rules_net_and_mcp_are_advisory_only() {
+        let rules = caps_to_rules(&[
+            Capability::Net { hosts: vec!["example.com".into()] },
+            Capability::Mcp { server: "echo".into(), tools: vec![] },
+        ]);
+        assert_eq!(rules, vec![SandboxRule::DenySpawn]);
+    }
+
+    #[test]
+    fn caps_to_rules_spawn_with_fs_omits_deny_spawn() {
+        let rules = caps_to_rules(&[
+            Capability::Spawn,
+            Capability::FsRead { prefix: "/workspace".into() },
+        ]);
+        assert!(!rules.contains(&SandboxRule::DenySpawn));
+        assert!(rules.contains(&SandboxRule::AllowFsRead { prefix: "/workspace".into() }));
+    }
 }
 
 async fn run_probe(prompt: &str) -> anyhow::Result<()> {

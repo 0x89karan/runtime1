@@ -90,12 +90,15 @@ impl McpClient {
         // Compile + apply sandbox rules in the child process before exec().
         // compile() may allocate — called in the parent, before fork().
         // apply_compiled() is async-signal-safe: raw syscalls only, no allocation.
+        // Gated to Linux: Landlock + seccomp are Linux-only mechanisms.
+        #[cfg(not(target_os = "linux"))]
+        let _ = sandbox;
+        #[cfg(target_os = "linux")]
         if let Some(rules) = sandbox {
             let compiled = sandbox::compile(rules)
                 .with_context(|| format!("compiling sandbox for '{command}'"))?;
             // SAFETY: apply_compiled() uses only async-signal-safe operations.
             // CompiledSandbox is Send + Sync, so the closure satisfies pre_exec bounds.
-            #[cfg(unix)]
             unsafe {
                 cmd.pre_exec(move || {
                     sandbox::apply_compiled(&compiled)
