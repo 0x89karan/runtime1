@@ -57,6 +57,11 @@ Phase 3 (Surfaces):
 - **Build, lint, and test before every commit:** `cargo build && cargo clippy --
   -D warnings && cargo test`. Do not commit code that does not compile or that
   has clippy warnings.
+- **Linux-gated code requires a Linux clippy pass before pushing.** Any code
+  under `#[cfg(target_os = "linux")]` (e.g. `surfaces/src/agents_fs.rs`) is
+  never compiled on macOS, so local clippy is a false green. Run
+  `make clippy-linux` from the repo root (requires Docker) before pushing a
+  branch that touches Linux-gated code. This mirrors the CI step exactly.
 - **Match the existing style.** Small modules, narrow traits, minimal
   dependencies. This is meant to be a *light* runtime — justify every new crate.
 - Update `docs/ROADMAP.md` (check off the increment) and any affected doc in the

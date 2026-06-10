@@ -83,6 +83,15 @@
 - Action: add a `--log-path <file>` CLI flag (or `[agent] log_path` TOML field) in p2.3
   or a dedicated increment so the log destination is explicit in all environments.
 
+**P2 — Linux-gated code not verifiable on macOS dev machines (p3.1 lesson)**
+- `#[cfg(target_os = "linux")]` blocks (fuser, libc usage in surfaces/) are never
+  compiled locally on macOS, so `cargo clippy -- -D warnings` is a false green.
+  Three CI failures on p3.1 (getattr signature, missing libc dep, two clippy lints)
+  all came from this blind spot.
+- Action: run `make clippy-linux` (Docker) from repo root before pushing any branch
+  that touches Linux-gated code. Target added to workspace Makefile; rule added to
+  CLAUDE.md quality gate.
+
 **P3 — No `--no-fuse` flag for CI and host dev environments (p3.1)**
 - `surfaces::agents_fs::mount()` is called unconditionally in main.rs. On host Linux dev machines
   without FUSE available (or in CI), the `Err` path logs a warn and continues — correct but
@@ -105,6 +114,14 @@
 - `distro/kernel-extras.config` adds `CONFIG_FUSE_FS=y`; `distro/overlay/agents/` mount point.
 - 188 tests pass (all platforms); negative FUSE read offset guard added post review-army.
 - **Completed:** v0.9.0 (2026-06-10)
+
+**p2.5 — Deferred cleanup (sync I/O, MCP pagination, MaxTokens, graceful shutdown)**
+- Native tools (`ReadFile`, `WriteFile`, `ListDir`) migrated to `tokio::fs`.
+- `McpClient::spawn` follows `nextCursor` in a loop until all pages loaded; capped at 100 pages.
+- `StopReason::MaxTokens` now emits `BudgetExceeded` flight event and returns `AgentEffect::Failed`
+  instead of silent `Ok("")`.
+- `McpClient::shutdown()` sends `notifications/shutdown`, waits 5s, escalates to SIGTERM then SIGKILL.
+- **Completed:** v0.8.0 (2026-06-09)
 
 **p2.3 — Boot/supervision basics (SIGTERM/SIGINT handling)**
 - `loop { tokio::select! { ... } }` in `Scheduler::run()` replaces `while let`.
