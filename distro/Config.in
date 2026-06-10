@@ -1,0 +1,1 @@
+# No custom Kconfig symbols — agentd is pre-built and dropped in via the overlay.

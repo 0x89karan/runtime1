@@ -51,6 +51,22 @@ pub(crate) async fn run(
                 sm.provide_tool_results(results, recorder);
             }
 
+            AgentEffect::SpawnAgent { .. } => {
+                // The single-agent driver does not support spawn-await.
+                // Use the Scheduler for multi-agent workloads.
+                return Err(anyhow::anyhow!(
+                    "spawn_agent is not supported in the single-agent driver; use the Scheduler"
+                ));
+            }
+
+            AgentEffect::SendMessage { .. } => {
+                // The single-agent driver does not support inter-agent messaging.
+                // Use the Scheduler for multi-agent workloads.
+                return Err(anyhow::anyhow!(
+                    "send_message is not supported in the single-agent driver; use the Scheduler"
+                ));
+            }
+
             AgentEffect::Completed(answer) => return Ok(answer),
             AgentEffect::Failed(msg) => return Err(anyhow::anyhow!("{msg}")),
         }

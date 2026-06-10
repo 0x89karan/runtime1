@@ -1,6 +1,27 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::capability::Capability;
+
+/// A discoverable identity card for an agent.
+/// Built from `AgentConfig` at scheduler seed time; held by `ListAgentsTool`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentCard {
+    pub id:          String,
+    pub name:        String,
+    pub description: String,
+    pub skills:      Vec<String>,
+}
+
+impl From<&AgentConfig> for AgentCard {
+    fn from(cfg: &AgentConfig) -> Self {
+        Self {
+            id:          cfg.id.clone(),
+            name:        cfg.name.clone().unwrap_or_else(|| cfg.id.clone()),
+            description: cfg.description.clone(),
+            skills:      cfg.skills.clone(),
+        }
+    }
+}
 
 // deny_unknown_fields is intentionally omitted here to allow both [agent] and [[agents]]
 // forms to coexist in the schema without serde rejecting the other key.
@@ -35,7 +56,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// Global token ceiling across all agents. 0 = unlimited.
@@ -44,6 +65,38 @@ pub struct SchedulerConfig {
     /// Maximum number of in-flight inference calls at once. 0 = unlimited.
     #[serde(default)]
     pub max_concurrent_inferences: usize,
+    /// Maximum spawn nesting depth. 0 = spawning disabled. Default 4.
+    #[serde(default = "default_max_spawn_depth")]
+    pub max_spawn_depth: u32,
+}
+
+fn default_max_spawn_depth() -> u32 {
+    4
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            global_token_budget: 0,
+            max_concurrent_inferences: 0,
+            max_spawn_depth: default_max_spawn_depth(),
+        }
+    }
+}
+
+/// Input to the `spawn_agent` tool — describes the child agent to create.
+/// Capabilities and max_turns inherit from parent when absent.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SpawnConfig {
+    /// If absent, auto-generated as `"{parent_id}-child-{seq}"`.
+    pub child_id: Option<String>,
+    /// The child's initial task (first user message).
+    pub task: String,
+    /// Scheduling priority. Default 0.
+    #[serde(default)]
+    pub priority: u32,
+    /// Per-agent token ceiling. Inherits parent's remaining budget if absent.
+    pub token_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,13 +118,22 @@ pub struct AgentConfig {
     /// `Some([...])` = allow only the listed capabilities.
     #[serde(default)]
     pub capabilities: Option<Vec<Capability>>,
+    /// Display name for this agent. Defaults to `id` if absent.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Human-readable description of this agent's purpose.
+    #[serde(default)]
+    pub description: String,
+    /// Free-form skill tags this agent advertises.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
-fn default_max_turns() -> u32 {
+pub fn default_max_turns() -> u32 {
     20
 }
 
-fn default_token_budget() -> u64 {
+pub fn default_token_budget() -> u64 {
     100_000
 }
 
@@ -293,6 +355,55 @@ id = "a"
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.scheduler.global_token_budget, 0, "0 means unlimited");
         assert_eq!(cfg.scheduler.max_concurrent_inferences, 0, "0 means unlimited");
+        assert_eq!(cfg.scheduler.max_spawn_depth, 4, "default spawn depth must be 4");
+    }
+
+    #[test]
+    fn scheduler_config_max_spawn_depth_explicit() {
+        let raw = r#"
+[agent]
+id = "a"
+
+[scheduler]
+max_spawn_depth = 2
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.scheduler.max_spawn_depth, 2);
+    }
+
+    #[test]
+    fn scheduler_config_default_impl_has_spawn_depth_4() {
+        // SchedulerConfig::default() must return max_spawn_depth=4 so that
+        // Rust-constructed configs (as used in tests) are not silently broken.
+        let sc = SchedulerConfig::default();
+        assert_eq!(sc.max_spawn_depth, 4);
+    }
+
+    #[test]
+    fn spawn_config_deserializes_task_only() {
+        let raw = r#"{"task": "do the thing"}"#;
+        let sc: SpawnConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(sc.task, "do the thing");
+        assert!(sc.child_id.is_none());
+        assert_eq!(sc.priority, 0);
+        assert!(sc.token_budget.is_none());
+    }
+
+    #[test]
+    fn spawn_config_deserializes_all_fields() {
+        let raw = r#"{"task":"sub","child_id":"my-child","priority":5,"token_budget":50000}"#;
+        let sc: SpawnConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(sc.task, "sub");
+        assert_eq!(sc.child_id.as_deref(), Some("my-child"));
+        assert_eq!(sc.priority, 5);
+        assert_eq!(sc.token_budget, Some(50_000));
+    }
+
+    #[test]
+    fn spawn_config_missing_task_is_error() {
+        let raw = r#"{"child_id": "orphan"}"#;
+        let result: Result<SpawnConfig, _> = serde_json::from_str(raw);
+        assert!(result.is_err(), "SpawnConfig requires `task`");
     }
 
     #[test]
@@ -381,5 +492,62 @@ capabilities = [
                 tools: vec!["echo_text".to_string()]
             }
         );
+    }
+
+    // ── p1.6: AgentCard tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn agent_card_name_defaults_to_id() {
+        let cfg = AgentConfig {
+            id:           "scout".to_string(),
+            task:         String::new(),
+            max_turns:    20,
+            token_budget: 100_000,
+            priority:     0,
+            capabilities: None,
+            name:         None,
+            description:  String::new(),
+            skills:       vec![],
+        };
+        let card = AgentCard::from(&cfg);
+        assert_eq!(card.id, "scout");
+        assert_eq!(card.name, "scout", "name should default to id when absent");
+        assert_eq!(card.description, "");
+        assert!(card.skills.is_empty());
+    }
+
+    #[test]
+    fn agent_card_explicit_name_and_skills() {
+        let cfg = AgentConfig {
+            id:           "reader".to_string(),
+            task:         String::new(),
+            max_turns:    20,
+            token_budget: 100_000,
+            priority:     0,
+            capabilities: None,
+            name:         Some("File Reader".to_string()),
+            description:  "Reads files".to_string(),
+            skills:       vec!["read".to_string(), "summarize".to_string()],
+        };
+        let card = AgentCard::from(&cfg);
+        assert_eq!(card.name, "File Reader");
+        assert_eq!(card.description, "Reads files");
+        assert_eq!(card.skills, vec!["read", "summarize"]);
+    }
+
+    #[test]
+    fn agent_config_name_description_skills_parse_from_toml() {
+        let raw = r#"
+[agent]
+id = "assistant"
+name = "My Assistant"
+description = "A helpful assistant"
+skills = ["research", "write"]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let ac = cfg.agent.unwrap();
+        assert_eq!(ac.name.as_deref(), Some("My Assistant"));
+        assert_eq!(ac.description, "A helpful assistant");
+        assert_eq!(ac.skills, vec!["research", "write"]);
     }
 }

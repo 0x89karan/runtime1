@@ -1,0 +1,18 @@
+[package]
+name = "surfaces"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# PINNED 0.14 — 0.17 changed spawn_mount2 signature incompatibly.
+# MUST be linux-gated: fuser-sys build.rs runs `pkg-config --libs fuse`
+# which fails on macOS even during `cargo check`.
+# libc is co-gated: agents_fs.rs uses libc::ENOENT/EIO in FUSE handlers.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.14", default-features = false }
+libc = "0.2"

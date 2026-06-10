@@ -278,3 +278,115 @@ command = "/nonexistent/binary-that-does-not-exist"
         "expected error mentioning the server, got: {stderr}"
     );
 }
+
+/// MCP tools/list pagination: all pages must be loaded and appear in tools_registered.
+/// echo-mcp --paginate returns page 1 (2 tools + nextCursor) then page 2 (1 tool).
+#[test]
+fn mcp_pagination_loads_all_pages() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+    let echo_mcp = echo_mcp_path();
+
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[agent]
+id = "pagination-test"
+task = "test"
+
+[[tools.mcp_servers]]
+name = "paginated-srv"
+command = "{echo_mcp}"
+args = ["--paginate"]
+"#
+        ),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let _output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("failed to spawn agentd");
+
+    let flight_log = dir.path().join("flight.jsonl");
+    assert!(flight_log.exists(), "flight.jsonl must be created");
+
+    let content = std::fs::read_to_string(&flight_log).unwrap();
+    let events: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+
+    let registered = events
+        .iter()
+        .find(|e| e["kind"] == "tools_registered")
+        .expect("tools_registered event missing");
+
+    let tools: Vec<&str> = registered["data"]["tools"]
+        .as_array()
+        .expect("tools must be array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+
+    assert!(
+        tools.contains(&"echo_p1a"),
+        "expected page-1 tool 'echo_p1a' in tools_registered, got: {tools:?}"
+    );
+    assert!(
+        tools.contains(&"echo_p1b"),
+        "expected page-1 tool 'echo_p1b' in tools_registered, got: {tools:?}"
+    );
+    assert!(
+        tools.contains(&"echo_p2a"),
+        "expected page-2 tool 'echo_p2a' in tools_registered, got: {tools:?}"
+    );
+}
+
+/// MCP graceful shutdown: agentd must send notifications/shutdown so echo-mcp
+/// can exit cleanly (writes --shutdown-file as evidence before exit(0)).
+#[test]
+fn mcp_graceful_shutdown_sends_notification() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+    let shutdown_file = dir.path().join("shutdown_received.txt");
+    let echo_mcp = echo_mcp_path();
+    let shutdown_path = shutdown_file.to_str().unwrap();
+
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[agent]
+id = "shutdown-test"
+task = "test"
+
+[[tools.mcp_servers]]
+name = "shutdown-srv"
+command = "{echo_mcp}"
+args = ["--shutdown-file", "{shutdown_path}"]
+"#
+        ),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let _output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(
+        shutdown_file.exists(),
+        "shutdown file must be written by echo-mcp on notifications/shutdown"
+    );
+    let contents = std::fs::read_to_string(&shutdown_file).unwrap();
+    assert_eq!(contents, "shutdown");
+}

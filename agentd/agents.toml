@@ -25,11 +25,14 @@ global_token_budget        = 0
 max_concurrent_inferences  = 0
 
 [[agents]]
-id           = "surveyor"
-task         = "List the agentd/src directory and describe every source file in one sentence each."
-max_turns    = 10
+id          = "surveyor"
+name        = "Source Surveyor"
+description = "Lists and summarises source files in the agentd/src directory."
+skills      = ["fs-read", "summarize"]
+task        = "List the agentd/src directory and describe every source file in one sentence each."
+max_turns   = 10
 token_budget = 50_000
-priority     = 0
+priority    = 0
 # Optional: least-privilege tool grants (p1.4+). Absent = unrestricted.
 # capabilities = [{ FsRead = { prefix = "/workspace" } }]           # read-only under prefix
 # capabilities = [{ FsRead = { prefix = "/" } }, { FsWrite = { prefix = "/tmp" } }]
@@ -37,8 +40,11 @@ priority     = 0
 # capabilities = []                                                   # deny all tools
 
 [[agents]]
-id           = "analyst"
-task         = "Read agentd/Cargo.toml and explain what each dependency is used for."
-max_turns    = 10
+id          = "analyst"
+name        = "Dependency Analyst"
+description = "Explains crate dependencies from Cargo.toml."
+skills      = ["fs-read", "explain"]
+task        = "Read agentd/Cargo.toml and explain what each dependency is used for."
+max_turns   = 10
 token_budget = 50_000
-priority     = 0
+priority    = 0

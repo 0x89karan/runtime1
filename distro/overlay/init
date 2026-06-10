@@ -1,0 +1,45 @@
+#!/bin/sh
+# AgentOS /init — PID 1.
+# Mounts virtual filesystems, loads secrets from the host via 9p, starts agentd.
+# agentd becomes the new PID 1 after exec; kernel panics (cleanly) when it exits.
+
+set -e
+
+mount -t proc    none /proc
+mount -t sysfs   none /sys
+mount -t devtmpfs none /dev 2>/dev/null || mdev -s
+
+mkdir -p /run/secrets /run/output
+
+# Mount host-shared directories injected by QEMU -virtfs.
+mount -t 9p -o trans=virtio,version=9p2000.L secrets0 /run/secrets || {
+    echo "ERROR: failed to mount secrets0 via 9p." >&2
+    echo "       Is -virtfs local,...,mount_tag=secrets0 in the QEMU command?" >&2
+    exec sh
+}
+
+mount -t 9p -o trans=virtio,version=9p2000.L output0 /run/output || {
+    echo "ERROR: failed to mount output0 via 9p." >&2
+    exec sh
+}
+
+# Source secrets. agentos.env must export ANTHROPIC_API_KEY (and any other vars).
+if [ ! -f /run/secrets/agentos.env ]; then
+    echo "ERROR: /run/secrets/agentos.env not found." >&2
+    echo "       Create ~/.agentos-secrets/agentos.env with:" >&2
+    echo "         ANTHROPIC_API_KEY=sk-ant-..." >&2
+    exec sh
+fi
+
+# shellcheck disable=SC1091
+. /run/secrets/agentos.env
+
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "ERROR: ANTHROPIC_API_KEY not set in agentos.env" >&2
+    exec sh
+fi
+
+# agentd writes flight.jsonl to its cwd; /run/output is the host-visible mount.
+cd /run/output
+
+exec /usr/bin/agentd /etc/agentd/agent.toml

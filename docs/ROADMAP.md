@@ -250,7 +250,7 @@ but kept linear here for a simple single stack)*
 `capability_denied`, error tool result); a granted agent succeeds; unit tests cover
 the checks.
 
-### ▢ p1.5 — Inter-agent bus + sub-agents (A2A/ACP)
+### ▣ p1.5 — Inter-agent bus + sub-agents (A2A/ACP)
 **Depends on:** p1.4
 **Goal:** Agents address and message each other; an agent can spawn a sub-agent and
 await its result.
@@ -264,15 +264,26 @@ await its result.
 capabilities); A receives B's result and uses it; flight log shows the cross-agent
 exchange.
 
-### ▢ p1.6 — Agent identity & Agent Cards (discovery)
+### ▣ p1.6 — Agent identity & Agent Cards (discovery) ✓
 **Depends on:** p1.5
 **Goal:** Each agent advertises an identity + skills so others can discover what it
-can do (A2A Agent Card).
-**Scope:** small additions to `agentd/src/bus.rs` / a registry; a `discover` tool.
-- `AgentCard { id, name, description, skills }`; a registry the bus consults; a
-  `list_agents` / `discover` tool.
+can do (A2A Agent Card) and send messages.
+**Delivered:**
+- `AgentCard { id, name, description, skills }` derived from TOML at startup; emits
+  `agent_card_registered` flight event.
+- `AgentConfig` gains optional `name`, `description`, `skills` fields with serde defaults.
+- `bus.rs` module: `MailMessage` + `Mailboxes` (per-agent `Vec<MailMessage>`).
+- `list_agents` tool: returns sorted JSON array of all `AgentCard`s; no capability required.
+- `send_message` tool (sole-call): `AgentEffect::SendMessage`; scheduler delivers to
+  recipient mailbox; synthesizes `ToolResult` so sender continues; unknown recipient
+  returns `is_error` tool result (no crash).
+- Mailbox drain: `drain_mailbox` called before each `step()`; `inject_messages` appends
+  to last User message block to satisfy Anthropic alternating-role requirement.
+- Shutdown drain fix: `shutdown_requested: bool` in `SchedulerState`; `drain_deferred`
+  emits `agent_admission_denied { reason: "shutdown" }` instead of silently re-queuing.
+- New flight events: `agent_card_registered`, `message_sent`, `message_received`.
 **Acceptance:** agents are enumerable with their cards; A can discover B's advertised
-skill before messaging it.
+skill before messaging it; A2A messaging is fully recorded.
 
 **Exit criteria for Phase 1:** multiple capability-scoped agents run under a
 budget-aware scheduler, discover and message each other, and spawn sub-agents — all
@@ -285,25 +296,77 @@ fully recorded. The runtime is now an OS for agents, still running on a normal d
 Goal: turn the runtime into a minimal bootable image where `agentd` is the userspace.
 See DESIGN.md Parts 4 & 6.
 
-### ▢ p2.1 — rustls + static musl binary
+### ▣ p2.1 — rustls + static musl binary ✓
 **Depends on:** Phase 1. Switch `reqwest` to `default-features = false, features =
 ["json", "rustls-tls"]`; build `--target x86_64-unknown-linux-musl`.
-**Acceptance:** a static `agentd` runs with no system OpenSSL dependency.
+**Delivered:** `reqwest` switched from `native-tls` to `rustls-tls`; `cross` used
+for `x86_64-unknown-linux-musl` target; binary is `static-pie linked, stripped`,
+3.1 MB, no system OpenSSL dependency.
+**Acceptance:** a static `agentd` runs with no system OpenSSL dependency. ✓
 
-### ▢ p2.2 — Buildroot minimal rootfs
+### ▣ p2.2 — Buildroot minimal rootfs ✓
 **Depends on:** p2.1. Buildroot config (musl + busybox) producing a tiny rootfs that
 boots straight to `agentd` as the boot target.
-**Acceptance:** QEMU boots directly into `agentd` running an agent.
+**Delivered:** `distro/` external Buildroot tree (x86_64 musl, BusyBox, cpio.gz initramfs);
+`/init` PID-1 sh script; two virtio-9p mounts (secrets, output); `make build/run/test`
+with QEMU `-no-reboot` + `jq` flight-event check; DNS via QEMU SLIRP (10.0.2.3);
+bundled CA certs via `webpki-roots` (no system ca-certificates needed).
+**Acceptance:** QEMU boots directly into `agentd` running an agent. ✓
 
-### ▢ p2.3 — Boot/supervision basics
+### ▣ p2.3 — Boot/supervision basics
 **Depends on:** p2.2. `agentd` (or a tiny init in front of it) handles PID-1 duties:
 signals, zombie reaping, essential mounts, clean shutdown.
-**Acceptance:** clean boot and shutdown in QEMU.
+**Acceptance:** clean boot and shutdown in QEMU. ✓
+**Delivered:** SIGTERM/SIGINT handling wired into `scheduler.rs::run()` via
+`tokio::select!`; `SystemShutdownRequested` flight event; essential mounts and
+zombie reaping already handled by `/init` + tokio respectively (no code needed).
 
-### ▢ p2.4 — Image size budget
+### ▣ p2.4 — Image size budget ✓
 **Depends on:** p2.3. Measure and trim toward the "super light" target; add a CI size
 check.
-**Acceptance:** documented image size with a CI guard against regressions.
+**Delivered:** musl static binary measured at 3.1 MB; CI guard added (`stat -c %s`; fails
+if > 4,194,304 bytes); release profile already at maximum optimization.
+**Acceptance:** documented image size with a CI guard against regressions. ✓
+
+### ▣ p2.5 — Phase 0/1 deferred-item cleanup ✓
+**Depends on:** p2.4. Resolves all P2-priority deferred items before Phase 3 adds
+architectural complexity. Scope is intentionally narrow — no new features, only correctness
+and observability fixes.
+
+**Items in scope:**
+
+1. **Async-safe native tools** (`p0.5` debt): migrate `read_file`, `write_file`, `list_dir`
+   from `std::fs` to `tokio::fs`. The sync calls block the tokio thread pool under concurrent
+   tool dispatch, which becomes a real problem in Phase 3.
+   — `TODOS.md`: "Sync I/O in native tool impls"
+
+2. **`StopReason::MaxTokens` silent empty response** (`p0.4` debt): when the model is cut off
+   mid-generation, `agent::run` currently returns `Ok("")` because no `Text` block is present.
+   Return a distinct `Err(AgentError::BudgetExceeded)` or emit a `tracing::warn!` so callers
+   can distinguish truncation from a genuine empty answer.
+   — `TODOS.md`: "StopReason::MaxTokens produces empty Ok("")"
+
+3. **MCP `tools/list` pagination** (`p0.5` debt): `McpClient::spawn` silently drops tools
+   beyond the first page. Implement cursor-based iteration so all tools are registered.
+   — `TODOS.md`: "MCP tools/list pagination not followed"
+
+4. **MCP graceful shutdown** (`p0.5` debt): replace SIGKILL-on-drop with
+   `notifications/shutdown` + SIGTERM + grace-period fallback to SIGKILL. Prevents data
+   loss in stateful MCP servers.
+   — `TODOS.md`: "MCP graceful shutdown"
+
+**Out of scope** (deferred by design to Phase 4):
+- Symlink traversal prevention (requires namespace sandbox)
+- Net capability enforcement (no Net tools exist yet)
+- Case-sensitive path matching on macOS (Linux-only production target)
+
+**Acceptance:** ✓
+- `cargo clippy -- -D warnings` clean; all existing tests pass; new tests cover each fix.
+- Native tools use `tokio::fs`; no `std::fs` calls in `tools/native.rs`.
+- `cargo test` includes a test that a max-tokens truncation is distinguishable from `Ok("")`.
+- MCP client iterates all pages; integration test with a fixture server that returns a `nextCursor`.
+- MCP shutdown sends `notifications/shutdown` before SIGTERM; integration test confirms ordering.
+- All four TODOS.md entries marked done.
 
 ---
 
@@ -311,7 +374,7 @@ check.
 
 Goal: make "agent as primitive" visible at the system level. See DESIGN.md Part 4 (L2).
 
-### ▢ p3.1 — `/agents` FUSE filesystem
+### ▣ p3.1 — `/agents` FUSE filesystem
 Each running agent appears as a directory (`status`, `context_size`, `budget`,
 `flight` tail). **Acceptance:** `ls /agents`, `cat /agents/<id>/status` work against
 the live runtime.

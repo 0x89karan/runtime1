@@ -6,7 +6,7 @@ use serde_json::json;
 const PREVIEW_CHARS: usize = 200;
 
 use crate::{
-    config::{AgentConfig, ModelConfig},
+    config::{AgentConfig, ModelConfig, SpawnConfig},
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceRequest, InferenceResponse, Msg, Role, StopReason, ToolSpec},
     tools::ToolRegistry,
@@ -17,6 +17,12 @@ pub enum AgentEffect {
     Infer(InferenceRequest),
     /// Only Block::ToolUse variants; step() filters the rest before returning.
     CallTools(Vec<Block>),
+    /// Emitted when the model calls `spawn_agent` as its sole tool in a turn.
+    /// The scheduler intercepts this before any tool `invoke()` is called.
+    SpawnAgent { call_id: String, config: SpawnConfig },
+    /// Emitted when the model calls `send_message` as its sole tool in a turn.
+    /// The scheduler delivers the message and synthesizes a ToolResult.
+    SendMessage { call_id: String, to: String, content: String },
     Completed(String),
     Failed(String),
 }
@@ -78,6 +84,26 @@ impl AgentTask {
     /// `None` = unrestricted; `Some([])` = deny all.
     pub fn cap_set_cloned(&self) -> Option<Vec<crate::capability::Capability>> {
         self.cfg.capabilities.clone()
+    }
+
+    /// Per-agent token budget. Used by the scheduler to set child budgets.
+    pub fn token_budget(&self) -> u64 {
+        self.cfg.token_budget
+    }
+
+    /// Clone of the model configuration. Used by the scheduler to seed child agents.
+    pub fn model_cfg_cloned(&self) -> ModelConfig {
+        self.model_cfg.clone()
+    }
+
+    /// Total tokens consumed so far (input + output). Used by the snapshot.
+    pub fn context_tokens(&self) -> u64 {
+        self.total_input + self.total_output
+    }
+
+    /// First `max_chars` Unicode scalar values of the agent's task string.
+    pub fn task_preview(&self, max_chars: usize) -> String {
+        self.cfg.task.chars().take(max_chars).collect()
     }
 
     /// Advance the state machine by one step.
@@ -145,6 +171,39 @@ impl AgentTask {
             blocks: results,
         });
         self.turn += 1;
+    }
+
+    /// Inject pending mailbox messages into this agent before inference.
+    ///
+    /// Appends each message as a Text block to the last User message in history.
+    /// This avoids creating a consecutive User message (which violates the Anthropic
+    /// API's strict alternating role requirement).
+    pub fn inject_messages(&mut self, messages: Vec<crate::bus::MailMessage>, recorder: &FlightRecorder) {
+        if messages.is_empty() {
+            return;
+        }
+        let text = messages
+            .iter()
+            .map(|m| format!("[Message from {}]: {}", m.from, m.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        recorder.record(
+            &self.agent_id,
+            Some(self.turn),
+            EventKind::MessageReceived,
+            json!({ "count": messages.len(), "preview": truncate(&text, PREVIEW_CHARS) }),
+        );
+
+        // Append to the last User message to avoid consecutive-User-message violations.
+        if let Some(last_user) = self.messages.iter_mut().rev().find(|m| m.role == Role::User) {
+            last_user.blocks.push(Block::Text { text });
+        } else {
+            self.messages.push(Msg {
+                role: Role::User,
+                blocks: vec![Block::Text { text }],
+            });
+        }
     }
 
     fn step_need_infer(&mut self, recorder: &FlightRecorder) -> AgentEffect {
@@ -230,10 +289,20 @@ impl AgentTask {
         });
 
         match response.stop_reason {
-            StopReason::EndTurn | StopReason::MaxTokens | StopReason::Other(_) => {
-                // TODO(p2): MaxTokens with no Text block produces empty Ok("").
-                // Surface a warning or return BudgetExceeded so callers can distinguish
-                // a real answer from a mid-generation cut-off.
+            StopReason::MaxTokens => {
+                recorder.record(
+                    &self.agent_id,
+                    Some(self.turn),
+                    EventKind::BudgetExceeded,
+                    json!({ "total_tokens": total, "budget": self.cfg.token_budget }),
+                );
+                self.terminal = true;
+                AgentEffect::Failed(
+                    "model generation hit max_tokens limit (truncated response)".into(),
+                )
+            }
+
+            StopReason::EndTurn | StopReason::Other(_) => {
                 let answer = response
                     .blocks
                     .iter()
@@ -286,6 +355,97 @@ impl AgentTask {
                     return AgentEffect::Failed(
                         "model returned stop_reason=tool_use with no ToolUse blocks".to_string(),
                     );
+                }
+
+                // Intercept spawn_agent before tool dispatch — it must be the sole call.
+                let spawn_idx = call_blocks.iter().position(|b| {
+                    matches!(b, Block::ToolUse { name, .. } if name == "spawn_agent")
+                });
+
+                if let Some(idx) = spawn_idx {
+                    if call_blocks.len() > 1 {
+                        self.terminal = true;
+                        return AgentEffect::Failed(
+                            "spawn_agent must be the sole tool call per turn; \
+                             cannot mix with other tools"
+                                .to_string(),
+                        );
+                    }
+                    let Block::ToolUse { id: call_id, input, .. } = &call_blocks[idx] else {
+                        unreachable!("filtered to ToolUse above")
+                    };
+                    let config: SpawnConfig = match serde_json::from_value(input.clone()) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            self.provide_tool_results(
+                                vec![Block::ToolResult {
+                                    tool_use_id: call_id.clone(),
+                                    content: format!(
+                                        "spawn_agent input could not be parsed: {e}"
+                                    ),
+                                    is_error: true,
+                                }],
+                                recorder,
+                            );
+                            return self.step_need_infer(recorder);
+                        }
+                    };
+                    return AgentEffect::SpawnAgent {
+                        call_id: call_id.clone(),
+                        config,
+                    };
+                }
+
+                // Intercept send_message before tool dispatch — must be sole call.
+                let send_idx = call_blocks.iter().position(|b| {
+                    matches!(b, Block::ToolUse { name, .. } if name == "send_message")
+                });
+
+                if let Some(idx) = send_idx {
+                    if call_blocks.len() > 1 {
+                        self.terminal = true;
+                        return AgentEffect::Failed(
+                            "send_message must be the sole tool call per turn; \
+                             cannot mix with other tools"
+                                .to_string(),
+                        );
+                    }
+                    let Block::ToolUse { id: call_id, input, .. } = &call_blocks[idx] else {
+                        unreachable!("filtered to ToolUse above")
+                    };
+                    let to = match input["to"].as_str() {
+                        Some(s) => s.to_string(),
+                        None => {
+                            self.provide_tool_results(
+                                vec![Block::ToolResult {
+                                    tool_use_id: call_id.clone(),
+                                    content: "send_message requires a `to` string field".to_string(),
+                                    is_error: true,
+                                }],
+                                recorder,
+                            );
+                            return self.step_need_infer(recorder);
+                        }
+                    };
+                    let content = match input["content"].as_str() {
+                        Some(s) => s.to_string(),
+                        None => {
+                            self.provide_tool_results(
+                                vec![Block::ToolResult {
+                                    tool_use_id: call_id.clone(),
+                                    content: "send_message requires a `content` string field".to_string(),
+                                    is_error: true,
+                                }],
+                                recorder,
+                            );
+                            return self.step_need_infer(recorder);
+                        }
+                    };
+                    return AgentEffect::SendMessage {
+                        call_id: call_id.clone(),
+                        to,
+                        content,
+                    };
                 }
 
                 AgentEffect::CallTools(call_blocks)
@@ -439,6 +599,9 @@ mod tests {
             token_budget,
             priority: 0,
             capabilities: None,
+            name: None,
+            description: String::new(),
+            skills: vec![],
         }
     }
 
@@ -489,7 +652,7 @@ mod tests {
         ]);
 
         let mut reg = crate::tools::ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()]).unwrap();
+        register_native(&mut reg, &["read_file".to_string()], None).unwrap();
         let (rec, _tmp) = recorder();
 
         let answer = run(
@@ -749,6 +912,166 @@ mod tests {
         assert!(log.lines().any(|l| l.contains("\"error\"") && l.contains("provide_tool_results")));
     }
 
+    // ── p1.5: spawn detection unit tests ──────────────────────────────────────
+
+    fn spawn_use_resp(call_id: &str, task: &str) -> InferenceResponse {
+        InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: call_id.to_string(),
+                name: "spawn_agent".to_string(),
+                input: serde_json::json!({ "task": task }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10,
+            output_tokens: 5,
+        }
+    }
+
+    #[test]
+    fn step_detects_spawn_agent_returns_spawn_effect() {
+        let (rec, _tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("spawner", "do the thing", &cfg, &model_cfg(), vec![]);
+
+        // Turn 0 → Infer
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Infer(_)));
+
+        // Provide a spawn_agent tool-use response
+        sm.provide_inference(spawn_use_resp("spawn_1", "summarise the repo"), &rec);
+
+        // step → SpawnAgent (not CallTools)
+        let eff = sm.step(&rec);
+        assert!(
+            matches!(&eff, AgentEffect::SpawnAgent { call_id, config }
+                if call_id == "spawn_1" && config.task == "summarise the repo"),
+            "expected SpawnAgent effect"
+        );
+    }
+
+    #[test]
+    fn step_spawn_mixed_with_other_tools_returns_failed() {
+        let (rec, _tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("spawner-mix", "task", &cfg, &model_cfg(), vec![]);
+
+        let eff = sm.step(&rec);
+        assert!(matches!(eff, AgentEffect::Infer(_)));
+
+        // Response contains spawn_agent mixed with another tool call
+        sm.provide_inference(
+            InferenceResponse {
+                blocks: vec![
+                    Block::ToolUse {
+                        id: "spawn_1".to_string(),
+                        name: "spawn_agent".to_string(),
+                        input: serde_json::json!({ "task": "subtask" }),
+                    },
+                    Block::ToolUse {
+                        id: "call_2".to_string(),
+                        name: "read_file".to_string(),
+                        input: serde_json::json!({ "path": "/tmp/x" }),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+            &rec,
+        );
+
+        let eff = sm.step(&rec);
+        assert!(
+            matches!(&eff, AgentEffect::Failed(msg) if msg.contains("sole tool call")),
+            "expected Failed when spawn_agent is mixed with other tools"
+        );
+    }
+
+    #[test]
+    fn step_spawn_agent_invalid_input_returns_failed() {
+        // A malformed spawn_agent call (missing required `task` field) must inject
+        // an is_error ToolResult and re-request inference so the model can retry.
+        // The agent must NOT be marked terminal.
+        let (rec, _tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("spawner-bad", "task", &cfg, &model_cfg(), vec![]);
+
+        let _ = sm.step(&rec); // → Infer
+
+        sm.provide_inference(
+            InferenceResponse {
+                blocks: vec![Block::ToolUse {
+                    id:    "spawn_bad".to_string(),
+                    name:  "spawn_agent".to_string(),
+                    // Missing required `task` field — deserialization will fail.
+                    input: serde_json::json!({ "child_id": "orphan" }),
+                }],
+                stop_reason:   StopReason::ToolUse,
+                input_tokens:  10,
+                output_tokens: 5,
+            },
+            &rec,
+        );
+
+        // After the parse failure, step() must inject an error ToolResult and
+        // return Infer (not Failed) so the model can recover.
+        let eff = sm.step(&rec);
+        assert!(
+            matches!(&eff, AgentEffect::Infer(_)),
+            "expected Infer (recoverable) for unparseable spawn input"
+        );
+        // Agent must NOT be terminal — it should still accept provide_inference.
+        assert!(
+            !matches!(&eff, AgentEffect::Failed(_)),
+            "parse failure must not terminate the agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn driver_rejects_spawn_agent_effect() {
+        // The single-agent driver does not support spawn-await; it must return Err.
+        use crate::tools::native::register_native;
+
+        struct SpawnGateway;
+        #[async_trait::async_trait]
+        impl InferenceGateway for SpawnGateway {
+            async fn infer(&self, _req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+                Ok(InferenceResponse {
+                    blocks: vec![Block::ToolUse {
+                        id:    "spawn_1".to_string(),
+                        name:  "spawn_agent".to_string(),
+                        input: serde_json::json!({ "task": "sub-task" }),
+                    }],
+                    stop_reason:   StopReason::ToolUse,
+                    input_tokens:  5,
+                    output_tokens: 3,
+                })
+            }
+            fn model_id(&self) -> &str { "spawn-gw" }
+        }
+
+        let mut reg = crate::tools::ToolRegistry::new();
+        register_native(&mut reg, &["spawn_agent".to_string()], None).unwrap();
+        let (rec, _tmp) = recorder();
+
+        let err = run(
+            "driver-spawn",
+            "spawn something",
+            &agent_cfg(5, 1_000_000),
+            &model_cfg(),
+            &SpawnGateway,
+            &reg,
+            &rec,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("single-agent driver"),
+            "driver must reject spawn_agent, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn run_tools_sequential_skips_non_tool_use_blocks() {
         let tmp = NamedTempFile::new().unwrap();
@@ -773,5 +1096,164 @@ mod tests {
         };
         assert_eq!(tool_use_id, "call_1");
         assert!(is_error, "unknown tool should produce is_error=true result");
+    }
+
+    // ── p1.6: inject_messages / send_message tests ───────────────────────────
+
+    #[test]
+    fn inject_messages_appends_to_last_user_message() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "initial task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+
+        assert_eq!(task.messages.len(), 1);
+
+        task.inject_messages(
+            vec![crate::bus::MailMessage { from: "alice".to_string(), content: "hello".to_string() }],
+            &rec,
+        );
+
+        // Must still be 1 message (appended, not pushed)
+        assert_eq!(task.messages.len(), 1, "inject_messages must NOT push a new Msg");
+        // The single User message should now have 2 blocks
+        assert_eq!(task.messages[0].blocks.len(), 2, "Text block should have been appended");
+        if let Block::Text { text } = &task.messages[0].blocks[1] {
+            assert!(text.contains("alice"), "injected block must reference sender");
+            assert!(text.contains("hello"), "injected block must contain message content");
+        } else {
+            panic!("expected Block::Text");
+        }
+    }
+
+    #[test]
+    fn inject_messages_empty_list_is_noop() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+        let original_len = task.messages[0].blocks.len();
+
+        task.inject_messages(vec![], &rec);
+
+        assert_eq!(task.messages[0].blocks.len(), original_len, "empty inject must not modify messages");
+    }
+
+    #[test]
+    fn step_send_message_sole_call_guard() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "send messages", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+
+        let response = InferenceResponse {
+            blocks: vec![
+                Block::ToolUse {
+                    id:    "msg_1".to_string(),
+                    name:  "send_message".to_string(),
+                    input: serde_json::json!({"to": "b", "content": "hello"}),
+                },
+                Block::ToolUse {
+                    id:    "extra_1".to_string(),
+                    name:  "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                },
+            ],
+            stop_reason:   StopReason::ToolUse,
+            input_tokens:  10,
+            output_tokens: 5,
+        };
+        task.provide_inference(response, &rec);
+        let effect = task.step(&rec);
+        assert!(matches!(effect, AgentEffect::Failed(_)), "mixed send_message + other tool must fail");
+    }
+
+    #[test]
+    fn step_send_message_missing_to_is_error_not_panic() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "send messages", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+
+        let response = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id:    "msg_bad".to_string(),
+                name:  "send_message".to_string(),
+                input: serde_json::json!({"content": "no recipient"}),
+            }],
+            stop_reason:   StopReason::ToolUse,
+            input_tokens:  10,
+            output_tokens: 5,
+        };
+        task.provide_inference(response, &rec);
+        let effect = task.step(&rec);
+        // Missing `to` → synthesizes error ToolResult and returns Infer (step_need_infer).
+        assert!(matches!(effect, AgentEffect::Infer(_)), "missing `to` must produce Infer (via error ToolResult), not panic");
+    }
+
+    #[test]
+    fn max_tokens_with_no_text_returns_failed() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+
+        // MaxTokens with no Text block — the truncated-generation bug case.
+        let response = InferenceResponse {
+            blocks: vec![],
+            stop_reason: StopReason::MaxTokens,
+            input_tokens: 10,
+            output_tokens: 5,
+        };
+        task.provide_inference(response, &rec);
+        let effect = task.step(&rec);
+        assert!(
+            matches!(effect, AgentEffect::Failed(_)),
+            "MaxTokens with no text must be Failed, not Completed"
+        );
+        if let AgentEffect::Failed(msg) = effect {
+            assert!(
+                msg.contains("max_tokens"),
+                "failure message must mention max_tokens, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_tokens_with_partial_text_returns_failed() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+
+        // MaxTokens WITH a partial Text block — partial text must be discarded (D1).
+        let response = InferenceResponse {
+            blocks: vec![Block::Text { text: "partial answer cut".to_string() }],
+            stop_reason: StopReason::MaxTokens,
+            input_tokens: 10,
+            output_tokens: 5,
+        };
+        task.provide_inference(response, &rec);
+        let effect = task.step(&rec);
+        assert!(
+            matches!(effect, AgentEffect::Failed(_)),
+            "MaxTokens with partial text must be Failed, not Completed (partial text discarded)"
+        );
+    }
+
+    #[test]
+    fn context_tokens_accumulates_input_and_output() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+        assert_eq!(task.context_tokens(), 0, "starts at zero before any inference");
+        let response = InferenceResponse {
+            blocks: vec![],
+            stop_reason: StopReason::EndTurn,
+            input_tokens: 100,
+            output_tokens: 50,
+        };
+        task.provide_inference(response, &rec);
+        assert_eq!(task.context_tokens(), 150);
+    }
+
+    #[test]
+    fn task_preview_handles_multibyte_unicode() {
+        let cfg = AgentConfig {
+            task: "こんにちは世界".to_string(),
+            ..agent_cfg(5, 100_000)
+        };
+        let task = AgentTask::new("t", &cfg.task, &cfg, &model_cfg(), vec![]);
+        let preview = task.task_preview(5);
+        assert_eq!(preview.chars().count(), 5);
+        assert_eq!(preview, "こんにちは");
+        assert_eq!(task.task_preview(100), "こんにちは世界");
     }
 }

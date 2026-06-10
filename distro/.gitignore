@@ -1,0 +1,8 @@
+# Pre-built agentd binary (copied in by `make build`; not tracked)
+overlay/usr/bin/agentd
+
+# Buildroot download cache and build tree
+build/
+
+# QEMU output directory (flight.jsonl, console.log, greeting.txt, ...)
+output/

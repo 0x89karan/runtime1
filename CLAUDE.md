@@ -24,25 +24,24 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Phase 0 complete; Phase 1 in progress (p1.4 landed).** `agentd/` is a working
-Rust binary. Phase 0 (`p0.1`–`p0.5`) built the single-agent loop end to end:
-config, flight recorder, inference gateway (Anthropic), tool ABI, native tools,
-and a real MCP stdio client. Phase 1 is underway:
+**Phases 0–2 complete; Phase 3 in progress (p3.1 landed).** `agentd/` is a
+working Rust binary. Phases 0–2 built the full single/multi-agent loop, config,
+flight recorder, Anthropic gateway, tool ABI, native tools, MCP stdio client,
+cooperative scheduler, capability system, agent spawning, agent cards, rustls
+static binary, Buildroot rootfs + QEMU boot, signal handling, MCP pagination,
+and graceful shutdown.
 
-- **p1.1** (done): `AgentTask` sans-IO state machine — `step()` → `AgentEffect`.
-- **p1.2** (done): cooperative multi-agent scheduler — `Scheduler` drives many
-  agents concurrently via `FuturesUnordered`; `[[agents]]` TOML form; `agents.toml`
-  example.
-- **p1.3** (done): metered scheduling & admission control — `[scheduler]` TOML
-  section with `global_token_budget` and `max_concurrent_inferences`; per-agent
-  `priority` field; deferred queue with `BinaryHeap`; `agent_scheduled`,
-  `agent_deferred`, `agent_admission_denied` flight events.
-- **p1.4** (done): capability system — `capabilities` TOML field; `Capability` enum
-  (`FsRead`, `FsWrite`, `Net`, `Mcp`, `Spawn`); enforcement at `ToolRegistry::invoke`;
-  `filtered_specs` for model context; `normalize_path` for traversal-safe prefix checks;
-  `capability_denied` flight event.
+Phase 3 (Surfaces):
 
-Next: `p1.5` inter-agent bus + sub-agents (A2A/ACP). See `docs/ROADMAP.md`.
+- **p3.1** (done): `/agents` FUSE virtual filesystem — `surfaces/` crate;
+  `AgentsFs` + `SchedulerSnapshot`; each running agent appears as a directory
+  with `status`, `context_size`, `budget`, `flight` virtual files; inode scheme
+  (root=1, dirs from 1010 step 10); `Arc<RwLock<SchedulerSnapshot>>` shared
+  between scheduler and FUSE handler; `FuseMounted`/`FuseUnmounted` flight
+  events; `fuser` dep Linux-only; `CONFIG_FUSE_FS=y` in kernel-extras.config;
+  15 unit tests in `surfaces`.
+
+**Next: `p3.2` — Agent checkpoint / restore. See `docs/ROADMAP.md`.**
 
 ## How to work here
 
@@ -106,9 +105,11 @@ cargo run -- agents.toml         # multiple agents concurrently (p1.2+)
 tail -f flight.jsonl             # watch it think
 ```
 
-Build needs OpenSSL dev headers (`libssl-dev` + `pkg-config` on Debian/Ubuntu;
-preinstalled on macOS) because Phase 0 uses native-tls. Phase 2 switches the
-`reqwest` features to `rustls-tls` for static musl builds — see the roadmap.
+No OpenSSL dependency since p2.1 (`rustls-tls`). For a static musl build:
+```bash
+# requires `cross` (cargo install cross) and Docker
+cross build --target x86_64-unknown-linux-musl --release
+```
 
 ## Repo layout
 
@@ -122,8 +123,8 @@ agentos/                   the repo root (run `claude` here)
     DESIGN.md              full design & research (the "why")
     ROADMAP.md             the staged build plan (the work queue)
     CONVENTIONS.md         how to extend the codebase consistently
-  agentd/                  the Phase 0 / Phase 1 runtime (Rust crate)
-    Cargo.toml             manifest (size-optimized release profile)
+  agentd/                  the runtime (Rust crate)
+    Cargo.toml             manifest
     agent.toml             single-agent example spec
     agents.toml            multi-agent example spec (p1.2+)
     README.md              runtime-specific quickstart
@@ -142,10 +143,27 @@ agentos/                   the repo root (run `claude` here)
         mod.rs             Tool trait + registry
         native.rs          built-in read_file / write_file / list_dir
         mcp.rs             real MCP stdio client -> tools
+  surfaces/                Phase 3: system surfaces (p3.1+)
+    Cargo.toml             manifest (fuser dep Linux-only)
+    src/
+      lib.rs               re-exports snapshot types + agents_fs module
+      snapshot.rs          SchedulerSnapshot / AgentSnapshot / AgentStatus
+      agents_fs.rs         AgentsFs FUSE handler + mount() (Linux); stub (others)
+  distro/                  Phase 2: Buildroot external tree + QEMU boot
+    Makefile               build / run / test / prereqs / clean
+    buildroot.config       Buildroot defconfig (x86_64 musl, busybox, cpio.gz)
+    kernel-extras.config   kernel fragment: virtio-net + virtio-9p + FUSE
+    overlay/
+      init                 /init PID-1 sh script
+      agents/              mount point for /agents FUSE filesystem (p3.1)
+      usr/bin/agentd       (gitignored; copied by make build)
+      etc/
+        resolv.conf        nameserver 10.0.2.3 (QEMU SLIRP DNS)
+        agentd/
+          agent.toml       demo agent config
 ```
 
-Future phases add siblings to `agentd/`: `distro/` (Phase 2: Buildroot + boot),
-`surfaces/` (Phase 3: `/agents` FUSE), `sandbox/` (Phase 4: isolation profiles).
+Future phases add siblings to `agentd/`: `sandbox/` (Phase 4: isolation profiles).
 
 When in doubt about *what* to build next, the roadmap decides. When in doubt
 about *how*, conventions decide. When in doubt about *why*, the design doc decides.

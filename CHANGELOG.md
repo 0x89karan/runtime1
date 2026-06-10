@@ -3,6 +3,168 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p3.1] - 2026-06-10
+
+### Added
+- **`surfaces/` crate**: new Rust library crate (`surfaces`) sibling to `agentd/`;
+  root `Cargo.toml` promoted to a workspace with `members = ["agentd", "surfaces"]`
+  and the release profile moved there.
+- **`surfaces::snapshot`**: `SchedulerSnapshot`, `AgentSnapshot`, `AgentStatus`
+  (`Running`, `Deferred`, `AwaitingChild(String)`, `Done`, `Failed`); shared via
+  `Arc<RwLock<SchedulerSnapshot>>` between scheduler and FUSE handler.
+- **`surfaces::agents_fs`** (Linux-only FUSE handler): `AgentsFs` implements
+  `fuser::Filesystem`; inode scheme (root=1, agent dirs from 1010 step 10, file
+  offsets +1..+4); four virtual files per agent (`status`, `context_size`, `budget`,
+  `flight`); TTL=0 (no kernel caching); `read_flight_tail()` scans last 64 KB of
+  `flight.jsonl`, returns up to 20 matching lines per agent.
+- **`surfaces::agents_fs::mount()`**: spawns FUSE `BackgroundSession` on Linux;
+  no-op stub on other platforms — clean build everywhere.
+- **`Scheduler` snapshot plumbing**: `Scheduler::new()` accepts a 7th argument
+  `Arc<RwLock<SchedulerSnapshot>>`; `update_snapshot()` is called after the seed loop
+  and after every effect result, keeping the snapshot current.
+- **`AgentTask` getters**: `context_tokens()` and `task_preview(max_chars)` added
+  to `agent/mod.rs` for snapshot population.
+- **`EventKind::FuseMounted` / `FuseUnmounted`**: emitted in `main.rs` when
+  `agentd` mounts/unmounts `/agents`.
+- **`distro/overlay/agents/.gitkeep`**: creates the `/agents` mount point in the
+  Buildroot rootfs overlay.
+- **`CONFIG_FUSE_FS=y`** in `distro/kernel-extras.config` so the QEMU VM can
+  serve FUSE mounts.
+- **15 unit tests** in `surfaces/src/agents_fs.rs` covering inode allocation, file
+  content rendering, read slicing, and flight tail parsing.
+
+### Changed
+- **`fuser` dependency** is in `[target.'cfg(target_os = "linux")'.dependencies]`
+  to avoid `pkg-config --libs fuse` failing on macOS during `cargo check/test`.
+- All `#[cfg(target_os = "linux")]`-gated items that are also needed by tests use
+  `#[cfg(any(test, target_os = "linux"))]` so the test suite runs on all platforms.
+
+## [p2.5] - 2026-06-09
+
+### Added
+- **MCP tools/list pagination**: `McpClient::spawn` now follows `nextCursor` in a
+  cursor-based loop until all pages are exhausted. Previously only the first page was
+  fetched; tools on page 2+ were silently dropped.
+- **`McpClient::shutdown()` method**: sends `notifications/shutdown` (JSON-RPC notification,
+  no id), waits up to 5 s for the server to exit cleanly, then escalates to SIGTERM, waits
+  another 5 s, and lets `kill_on_drop` deliver the final SIGKILL. Servers that flush WAL or
+  release locks on clean exit now get the chance to do so.
+- **Graceful shutdown on all exit paths**: `run_agent` in `main.rs` calls
+  `client.shutdown().await` for each MCP client on three exit paths: successful completion,
+  `AnthropicGateway::from_env` failure, and `Scheduler::new` failure. The previous
+  code used `?` early-return on the latter two, causing SIGKILL-only teardown.
+- **`StopReason::MaxTokens` → `AgentEffect::Failed`**: when the model is cut off
+  mid-generation the agent now emits a `BudgetExceeded` flight event and returns
+  `AgentEffect::Failed("model generation hit max_tokens limit …")` instead of silently
+  returning `Ok("")`. Callers can now distinguish a truncated response from a real empty answer.
+- **`nix` dependency** (`v0.29`, `signal` feature) promoted from dev-dependency to
+  dependency so `kill(SIGTERM, …)` is available in production `shutdown()`.
+- **`tokio` `fs` feature** added to `Cargo.toml` for `tokio::fs` in native tools.
+
+### Changed
+- **Native tools use `tokio::fs`**: `ReadFile`, `WriteFile`, and `ListDir` now use
+  `tokio::fs::read_to_string`, `tokio::fs::write`, `tokio::fs::create_dir_all`, and
+  `tokio::fs::read_dir` with the async entry iterator. Previously they used blocking
+  `std::fs` calls on the tokio thread pool, which would have stalled concurrent agents.
+
+### Tests
+- 2 new unit tests in `agent/mod.rs`: `max_tokens_with_no_text_returns_failed`,
+  `max_tokens_with_partial_text_returns_failed`.
+- 2 new integration tests in `tests/mcp.rs`: `mcp_pagination_loads_all_pages` (asserts
+  all three tools from a two-page echo-mcp paginated server appear in `tools_registered`);
+  `mcp_graceful_shutdown_sends_notification` (asserts echo-mcp writes a file on
+  `notifications/shutdown` before exiting).
+- `echo-mcp` fixture updated: `--paginate` flag returns two-page tool list with
+  `nextCursor`; `--shutdown-file <path>` flag writes `"shutdown"` to path on notification.
+
+## [p2.3] - 2026-06-09
+
+### Added
+- **SIGTERM/SIGINT handling in `Scheduler::run()`**: replaced the `while let
+  Some(er) = pending.next().await` loop with `loop { tokio::select! { ... } }`.
+  Signal arms set `shutdown_requested = true` and break, causing in-flight futures
+  to be dropped and the existing deferred-queue drain to run.
+- **`EventKind::SystemShutdownRequested`** flight event: emitted with
+  `{ "signal": "SIGTERM" }` or `{ "signal": "SIGINT" }` when a signal fires.
+- **`tokio` `signal` feature** added to `Cargo.toml`; **`nix` dev-dependency**
+  (v0.29, `signal` feature) added for test-side signal delivery.
+- **`sigterm_drains_scheduler` test**: sends SIGTERM 50 ms into a 30-second gateway
+  delay; asserts `run()` returns in < 5 s and the flight log contains the shutdown
+  event.
+
+### Not in scope
+- Graceful MCP shutdown (SIGTERM + drain before SIGKILL) → p2.5
+- Essential mounts: already done in `distro/overlay/init` (p2.2)
+- Zombie reaping: already handled by tokio (owns SIGCHLD; competing handler disallowed)
+
+## [p2.2] - 2026-06-09
+
+### Added
+- **`distro/` Buildroot external tree**: x86_64 musl + BusyBox; `make build` produces
+  `output/bzImage` + `output/rootfs.cpio.gz` (cpio initramfs).
+- **`/init` PID-1 script** (`distro/overlay/init`): mounts proc/sys/devtmpfs, mounts two
+  virtio-9p host directories (`secrets0` → `/run/secrets/`, `output0` → `/run/output/`),
+  sources `agentos.env`, and `exec`s agentd. Drops to busybox sh on mount/secret failure.
+- **virtio-9p kernel config** (`distro/kernel-extras.config`): `CONFIG_9P_FS`, `CONFIG_NET_9P`,
+  `CONFIG_NET_9P_VIRTIO`, `CONFIG_VIRTIO_NET`, `CONFIG_IP_PNP_DHCP` applied on top of
+  `x86_64_defconfig`.
+- **`make prereqs / build / run / test / clean / distclean`**: `test` boots with `-no-reboot`
+  and confirms an `agent_completed` or `budget_exceeded` event in `output/test-run/flight.jsonl`.
+- **Demo agent config** (`distro/overlay/etc/agentd/agent.toml`): Haiku model, native tools
+  only, writes a greeting to `/run/output/greeting.txt`. Validates the full boot-to-inference path.
+- **No system CA certs needed**: agentd's bundled `webpki-roots` (via `reqwest rustls-tls`)
+  provides Mozilla CAs; the rootfs carries no `ca-certificates` package.
+
+## [0.7.0] - 2026-06-09
+
+### Changed
+- **`reqwest` TLS backend**: switched from `native-tls` to `rustls-tls` (`default-features = false, features = ["json", "rustls-tls"]`). No longer requires OpenSSL headers at build time or system OpenSSL at runtime.
+
+### Build
+- **Static musl binary**: `cross build --target x86_64-unknown-linux-musl --release` produces a `static-pie linked, stripped` ELF binary (~3.1 MB) with no dynamic dependencies. Use `cross` (Docker-based) from macOS; on Linux with musl toolchain available, `cargo build --target x86_64-unknown-linux-musl --release` works directly.
+
+## [0.6.0] - 2026-06-09
+
+### Added
+- **`AgentCard { id, name, description, skills }`**: derived from `AgentConfig` at scheduler seed time. Emits `agent_card_registered` flight event per agent.
+- **`AgentConfig` identity fields**: optional `name`, `description`, `skills` TOML fields (all with `#[serde(default)]`). `name` defaults to `id` when absent.
+- **`bus.rs` module**: `MailMessage { from, content }` and `Mailboxes = HashMap<String, Vec<MailMessage>>`. Canonical home for A2A bus primitives.
+- **`list_agents` tool**: returns a sorted JSON array of all registered `AgentCard`s. No capability required — available to every agent.
+- **`send_message` tool + `AgentEffect::SendMessage { call_id, to, content }`**: sole-call tool intercepted by the scheduler. Delivers message to recipient's mailbox; synthesizes an immediate `ToolResult` so the sender continues. Unknown recipient returns an `is_error` tool result (no panic, no crash).
+- **Mailbox drain before each inference**: `drain_mailbox` is called after `provide_inference`/`provide_tool_results` and before `step()`. `AgentTask::inject_messages` appends mail as a `Block::Text` to the last `User` message, preserving the Anthropic API's strict alternating-role requirement.
+- **Shutdown drain fix**: `shutdown_requested: bool` in `SchedulerState`. `drain_deferred` now checks this flag and emits `agent_admission_denied { reason: "shutdown" }` instead of re-queuing agents that can never run.
+- **New flight events**: `AgentCardRegistered`, `MessageSent`, `MessageReceived`.
+- **9 new unit tests** covering: `inject_messages` appends to last User msg; empty inject is noop; sole-call guard for `send_message`; missing `to` field error; `send_message` delivery + `message_sent` event; unknown-recipient error; `AgentCard` name defaulting; explicit name/skills round-trip; TOML parsing of new identity fields.
+
+### For contributors
+- `dispatch_send_message` in `scheduler.rs` handles the full message lifecycle: recipient validation → mailbox push → `MessageSent` flight event → synthesize ToolResult → re-enqueue sender.
+- `register_native` gains a third `cards: Option<Arc<Vec<AgentCard>>>` parameter; pass `None` in tests.
+- `agents.toml` example updated with `name`, `description`, `skills` fields on both agents.
+
+## [0.5.0] - 2026-06-09
+
+### Added
+- **`spawn_agent` tool**: an agent with the `Spawn` capability calls `spawn_agent{task, child_id?, priority?, token_budget?}` to create a child agent. The child runs to completion; its result is injected back into the parent as a `ToolResult` so the parent can continue. The call must be the sole tool use in its turn.
+- **`SchedulerState` refactor**: all mutable scheduler run-loop state consolidated into a single `SchedulerState` struct (`agents`, `outcomes`, `pending`, `deferred`, `in_flight`, `tokens_spent`, `awaiting`, `child_seq`, `spawn_depths`, `max_spawn_depth`). Eliminates the previous 13-loose-locals pattern.
+- **`AgentEffect::SpawnAgent { call_id, config }`**: new variant intercepted by the scheduler before any tool `invoke()`. The agent state machine recognizes a `spawn_agent` tool-use response and returns this effect instead of `CallTools`.
+- **Spawn depth limit**: `max_spawn_depth: u32` in `[scheduler]` TOML (default 4). If exceeded, the parent receives an `is_error` tool result instead of a child being created.
+- **Child admission denial**: if a child's first inference is denied (budget or slot exhausted), the parent receives an `is_error` tool result and continues running.
+- **`Capability::Spawn` enforcement**: `dispatch_spawn` checks the parent's cap set; absence of `Spawn` returns an `is_error` tool result to the parent rather than creating a child.
+- **`agent_child_result_delivered` flight event**: emitted when a child's result is injected into its parent, carrying `{child_id, parent_id, call_id, success}`.
+- **`SpawnAgentTool`** in `native.rs`: registered as a stub tool so it appears in `filtered_specs` for agents with `Spawn` capability. Its `invoke()` is a safety net that always errors (the scheduler intercepts before `invoke` is reached).
+- **Child ID naming**: auto-generated as `"{parent_id}-child-{seq}"` with a monotonic counter.
+- **Child inherits parent's capabilities and `model_cfg`**: spawned child uses the same model and capability set as its parent (unless overridden).
+
+### Fixed
+- `Capability::Spawn` was previously hard-coded to always return `false` in `satisfies()`; it now correctly checks whether the granted set contains `Spawn`.
+- `SchedulerConfig::Default` now returns `max_spawn_depth = 4` instead of `0` (the derived `Default` was overriding the serde default, silently disabling all spawning for Rust-constructed configs).
+
+### For contributors
+- `SpawnConfig` struct in `config.rs`: `{ child_id: Option<String>, task: String, priority: u32, token_budget: Option<u64> }`.
+- `dispatch_spawn` in `scheduler.rs` handles the full spawn lifecycle: cap check → depth check → child ID → child `AgentTask` creation → awaiting registration → seeding.
+- `handle_agent_terminal` routes child completions to the parent via `provide_tool_results` + `step` + `enqueue_or_defer`; non-child completions go straight to `outcomes`.
+- `send_message` deferred to p1.6 (Agent Cards increment).
+
 ## [0.4.0] - 2026-06-08
 
 ### Added

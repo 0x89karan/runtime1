@@ -1,4 +1,4 @@
-use std::{io::IsTerminal, path::PathBuf, sync::Arc};
+use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
 use agentd::{config, scheduler::Scheduler};
@@ -9,6 +9,7 @@ use agentd::tools::{
     native::register_native,
     ToolRegistry,
 };
+use surfaces::SchedulerSnapshot;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -78,8 +79,26 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         }
     }
 
+    // Build AgentCards from configs — static, used by list_agents tool.
+    let cards: Arc<Vec<crate::config::AgentCard>> = Arc::new(
+        agent_cfgs.iter().map(crate::config::AgentCard::from).collect()
+    );
+    for card in cards.iter() {
+        recorder.record(
+            &card.id,
+            None,
+            EventKind::AgentCardRegistered,
+            serde_json::json!({
+                "id":          card.id,
+                "name":        card.name,
+                "description": card.description,
+                "skills":      card.skills,
+            }),
+        );
+    }
+
     let mut registry = ToolRegistry::new();
-    register_native(&mut registry, &cfg.tools.native)?;
+    register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)))?;
 
     // Held for Drop: keeps MCP child processes alive until run_agent returns.
     // std::process::exit() bypasses Drop, so we must return Err instead of
@@ -134,21 +153,80 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         tracing::info!(agent = %ac.id, model = %cfg.model.model, "agent spawned");
     }
 
-    let gateway = Arc::new(
-        AnthropicGateway::from_env(&cfg.model.model).context("initializing Anthropic gateway")?,
-    );
+    let snapshot: Arc<RwLock<SchedulerSnapshot>> =
+        Arc::new(RwLock::new(SchedulerSnapshot::default()));
+
+    #[cfg(target_os = "linux")]
+    let fuse_mountpoint = PathBuf::from("/agents");
+
+    #[cfg(target_os = "linux")]
+    let maybe_session = {
+        match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot)) {
+            Ok(session) => {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::FuseMounted,
+                    serde_json::json!({ "mountpoint": fuse_mountpoint.display().to_string() }),
+                );
+                Some(session)
+            }
+            Err(e) => {
+                tracing::warn!("FUSE mount failed (continuing without /agents): {e}");
+                None
+            }
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let _maybe_session: Option<()> = None;
+
+    let gateway = match AnthropicGateway::from_env(&cfg.model.model)
+        .context("initializing Anthropic gateway")
+    {
+        Ok(gw) => Arc::new(gw),
+        Err(e) => {
+            for client in &mcp_clients {
+                client.shutdown().await;
+            }
+            return Err(e);
+        }
+    };
     let registry = Arc::new(registry);
 
-    let scheduler = Scheduler::new(
+    let scheduler = match Scheduler::new(
         agent_cfgs,
         &cfg.model,
         cfg.scheduler,
         gateway,
         registry,
         Arc::clone(&recorder),
-    )?;
+        Arc::clone(&snapshot),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            for client in &mcp_clients {
+                client.shutdown().await;
+            }
+            return Err(e);
+        }
+    };
 
     let outcomes = scheduler.run().await;
+
+    #[cfg(target_os = "linux")]
+    if let Some(session) = maybe_session {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(session)));
+        recorder.record(
+            "agentd",
+            None,
+            EventKind::FuseUnmounted,
+            serde_json::json!({ "mountpoint": fuse_mountpoint.display().to_string() }),
+        );
+    }
+
+    for client in &mcp_clients {
+        client.shutdown().await;
+    }
 
     let mut any_failed = false;
     for (id, result) in &outcomes {

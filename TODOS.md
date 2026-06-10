@@ -2,11 +2,8 @@
 
 ## Phase 0 — Technical Debt
 
-**P2 — Sync I/O in native tool impls (p0.5)**
-- `ReadFile`, `WriteFile`, `ListDir` all use `std::fs` inside `#[async_trait]` methods,
-  blocking the tokio thread. Harmless for p0.3 (sequential, small files), but will
-  matter when parallel tool dispatch arrives in Phase 1.
-- Action: migrate to `tokio::fs` when the first concurrent tool call path lands (p0.5 or p1.1).
+**~~P2 — Sync I/O in native tool impls (p0.5)~~** ✓ Done in p2.5.
+- `ReadFile`, `WriteFile`, `ListDir` migrated to `tokio::fs` (non-blocking).
 
 **~~P2 — ToolRegistry::register should error on collision (p0.5)~~** ✓ Done in p0.5.
 
@@ -23,10 +20,9 @@
   `Path::components()` — no filesystem access, so symlinks are not resolved.
 - Action: Phase 4 sandbox (seccomp/namespaces) is the correct enforcement layer.
 
-**P3 — 2 MB binary target needs re-evaluation at p0.2**
-- `reqwest` + `native-tls` (arriving in p0.2) will significantly increase binary size.
-- Consider `rustls` instead of `native-tls`, or a size audit, before p2.1.
-- Tracked: known from autoplan review of p0.1.
+**~~P3 — 2 MB binary target needs re-evaluation at p0.2~~** ✓ Done in p2.1.
+- Switched to `rustls-tls`; static musl binary is 3.1 MB (vs ~1.4 MB macOS debug).
+  Acceptable for Phase 2; a dedicated size-audit increment is p2.4.
 
 **~~P3 — flight.jsonl CWD footgun for multi-agent (p1.2)~~** ✓ Resolved in p1.2.
 - Resolution: single shared `flight.jsonl` + per-event `agent` field (CONVENTIONS.md invariant).
@@ -54,34 +50,69 @@
   (case-sensitive ext4/btrfs) so this is a dev-environment edge case, not a security gap.
 - Action: document the Linux-only assumption or add a config flag for CI on macOS.
 
-**P3 — SchedulerState refactor (p1.3 deferred)**
-- `drain_deferred` and `enqueue_or_defer` in `scheduler.rs` take many arguments
-  (`#[allow(clippy::too_many_arguments)]`). A `SchedulerState` struct should collect
-  `in_flight`, `tokens_spent`, `deferred`, `deferred_seq`, and `outcomes` into one place.
-- Action: introduce `SchedulerState` at p1.5 (p1.4 deferred — still deferred).
+**~~P3 — SchedulerState refactor (p1.5)~~** ✓ Done in p1.5.
+
+**~~P3 — Shutdown drain re-enqueues to exited poll loop (p1.5 red-team)~~** ✓ Done in p1.6.
+- Added `shutdown_requested: bool` to `SchedulerState`; `drain_deferred` now
+  checks the flag and emits `agent_admission_denied { reason: "shutdown" }`
+  instead of re-enqueueing onto the already-exited poll loop.
 
 **P3 — EventKind enum in flight_recorder.rs → events.rs at p0.4**
 - Once all 11 Phase-0 kinds are actively emitted, extract to its own module.
 - Keeps `flight_recorder.rs` focused on I/O, not taxonomy.
 - Action: extract during p0.4 implementation.
 
-**P2 — MCP tools/list pagination not followed (p0.5 adversarial review)**
-- `McpClient::spawn` only fetches the first page of `tools/list`. A `tracing::warn!` is
-  emitted when `nextCursor` is present, but the remaining pages are silently dropped.
-- Action: implement cursor-based iteration in the first increment that uses a multi-page server.
+**~~P2 — MCP tools/list pagination not followed (p0.5 adversarial review)~~** ✓ Done in p2.5.
+- `McpClient::spawn` now follows `nextCursor` in a loop until all pages are loaded.
 
-**P2 — MCP graceful shutdown (p0.5 adversarial review)**
-- Process teardown uses SIGKILL via `kill_on_drop(true)`. Servers needing a clean shutdown
-  (flush WAL, release locks) may lose state.
-- Action: send `notifications/shutdown` + SIGTERM with a grace period before SIGKILL; implement
-  in Phase 1 when the scheduler owns process lifecycle.
+**~~P2 — MCP graceful shutdown (p0.5 adversarial review)~~** ✓ Done in p2.5.
+- `McpClient::shutdown()` sends `notifications/shutdown`, waits 5s for clean exit, escalates to SIGTERM, then SIGKILL.
 
-**P2 — StopReason::MaxTokens produces empty Ok("") (pre-existing, p0.4)**
-- When the model is cut off mid-generation, `agent::run` returns `Ok("")` because no `Text`
-  block is present. Callers can't distinguish a real empty answer from a truncated one.
-- Action: emit a `tracing::warn!` or return `Err(BudgetExceeded)` at Phase 1 iteration.
+**~~P2 — StopReason::MaxTokens produces empty Ok("") (pre-existing, p0.4)~~** ✓ Done in p2.5.
+- `StopReason::MaxTokens` now emits `BudgetExceeded` flight event and returns `AgentEffect::Failed`.
+
+**P3 — Buildroot ccache volume not wired (p2.2)**
+- `make build` recompiles the toolchain from source on every `distclean`. Buildroot
+  supports ccache via `BR2_CCACHE=y`; wiring a persistent Docker volume or host cache
+  dir would cut rebuild time from ~30 min to ~2 min on subsequent clean builds.
+- Action: add `BR2_CCACHE=y` + cache-dir Makefile variable in a future p2.x hardening pass.
+
+**P3 — agentd flight log path is hard-coded to CWD (p2.2)**
+- `flight.jsonl` is always written to the process CWD. In the VM this is `/run/output`
+  (the host-visible 9p mount), which works. On the host it depends on the user's shell CWD.
+- Action: add a `--log-path <file>` CLI flag (or `[agent] log_path` TOML field) in p2.3
+  or a dedicated increment so the log destination is explicit in all environments.
+
+**P3 — No `--no-fuse` flag for CI and host dev environments (p3.1)**
+- `surfaces::agents_fs::mount()` is called unconditionally in main.rs. On host Linux dev machines
+  without FUSE available (or in CI), the `Err` path logs a warn and continues — correct but
+  noisy. A `--no-fuse` CLI flag (or `AGENTOS_NO_FUSE` env var) would explicitly skip mount()
+  without a warning, making CI output clean and intentional.
+- Blocked by: nothing. Pure main.rs change.
+- Action: add `--no-fuse` flag alongside the existing CLI args in a future p3.x increment.
 
 ## Completed
+
+**p3.1 — /agents FUSE virtual filesystem**
+- `surfaces/` crate: `SchedulerSnapshot` / `AgentSnapshot` / `AgentStatus` snapshot types.
+- `AgentsFs` (`fuser` 0.14, Linux-only): root dir + per-agent dirs with `status`, `context_size`,
+  `budget`, `flight` virtual files. Inode scheme: root=1, dirs from 1010 step 10, files at dir+1..4.
+- `mount()` spawns FUSE thread; returns `FuseMounted` guard (RAII unmount); stubs on non-Linux.
+- `Scheduler::new` gains 7th `Arc<RwLock<SchedulerSnapshot>>` arg; `update_snapshot` called after
+  every scheduler effect; `AgentTask::context_tokens()` + `task_preview()` supply snapshot fields.
+- New flight events: `FuseMounted`, `FuseUnmounted`.
+- Workspace promoted: root `Cargo.toml` with `members = ["agentd", "surfaces"]`.
+- `distro/kernel-extras.config` adds `CONFIG_FUSE_FS=y`; `distro/overlay/agents/` mount point.
+- 188 tests pass (all platforms); negative FUSE read offset guard added post review-army.
+- **Completed:** v0.9.0 (2026-06-10)
+
+**p2.3 — Boot/supervision basics (SIGTERM/SIGINT handling)**
+- `loop { tokio::select! { ... } }` in `Scheduler::run()` replaces `while let`.
+- SIGTERM/SIGINT arms set `shutdown_requested = true` and break; deferred drain runs as before.
+- `EventKind::SystemShutdownRequested` flight event emitted on signal.
+- 1 new test: `sigterm_drains_scheduler` — sends SIGTERM, asserts < 5s exit + flight event.
+- Essential mounts and zombie reaping required no code (handled by `/init` and tokio respectively).
+- **Completed:** p2.3 (2026-06-09)
 
 **p0.1 — Crate scaffold + config + flight recorder**
 - Created `agentd/` binary crate with Config (TOML), FlightRecorder (append-only JSONL),
@@ -154,3 +185,42 @@
 - `McpTool::server_name` for Mcp{} cap gating.
 - 130 tests pass (unit + integration + MCP + MCP client).
 - **Completed:** v0.4.0 (2026-06-08)
+
+**p1.5 — Inter-agent spawn-await**
+- `spawn_agent` tool: parent with `Spawn` cap creates a child agent; child runs to completion;
+  result injected back into parent as a `ToolResult`. Sole-call guard enforced.
+- `AgentEffect::SpawnAgent { call_id, config }` — intercepted by scheduler before `invoke()`.
+- `SpawnConfig` in `config.rs`: `task` (required), `child_id`/`priority`/`token_budget` (optional).
+- `SchedulerState` struct consolidates all mutable scheduler state (`agents`, `outcomes`, `pending`,
+  `deferred`, `in_flight`, `tokens_spent`, `awaiting`, `child_seq`, `spawn_depths`, `max_spawn_depth`).
+- `dispatch_spawn` / `handle_agent_terminal` in `scheduler.rs` manage the full spawn lifecycle.
+- Spawn depth limit: `max_spawn_depth: u32` in `[scheduler]` TOML (default 4; 0 = disabled).
+- `agent_child_result_delivered` flight event.
+- `Capability::Spawn` `satisfies()` fix; `SchedulerConfig::Default` fix (max_spawn_depth was 0).
+- `send_message` deferred to p1.6 (Agent Cards increment).
+- 133 tests pass (unit + integration).
+- **Completed:** v0.5.0 (2026-06-09)
+
+**p2.1 — rustls + static musl binary**
+- Switched `reqwest` from `native-tls` to `rustls-tls`; all 142 tests pass.
+- Cross-compiled `x86_64-unknown-linux-musl` via `cross` (Docker); binary is `static-pie linked, stripped`, 3.1 MB.
+- **Completed:** v0.7.0 (2026-06-09)
+
+**p2.2 — Buildroot minimal rootfs**
+- `distro/` external Buildroot tree: x86_64 musl + BusyBox, cpio.gz initramfs, `make build/run/test`.
+- `/init` PID-1 sh: mounts proc/sys/9p shares, sources `agentos.env`, `exec`s agentd.
+- Two virtio-9p mounts: `secrets0` (API key) + `output0` (flight.jsonl visible on host).
+- `make test` boots with `-no-reboot`, checks flight.jsonl for `agent_completed` event.
+- **Completed:** p2.2 (2026-06-09)
+
+**p1.6 — Agent identity & Agent Cards (discovery)**
+- `AgentCard { id, name, description, skills }` derived from `AgentConfig` at scheduler seed; `agent_card_registered` flight event.
+- `AgentConfig` gains `name`, `description`, `skills` optional TOML fields.
+- `bus.rs`: `MailMessage` + `Mailboxes`.
+- `list_agents` tool: sorted JSON array of all AgentCards; no capability required.
+- `send_message` tool + `AgentEffect::SendMessage`: sole-call; scheduler delivers to mailbox; synthesizes ToolResult; unknown recipient → `is_error` (no panic).
+- Mailbox drain before each inference; `inject_messages` appends to last User message (no consecutive-User-message violation).
+- Shutdown drain fix: `shutdown_requested` flag in `SchedulerState`.
+- New flight events: `agent_card_registered`, `message_sent`, `message_received`.
+- 142 tests pass (unit + integration).
+- **Completed:** v0.6.0 (2026-06-09)

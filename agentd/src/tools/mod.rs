@@ -180,8 +180,8 @@ mod tests {
     #[test]
     fn duplicate_registration_returns_error() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()]).unwrap();
-        let err = register_native(&mut reg, &["read_file".to_string()]).unwrap_err();
+        register_native(&mut reg, &["read_file".to_string()], None).unwrap();
+        let err = register_native(&mut reg, &["read_file".to_string()], None).unwrap_err();
         assert!(err.to_string().contains("read_file"));
         assert!(err.to_string().contains("already registered"));
     }
@@ -189,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn registry_specs_and_names_are_sorted() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()]).unwrap();
+        register_native(&mut reg, &["all".to_string()], None).unwrap();
         let names = reg.tool_names();
         let mut sorted = names.clone();
         sorted.sort();
@@ -204,21 +204,30 @@ mod tests {
     #[test]
     fn filtered_specs_none_cap_set_returns_all() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()]).unwrap();
+        register_native(&mut reg, &["all".to_string()], None).unwrap();
         assert_eq!(reg.filtered_specs(None).len(), reg.specs().len());
     }
 
     #[test]
-    fn filtered_specs_empty_cap_set_returns_none() {
+    fn filtered_specs_empty_cap_set_returns_only_no_cap_tools() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()]).unwrap();
-        assert_eq!(reg.filtered_specs(Some(&[])).len(), 0);
+        register_native(&mut reg, &["all".to_string()], None).unwrap();
+        let specs = reg.filtered_specs(Some(&[]));
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        // list_agents and send_message require no capability; they remain visible.
+        assert!(names.contains(&"list_agents"), "list_agents must be visible without capabilities");
+        assert!(names.contains(&"send_message"), "send_message must be visible without capabilities");
+        // Capability-gated tools must be hidden.
+        assert!(!names.contains(&"read_file"), "read_file must be hidden without FsRead capability");
+        assert!(!names.contains(&"write_file"), "write_file must be hidden without FsWrite capability");
+        assert!(!names.contains(&"list_dir"), "list_dir must be hidden without FsRead capability");
+        assert!(!names.contains(&"spawn_agent"), "spawn_agent must be hidden without Spawn capability");
     }
 
     #[test]
     fn filtered_specs_fs_read_only_excludes_write() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()]).unwrap();
+        register_native(&mut reg, &["all".to_string()], None).unwrap();
         let caps = [Capability::FsRead { prefix: "/".to_string() }];
         let specs = reg.filtered_specs(Some(&caps));
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
@@ -230,7 +239,7 @@ mod tests {
     #[tokio::test]
     async fn capability_denied_event_emitted_and_error_returned() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()]).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None).unwrap();
         let (rec, tmp) = recorder();
 
         // Grant only FsRead — write_file requires FsWrite, so it should be denied.
@@ -263,7 +272,7 @@ mod tests {
         // An agent with the matching FsWrite cap MUST be able to invoke write_file.
         // This is the "granted agent succeeds" half of the p1.4 acceptance criterion.
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()]).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None).unwrap();
         let (rec, _tmp) = recorder();
         let tmp_dir = tempfile::TempDir::new_in("/tmp").unwrap();
         let path = tmp_dir.path().join("test.txt").to_string_lossy().to_string();
@@ -279,5 +288,23 @@ mod tests {
             )
             .await;
         assert!(result.is_ok(), "granted cap should allow write_file: {result:?}");
+    }
+
+    #[test]
+    fn filtered_specs_spawn_visible_with_cap_hidden_without() {
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["all".to_string()], None).unwrap();
+
+        // With Spawn capability: spawn_agent should appear in specs.
+        let caps_with_spawn = [Capability::Spawn];
+        let specs_with = reg.filtered_specs(Some(&caps_with_spawn));
+        let names_with: Vec<&str> = specs_with.iter().map(|s| s.name.as_str()).collect();
+        assert!(names_with.contains(&"spawn_agent"), "spawn_agent must be visible when Spawn cap granted");
+
+        // Without Spawn capability (e.g. only FsRead): spawn_agent must be hidden.
+        let caps_no_spawn = [Capability::FsRead { prefix: "/".to_string() }];
+        let specs_without = reg.filtered_specs(Some(&caps_no_spawn));
+        let names_without: Vec<&str> = specs_without.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names_without.contains(&"spawn_agent"), "spawn_agent must be hidden without Spawn cap");
     }
 }

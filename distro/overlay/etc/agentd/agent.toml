@@ -1,0 +1,19 @@
+[agent]
+id = "boot-agent"
+task = """
+You are running inside AgentOS — a minimal Linux VM where you are the userspace.
+Do three things:
+1. Run list_dir on /etc/agentd/ to see your own config directory.
+2. Read /proc/version to learn the kernel version.
+3. Write a one-paragraph greeting to /run/output/greeting.txt that mentions
+   the kernel version and the files you found. Keep it under 100 words.
+"""
+max_turns = 8
+token_budget = 2000
+
+[model]
+provider = "anthropic"
+model_id = "claude-haiku-4-5-20251001"
+
+[tools]
+native = ["all"]

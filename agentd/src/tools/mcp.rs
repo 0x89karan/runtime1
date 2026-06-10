@@ -8,6 +8,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::Pid;
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -18,6 +20,8 @@ use tokio::{
 
 /// Maximum time to wait for any MCP server response (handshake or tool call).
 const MCP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Grace period after sending notifications/shutdown + SIGTERM before SIGKILL fires.
+const MCP_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Maximum bytes accumulated for a single JSON-RPC response line. Checked
 /// incrementally (before each chunk is appended) so the buffer never grows
 /// beyond this limit plus one internal BufReader fill (~8 KB).
@@ -26,6 +30,9 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DESC_CHARS: usize = 1024;
 /// Maximum byte length for a tool name (MCP convention, matches OpenAI function names).
 const MAX_NAME_LEN: usize = 64;
+/// Maximum pages fetched during tools/list pagination; prevents infinite loops
+/// with buggy or malicious servers that always return nextCursor.
+const MCP_MAX_TOOL_PAGES: usize = 100;
 
 use super::Tool;
 use crate::capability::Capability;
@@ -44,11 +51,11 @@ struct Transport {
 /// will introduce parallel tool dispatch at the agent level; when that lands,
 /// consider multiplexing or per-server connection pools.
 ///
-/// KNOWN LIMITATION: process teardown uses SIGKILL via `kill_on_drop(true)`.
-/// MCP servers that flush state on a clean shutdown may lose it. Graceful
-/// shutdown via `notifications/shutdown` + SIGTERM is a Phase 1 item.
+/// SHUTDOWN: `shutdown()` sends `notifications/shutdown` + SIGTERM and waits up
+/// to `MCP_SHUTDOWN_GRACE` for the process to exit. `kill_on_drop(true)` on
+/// `child` ensures SIGKILL fires if the process is still alive when McpClient drops.
 pub struct McpClient {
-    _child: Child,
+    child: Mutex<Child>,
     transport: Mutex<Transport>,
     next_id: AtomicU64,
     /// Set to `true` after a timeout cancels a request. The BufReader's internal
@@ -89,7 +96,7 @@ impl McpClient {
         });
 
         let client = Arc::new(Self {
-            _child: child,
+            child: Mutex::new(child),
             transport: Mutex::new(Transport {
                 stdin,
                 stdout: BufReader::new(stdout),
@@ -115,22 +122,29 @@ impl McpClient {
             .await
             .context("MCP notifications/initialized")?;
 
-        let list = client
-            .request("tools/list", json!({}))
-            .await
-            .context("MCP tools/list")?;
-
-        // MCP supports cursor-based pagination for large tool lists. Only the first
-        // page is fetched; warn so the operator knows tools may be missing.
-        if list.get("nextCursor").is_some() {
-            tracing::warn!(
-                mcp_server = %command,
-                "server has multiple tool pages (nextCursor present) — only the first page was loaded"
-            );
+        let mut all_specs = Vec::new();
+        let mut cursor: Option<String> = None;
+        // Guard against misbehaving servers that return nextCursor forever.
+        for _ in 0..MCP_MAX_TOOL_PAGES {
+            let params = match &cursor {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
+            let list = client
+                .request("tools/list", params)
+                .await
+                .context("MCP tools/list")?;
+            all_specs.extend(parse_tool_list(&list)?);
+            cursor = list
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
         }
 
-        let specs = parse_tool_list(&list)?;
-        Ok((client, specs))
+        Ok((client, all_specs))
     }
 
     /// Send a JSON-RPC request and return the `result` field of the response.
@@ -253,6 +267,32 @@ impl McpClient {
                 ))
             }
         }
+    }
+
+    /// Gracefully shut down the MCP server:
+    ///
+    /// 1. Send `notifications/shutdown` so the server can flush state.
+    /// 2. Give the server `MCP_SHUTDOWN_GRACE` to exit on its own.
+    /// 3. If still running, send SIGTERM and wait another `MCP_SHUTDOWN_GRACE`.
+    ///
+    /// All errors are best-effort; `kill_on_drop` provides the SIGKILL backstop.
+    pub async fn shutdown(&self) {
+        let _ = self.notify("notifications/shutdown").await;
+        let mut child = self.child.lock().await;
+        // Give the server time to process the notification and exit cleanly before
+        // sending SIGTERM.  Sending SIGTERM immediately races with the server reading
+        // the notification from the pipe, which would prevent the clean-exit path.
+        if tokio::time::timeout(MCP_SHUTDOWN_GRACE, child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        // Server did not exit gracefully — escalate to SIGTERM.
+        if let Some(pid) = child.id() {
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        }
+        let _ = tokio::time::timeout(MCP_SHUTDOWN_GRACE, child.wait()).await;
     }
 }
 

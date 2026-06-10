@@ -29,6 +29,13 @@ pub enum EventKind {
     BudgetExceeded,
     MaxTurnsReached,
     CapabilityDenied,
+    AgentChildResultDelivered,
+    AgentCardRegistered,
+    MessageSent,
+    MessageReceived,
+    SystemShutdownRequested,
+    FuseMounted,
+    FuseUnmounted,
     Error,
 }
 
@@ -148,6 +155,23 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(event["kind"], "perceive");
         assert_eq!(event["turn"], 1);
+    }
+
+    #[test]
+    fn fuse_event_kinds_serialize_to_snake_case() {
+        let tmp = NamedTempFile::new().unwrap();
+        let recorder = FlightRecorder::new(tmp.path()).unwrap();
+
+        recorder.record("agentd", None, EventKind::FuseMounted,   serde_json::json!({"mountpoint": "/agents"}));
+        recorder.record("agentd", None, EventKind::FuseUnmounted, serde_json::json!({"mountpoint": "/agents"}));
+
+        let mut content = String::new();
+        File::open(tmp.path()).unwrap().read_to_string(&mut content).unwrap();
+        let lines: Vec<serde_json::Value> = content.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["kind"], "fuse_mounted");
+        assert_eq!(lines[1]["kind"], "fuse_unmounted");
     }
 
     #[test]

@@ -125,7 +125,7 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
                 false
             }
         }),
-        Capability::Spawn => false,
+        Capability::Spawn => granted.iter().any(|g| matches!(g, Capability::Spawn)),
     }
 }
 
@@ -302,9 +302,15 @@ mod tests {
     }
 
     #[test]
-    fn satisfies_spawn_always_denied() {
+    fn satisfies_spawn_requires_spawn_grant() {
+        // Granted Spawn → allowed.
         let caps = vec![Capability::Spawn];
-        assert!(!satisfies(&caps, &Capability::Spawn));
+        assert!(satisfies(&caps, &Capability::Spawn));
+        // Empty cap-set → denied.
+        assert!(!satisfies(&[], &Capability::Spawn));
+        // Only non-Spawn caps → denied.
+        let other = vec![Capability::FsRead { prefix: "/workspace".to_string() }];
+        assert!(!satisfies(&other, &Capability::Spawn));
     }
 
     #[test]
