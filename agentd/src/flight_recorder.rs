@@ -38,6 +38,10 @@ pub enum EventKind {
     SystemShutdownRequested,
     FuseMounted,
     FuseUnmounted,
+    /// MCP server subprocess sandboxed via Landlock + seccomp before exec.
+    SandboxApplied,
+    /// MCP server configured without `capabilities`; running unsandboxed.
+    SandboxSkipped,
     Error,
 }
 

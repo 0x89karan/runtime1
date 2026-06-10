@@ -190,13 +190,17 @@ pub struct ToolsConfig {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-// Fields are consumed by McpClient in p0.5; unused until then.
-#[allow(dead_code)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Capability-based sandbox rules applied to this MCP server subprocess.
+    /// `None` (field absent) = no sandbox — server runs unrestricted.
+    /// `Some([])` = deny-all spawn; no filesystem grants.
+    /// `Some([...])` = exact capability set converted to Landlock + seccomp rules.
+    #[serde(default)]
+    pub capabilities: Option<Vec<Capability>>,
 }
 
 #[cfg(test)]

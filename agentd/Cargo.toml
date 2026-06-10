@@ -11,9 +11,15 @@ path = "src/main.rs"
 name = "echo-mcp"
 path = "tests/fixtures/echo_mcp.rs"
 
+[[bin]]
+name = "sandbox-probe"
+path = "tests/fixtures/sandbox_probe.rs"
+
 [dependencies]
 anyhow = "1"
 surfaces = { path = "../surfaces" }
+sandbox = { path = "../sandbox" }
+libc = "0.2"
 async-trait = "0.1"
 futures = "0.3"
 chrono = { version = "0.4", features = ["serde"] }

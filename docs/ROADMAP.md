@@ -383,7 +383,7 @@ the live runtime.
 Persist an agent's working context + ledger to disk and resume it (app-level first;
 CRIU exploration later). **Acceptance:** suspend an agent, restart `agentd`, resume it.
 
-### ▢ p3.3 — eBPF/LSM enforcement (exploratory)
+### ▣ p3.3 — eBPF/LSM enforcement (exploratory)
 Enforce capability scopes (p1.4) at the syscall boundary for tool subprocesses.
 **Acceptance:** spike doc + prototype showing a denied syscall.
 

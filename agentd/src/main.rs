@@ -2,6 +2,7 @@ use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
 use agentd::{checkpoint::CheckpointStore, config, scheduler::Scheduler};
+use agentd::capability::Capability;
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
 use agentd::tools::{
@@ -9,6 +10,7 @@ use agentd::tools::{
     native::register_native,
     ToolRegistry,
 };
+use sandbox::SandboxRule;
 use surfaces::SchedulerSnapshot;
 
 #[tokio::main]
@@ -105,14 +107,49 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     // calling exit() while mcp_clients is still in scope.
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
     for server in &cfg.tools.mcp_servers {
+        let sandbox_rules: Option<Vec<SandboxRule>> =
+            server.capabilities.as_deref().map(caps_to_rules);
+
+        match &sandbox_rules {
+            None => {
+                tracing::warn!(
+                    name = %server.name,
+                    "MCP server has no `capabilities` field — running unsandboxed"
+                );
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::SandboxSkipped,
+                    serde_json::json!({ "server": server.name }),
+                );
+            }
+            Some(rules) => {
+                let rule_descs: Vec<String> = rules.iter().map(|r| format!("{r:?}")).collect();
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::SandboxApplied,
+                    serde_json::json!({
+                        "server": server.name,
+                        "rules": rule_descs,
+                    }),
+                );
+            }
+        }
+
         tracing::info!(
             name = %server.name,
             command = %server.command,
+            sandboxed = sandbox_rules.is_some(),
             "spawning MCP server"
         );
-        let (client, specs) = McpClient::spawn(&server.command, &server.args)
-            .await
-            .with_context(|| format!("spawning MCP server '{}'", server.name))?;
+        let (client, specs) = McpClient::spawn(
+            &server.command,
+            &server.args,
+            sandbox_rules.as_deref(),
+        )
+        .await
+        .with_context(|| format!("spawning MCP server '{}'", server.name))?;
         let n = specs.len();
         for spec in specs {
             registry
@@ -273,6 +310,33 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("one or more agents failed");
     }
     Ok(())
+}
+
+/// Convert an agent capability set into sandbox rules for an MCP server subprocess.
+///
+/// Landlock FS rules map 1:1 from FsRead/FsWrite capabilities. DenySpawn is
+/// added whenever the Spawn capability is absent, blocking execve/execveat/fork
+/// in the server child via seccomp-bpf.
+fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
+    let mut rules = Vec::new();
+    let has_spawn = caps.iter().any(|c| matches!(c, Capability::Spawn));
+    if !has_spawn {
+        rules.push(SandboxRule::DenySpawn);
+    }
+    for cap in caps {
+        match cap {
+            Capability::FsRead { prefix } => {
+                rules.push(SandboxRule::AllowFsRead { prefix: prefix.clone() });
+            }
+            Capability::FsWrite { prefix } => {
+                rules.push(SandboxRule::AllowFsWrite { prefix: prefix.clone() });
+            }
+            // Net and Mcp capabilities are advisory at this layer; kernel-level
+            // network enforcement requires Landlock ABI v4 + net rules (Phase 4 TODO).
+            Capability::Net { .. } | Capability::Mcp { .. } | Capability::Spawn => {}
+        }
+    }
+    rules
 }
 
 async fn run_probe(prompt: &str) -> anyhow::Result<()> {

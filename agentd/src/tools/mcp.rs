@@ -37,6 +37,7 @@ const MCP_MAX_TOOL_PAGES: usize = 100;
 use super::Tool;
 use crate::capability::Capability;
 use crate::inference::ToolSpec;
+use sandbox::SandboxRule;
 
 struct Transport {
     stdin: ChildStdin,
@@ -68,16 +69,42 @@ impl McpClient {
     /// Spawn the MCP server process, run the initialize handshake, and list
     /// available tools. Returns `(client, specs)` — the caller wraps each spec
     /// as an `McpTool` and registers it in the `ToolRegistry`.
-    pub async fn spawn(command: &str, args: &[String]) -> Result<(Arc<Self>, Vec<ToolSpec>)> {
+    ///
+    /// `sandbox` — when `Some(rules)`, the child process is sandboxed via
+    /// Landlock + seccomp before exec. When `None`, no sandbox is applied.
+    pub async fn spawn(
+        command: &str,
+        args: &[String],
+        sandbox: Option<&[SandboxRule]>,
+    ) -> Result<(Arc<Self>, Vec<ToolSpec>)> {
         use std::process::Stdio;
         use tokio::process::Command;
 
-        let mut child = Command::new(command)
-            .args(args)
+        let mut cmd = Command::new(command);
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+
+        // Compile + apply sandbox rules in the child process before exec().
+        // compile() may allocate — called in the parent, before fork().
+        // apply_compiled() is async-signal-safe: raw syscalls only, no allocation.
+        if let Some(rules) = sandbox {
+            let compiled = sandbox::compile(rules)
+                .with_context(|| format!("compiling sandbox for '{command}'"))?;
+            // SAFETY: apply_compiled() uses only async-signal-safe operations.
+            // CompiledSandbox is Send + Sync, so the closure satisfies pre_exec bounds.
+            #[cfg(unix)]
+            unsafe {
+                cmd.pre_exec(move || {
+                    sandbox::apply_compiled(&compiled)
+                        .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))
+                });
+            }
+        }
+
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawning MCP server '{command}'"))?;
 
