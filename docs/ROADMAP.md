@@ -379,7 +379,7 @@ Each running agent appears as a directory (`status`, `context_size`, `budget`,
 `flight` tail). **Acceptance:** `ls /agents`, `cat /agents/<id>/status` work against
 the live runtime.
 
-### ▢ p3.2 — Agent checkpoint / restore
+### ▣ p3.2 — Agent checkpoint / restore
 Persist an agent's working context + ledger to disk and resume it (app-level first;
 CRIU exploration later). **Acceptance:** suspend an agent, restart `agentd`, resume it.
 

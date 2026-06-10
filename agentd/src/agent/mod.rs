@@ -96,6 +96,47 @@ impl AgentTask {
         self.model_cfg.clone()
     }
 
+    /// True when the agent has reached a terminal state (Completed or Failed).
+    pub fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    /// Snapshot all agent state to a serializable checkpoint.
+    pub fn to_checkpoint(&self) -> crate::checkpoint::AgentCheckpoint {
+        crate::checkpoint::AgentCheckpoint {
+            agent_id:        self.agent_id.clone(),
+            cfg:             self.cfg.clone(),
+            model_cfg:       self.model_cfg.clone(),
+            messages:        self.messages.clone(),
+            specs:           self.specs.clone(),
+            total_input:     self.total_input,
+            total_output:    self.total_output,
+            turn:            self.turn,
+            stored_response: self.stored_response.clone(),
+            terminal:        self.terminal,
+        }
+    }
+
+    /// Restore an agent from a checkpoint, using `specs` from the current registry
+    /// rather than the saved specs (guards against stale tool lists after restart).
+    pub fn from_checkpoint(
+        cp: crate::checkpoint::AgentCheckpoint,
+        specs: Vec<ToolSpec>,
+    ) -> Self {
+        Self {
+            agent_id:        cp.agent_id,
+            cfg:             cp.cfg,
+            model_cfg:       cp.model_cfg,
+            messages:        cp.messages,
+            specs,
+            total_input:     cp.total_input,
+            total_output:    cp.total_output,
+            turn:            cp.turn,
+            stored_response: cp.stored_response,
+            terminal:        false,
+        }
+    }
+
     /// Total tokens consumed so far (input + output). Used by the snapshot.
     pub fn context_tokens(&self) -> u64 {
         self.total_input + self.total_output
@@ -1242,6 +1283,104 @@ mod tests {
         };
         task.provide_inference(response, &rec);
         assert_eq!(task.context_tokens(), 150);
+    }
+
+    // ── p3.2: checkpoint tests ────────────────────────────────────────────────
+
+    #[test]
+    fn is_terminal_false_for_new_task() {
+        let task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+        assert!(!task.is_terminal());
+    }
+
+    #[test]
+    fn is_terminal_true_after_completion() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+        let _ = task.step(&rec);
+        task.provide_inference(end_turn("done"), &rec);
+        let _ = task.step(&rec);
+        assert!(task.is_terminal());
+    }
+
+    #[test]
+    fn to_checkpoint_captures_all_fields() {
+        use crate::inference::ToolSpec;
+        let spec = ToolSpec {
+            name: "read_file".to_string(),
+            description: "reads a file".to_string(),
+            input_schema: serde_json::json!({}),
+        };
+        let cfg = agent_cfg(7, 50_000);
+        let task = AgentTask::new("agent-42", "do the thing", &cfg, &model_cfg(), vec![spec.clone()]);
+        let cp = task.to_checkpoint();
+        assert_eq!(cp.agent_id, "agent-42");
+        assert_eq!(cp.turn, 0);
+        assert_eq!(cp.total_input, 0);
+        assert_eq!(cp.total_output, 0);
+        assert!(!cp.terminal, "terminal must be false in checkpoint");
+        assert!(cp.stored_response.is_none());
+        assert_eq!(cp.messages.len(), 1);
+        assert_eq!(cp.specs[0].name, "read_file");
+    }
+
+    #[test]
+    fn from_checkpoint_uses_fresh_specs_and_clears_terminal() {
+        use crate::checkpoint::AgentCheckpoint;
+        use crate::inference::ToolSpec;
+
+        let stale_spec = ToolSpec {
+            name: "old_tool".to_string(),
+            description: "stale".to_string(),
+            input_schema: serde_json::json!({}),
+        };
+        let fresh_spec = ToolSpec {
+            name: "new_tool".to_string(),
+            description: "fresh".to_string(),
+            input_schema: serde_json::json!({}),
+        };
+
+        let cp = AgentCheckpoint {
+            agent_id:        "agent-42".to_string(),
+            cfg:             agent_cfg(7, 50_000),
+            model_cfg:       model_cfg(),
+            messages:        vec![],
+            specs:           vec![stale_spec],
+            total_input:     100,
+            total_output:    50,
+            turn:            3,
+            stored_response: None,
+            terminal:        true, // saved as true — must be reset to false
+        };
+        let task = AgentTask::from_checkpoint(cp, vec![fresh_spec]);
+        assert_eq!(task.agent_id, "agent-42");
+        assert_eq!(task.turn, 3);
+        assert_eq!(task.total_input, 100);
+        assert_eq!(task.total_output, 50);
+        assert!(!task.terminal, "terminal must be false after restore");
+        assert_eq!(task.specs[0].name, "new_tool", "specs must come from fresh registry");
+    }
+
+    #[test]
+    fn checkpoint_roundtrip_preserves_messages_and_turn() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("rt", "roundtrip task", &agent_cfg(10, 200_000), &model_cfg(), vec![]);
+
+        // Advance one tool cycle so turn = 1 and messages > 1
+        let _ = task.step(&rec);
+        task.provide_inference(tool_use_resp("c1", "dummy", serde_json::json!({})), &rec);
+        let _ = task.step(&rec);
+        task.provide_tool_results(
+            vec![Block::ToolResult { tool_use_id: "c1".to_string(), content: "out".to_string(), is_error: false }],
+            &rec,
+        );
+        assert_eq!(task.turn, 1);
+
+        let cp = task.to_checkpoint();
+        let restored = AgentTask::from_checkpoint(cp, vec![]);
+        assert_eq!(restored.turn, 1);
+        assert_eq!(restored.messages.len(), task.messages.len());
+        assert!(!restored.is_terminal());
     }
 
     #[test]

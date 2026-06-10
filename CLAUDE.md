@@ -24,7 +24,7 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Phases 0–2 complete; Phase 3 in progress (p3.1 landed).** `agentd/` is a
+**Phases 0–2 complete; Phase 3 in progress (p3.2 landed).** `agentd/` is a
 working Rust binary. Phases 0–2 built the full single/multi-agent loop, config,
 flight recorder, Anthropic gateway, tool ABI, native tools, MCP stdio client,
 cooperative scheduler, capability system, agent spawning, agent cards, rustls
@@ -40,8 +40,15 @@ Phase 3 (Surfaces):
   between scheduler and FUSE handler; `FuseMounted`/`FuseUnmounted` flight
   events; `fuser` dep Linux-only; `CONFIG_FUSE_FS=y` in kernel-extras.config;
   15 unit tests in `surfaces`.
+- **p3.2** (done): Agent checkpoint / restore — `checkpoint.rs` with
+  `CheckpointStore` (atomic tmp→rename), `AgentCheckpoint` + `SchedulerCheckpoint`
+  serde types; `AgentTask::to_checkpoint`/`from_checkpoint`/`is_terminal`; periodic
+  auto-checkpoint every N turns (`checkpoint_interval_turns`, default=1); SIGTERM
+  checkpoint; corrupt checkpoint → rename to `.corrupt` + start fresh; full restore
+  of awaiting map, mailboxes, `tokens_spent`, `child_seq`, `spawn_depths`;
+  `AgentCheckpointed`/`AgentRestored` flight events; 166 unit tests pass.
 
-**Next: `p3.2` — Agent checkpoint / restore. See `docs/ROADMAP.md`.**
+**Next: `p3.3` — eBPF/LSM enforcement (exploratory). See `docs/ROADMAP.md`.**
 
 ## How to work here
 

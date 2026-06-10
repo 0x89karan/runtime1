@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 /// A message waiting in an agent's mailbox.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MailMessage {
     pub from:    String,
     pub content: String,
