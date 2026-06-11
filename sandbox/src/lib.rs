@@ -3,7 +3,9 @@
 /// Two mechanisms are combined:
 /// - Landlock LSM: filesystem path-beneath rules (BestEffort; degrades silently on
 ///   kernels < 5.13 or without CONFIG_SECURITY_LANDLOCK).
-/// - seccomp-bpf: syscall filter blocking execve/execveat/fork (DenySpawn rule).
+/// - seccomp-bpf: syscall filter blocking fork/vfork (DenySpawn rule; x86_64 only).
+///   Exec is not blocked — the initial execve that loads the MCP binary must succeed.
+///   Landlock FS rules persist across exec, so re-exec into another binary stays restricted.
 ///
 /// Usage pattern:
 /// 1. Call `compile(rules)` in the parent process (may allocate).
@@ -19,9 +21,10 @@ use std::fmt;
 pub enum SandboxRule {
     /// Allow read access (ReadFile + ReadDir) to all paths beneath `prefix`.
     AllowFsRead { prefix: String },
-    /// Allow full filesystem access to all paths beneath `prefix`.
+    /// Allow read and write access to all paths beneath `prefix` (all Landlock ABI V1 flags except Execute).
     AllowFsWrite { prefix: String },
-    /// Block execve, execveat, and fork via seccomp-bpf.
+    /// Block fork/vfork via seccomp-bpf (x86_64 only; aarch64 deferred pending clone3 inspection).
+    /// Exec is not blocked — Landlock FS rules persist across exec, keeping any re-exec restricted.
     DenySpawn,
 }
 
@@ -129,11 +132,10 @@ mod linux {
     const LANDLOCK_RULE_PATH_BENEATH: libc::c_long = 1;
 
     // Landlock ABI V1 access flags (include/uapi/linux/landlock.h)
-    const ACCESS_FS_V1_ALL: u64 = 0x1FFF; // bits 0–12 (Execute..MakeSym)
     // Execute (bit 0) is excluded from handled_access_fs: if we declare we control
     // execute, Landlock denies execve for any path not in our rules — which would
     // prevent the MCP binary itself from being loaded by exec() in the child.
-    // exec control is provided by the seccomp DenySpawn filter instead.
+    // DenySpawn blocks fork/vfork only; exec is intentionally left unrestricted.
     const ACCESS_FS_HANDLED: u64 = 0x1FFE; // V1 all except Execute (bit 0)
     const ACCESS_FS_READ_ONLY: u64 = 0x000C; // ReadFile(1<<2) | ReadDir(1<<3)
 
@@ -307,6 +309,10 @@ mod linux {
         // seccomp_data.nr is at offset 0 on all architectures.
         const NR_OFFSET: u32 = 0;
 
+        // execve/execveat are NOT blocked: the filter runs in pre_exec (after fork,
+        // before exec), so blocking execve would kill the child before the MCP binary
+        // is loaded. Landlock FS rules persist across exec, so any re-exec stays
+        // restricted. We only block fork/vfork to prevent new child processes.
         let mut filter: Vec<libc::sock_filter> = vec![
             // Load syscall number into accumulator
             libc::sock_filter {
@@ -314,32 +320,6 @@ mod linux {
                 jt: 0,
                 jf: 0,
                 k: NR_OFFSET,
-            },
-            // Block execve (true→skip 0→kill; false→skip 1→next check)
-            libc::sock_filter {
-                code: BPF_JMP_JEQ_K,
-                jt: 0,
-                jf: 1,
-                k: libc::SYS_execve as u32,
-            },
-            libc::sock_filter {
-                code: BPF_RET_K,
-                jt: 0,
-                jf: 0,
-                k: SECCOMP_RET_KILL_PROCESS,
-            },
-            // Block execveat
-            libc::sock_filter {
-                code: BPF_JMP_JEQ_K,
-                jt: 0,
-                jf: 1,
-                k: libc::SYS_execveat as u32,
-            },
-            libc::sock_filter {
-                code: BPF_RET_K,
-                jt: 0,
-                jf: 0,
-                k: SECCOMP_RET_KILL_PROCESS,
             },
         ];
 
@@ -420,7 +400,7 @@ mod linux {
             }
         }
 
-        // Apply seccomp BPF (blocks execve/execveat/fork).
+        // Apply seccomp BPF (blocks fork/vfork on x86_64).
         if let Some(bpf) = &inner.bpf {
             let fprog = libc::sock_fprog {
                 len: bpf.0.len() as u16,
@@ -508,8 +488,8 @@ mod tests {
             "DenySpawn should produce a BPF program"
         );
         let bpf = compiled.inner.bpf.as_ref().unwrap();
-        // Must have at least: load nr, execve check+kill, execveat check+kill, allow
-        assert!(bpf.0.len() >= 6, "BPF program too short: {} insns", bpf.0.len());
+        // Must have at least: load nr, allow
+        assert!(bpf.0.len() >= 2, "BPF program too short: {} insns", bpf.0.len());
     }
 
     #[test]
@@ -572,16 +552,17 @@ mod tests {
         assert!(compiled.inner.bpf.is_some());
     }
 
-    // On x86_64 the filter has 10 instructions after we added vfork:
-    // load(1) + execve(2) + execveat(2) + fork(2) + vfork(2) + allow(1) = 10
+    // On x86_64 the filter has 6 instructions:
+    // load(1) + fork(2) + vfork(2) + allow(1) = 6
+    // execve/execveat are NOT blocked (filter runs in pre_exec before exec).
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deny_spawn_bpf_includes_vfork_on_x86_64() {
         let rules = vec![SandboxRule::DenySpawn];
         let compiled = compile(&rules).unwrap();
         let bpf = compiled.inner.bpf.as_ref().unwrap();
-        assert_eq!(bpf.0.len(), 10,
-            "expected 10 BPF insns (load + execve + execveat + fork + vfork + allow), got {}",
+        assert_eq!(bpf.0.len(), 6,
+            "expected 6 BPF insns (load + fork + vfork + allow), got {}",
             bpf.0.len());
     }
 }
