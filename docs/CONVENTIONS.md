@@ -69,13 +69,18 @@ Phase 0 kinds (canonical — do not rename):
 | `agent_deferred` | inference deferred: concurrency cap full; includes priority + seq (p1.3+) |
 | `agent_admission_denied` | terminal: global token budget exhausted; agent cannot run (p1.3+) |
 | `error` | a stage failed (stage, error) |
+| `capability_denied` | tool invocation blocked by capability check (tool, required, agent id) (p1.4+) |
+| `message_sent` | agent sent a message to another agent (from, to) (p1.6+) |
+| `message_received` | agent received a message (from, to) (p1.6+) |
+| `agent_card_registered` | agent card recorded at scheduler seed (id, name, skills) (p1.6+) |
+| `fuse_mounted` | `/agents` FUSE filesystem mounted (mount_point) (p3.1+) |
+| `fuse_unmounted` | `/agents` FUSE filesystem unmounted (p3.1+) |
+| `sandbox_applied` | kernel sandbox applied to MCP server subprocess (server, rules) (p3.3+) |
+| `sandbox_skipped` | MCP server spawned without sandbox (server, reason) (p3.3+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
-small flat `data` object. Conventions for upcoming phases:
-
-- Capabilities (p1.4): `capability_denied` (tool, required capability, agent id).
-- Bus (p1.5): `message_sent`, `message_received` (from, to); a spawned child emits its
-  own `agent_spawned` under its own id, with a `parent` field.
+small flat `data` object. The table above is the canonical reference — update it
+when a new event kind lands.
 
 Keep the recorder agent-tagged: in multi-agent phases, every event must carry the
 acting agent's id so a single `flight.jsonl` is demultiplexable.
@@ -101,9 +106,13 @@ acting agent's id so a single `flight.jsonl` is demultiplexable.
 > as **MCP servers** — MCP is the tool ABI.
 
 ### Connect an MCP server
-Configure it under `[[tools.mcp_servers]]` (name, command, args). The stdio client
-(`agentd/src/tools/mcp.rs`) spawns it, does the `initialize` handshake, lists tools, and
-registers each as a `Tool`. No code change needed to add a server — only config.
+Configure it under `[[tools.mcp_servers]]` (name, command, args, optional capabilities).
+The stdio client (`agentd/src/tools/mcp.rs`) spawns it, does the `initialize` handshake,
+lists tools, and registers each as a `Tool`. No code change needed to add a server — only config.
+
+To sandbox the server subprocess (p3.3+), add a `capabilities` array to the server entry.
+The `sandbox/` crate compiles Landlock FS rules + seccomp-bpf into a `CompiledSandbox`
+applied via `pre_exec`. Omitting `capabilities` runs the server unsandboxed (warn emitted).
 
 ## Config
 

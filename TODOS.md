@@ -37,6 +37,43 @@
   the correct enforcement layer. Documents as advisory in the enum docstring.
 - Action: wire real enforcement when the first Net tool lands, or in Phase 4.
 
+**P3 — Net enforcement via Landlock ABI v4 not yet wired (p3.3 deferred)**
+- `Net { hosts }` capability is advisory at the kernel layer. Landlock ABI V4 (Linux 6.7)
+  adds `LANDLOCK_ACCESS_NET_BIND_TCP` / `LANDLOCK_ACCESS_NET_CONNECT_TCP`, which would
+  enforce per-host connection rules. Our kernel (6.6 LTS) supports V4 but the sandbox
+  crate only uses V1 FS rules.
+- Action: extend `SandboxRule` with `AllowNetConnect { host, port }`, bump to V4, and
+  enforce in `sandbox/src/lib.rs` during Phase 4.
+
+**P3 — MCP server without `capabilities` runs unsandboxed with warn-only (p3.3)**
+- `McpServerConfig.capabilities = None` (the default, for backward compat) bypasses
+  all kernel enforcement. Only a `tracing::warn!` and `SandboxSkipped` flight event are
+  emitted. A malicious or buggy MCP server with no capabilities field has full OS access.
+- Action: Phase 4 — add a `[tools] mcp_require_capabilities = true` global flag that
+  makes sandboxing mandatory and rejects startup when any server omits `capabilities`.
+
+**P3 — DenySpawn does not block `clone()`/`clone3()` on x86_64 (p3.3 adversarial review)**
+- seccomp filter blocks `fork(57)` and `vfork(58)` but not `clone(56)` or `clone3(435)`.
+  A sandboxed MCP server can spawn child processes via `clone(SIGCHLD)`. Classic BPF cannot
+  inspect `clone` flags to distinguish thread-create vs. process-create without SECCOMP_DATA_ARGS.
+- Action: Phase 4 — either accept the limitation and document it, or switch to `seccomp(2)`
+  with `SECCOMP_FILTER_FLAG_NEW_LISTENER` for args-aware filtering.
+
+**P3 — DenySpawn is a no-op on aarch64 (p3.3 adversarial review)**
+- The BPF filter only adds fork/vfork instructions under `#[cfg(target_arch = "x86_64")]`.
+  On aarch64 the compiled filter is two instructions (load + allow) and enforces nothing.
+  `SandboxApplied` still fires, giving a false signal on aarch64 hosts.
+- Action: emit `SandboxSkipped { reason: "deny-spawn-unsupported-arch" }` on non-x86_64
+  when `DenySpawn` is the only active rule; update docs.
+
+**P3 — SandboxApplied fires even when Landlock degrades to no-op (p3.3 adversarial review)**
+- On kernels < 5.13 without CONFIG_SECURITY_LANDLOCK, `compile()` returns `landlock_fd = -1`
+  (BestEffort). If `DenySpawn` is also absent, `apply_compiled_inner` is a complete no-op but
+  the parent still emits `sandbox_applied`. An operator trusting the flight log believes FS
+  isolation is active when it isn't.
+- Action: return an `enforced: bool` (or `{ landlock: bool, seccomp: bool }`) from
+  `apply_compiled_inner` and include it in the `SandboxApplied` flight event payload.
+
 **P3 — `required_capability_for → None` tools are always visible (p1.4 design)**
 - Tools that return `None` from `required_capability_for` appear in `filtered_specs` even
   when `cap_set = Some([])`. This is the documented contract ("tools that require no cap
@@ -101,6 +138,18 @@
 - Action: add `--no-fuse` flag alongside the existing CLI args in a future p3.x increment.
 
 ## Completed
+
+**p3.3 — Landlock LSM + seccomp-bpf sandbox for MCP server subprocesses**
+- `sandbox/` crate: `SandboxRule` enum (`AllowFsRead`, `AllowFsWrite`, `DenySpawn`);
+  `CompiledSandbox` / `compile()` / `apply_compiled()` / `apply_sandbox()` API.
+- Landlock V1 FS rules via raw syscalls (444/445/446); `ACCESS_FS_HANDLED = 0x1FFE`
+  (excludes Execute bit to allow initial exec of MCP binary).
+- seccomp-bpf filter blocks `fork(57)` + `vfork(58)` on x86_64 only; classic BPF.
+- `caps_to_rules()` in `main.rs`: converts agent `Capability` set to `SandboxRule` list.
+- `SandboxApplied` / `SandboxSkipped` flight events; `O_NOFOLLOW` on Landlock path fds.
+- `CONFIG_SECCOMP=y / CONFIG_SECCOMP_FILTER=y` in `distro/kernel-extras.config`.
+- 180 tests pass; Linux-gated tests deferred to CI via `#[cfg(target_os = "linux")]`.
+- **Completed:** v0.10.0 (2026-06-11)
 
 **p3.1 — /agents FUSE virtual filesystem**
 - `surfaces/` crate: `SchedulerSnapshot` / `AgentSnapshot` / `AgentStatus` snapshot types.

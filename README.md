@@ -14,13 +14,15 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phase 0 complete; Phase 1 in progress.** `agentd` is a working Rust binary.
-Phase 0 landed a full single-agent loop (config, flight recorder, inference
-gateway, tools, MCP stdio client). Phase 1 is underway — p1.1 refactored the
-agent into a sans-IO state machine; p1.2 added a cooperative multi-agent
-scheduler; p1.3 added metered scheduling and admission control (`[scheduler]`
-token budget + concurrency cap with a priority-based deferred queue). See
-[`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
+**Phases 0–3 in progress (p3.3 done).** `agentd` is a working Rust binary.
+Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
+inference gateway, tools, MCP stdio client, cooperative scheduler, capability
+system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
+QEMU boot, signal handling, MCP pagination, and graceful shutdown. Phase 3
+added the `/agents` FUSE virtual filesystem (`surfaces/`) and the
+Landlock LSM + seccomp-bpf sandbox crate (`sandbox/`) for MCP server
+subprocesses. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment
+list.
 
 ## Repo structure
 
@@ -29,18 +31,20 @@ agentos/                   ← run `claude` here
 ├── README.md              this file
 ├── CLAUDE.md              project memory for Claude Code
 ├── CHANGELOG.md           notable changes per release
+├── TODOS.md               open technical-debt items and completed increments
 ├── docs/
 │   ├── DESIGN.md          full design & research — the why
 │   ├── ROADMAP.md         the staged build plan — the what
 │   └── CONVENTIONS.md     how to extend the codebase — the how
-└── agentd/                the runtime (Rust crate)
-    ├── agent.toml         single-agent example
-    └── agents.toml        multi-agent example (p1.2+)
+├── agentd/                the runtime (Rust crate)
+│   ├── agent.toml         single-agent example
+│   └── agents.toml        multi-agent example (p1.2+)
+├── surfaces/              Phase 3: /agents FUSE virtual filesystem (p3.1+)
+├── sandbox/               Phase 3: Landlock LSM + seccomp-bpf sandbox (p3.3+)
+└── distro/                Phase 2: Buildroot external tree + QEMU boot
 ```
 
-Future phases add siblings next to `agentd/`: `distro/` (Phase 2: Buildroot +
-boot), `surfaces/` (Phase 3: `/agents` FUSE), `sandbox/` (Phase 4: isolation
-profiles). The repo is a single monorepo across phases, not a per-phase split.
+The repo is a single monorepo across phases, not a per-phase split.
 
 ## Quickstart
 

@@ -3,6 +3,51 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p3.3] - 2026-06-11
+
+### Added
+- **`sandbox/` crate**: new Rust library crate (`sandbox`) in the workspace. Provides
+  kernel-level enforcement for MCP server subprocesses via two mechanisms:
+  - **Landlock LSM** (Linux 5.13+): filesystem path-beneath rules. `AllowFsRead { prefix }`
+    grants `ReadFile | ReadDir`; `AllowFsWrite { prefix }` grants all ABI V1 flags except
+    Execute. BestEffort — degrades silently on older kernels without breaking startup.
+  - **seccomp-bpf** (`DenySpawn` rule): classic BPF filter installed in `pre_exec` that
+    blocks `fork(2)` and `vfork(2)` on x86_64, preventing the MCP server from spawning
+    new child processes. Exec is intentionally left unblocked (the initial `execve` that
+    loads the MCP binary must succeed); Landlock FS rules persist across exec.
+- **`capabilities` field on `[[tools.mcp_servers]]`**: optional array of capability objects
+  (`FsRead { prefix }`, `FsWrite { prefix }`, `Net { hosts }`, `Mcp { server, tools }`,
+  `Spawn`). When present, a sandbox is compiled and applied to the server subprocess before
+  exec. When absent, the server runs unsandboxed with a `tracing::warn!` and a
+  `SandboxSkipped` flight event. `capabilities = []` with no `Spawn` produces a
+  `DenySpawn`-only sandbox (fork/vfork blocked; no FS restriction).
+- **`caps_to_rules()` adapter** in `main.rs`: converts agent `Capability` values to
+  `SandboxRule` values — `FsRead`/`FsWrite` map 1:1; `Spawn` suppresses `DenySpawn`;
+  `Net`/`Mcp` are advisory (kernel-level net enforcement deferred to Landlock ABI V4).
+- **`EventKind::SandboxApplied` / `SandboxSkipped`**: emitted in `flight.jsonl` after
+  each MCP server spawn, recording which rules were applied or why the sandbox was skipped.
+- **`CONFIG_SECCOMP=y` / `CONFIG_SECCOMP_FILTER=y`** added to `distro/kernel-extras.config`.
+- **`docs/SPIKES/p3.3-ebpf-lsm.md`**: implementation spike doc covering raw syscall ABI,
+  BPF filter construction, execute-bit exclusion, known limitations, and CI gate.
+
+### Fixed
+- **`O_NOFOLLOW` on Landlock path fds**: `open_path_fd` now passes `O_NOFOLLOW` so a
+  symlink at the configured prefix cannot redirect the Landlock allowance to another dir.
+- **`SandboxApplied` accuracy**: only emitted on Linux (non-Linux is a no-op platform);
+  not emitted when compiled rules are empty (e.g. `capabilities = [{ Spawn }]` only).
+- **Empty `caps_to_rules` result treated as no sandbox**: `capabilities=[{Spawn}]` maps to
+  zero kernel rules and now correctly emits `SandboxSkipped` rather than a misleading
+  `SandboxApplied { rules: [] }`.
+
+### Tests
+- **180 tests pass** (macOS + CI); Linux-gated tests (`allow_fs_write_*`, `combined_fs_*`,
+  `deny_spawn_bpf_includes_vfork_on_x86_64`) verified by CI.
+- 6 `caps_to_rules` unit tests in `main.rs`.
+- 3 `McpServerConfig` capability TOML parse tests in `config.rs`.
+- 1 `sandbox_event_kinds_serialize_to_snake_case` test in `flight_recorder.rs`.
+- 5 sandbox-crate tests: `PartialEq`, Landlock rule construction, combined Landlock+BPF,
+  vfork BPF instruction count (expects 6: `load + fork + vfork + allow`).
+
 ## [p3.2] - 2026-06-10
 
 ### Added

@@ -19,9 +19,8 @@ The AgentOS runtime. Agents are the primitive; `agentd` runs them.
    tail -f flight.jsonl
    ```
 
-> **Note:** OpenSSL dev headers (`libssl-dev` + `pkg-config` on Debian/Ubuntu) are
-> required because the Anthropic backend uses `native-tls`. They are preinstalled on
-> macOS. Phase 2 switches to `rustls-tls` for static musl builds.
+> **Note:** No OpenSSL dependency — the Anthropic backend uses `rustls-tls` (switched in p2.1).
+> For a static musl build: `cross build --target x86_64-unknown-linux-musl --release` (requires Docker).
 
 ## Configuration
 
@@ -62,6 +61,7 @@ Both forms share `[model]`, `[tools]`, and `[scheduler]` sections. See `agent.to
 | `model.model` | `"claude-sonnet-4-6"` | Model identifier passed to the provider |
 | `model.max_tokens` | `4096` | Max tokens per inference response |
 | `tools.native` | `[]` | Native tools: `["all"]` or `["read_file", "write_file", "list_dir"]` |
+| `[[tools.mcp_servers]].capabilities` | absent (unsandboxed) | Kernel sandbox for this MCP server subprocess. Absent = no sandbox (warn + `SandboxSkipped` event); `[]` = deny spawn only; `[{FsRead={prefix="/data"}}]` = Landlock FS read grant. Variants mirror agent capabilities: `FsRead{prefix}`, `FsWrite{prefix}`, `Net{hosts}` (advisory), `Mcp{server,tools}`, `Spawn` (suppresses DenySpawn). Linux 5.13+ for Landlock; seccomp-bpf x86_64 only. |
 | `scheduler.global_token_budget` | `0` | Global token ceiling across all agents; `0` = unlimited |
 | `scheduler.max_concurrent_inferences` | `0` | Max in-flight model calls at once; `0` = unlimited |
 

@@ -38,6 +38,10 @@ pub enum EventKind {
     SystemShutdownRequested,
     FuseMounted,
     FuseUnmounted,
+    /// MCP server subprocess sandboxed via Landlock + seccomp before exec.
+    SandboxApplied,
+    /// MCP server configured without `capabilities`; running unsandboxed.
+    SandboxSkipped,
     Error,
 }
 
@@ -192,6 +196,25 @@ mod tests {
         assert_eq!(lines[0]["kind"], "agent_checkpointed");
         assert_eq!(lines[1]["kind"], "agent_restored");
         assert_eq!(lines[1]["data"]["turn"], 2);
+    }
+
+    #[test]
+    fn sandbox_event_kinds_serialize_to_snake_case() {
+        let tmp = NamedTempFile::new().unwrap();
+        let recorder = FlightRecorder::new(tmp.path()).unwrap();
+
+        recorder.record("agentd", None, EventKind::SandboxApplied,
+            serde_json::json!({"server": "echo", "rules": ["DenySpawn"]}));
+        recorder.record("agentd", None, EventKind::SandboxSkipped,
+            serde_json::json!({"server": "echo"}));
+
+        let mut content = String::new();
+        File::open(tmp.path()).unwrap().read_to_string(&mut content).unwrap();
+        let lines: Vec<serde_json::Value> = content.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["kind"], "sandbox_applied");
+        assert_eq!(lines[1]["kind"], "sandbox_skipped");
     }
 
     #[test]

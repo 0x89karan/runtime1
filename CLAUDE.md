@@ -24,14 +24,14 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Phases 0–2 complete; Phase 3 in progress (p3.2 landed).** `agentd/` is a
+**Phases 0–3 complete (p3.1 + p3.2 + p3.3 all landed).** `agentd/` is a
 working Rust binary. Phases 0–2 built the full single/multi-agent loop, config,
 flight recorder, Anthropic gateway, tool ABI, native tools, MCP stdio client,
 cooperative scheduler, capability system, agent spawning, agent cards, rustls
 static binary, Buildroot rootfs + QEMU boot, signal handling, MCP pagination,
 and graceful shutdown.
 
-Phase 3 (Surfaces):
+Phase 3 (Surfaces + Sandbox):
 
 - **p3.1** (done): `/agents` FUSE virtual filesystem — `surfaces/` crate;
   `AgentsFs` + `SchedulerSnapshot`; each running agent appears as a directory
@@ -46,9 +46,15 @@ Phase 3 (Surfaces):
   auto-checkpoint every N turns (`checkpoint_interval_turns`, default=1); SIGTERM
   checkpoint; corrupt checkpoint → rename to `.corrupt` + start fresh; full restore
   of awaiting map, mailboxes, `tokens_spent`, `child_seq`, `spawn_depths`;
-  `AgentCheckpointed`/`AgentRestored` flight events; 166 unit tests pass.
+  `AgentCheckpointed`/`AgentRestored` flight events; 175 unit tests pass.
+- **p3.3** (done): Landlock LSM + seccomp-bpf sandbox — `sandbox/` crate;
+  `SandboxRule` enum (`AllowFsRead`, `AllowFsWrite`, `DenySpawn`);
+  `compile()` + `apply_compiled()` API; `capabilities` field on
+  `[[tools.mcp_servers]]`; `caps_to_rules()` adapter in `main.rs`;
+  `SandboxApplied`/`SandboxSkipped` flight events; `CONFIG_SECCOMP=y` in
+  kernel-extras.config; 180 tests pass.
 
-**Next: `p3.3` — eBPF/LSM enforcement (exploratory). See `docs/ROADMAP.md`.**
+**Next: Phase 4 — Isolation & hardening. See `docs/ROADMAP.md`.**
 
 ## How to work here
 
@@ -135,6 +141,7 @@ agentos/                   the repo root (run `claude` here)
     DESIGN.md              full design & research (the "why")
     ROADMAP.md             the staged build plan (the work queue)
     CONVENTIONS.md         how to extend the codebase consistently
+    SPIKES/                exploratory spike docs (implementation notes per increment)
   agentd/                  the runtime (Rust crate)
     Cargo.toml             manifest
     agent.toml             single-agent example spec
@@ -161,10 +168,14 @@ agentos/                   the repo root (run `claude` here)
       lib.rs               re-exports snapshot types + agents_fs module
       snapshot.rs          SchedulerSnapshot / AgentSnapshot / AgentStatus
       agents_fs.rs         AgentsFs FUSE handler + mount() (Linux); stub (others)
+  sandbox/                 Phase 3: kernel sandbox for MCP subprocesses (p3.3+)
+    Cargo.toml             manifest (Linux-only raw syscall dependencies)
+    src/
+      lib.rs               SandboxRule enum + CompiledSandbox + compile()/apply_compiled()
   distro/                  Phase 2: Buildroot external tree + QEMU boot
     Makefile               build / run / test / prereqs / clean
     buildroot.config       Buildroot defconfig (x86_64 musl, busybox, cpio.gz)
-    kernel-extras.config   kernel fragment: virtio-net + virtio-9p + FUSE
+    kernel-extras.config   kernel fragment: virtio-net + virtio-9p + FUSE + SECCOMP
     overlay/
       init                 /init PID-1 sh script
       agents/              mount point for /agents FUSE filesystem (p3.1)
@@ -175,7 +186,7 @@ agentos/                   the repo root (run `claude` here)
           agent.toml       demo agent config
 ```
 
-Future phases add siblings to `agentd/`: `sandbox/` (Phase 4: isolation profiles).
+Future phases add further siblings: Phase 4 hardens the sandbox (net enforcement, mandatory capabilities, clone3 filter).
 
 When in doubt about *what* to build next, the roadmap decides. When in doubt
 about *how*, conventions decide. When in doubt about *why*, the design doc decides.
