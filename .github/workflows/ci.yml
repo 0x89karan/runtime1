@@ -51,4 +51,3 @@ jobs:
           echo "agentd musl binary: ${SIZE} bytes"
           MAX_BYTES=4194304  # 4 MB = 4 * 1024 * 1024
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 4 MB limit"; exit 1; }
-        working-directory: agentd
