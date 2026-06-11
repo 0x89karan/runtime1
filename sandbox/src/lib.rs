@@ -651,6 +651,7 @@ mod tests {
         assert!(!s.namespace_mount, "no rules → namespace_mount false");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enforcement_status_isolate_network_sets_flag() {
         let compiled = compile(&[SandboxRule::IsolateNetwork]).unwrap();
@@ -659,6 +660,7 @@ mod tests {
         assert!(!s.namespace_mount, "IsolateNetwork alone → namespace_mount false");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enforcement_status_isolate_mount_sets_flag() {
         let compiled = compile(&[SandboxRule::IsolateMount]).unwrap();
@@ -667,6 +669,7 @@ mod tests {
         assert!(s.namespace_mount, "IsolateMount → namespace_mount true");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn enforcement_status_both_namespace_rules() {
         let compiled = compile(&[SandboxRule::IsolateNetwork, SandboxRule::IsolateMount]).unwrap();

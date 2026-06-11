@@ -545,7 +545,7 @@ pub(crate) async fn run_tools_sequential(
                     json!({
                         "id": id, "name": name,
                         "is_error": true,
-                        "error": msg,
+                        "error": truncate(&msg, PREVIEW_CHARS),
                     }),
                 );
                 (msg, true)
@@ -834,6 +834,44 @@ mod tests {
         let preview = event["data"]["input_preview"].as_str().expect("input_preview must be string");
         assert!(preview.ends_with('…'), "long input must end with ellipsis");
         assert!(preview.chars().count() <= PREVIEW_CHARS + 1, "preview must not exceed PREVIEW_CHARS");
+    }
+
+    #[tokio::test]
+    async fn tool_result_error_event_truncates_long_error_message() {
+        struct LongErrorTool;
+
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for LongErrorTool {
+            fn name(&self) -> &str { "long_error_tool" }
+            fn description(&self) -> &str { "always fails with a long error" }
+            fn input_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+            async fn invoke(&self, _: serde_json::Value) -> anyhow::Result<String> {
+                anyhow::bail!("{}", "e".repeat(PREVIEW_CHARS + 100))
+            }
+        }
+
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap();
+        let mut registry = crate::tools::ToolRegistry::new();
+        registry.register(Box::new(LongErrorTool)).unwrap();
+
+        let blocks = vec![Block::ToolUse {
+            id:    "call_err".to_string(),
+            name:  "long_error_tool".to_string(),
+            input: serde_json::json!({}),
+        }];
+        run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|e: &serde_json::Value| e["kind"] == "tool_result" && e["data"]["is_error"] == true)
+            .expect("tool_result error event missing");
+
+        let error_str = event["data"]["error"].as_str().expect("error field must be a string");
+        assert!(error_str.ends_with('…'), "long error must end with ellipsis");
+        assert!(error_str.chars().count() <= PREVIEW_CHARS + 1, "error must not exceed PREVIEW_CHARS");
     }
 
     // ── State-machine unit tests (sync, no network) ───────────────────────────

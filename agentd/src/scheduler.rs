@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use serde_json::json;
 
 use crate::{
-    agent::{run_tools_sequential, AgentEffect, AgentTask},
+    agent::{run_tools_sequential, truncate, AgentEffect, AgentTask, PREVIEW_CHARS},
     bus::{MailMessage, Mailboxes},
     capability::Capability,
     checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, SchedulerCheckpoint},
@@ -860,7 +860,7 @@ fn dispatch_spawn(
         EventKind::AgentSpawned,
         json!({
             "parent_id":    &parent_id,
-            "task_preview": config.task.chars().take(200).collect::<String>(),
+            "task_preview": truncate(&config.task, PREVIEW_CHARS),
             "depth":        parent_depth + 1,
         }),
     );

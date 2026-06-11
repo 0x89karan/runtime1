@@ -421,7 +421,8 @@ TODOS.md); `clone3()` bypass in the namespace-only path remains (TODOS.md);
 ### ✓ p4.3 — Security review pass
 Threat model: secret handling, flight-recorder redaction, budget-exhaustion DoS,
 supply chain. `docs/THREAT_MODEL.md` written. `ToolCall.input` → `input_preview`
-(200-char truncation); `AgentSpawned.task` → `task_preview` (200-char truncation).
+(200-char truncation); `ToolResult.error` → truncated (200-char); `AgentSpawned.task`
+→ `task_preview` (200-char, both `main.rs` and `scheduler.rs` dispatch_spawn paths).
 `truncate()` + `PREVIEW_CHARS` made `pub` in `agent/mod.rs`. TODOS entry for
 checkpoint.json encryption. **Acceptance:** ✓
 

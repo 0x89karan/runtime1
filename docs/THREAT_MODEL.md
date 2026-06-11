@@ -68,8 +68,9 @@ Before this increment, `ToolCall` events recorded the **full, untruncated** tool
 input as `input`. A `write_file` call with a large file body, or any tool called
 with an argument containing a secret, would land verbatim in the log.
 
-Similarly, `AgentSpawned` events recorded the **full task string**, which could
-contain sensitive context passed at invocation time.
+Similarly, `AgentSpawned` events recorded the **full task string**, and `ToolResult`
+error events recorded the **full error message** as `error` — which could echo
+back the tool input that caused the failure. Both could contain sensitive context.
 
 ### 2.2 What is logged now (post-p4.3)
 
@@ -80,7 +81,8 @@ to a 200-character preview:
 |---|---|---|---|
 | `agent_spawned` | `task` (full) | verbatim | `task_preview` (≤200 chars + `…`) |
 | `tool_call` | `input` (full JSON) | verbatim | `input_preview` (≤200 chars + `…`) |
-| `tool_result` | `preview` | ≤200 chars ✓ | unchanged |
+| `tool_result` | `preview` (success path) | ≤200 chars ✓ | unchanged |
+| `tool_result` | `error` (error path) | verbatim | ≤200 chars (fixed in p4.3) |
 | `perceive` | `preview` | ≤200 chars ✓ | unchanged |
 | `inference_response` | `preview` | ≤200 chars ✓ | unchanged |
 | `agent_completed` | `answer_preview` | ≤200 chars ✓ | unchanged |
