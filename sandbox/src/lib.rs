@@ -89,7 +89,7 @@ impl From<std::ffi::NulError> for SandboxError {
 pub fn compile(rules: &[SandboxRule]) -> Result<CompiledSandbox, SandboxError> {
     #[cfg(target_os = "linux")]
     {
-        return linux::compile(rules).map(|inner| CompiledSandbox { inner });
+        linux::compile(rules).map(|inner| CompiledSandbox { inner })
     }
     #[cfg(not(target_os = "linux"))]
     {
