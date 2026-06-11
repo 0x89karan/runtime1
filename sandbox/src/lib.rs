@@ -179,11 +179,16 @@ mod linux {
     const ACCESS_FS_HANDLED: u64 = 0x1FFE; // V1 all except Execute (bit 0)
     const ACCESS_FS_READ_ONLY: u64 = 0x000C; // ReadFile(1<<2) | ReadDir(1<<3)
 
-    // ── seccomp BPF opcodes (classic BPF ABI; stable since 1993) ──────────
+    // ── seccomp BPF opcodes (classic BPF ABI; stable since 1993; x86_64 only) ──
+    #[cfg(target_arch = "x86_64")]
     const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    #[cfg(target_arch = "x86_64")]
     const BPF_JMP_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    #[cfg(target_arch = "x86_64")]
     const BPF_RET_K: u16 = 0x06; // BPF_RET | BPF_K
+    #[cfg(target_arch = "x86_64")]
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    #[cfg(target_arch = "x86_64")]
     const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 
     #[repr(C)]
@@ -208,9 +213,9 @@ mod linux {
         /// Pre-compiled seccomp BPF. None if DenySpawn rule was not requested,
         /// or if the current arch does not support fork/vfork filtering.
         pub bpf: Option<BpfProgram>,
-        /// True when DenySpawn was in the rule set, regardless of whether a BPF
-        /// filter was actually compiled (x86_64 only). Used by `enforcement_status()`
-        /// to distinguish "DenySpawn not requested" from "requested but not enforceable".
+        /// True when DenySpawn was in the rule set (x86_64 only). Used by
+        /// `enforcement_status()` to distinguish "not requested" from "not enforceable".
+        #[cfg(target_arch = "x86_64")]
         pub deny_spawn_requested: bool,
     }
 
@@ -278,17 +283,17 @@ mod linux {
         // On non-x86_64 arches fork()/vfork() do not exist as distinct syscalls;
         // building a filter would produce a 2-instruction no-op. Gate compilation
         // so `bpf.is_some()` reliably means "a real filter was installed".
-        let deny_spawn_requested = rules.iter().any(|r| matches!(r, SandboxRule::DenySpawn));
         #[cfg(target_arch = "x86_64")]
-        let bpf = if deny_spawn_requested {
-            Some(build_spawn_deny_filter())
-        } else {
-            None
-        };
+        {
+            let deny_spawn_requested = rules.iter().any(|r| matches!(r, SandboxRule::DenySpawn));
+            let bpf = if deny_spawn_requested { Some(build_spawn_deny_filter()) } else { None };
+            Ok(Inner { landlock_fd, bpf, deny_spawn_requested })
+        }
         #[cfg(not(target_arch = "x86_64"))]
-        let bpf: Option<BpfProgram> = None;
-
-        Ok(Inner { landlock_fd, bpf, deny_spawn_requested })
+        {
+            let bpf: Option<BpfProgram> = None;
+            Ok(Inner { landlock_fd, bpf })
+        }
     }
 
     fn open_path_fd(path: &str) -> Result<i32, SandboxError> {
@@ -361,6 +366,7 @@ mod linux {
         Ok(ruleset_fd)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn build_spawn_deny_filter() -> BpfProgram {
         // seccomp_data.nr is at offset 0 on all architectures.
         const NR_OFFSET: u32 = 0;
