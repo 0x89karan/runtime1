@@ -37,7 +37,6 @@ const MCP_MAX_TOOL_PAGES: usize = 100;
 use super::Tool;
 use crate::capability::Capability;
 use crate::inference::ToolSpec;
-use sandbox::SandboxRule;
 
 struct Transport {
     stdin: ChildStdin,
@@ -70,12 +69,13 @@ impl McpClient {
     /// available tools. Returns `(client, specs)` — the caller wraps each spec
     /// as an `McpTool` and registers it in the `ToolRegistry`.
     ///
-    /// `sandbox` — when `Some(rules)`, the child process is sandboxed via
-    /// Landlock + seccomp before exec. When `None`, no sandbox is applied.
+    /// `sandbox` — when `Some(compiled)`, the child process is sandboxed via
+    /// Landlock + seccomp before exec. Call `sandbox::compile()` in the parent
+    /// and pass the result here. When `None`, no sandbox is applied.
     pub async fn spawn(
         command: &str,
         args: &[String],
-        sandbox: Option<&[SandboxRule]>,
+        sandbox: Option<sandbox::CompiledSandbox>,
     ) -> Result<(Arc<Self>, Vec<ToolSpec>)> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -87,16 +87,13 @@ impl McpClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        // Compile + apply sandbox rules in the child process before exec().
-        // compile() may allocate — called in the parent, before fork().
+        // Apply pre-compiled sandbox in the child process before exec().
         // apply_compiled() is async-signal-safe: raw syscalls only, no allocation.
         // Gated to Linux: Landlock + seccomp are Linux-only mechanisms.
         #[cfg(not(target_os = "linux"))]
         let _ = sandbox;
         #[cfg(target_os = "linux")]
-        if let Some(rules) = sandbox {
-            let compiled = sandbox::compile(rules)
-                .with_context(|| format!("compiling sandbox for '{command}'"))?;
+        if let Some(compiled) = sandbox {
             // SAFETY: apply_compiled() uses only async-signal-safe operations.
             // CompiledSandbox is Send + Sync, so the closure satisfies pre_exec bounds.
             unsafe {

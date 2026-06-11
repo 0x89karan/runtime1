@@ -186,6 +186,10 @@ pub struct ToolsConfig {
     pub native: Vec<String>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// When `true`, startup fails if any MCP server omits the `capabilities` field.
+    /// Ensures all servers are sandboxed; defaults to `false` for backward compat.
+    #[serde(default)]
+    pub mcp_require_capabilities: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -562,6 +566,34 @@ capabilities = [
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[0], Capability::FsRead { prefix: "/workspace".into() });
         assert_eq!(caps[1], Capability::FsWrite { prefix: "/tmp".into() });
+    }
+
+    // ── p4.1: mcp_require_capabilities tests ─────────────────────────────────
+
+    #[test]
+    fn mcp_require_capabilities_defaults_to_false() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.tools.mcp_require_capabilities,
+            "mcp_require_capabilities must default to false");
+    }
+
+    #[test]
+    fn mcp_require_capabilities_true_parses() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[tools]
+mcp_require_capabilities = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.tools.mcp_require_capabilities);
     }
 
     // ── p1.6: AgentCard tests ─────────────────────────────────────────────────
