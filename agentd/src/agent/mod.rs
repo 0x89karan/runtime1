@@ -3,7 +3,7 @@ pub mod driver;
 
 use serde_json::json;
 
-const PREVIEW_CHARS: usize = 200;
+pub const PREVIEW_CHARS: usize = 200;
 
 use crate::{
     config::{AgentConfig, ModelConfig, SpawnConfig},
@@ -516,7 +516,7 @@ pub(crate) async fn run_tools_sequential(
             agent_id,
             Some(turn),
             EventKind::ToolCall,
-            json!({ "id": id, "name": name, "input": input }),
+            json!({ "id": id, "name": name, "input_preview": truncate(&input.to_string(), PREVIEW_CHARS) }),
         );
 
         let (content, is_error) = match registry
@@ -561,7 +561,7 @@ pub(crate) async fn run_tools_sequential(
     results
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
+pub fn truncate(s: &str, max_chars: usize) -> String {
     let mut chars = s.chars().peekable();
     let out: String = chars.by_ref().take(max_chars).collect();
     if chars.next().is_some() {

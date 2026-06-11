@@ -3,6 +3,36 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.3] - 2026-06-12
+
+### Added
+- **`docs/THREAT_MODEL.md`**: full threat model covering secret handling,
+  flight-recorder data sensitivity, checkpoint.json exposure, budget-exhaustion DoS
+  guards, supply chain posture, and sandbox bypass vectors (BP-1 through BP-6) with
+  explicit "not yet fixed" labels for each known gap.
+
+### Fixed
+- **`ToolCall` event now logs `input_preview` (≤200 chars) instead of the full,
+  untruncated tool input**: prevents large file contents and any short secrets
+  passed as tool arguments from landing verbatim in `flight.jsonl`. Consistent with
+  `ToolResult`, `Perceive`, `AgentCompleted`, and `InferenceResponse` events, which
+  already truncated.
+- **`AgentSpawned` event now logs `task_preview` (≤200 chars) instead of the full
+  task string**: a long or sensitive task description no longer appears unredacted
+  in the startup flight events.
+- **`truncate()` and `PREVIEW_CHARS` made `pub` in `agentd::agent`**: previously
+  private, preventing reuse from `main.rs`; now part of the library's public surface.
+
+### Known Limitations (TODOS.md)
+- `checkpoint.json` has no encryption or restricted file permissions; tracked as
+  P3 TODOS entry for a future increment.
+- 200-char truncation does not prevent short secrets (≤200 chars) in tool
+  arguments; operational guidance: pass secrets via environment, not tool inputs.
+- `cargo audit` CVE scanning not yet in CI.
+
+### Tests
+- All 209 tests pass (macOS + CI unchanged).
+
 ## [p4.2] - 2026-06-11
 
 ### Added

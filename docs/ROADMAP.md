@@ -418,9 +418,12 @@ TODOS.md); `clone3()` bypass in the namespace-only path remains (TODOS.md);
 `CLONE_NEWPID` for PID namespace requires a re-fork and is deferred.
 **Acceptance:** ✓
 
-### ▢ p4.3 — Security review pass
+### ✓ p4.3 — Security review pass
 Threat model: secret handling, flight-recorder redaction, budget-exhaustion DoS,
-supply chain. **Acceptance:** documented threat model + fixes landed.
+supply chain. `docs/THREAT_MODEL.md` written. `ToolCall.input` → `input_preview`
+(200-char truncation); `AgentSpawned.task` → `task_preview` (200-char truncation).
+`truncate()` + `PREVIEW_CHARS` made `pub` in `agent/mod.rs`. TODOS entry for
+checkpoint.json encryption. **Acceptance:** ✓
 
 ---
 

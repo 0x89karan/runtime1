@@ -129,6 +129,13 @@
   that touches Linux-gated code. Target added to workspace Makefile; rule added to
   CLAUDE.md quality gate.
 
+**P3 — checkpoint.json has no access-control or encryption (p4.3)**
+- `checkpoint.json` is written to CWD with the process umask (typically 0644 → world-readable).
+  It contains the full, unredacted conversation history of each agent for the duration of the run.
+  File is deleted after successful restore; risk window is crash-only (or during active run).
+- Action: set `O_CREAT | 0600` permissions on the checkpoint file at write time, or add at-rest
+  encryption keyed to the agent identity. Either should land in a future p4.x increment.
+
 **P4 — `runsc do` is experimental; full OCI bundle integration deferred (p4.2)**
 - `isolation = "gvisor"` wraps the MCP server command with `runsc do -- <cmd>`. The `do`
   subcommand is undocumented/experimental in gVisor and may not be stable across versions.
