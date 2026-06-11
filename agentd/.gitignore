@@ -1,2 +1,4 @@
 /target/
 flight.jsonl
+checkpoint.json
+checkpoint.json.corrupt

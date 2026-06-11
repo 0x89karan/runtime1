@@ -1,7 +1,7 @@
 use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
-use agentd::{config, scheduler::Scheduler};
+use agentd::{checkpoint::CheckpointStore, config, scheduler::Scheduler};
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
 use agentd::tools::{
@@ -193,6 +193,33 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     };
     let registry = Arc::new(registry);
 
+    // Attempt to restore from a prior checkpoint. On corrupt file: rename and start fresh.
+    let store = CheckpointStore::new(std::path::Path::new("."));
+    let maybe_checkpoint = match store.load() {
+        Ok(Some(cp)) => {
+            tracing::info!(agents = cp.agents.len(), "restoring from checkpoint");
+            for agent_cp in &cp.agents {
+                recorder.record(
+                    &agent_cp.agent_id,
+                    Some(agent_cp.turn),
+                    EventKind::AgentRestored,
+                    serde_json::json!({ "turn": agent_cp.turn }),
+                );
+            }
+            // Remove checkpoint after successful load so a second restart starts fresh.
+            if let Err(e) = std::fs::remove_file("checkpoint.json") {
+                tracing::warn!("could not remove checkpoint.json after restore: {e}");
+            }
+            Some(cp)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            tracing::error!("checkpoint corrupt, starting fresh: {e:#}");
+            let _ = std::fs::rename("checkpoint.json", "checkpoint.json.corrupt");
+            None
+        }
+    };
+
     let scheduler = match Scheduler::new(
         agent_cfgs,
         &cfg.model,
@@ -201,6 +228,7 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         registry,
         Arc::clone(&recorder),
         Arc::clone(&snapshot),
+        maybe_checkpoint,
     ) {
         Ok(s) => s,
         Err(e) => {

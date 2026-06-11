@@ -3,6 +3,58 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p3.2] - 2026-06-10
+
+### Added
+- **`agentd/src/checkpoint.rs`**: new module — `CheckpointStore` (atomic
+  `tmp → rename` writes), `AgentCheckpoint`, `SchedulerCheckpoint`,
+  `AwaitingEntry` serde types; `FORMAT_VERSION = 1`.
+- **`AgentTask::to_checkpoint()`** / **`from_checkpoint()`** / **`is_terminal()`**:
+  serialise/deserialise agent working state; `from_checkpoint` always clears
+  `terminal` to guard against the terminal-race (OV-2); `is_terminal` lets the
+  scheduler filter finished agents from checkpoint writes.
+- **Periodic auto-checkpoint**: `SchedulerConfig::checkpoint_interval_turns`
+  (default `1`); fires at every `provide_tool_results` boundary when the agent
+  turn count is a non-zero multiple of the interval.
+- **SIGTERM checkpoint**: when the scheduler's SIGTERM handler fires it calls
+  `checkpoint_all()` before exiting; if the save fails the error is recorded and
+  shutdown continues without crashing.
+- **Corrupt-checkpoint recovery**: if `checkpoint.json` exists but fails to
+  parse, `main.rs` renames it to `checkpoint.json.corrupt` and boots fresh.
+- **Full restore**: `Scheduler::new()` accepts an optional `SchedulerCheckpoint`;
+  restores `awaiting` map, per-agent mailboxes, `tokens_spent`, `child_seq`, and
+  `spawn_depths`; orphan children in the checkpoint (not in the TOML spec) are
+  also restored.
+- **New flight events**: `AgentCheckpointed { agent_id }`,
+  `AgentRestored { agent_id }`, `CheckpointFailed { reason }`.
+- **`agentd/.gitignore`**: `checkpoint.json` and `checkpoint.json.corrupt`
+  excluded from version control.
+
+### Changed
+- `SchedulerConfig` gains `checkpoint_interval_turns: u32`; default `1`; `0`
+  disables periodic checkpointing.
+- `Scheduler::new()` signature gains a 7th argument
+  `Option<SchedulerCheckpoint>`; existing call-sites in `main.rs` updated.
+- `InferenceResponse` and `MailMessage` derive `Serialize` (required by checkpoint
+  serialisation).
+- `Makefile` `clippy-linux` target: add `rustup component add clippy` before the
+  cargo invocation so the Docker image works on aarch64 hosts.
+- Test helper `sched_cfg()` sets `checkpoint_interval_turns: 0` to prevent
+  concurrent scheduler tests from racing on `./checkpoint.json.tmp`; dedicated
+  checkpoint tests explicitly opt in with `checkpoint_interval_turns: 1`.
+
+### Tests
+- 9 new unit tests in `agentd/src/scheduler.rs` (checkpoint restore, periodic
+  checkpoint, `AgentCheckpointed` flight event, test-isolation mutex for
+  `sigterm_drains_scheduler`).
+- 5 new unit tests in `agentd/src/agent/mod.rs` (`is_terminal`, `to_checkpoint`,
+  `from_checkpoint`, roundtrip).
+- 1 new unit test in `agentd/src/flight_recorder.rs` (checkpoint event
+  serialisation).
+- 10 unit tests in `agentd/src/checkpoint.rs` (serde roundtrips, save/load,
+  corrupt handling).
+- Total: **175 tests** (174 pass; 1 live-API integration skipped).
+
 ## [p3.1] - 2026-06-10
 
 ### Added

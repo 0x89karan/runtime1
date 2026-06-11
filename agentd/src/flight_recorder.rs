@@ -31,6 +31,8 @@ pub enum EventKind {
     CapabilityDenied,
     AgentChildResultDelivered,
     AgentCardRegistered,
+    AgentCheckpointed,
+    AgentRestored,
     MessageSent,
     MessageReceived,
     SystemShutdownRequested,
@@ -172,6 +174,24 @@ mod tests {
             .collect();
         assert_eq!(lines[0]["kind"], "fuse_mounted");
         assert_eq!(lines[1]["kind"], "fuse_unmounted");
+    }
+
+    #[test]
+    fn checkpoint_event_kinds_serialize_to_snake_case() {
+        let tmp = NamedTempFile::new().unwrap();
+        let recorder = FlightRecorder::new(tmp.path()).unwrap();
+
+        recorder.record("agent-1", Some(2), EventKind::AgentCheckpointed, serde_json::json!({}));
+        recorder.record("agent-1", Some(2), EventKind::AgentRestored,     serde_json::json!({ "turn": 2 }));
+
+        let mut content = String::new();
+        File::open(tmp.path()).unwrap().read_to_string(&mut content).unwrap();
+        let lines: Vec<serde_json::Value> = content.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines[0]["kind"], "agent_checkpointed");
+        assert_eq!(lines[1]["kind"], "agent_restored");
+        assert_eq!(lines[1]["data"]["turn"], 2);
     }
 
     #[test]

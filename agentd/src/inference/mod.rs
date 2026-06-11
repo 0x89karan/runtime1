@@ -40,7 +40,7 @@ pub enum Block {
 }
 
 /// A single turn in the conversation history.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Msg {
     pub role: Role,
     pub blocks: Vec<Block>,
@@ -62,7 +62,7 @@ pub struct InferenceRequest {
     pub max_tokens: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InferenceResponse {
     pub blocks: Vec<Block>,
     pub stop_reason: StopReason,
@@ -70,7 +70,7 @@ pub struct InferenceResponse {
     pub output_tokens: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StopReason {
     EndTurn,
     ToolUse,

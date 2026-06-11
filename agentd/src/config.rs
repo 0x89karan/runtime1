@@ -68,18 +68,27 @@ pub struct SchedulerConfig {
     /// Maximum spawn nesting depth. 0 = spawning disabled. Default 4.
     #[serde(default = "default_max_spawn_depth")]
     pub max_spawn_depth: u32,
+    /// Checkpoint the full scheduler state every N completed turns (after tool results).
+    /// 0 = SIGTERM/SIGINT only. Default 1 (every turn).
+    #[serde(default = "default_checkpoint_interval_turns")]
+    pub checkpoint_interval_turns: u32,
 }
 
 fn default_max_spawn_depth() -> u32 {
     4
 }
 
+fn default_checkpoint_interval_turns() -> u32 {
+    1
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            global_token_budget: 0,
+            global_token_budget:       0,
             max_concurrent_inferences: 0,
-            max_spawn_depth: default_max_spawn_depth(),
+            max_spawn_depth:           default_max_spawn_depth(),
+            checkpoint_interval_turns: default_checkpoint_interval_turns(),
         }
     }
 }
@@ -99,7 +108,7 @@ pub struct SpawnConfig {
     pub token_budget: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub id: String,
@@ -137,7 +146,7 @@ pub fn default_token_budget() -> u64 {
     100_000
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     #[serde(default = "default_provider")]

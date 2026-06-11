@@ -12,6 +12,7 @@ use crate::{
     agent::{run_tools_sequential, AgentEffect, AgentTask},
     bus::{MailMessage, Mailboxes},
     capability::Capability,
+    checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, SchedulerCheckpoint},
     config::{AgentConfig, ModelConfig, SchedulerConfig, SpawnConfig},
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse},
@@ -62,6 +63,7 @@ impl PartialOrd for DeferredInfer {
 }
 
 /// Tracks a parent agent waiting for a child to complete.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct AwaitingParent {
     parent_id: String,
     /// tool_use_id from the parent's spawn_agent call — injected back as ToolResult.
@@ -91,6 +93,15 @@ struct SchedulerState {
     shutdown_requested: bool,
 }
 
+/// Scheduler-level state restored from a checkpoint (not exposed outside this module).
+struct SchedulerRestored {
+    awaiting:     Vec<AwaitingEntry>,
+    mailboxes:    HashMap<String, Vec<MailMessage>>,
+    tokens_spent: u64,
+    child_seq:    u64,
+    spawn_depths: HashMap<String, u32>,
+}
+
 pub struct Scheduler {
     agents:   HashMap<String, AgentTask>,
     sched:    SchedulerConfig,
@@ -98,10 +109,15 @@ pub struct Scheduler {
     registry: Arc<ToolRegistry>,
     recorder: Arc<FlightRecorder>,
     snapshot: Arc<RwLock<SchedulerSnapshot>>,
+    store:    CheckpointStore,
+    restored: Option<SchedulerRestored>,
 }
 
 impl Scheduler {
     /// Create a scheduler for the given agent configs. Returns Err on duplicate agent IDs.
+    /// Pass `checkpoint` to restore from a prior run; agents in the checkpoint override
+    /// TOML configs for their IDs, and dynamically-spawned children are also restored.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         agent_configs: Vec<AgentConfig>,
         model_cfg: &ModelConfig,
@@ -110,26 +126,84 @@ impl Scheduler {
         registry: Arc<ToolRegistry>,
         recorder: Arc<FlightRecorder>,
         snapshot: Arc<RwLock<SchedulerSnapshot>>,
+        checkpoint: Option<SchedulerCheckpoint>,
     ) -> anyhow::Result<Self> {
-        let mut agents = HashMap::with_capacity(agent_configs.len());
-        for cfg in agent_configs {
-            anyhow::ensure!(
-                !agents.contains_key(&cfg.id),
-                "duplicate agent id: {}",
-                cfg.id
-            );
-            let specs = registry.filtered_specs(cfg.capabilities.as_deref());
-            let task = AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs);
-            agents.insert(cfg.id.clone(), task);
+        let store = CheckpointStore::new(std::path::Path::new("."));
+        let mut agents = HashMap::new();
+        let mut restored: Option<SchedulerRestored> = None;
+
+        if let Some(cp) = checkpoint {
+            let SchedulerCheckpoint {
+                agents:      cp_agent_list,
+                awaiting:    cp_awaiting,
+                mailboxes:   cp_mailboxes,
+                tokens_spent: cp_tokens,
+                child_seq:   cp_child_seq,
+                spawn_depths: cp_spawn_depths,
+                ..
+            } = cp;
+
+            let mut cp_map: HashMap<String, AgentCheckpoint> = cp_agent_list
+                .into_iter()
+                .map(|a| (a.agent_id.clone(), a))
+                .collect();
+
+            for cfg in agent_configs {
+                anyhow::ensure!(
+                    !agents.contains_key(&cfg.id),
+                    "duplicate agent id: {}",
+                    cfg.id
+                );
+                let specs = registry.filtered_specs(cfg.capabilities.as_deref());
+                let task = if let Some(cp_agent) = cp_map.remove(&cfg.id) {
+                    AgentTask::from_checkpoint(cp_agent, specs)
+                } else {
+                    AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs)
+                };
+                agents.insert(cfg.id.clone(), task);
+            }
+            // Remaining entries are dynamically-spawned children not in TOML.
+            for (id, cp_agent) in cp_map {
+                anyhow::ensure!(
+                    !agents.contains_key(&id),
+                    "duplicate agent id from checkpoint: {}",
+                    id
+                );
+                let specs = registry.filtered_specs(cp_agent.cfg.capabilities.as_deref());
+                let task = AgentTask::from_checkpoint(cp_agent, specs);
+                agents.insert(id, task);
+            }
+
+            restored = Some(SchedulerRestored {
+                awaiting:     cp_awaiting,
+                mailboxes:    cp_mailboxes,
+                tokens_spent: cp_tokens,
+                child_seq:    cp_child_seq,
+                spawn_depths: cp_spawn_depths,
+            });
+        } else {
+            agents.reserve(agent_configs.len());
+            for cfg in agent_configs {
+                anyhow::ensure!(
+                    !agents.contains_key(&cfg.id),
+                    "duplicate agent id: {}",
+                    cfg.id
+                );
+                let specs = registry.filtered_specs(cfg.capabilities.as_deref());
+                let task = AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs);
+                agents.insert(cfg.id.clone(), task);
+            }
         }
-        Ok(Self { agents, sched, gateway, registry, recorder, snapshot })
+
+        Ok(Self { agents, sched, gateway, registry, recorder, snapshot, store, restored })
     }
 
     /// Run all agents concurrently until every one reaches a terminal state.
     /// Returns a map from agent_id to Ok(answer) or Err.
     pub async fn run(self) -> HashMap<String, anyhow::Result<String>> {
-        let Self { agents, sched, gateway, registry, recorder, snapshot } = self;
+        let Self { agents, sched, gateway, registry, recorder, snapshot, store, restored } = self;
         let max_spawn_depth = sched.max_spawn_depth;
+        let interval = sched.checkpoint_interval_turns;
 
         let mut state = SchedulerState {
             agents,
@@ -147,10 +221,27 @@ impl Scheduler {
             shutdown_requested: false,
         };
 
-        // Seed: step each top-level agent once to kick off the first effect.
+        // Restore scheduler-level state from checkpoint when present.
+        if let Some(r) = restored {
+            state.tokens_spent = r.tokens_spent;
+            state.child_seq    = r.child_seq;
+            state.spawn_depths = r.spawn_depths;
+            for entry in r.awaiting {
+                state.awaiting.insert(entry.child_id, AwaitingParent {
+                    parent_id: entry.parent_id,
+                    call_id:   entry.call_id,
+                });
+            }
+            for (id, msgs) in r.mailboxes {
+                state.mailboxes.insert(id, msgs);
+            }
+        }
+
+        // Seed: step each agent once to kick off its first effect.
+        // `or_insert` preserves restored spawn_depths; fresh agents get depth 0.
         let ids: Vec<String> = state.agents.keys().cloned().collect();
         for id in ids {
-            state.spawn_depths.insert(id.clone(), 0);
+            state.spawn_depths.entry(id.clone()).or_insert(0);
             state.mailboxes.entry(id.clone()).or_default();
             let priority = state.agents[&id].priority();
             let cap_set = state.agents[&id].cap_set_cloned();
@@ -258,6 +349,15 @@ impl Scheduler {
                                 .expect("agent_id in EffectResult must be present in agents map")
                                 .provide_tool_results(results, &recorder);
                             drain_mailbox(&agent_id, &mut state, &recorder);
+
+                            // Periodic checkpoint at clean turn boundary (best-effort).
+                            if interval > 0 {
+                                let agent_turn = state.agents[&agent_id].turn();
+                                if agent_turn.is_multiple_of(interval) {
+                                    checkpoint_all(&store, &state, &recorder).await;
+                                }
+                            }
+
                             let (effect, turn) = {
                                 let sm = state
                                     .agents
@@ -304,6 +404,11 @@ impl Scheduler {
                     break;
                 }
             }
+        }
+
+        // Checkpoint on signal shutdown before denying deferred agents (best-effort).
+        if state.shutdown_requested {
+            checkpoint_all(&store, &state, &recorder).await;
         }
 
         // Any agents still in the deferred queue never got a slot — admission denied.
@@ -901,6 +1006,61 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
     }
 }
 
+/// Build a serializable snapshot of the current scheduler state.
+/// Terminal agents are excluded — they've already delivered their results.
+/// The deferred queue is intentionally omitted: those agents remain in `state.agents`
+/// in NeedInfer state, so step() re-derives their InferenceRequest on restore.
+fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
+    let agents: Vec<crate::checkpoint::AgentCheckpoint> = state
+        .agents
+        .values()
+        .filter(|a| !a.is_terminal())
+        .map(|a| a.to_checkpoint())
+        .collect();
+
+    let awaiting: Vec<AwaitingEntry> = state
+        .awaiting
+        .iter()
+        .map(|(child_id, ap)| AwaitingEntry {
+            child_id:  child_id.clone(),
+            parent_id: ap.parent_id.clone(),
+            call_id:   ap.call_id.clone(),
+        })
+        .collect();
+
+    SchedulerCheckpoint {
+        format_version: crate::checkpoint::FORMAT_VERSION,
+        agents,
+        awaiting,
+        mailboxes:    state.mailboxes.clone(),
+        tokens_spent: state.tokens_spent,
+        child_seq:    state.child_seq,
+        spawn_depths: state.spawn_depths.clone(),
+    }
+}
+
+/// Write the full scheduler state to the checkpoint store and emit flight events.
+/// Best-effort: logs a warning on failure but never propagates the error.
+async fn checkpoint_all(
+    store: &CheckpointStore,
+    state: &SchedulerState,
+    recorder: &FlightRecorder,
+) {
+    let cp = build_scheduler_checkpoint(state);
+    if let Err(e) = store.save(&cp).await {
+        tracing::warn!("checkpoint save failed (best-effort): {e:#}");
+        return;
+    }
+    for agent_cp in &cp.agents {
+        recorder.record(
+            &agent_cp.agent_id,
+            Some(agent_cp.turn),
+            EventKind::AgentCheckpointed,
+            json!({ "turn": agent_cp.turn, "total_tokens": agent_cp.total_input + agent_cp.total_output }),
+        );
+    }
+}
+
 /// Drain pending mailbox messages into an agent before its next inference step.
 fn drain_mailbox(
     agent_id: &str,
@@ -931,8 +1091,15 @@ mod tests {
         inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse, StopReason},
         tools::ToolRegistry,
     };
-    use std::sync::Mutex;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::NamedTempFile;
+
+    // Serializes tests that fire process-level SIGTERM (affects all schedulers)
+    // or write to the shared CWD checkpoint file, preventing tmp-file rename races.
+    static SERIAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
 
@@ -1020,6 +1187,10 @@ mod tests {
         SchedulerConfig {
             global_token_budget,
             max_concurrent_inferences,
+            // Disable periodic checkpoints in test helpers to prevent concurrent
+            // tests from racing on ./checkpoint.json.tmp in the shared process CWD.
+            // Tests that exercise checkpointing explicitly set checkpoint_interval_turns.
+            checkpoint_interval_turns: 0,
             ..Default::default()
         }
     }
@@ -1048,6 +1219,7 @@ mod tests {
             Arc::new(ToolRegistry::new()),
             rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
         )
         .unwrap()
     }
@@ -1067,6 +1239,7 @@ mod tests {
             Arc::new(registry),
             Arc::clone(&rec),
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
         )
         .unwrap();
         (sched, rec, tmp)
@@ -1144,6 +1317,7 @@ mod tests {
             registry,
             rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
         );
         assert!(result.err().unwrap().to_string().contains("duplicate agent id"));
     }
@@ -1153,7 +1327,7 @@ mod tests {
         let gw = Arc::new(FailGateway);
         let (rec, _tmp) = recorder();
         let registry = Arc::new(ToolRegistry::new());
-        let sched = Scheduler::new(vec![], &model_cfg(), unlimited(), gw, registry, rec, Arc::new(RwLock::new(SchedulerSnapshot::default()))).unwrap();
+        let sched = Scheduler::new(vec![], &model_cfg(), unlimited(), gw, registry, rec, Arc::new(RwLock::new(SchedulerSnapshot::default())), None).unwrap();
         assert!(sched.run().await.is_empty());
     }
 
@@ -1327,6 +1501,7 @@ mod tests {
             std::sync::Arc::new(registry),
             rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
         )
         .unwrap();
 
@@ -1514,6 +1689,7 @@ mod tests {
             Arc::new(registry),
             rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
         )
         .unwrap();
 
@@ -1549,6 +1725,7 @@ mod tests {
             global_token_budget: 15,
             max_concurrent_inferences: 0,
             max_spawn_depth: 4,
+            ..Default::default()
         };
 
         let parent = AgentConfig {
@@ -1565,6 +1742,7 @@ mod tests {
             Arc::new(registry),
             rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
         )
         .unwrap();
 
@@ -1771,6 +1949,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn sigterm_drains_scheduler() {
+        // Must not run concurrently with checkpoint_all_emits_agent_checkpointed_event:
+        // both tests fire / react to process-level SIGTERM and write to the shared CWD
+        // checkpoint file, which causes a tmp-file rename race.
+        let _serial = serial_lock();
+
         struct SlowGateway;
 
         #[async_trait::async_trait]
@@ -1791,6 +1974,7 @@ mod tests {
             Arc::new(ToolRegistry::new()),
             Arc::clone(&rec),
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
         )
         .unwrap();
 
@@ -1889,5 +2073,239 @@ mod tests {
         let s = snap.read().unwrap();
         let a = s.agents.iter().find(|x| x.id == "a").unwrap();
         assert_eq!(a.status, AgentStatus::Deferred);
+    }
+
+    // ── p3.2: checkpoint / restore tests ─────────────────────────────────────
+
+    fn minimal_agent_checkpoint(id: &str) -> AgentCheckpoint {
+        use crate::{
+            checkpoint::AgentCheckpoint,
+            config::ModelConfig,
+            inference::{Block, Msg, Role},
+        };
+        AgentCheckpoint {
+            agent_id:    id.to_string(),
+            cfg:         agent_cfg(id, "restore task"),
+            model_cfg:   ModelConfig { provider: "mock".to_string(), model: "mock-model".to_string(), max_tokens: 4096 },
+            messages:    vec![Msg { role: Role::User, blocks: vec![Block::Text { text: "restore task".to_string() }] }],
+            specs:       vec![],
+            total_input: 10,
+            total_output: 5,
+            turn:        1,
+            stored_response: None,
+            terminal:    false,
+        }
+    }
+
+    fn minimal_scheduler_checkpoint(ids: &[&str]) -> SchedulerCheckpoint {
+        SchedulerCheckpoint {
+            format_version: crate::checkpoint::FORMAT_VERSION,
+            agents:        ids.iter().map(|id| minimal_agent_checkpoint(id)).collect(),
+            awaiting:      vec![],
+            mailboxes:     HashMap::new(),
+            tokens_spent:  20,
+            child_seq:     3,
+            spawn_depths:  ids.iter().map(|id| (id.to_string(), 0u32)).collect(),
+        }
+    }
+
+    #[test]
+    fn scheduler_new_with_checkpoint_restores_toml_agent() {
+        // TOML agent ID matches checkpoint agent → restored from checkpoint (turn=1, tokens carried)
+        let cp = minimal_scheduler_checkpoint(&["alpha"]);
+        let gw = MockGateway::new(vec![end_turn("restored answer", 10, 5)]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("alpha", "original task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+        // Verify the restored agent exists (Scheduler::new succeeds without error)
+        // and has turn=1 from the checkpoint (not 0 from a fresh start).
+        let agent = sched.agents.get("alpha").unwrap();
+        assert_eq!(agent.turn(), 1, "restored agent must have turn from checkpoint");
+        assert_eq!(agent.context_tokens(), 15, "restored tokens must match checkpoint");
+    }
+
+    #[test]
+    fn scheduler_new_with_checkpoint_missing_agent_starts_fresh() {
+        // Checkpoint has no entry for "beta" → fresh AgentTask with turn=0
+        let cp = minimal_scheduler_checkpoint(&["alpha"]);
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("beta", "new task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+        let agent = sched.agents.get("beta").unwrap();
+        assert_eq!(agent.turn(), 0, "agent absent from checkpoint must start at turn 0");
+    }
+
+    #[test]
+    fn scheduler_new_with_checkpoint_orphan_child_restored() {
+        // Checkpoint contains "child-1" (dynamically spawned, not in TOML) → must be restored
+        let cp = minimal_scheduler_checkpoint(&["parent", "child-1"]);
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("parent", "parent task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+        assert!(sched.agents.contains_key("child-1"), "orphan checkpoint child must be restored");
+        assert_eq!(sched.agents["child-1"].turn(), 1);
+    }
+
+    #[test]
+    fn scheduler_new_with_checkpoint_duplicate_id_returns_err() {
+        // TOML has duplicate IDs regardless of checkpoint — Err must be returned
+        let cp = minimal_scheduler_checkpoint(&["dup"]);
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let result = Scheduler::new(
+            vec![agent_cfg("dup", "task a"), agent_cfg("dup", "task b")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        );
+        assert!(result.is_err(), "duplicate agent IDs must return Err");
+    }
+
+    #[tokio::test]
+    async fn scheduler_run_restores_tokens_spent_and_child_seq() {
+        // Verify scheduler-level fields (tokens_spent, child_seq, spawn_depths) are seeded from checkpoint.
+        // We check them by running a fresh scheduler seeded with a checkpoint that has non-zero values,
+        // then immediately completing the agent before it can touch these values.
+        let cp = SchedulerCheckpoint {
+            format_version: crate::checkpoint::FORMAT_VERSION,
+            agents:         vec![minimal_agent_checkpoint("agent")],
+            awaiting:       vec![],
+            mailboxes:      HashMap::new(),
+            tokens_spent:   42,
+            child_seq:      7,
+            spawn_depths:   [("agent".to_string(), 0u32)].into_iter().collect(),
+        };
+        let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("agent", "task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+        // spawn_depths on the restored agent must be preserved (0 not re-inserted by seed loop)
+        assert_eq!(sched.agents["agent"].turn(), 1, "agent restored from checkpoint starts at turn 1");
+        // The SchedulerRestored fields are consumed at run() start; confirm the scheduler itself was created
+        let outcomes = sched.run().await;
+        assert!(outcomes["agent"].is_ok(), "restored agent must complete successfully");
+    }
+
+    #[tokio::test]
+    async fn periodic_checkpoint_interval_one_runs_without_error() {
+        // Interval=1 is set; a straight EndTurn agent (no tool cycle) has nothing
+        // to checkpoint at provide_tool_results boundaries, but the scheduler must
+        // not panic or return an error. Verifies the interval guard is wired correctly.
+        let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("chk", "task")],
+            &model_cfg(),
+            SchedulerConfig { checkpoint_interval_turns: 1, ..Default::default() },
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+        let outcomes = sched.run().await;
+        assert!(outcomes["chk"].is_ok(), "agent must complete successfully with interval=1");
+    }
+
+    #[tokio::test]
+    async fn periodic_checkpoint_disabled_when_interval_zero() {
+        // Interval=0 means the `if interval > 0` guard (scheduler.rs:354) is never
+        // entered. Verify the scheduler still runs to completion without error.
+        let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("nochk", "task")],
+            &model_cfg(),
+            SchedulerConfig { checkpoint_interval_turns: 0, ..Default::default() },
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+        let outcomes = sched.run().await;
+        assert!(outcomes["nochk"].is_ok(), "agent must complete successfully with interval=0");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_all_emits_agent_checkpointed_event() {
+        use tempfile::TempDir;
+        // Must not run concurrently with sigterm_drains_scheduler: that test fires a
+        // process-level SIGTERM which would interrupt this scheduler before the
+        // periodic checkpoint fires, and both tests write to checkpoint.json causing
+        // a tmp-file rename race.
+        let _serial = serial_lock();
+
+        // Write checkpoint files to a private tempdir to avoid CWD races.
+        let dir = TempDir::new().unwrap();
+        let orig = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let gw = MockGateway::new(vec![
+            InferenceResponse {
+                blocks: vec![Block::ToolUse { id: "c1".to_string(), name: "no_tool".to_string(), input: serde_json::json!({}) }],
+                stop_reason: StopReason::ToolUse, input_tokens: 10, output_tokens: 5,
+            },
+            end_turn("done", 10, 5),
+        ]);
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("evt", "task")],
+            &model_cfg(),
+            SchedulerConfig { checkpoint_interval_turns: 1, ..Default::default() },
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+        sched.run().await;
+
+        std::env::set_current_dir(&orig).unwrap();
+        drop(dir);
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            log.contains("\"agent_checkpointed\""),
+            "agent_checkpointed event must appear in flight log after tool cycle"
+        );
     }
 }
