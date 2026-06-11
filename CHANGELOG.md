@@ -3,6 +3,31 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.2] - 2026-06-11
+
+### Added
+- **`IsolateNetwork` and `IsolateMount` `SandboxRule` variants**: applied via `unshare(CLONE_NEWUSER | CLONE_NEWNET/CLONE_NEWNS)` in `pre_exec`. BestEffort degradation if kernel policy blocks user namespaces (`EPERM`/`ENOSYS`).
+- **`Net` capability now enforced at kernel level**: `caps_to_rules()` adds `IsolateNetwork` whenever the `Net` capability is absent. MCP servers without an explicit `Net` grant are network-isolated by default. Previously `Net` was advisory-only.
+- **`isolation = "gvisor"` field on `[[tools.mcp_servers]]`**: wraps the server command with `runsc do [--network=none] --`. agentd fails fast at startup if `runsc` is not found on PATH. gVisor's Sentry handles all syscall interception — Landlock/seccomp/namespace pre_exec is skipped for gVisor-mode servers.
+- **`EnforcementStatus` extended**: `namespace_net: bool` and `namespace_mount: bool` fields added. `SandboxApplied` event payload extended with `isolation`, `namespace_net`, `namespace_mount` fields.
+- **`CONFIG_USER_NS=y`, `CONFIG_NET_NS=y`, `CONFIG_UTS_NS=y`** in `distro/kernel-extras.config` for QEMU image.
+
+### Changed
+- **Breaking:** `capabilities = []` now also produces `IsolateNetwork` (network-isolated). Previously it produced only `DenySpawn`. Servers that need outbound access must add `Net` to their capabilities list.
+- **`capabilities = ["Spawn"]` behavior**: previously produced empty rules (caught by `mcp_require_capabilities` as a bypass). Now produces `[IsolateNetwork]` — a real enforcement rule. The config is valid; the server can spawn children but cannot reach the network.
+
+### Known Limitations (TODOS.md)
+- `runsc do` is experimental; full OCI bundle integration deferred.
+- `clone3()` bypass remains in the namespace-only path (gVisor fixes it).
+- `CLONE_NEWPID` for PID namespace requires a re-fork; deferred.
+
+### Tests
+- **209 tests pass** (macOS + CI).
+- 8 new sandbox unit tests (`isolate_network/mount` variants, `enforcement_status` namespace fields).
+- 3 new config unit tests (`isolation` field parsing).
+- 7 updated `caps_to_rules` unit tests reflecting `IsolateNetwork` default.
+- 1 new integration test: `isolation_gvisor_fails_fast_when_runsc_not_on_path` (Linux only).
+
 ## [p4.1] - 2026-06-11
 
 ### Added

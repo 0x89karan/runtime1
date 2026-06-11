@@ -420,10 +420,11 @@ command = "/nonexistent/beta"
     );
 }
 
-/// mcp_require_capabilities = true with capabilities=[{Spawn}] (produces empty rules) → bail.
-/// Regression test for the bypass: capabilities present but caps_to_rules() returns empty vec.
+/// mcp_require_capabilities = true with capabilities=["Spawn"] passes validation.
+/// Before p4.2, Spawn-only produced empty rules (bypass). After p4.2, it also adds
+/// IsolateNetwork, so it produces real enforcement and correctly passes validation.
 #[test]
-fn mcp_require_capabilities_spawn_only_caps_exits_nonzero() {
+fn mcp_require_capabilities_spawn_only_caps_passes_with_isolate_network() {
     let dir = TempDir::new().unwrap();
     let cfg_path = dir.path().join("agent.toml");
 
@@ -431,7 +432,7 @@ fn mcp_require_capabilities_spawn_only_caps_exits_nonzero() {
         &cfg_path,
         r#"
 [agent]
-id = "req-caps-spawn-bypass"
+id = "req-caps-spawn-net"
 task = "test"
 
 [tools]
@@ -452,18 +453,20 @@ capabilities = ["Spawn"]
         .output()
         .expect("failed to spawn agentd");
 
+    // Validation passes (IsolateNetwork is a real rule), but the server binary
+    // doesn't exist so the run still fails — just for a different reason.
     assert!(
         !output.status.success(),
-        "capabilities=[{{Spawn}}] must not bypass mcp_require_capabilities validation"
+        "run should still fail (binary doesn't exist), but for spawn reason not validation"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("spawn-only-srv"),
-        "error must name the offending server, got: {stderr}"
+        !stderr.contains("mcp_require_capabilities is set"),
+        "validation must pass for capabilities=[Spawn] (produces IsolateNetwork), got: {stderr}"
     );
     assert!(
-        stderr.contains("mcp_require_capabilities") || stderr.contains("effective sandbox rules"),
-        "error must mention the policy violation, got: {stderr}"
+        stderr.contains("spawn-only-srv") || stderr.contains("nonexistent"),
+        "error should be about spawning the binary, not validation, got: {stderr}"
     );
 }
 
@@ -533,6 +536,59 @@ args = ["--paginate"]
     assert!(
         tools.contains(&"echo_p2a"),
         "expected page-2 tool 'echo_p2a' in tools_registered, got: {tools:?}"
+    );
+}
+
+/// isolation = "gvisor" requires runsc on PATH; agentd must bail fast if absent.
+/// This test only runs on Linux where the gVisor availability check is compiled in.
+#[cfg(target_os = "linux")]
+#[test]
+fn isolation_gvisor_fails_fast_when_runsc_not_on_path() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+    let echo_mcp = echo_mcp_path();
+
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[agent]
+id = "gvisor-test"
+task = "test"
+
+[[tools.mcp_servers]]
+name = "secure-srv"
+command = "{echo_mcp}"
+isolation = "gvisor"
+"#
+        ),
+    )
+    .unwrap();
+
+    let empty_path_dir = dir.path().join("empty_path");
+    std::fs::create_dir_all(&empty_path_dir).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        // Override PATH to a directory that definitely has no runsc binary.
+        .env("PATH", &empty_path_dir)
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when isolation=gvisor but runsc not on PATH"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("runsc"),
+        "error must mention 'runsc', got: {stderr}"
+    );
+    assert!(
+        stderr.contains("secure-srv") || stderr.contains("gvisor"),
+        "error must name the server or isolation mode, got: {stderr}"
     );
 }
 

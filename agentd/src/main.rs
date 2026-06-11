@@ -102,7 +102,24 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     let mut registry = ToolRegistry::new();
     register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)))?;
 
-    // Pass 1: validate capabilities before spawning any process.
+    // Pass 1: validate capabilities and isolation settings before spawning any process.
+
+    // Check gVisor availability upfront so the error is clear, not buried in spawn output.
+    #[cfg(target_os = "linux")]
+    for server in &cfg.tools.mcp_servers {
+        if server.isolation == config::IsolationMode::Gvisor {
+            let runsc_found = std::env::var("PATH").ok()
+                .map(|p| std::env::split_paths(&p).any(|dir| dir.join("runsc").exists()))
+                .unwrap_or(false);
+            if !runsc_found {
+                anyhow::bail!(
+                    "MCP server '{}' requires isolation = \"gvisor\" but 'runsc' is not found on PATH",
+                    server.name
+                );
+            }
+        }
+    }
+
     // When mcp_require_capabilities is true, refuse to start if any server would
     // run unsandboxed — either because the field is missing OR because the caps
     // produce no effective rules (e.g. capabilities=[{Spawn}] yields empty rules).
@@ -167,43 +184,79 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
             None => None,
         };
 
+        // gVisor mode: transform command to `runsc do [--network=none] -- <cmd> [args]`.
+        // Landlock/seccomp/namespace pre_exec is skipped — gVisor's Sentry handles isolation.
+        let is_gvisor = server.isolation == config::IsolationMode::Gvisor;
+        let has_net_cap = server.capabilities.as_deref()
+            .map(|c| c.iter().any(|cap| matches!(cap, Capability::Net { .. })))
+            .unwrap_or(true); // absent capabilities field = unrestricted (net allowed)
+        let (effective_cmd, effective_args, effective_compiled): (&str, Vec<String>, Option<sandbox::CompiledSandbox>) =
+            if is_gvisor {
+                let mut gv_args = vec!["do".to_string()];
+                if !has_net_cap { gv_args.push("--network=none".to_string()); }
+                gv_args.push("--".to_string());
+                gv_args.push(server.command.clone());
+                gv_args.extend_from_slice(&server.args);
+                ("runsc", gv_args, None)
+            } else {
+                (server.command.as_str(), server.args.clone(), compiled)
+            };
+
         // Read enforcement status before consuming the compiled sandbox (Linux only).
         #[cfg(target_os = "linux")]
-        let enforcement = compiled.as_ref().map(|c| c.enforcement_status());
+        let enforcement = effective_compiled.as_ref().map(|c| c.enforcement_status());
 
-        let had_sandbox = compiled.is_some();
+        let had_sandbox = effective_compiled.is_some() || is_gvisor;
         tracing::info!(
             name = %server.name,
             command = %server.command,
             sandboxed = had_sandbox,
+            isolation = ?server.isolation,
             "spawning MCP server"
         );
         let (client, specs) = McpClient::spawn(
-            &server.command,
-            &server.args,
-            compiled,
+            effective_cmd,
+            &effective_args,
+            effective_compiled,
         )
         .await
         .with_context(|| format!("spawning MCP server '{}'", server.name))?;
 
-        // Record SandboxApplied only after spawn succeeds and only on Linux where
-        // the kernel mechanisms (Landlock + seccomp) are actually applied. On other
-        // platforms the sandbox is a no-op and SandboxSkipped is the correct event.
+        // Record SandboxApplied after spawn succeeds.
+        // On Linux: emit full enforcement detail.
+        // On non-Linux: emit SandboxSkipped (no kernel mechanisms active).
         #[cfg(target_os = "linux")]
-        if let Some(ref enf) = enforcement {
-            recorder.record(
-                "agentd",
-                None,
-                EventKind::SandboxApplied,
-                serde_json::json!({
-                    "server": server.name,
-                    "enforced": {
-                        "landlock": enf.landlock,
-                        "seccomp":  enf.seccomp,
-                        "spawn_enforcement": enf.spawn_enforcement,
-                    },
-                }),
-            );
+        {
+            let isolation_str = if is_gvisor { "gvisor" } else { "none" };
+            if is_gvisor {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::SandboxApplied,
+                    serde_json::json!({
+                        "server":    server.name,
+                        "isolation": isolation_str,
+                        "enforced":  { "mode": "gvisor" },
+                    }),
+                );
+            } else if let Some(ref enf) = enforcement {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::SandboxApplied,
+                    serde_json::json!({
+                        "server":    server.name,
+                        "isolation": isolation_str,
+                        "enforced": {
+                            "landlock":          enf.landlock,
+                            "seccomp":           enf.seccomp,
+                            "spawn_enforcement": enf.spawn_enforcement,
+                            "namespace_net":     enf.namespace_net,
+                            "namespace_mount":   enf.namespace_mount,
+                        },
+                    }),
+                );
+            }
         }
         #[cfg(not(target_os = "linux"))]
         if had_sandbox {
@@ -379,13 +432,18 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
 /// Convert an agent capability set into sandbox rules for an MCP server subprocess.
 ///
 /// Landlock FS rules map 1:1 from FsRead/FsWrite capabilities. DenySpawn is
-/// added whenever the Spawn capability is absent, blocking execve/execveat/fork
-/// in the server child via seccomp-bpf.
+/// added whenever the Spawn capability is absent. IsolateNetwork is added
+/// whenever the Net capability is absent — enforcing network isolation at the
+/// Linux namespace level for servers that don't need outbound access.
 fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
     let mut rules = Vec::new();
     let has_spawn = caps.iter().any(|c| matches!(c, Capability::Spawn));
+    let has_net   = caps.iter().any(|c| matches!(c, Capability::Net { .. }));
     if !has_spawn {
         rules.push(SandboxRule::DenySpawn);
+    }
+    if !has_net {
+        rules.push(SandboxRule::IsolateNetwork);
     }
     for cap in caps {
         match cap {
@@ -395,8 +453,7 @@ fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
             Capability::FsWrite { prefix } => {
                 rules.push(SandboxRule::AllowFsWrite { prefix: prefix.clone() });
             }
-            // Net and Mcp capabilities are advisory at this layer; kernel-level
-            // network enforcement requires Landlock ABI v4 + net rules (Phase 4 TODO).
+            // Mcp is advisory; Spawn and Net are handled above.
             Capability::Net { .. } | Capability::Mcp { .. } | Capability::Spawn => {}
         }
     }
@@ -410,15 +467,17 @@ mod tests {
     use sandbox::SandboxRule;
 
     #[test]
-    fn caps_to_rules_empty_caps_yields_deny_spawn() {
+    fn caps_to_rules_empty_caps_yields_deny_spawn_and_isolate_network() {
         let rules = caps_to_rules(&[]);
-        assert_eq!(rules, vec![SandboxRule::DenySpawn]);
+        assert!(rules.contains(&SandboxRule::DenySpawn),       "empty caps → DenySpawn");
+        assert!(rules.contains(&SandboxRule::IsolateNetwork),  "empty caps → IsolateNetwork");
     }
 
     #[test]
     fn caps_to_rules_spawn_cap_removes_deny_spawn() {
         let rules = caps_to_rules(&[Capability::Spawn]);
-        assert!(!rules.contains(&SandboxRule::DenySpawn));
+        assert!(!rules.contains(&SandboxRule::DenySpawn),     "Spawn cap → no DenySpawn");
+        assert!(rules.contains(&SandboxRule::IsolateNetwork), "Spawn cap alone → still IsolateNetwork");
     }
 
     #[test]
@@ -426,6 +485,7 @@ mod tests {
         let rules = caps_to_rules(&[Capability::FsRead { prefix: "/workspace".into() }]);
         assert!(rules.contains(&SandboxRule::AllowFsRead { prefix: "/workspace".into() }));
         assert!(rules.contains(&SandboxRule::DenySpawn));
+        assert!(rules.contains(&SandboxRule::IsolateNetwork));
     }
 
     #[test]
@@ -433,15 +493,18 @@ mod tests {
         let rules = caps_to_rules(&[Capability::FsWrite { prefix: "/tmp".into() }]);
         assert!(rules.contains(&SandboxRule::AllowFsWrite { prefix: "/tmp".into() }));
         assert!(rules.contains(&SandboxRule::DenySpawn));
+        assert!(rules.contains(&SandboxRule::IsolateNetwork));
     }
 
     #[test]
-    fn caps_to_rules_net_and_mcp_are_advisory_only() {
+    fn caps_to_rules_net_cap_permits_network() {
+        // Net present → no IsolateNetwork; Mcp is still advisory.
         let rules = caps_to_rules(&[
             Capability::Net { hosts: vec!["example.com".into()] },
             Capability::Mcp { server: "echo".into(), tools: vec![] },
         ]);
-        assert_eq!(rules, vec![SandboxRule::DenySpawn]);
+        assert!(rules.contains(&SandboxRule::DenySpawn),        "no Spawn cap → DenySpawn");
+        assert!(!rules.contains(&SandboxRule::IsolateNetwork),  "Net cap → no IsolateNetwork");
     }
 
     #[test]
@@ -452,6 +515,14 @@ mod tests {
         ]);
         assert!(!rules.contains(&SandboxRule::DenySpawn));
         assert!(rules.contains(&SandboxRule::AllowFsRead { prefix: "/workspace".into() }));
+        assert!(rules.contains(&SandboxRule::IsolateNetwork), "no Net cap → still IsolateNetwork");
+    }
+
+    #[test]
+    fn caps_to_rules_net_and_spawn_both_present_no_isolation_no_deny() {
+        let rules = caps_to_rules(&[Capability::Net { hosts: vec![] }, Capability::Spawn]);
+        assert!(!rules.contains(&SandboxRule::DenySpawn),      "Spawn → no DenySpawn");
+        assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
     }
 }
 

@@ -192,6 +192,19 @@ pub struct ToolsConfig {
     pub mcp_require_capabilities: bool,
 }
 
+/// Isolation mode for an MCP server subprocess.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum IsolationMode {
+    /// Default: Landlock + seccomp + Linux namespaces applied via pre_exec.
+    #[default]
+    None,
+    /// Stronger isolation: wrap the server command with `runsc do` (gVisor).
+    /// Requires `runsc` on PATH; fails fast at startup if not found.
+    /// Landlock/seccomp/namespaces are NOT applied (gVisor's Sentry handles isolation).
+    Gvisor,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
@@ -201,10 +214,14 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     /// Capability-based sandbox rules applied to this MCP server subprocess.
     /// `None` (field absent) = no sandbox — server runs unrestricted.
-    /// `Some([])` = deny-all spawn; no filesystem grants.
-    /// `Some([...])` = exact capability set converted to Landlock + seccomp rules.
+    /// `Some([])` = deny-all spawn + network isolation; no filesystem grants.
+    /// `Some([...])` = exact capability set converted to Landlock + seccomp + namespace rules.
     #[serde(default)]
     pub capabilities: Option<Vec<Capability>>,
+    /// Stronger isolation mode. `"none"` (default): pre_exec sandbox.
+    /// `"gvisor"`: wrap command with `runsc do`; requires `runsc` on PATH.
+    #[serde(default)]
+    pub isolation: IsolationMode,
 }
 
 #[cfg(test)]
@@ -566,6 +583,55 @@ capabilities = [
         assert_eq!(caps.len(), 2);
         assert_eq!(caps[0], Capability::FsRead { prefix: "/workspace".into() });
         assert_eq!(caps[1], Capability::FsWrite { prefix: "/tmp".into() });
+    }
+
+    // ── p4.2: IsolationMode + isolation field tests ──────────────────────────
+
+    #[test]
+    fn mcp_server_isolation_defaults_to_none() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.tools.mcp_servers[0].isolation, IsolationMode::None);
+    }
+
+    #[test]
+    fn mcp_server_isolation_gvisor_parses() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "secure"
+command = "/usr/bin/python3"
+isolation = "gvisor"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.tools.mcp_servers[0].isolation, IsolationMode::Gvisor);
+    }
+
+    #[test]
+    fn mcp_server_isolation_unknown_value_is_error() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+isolation = "firecracker"
+"#;
+        let result: Result<Config, _> = toml::from_str(raw);
+        assert!(result.is_err(), "unknown isolation value should fail to parse");
     }
 
     // ── p4.1: mcp_require_capabilities tests ─────────────────────────────────

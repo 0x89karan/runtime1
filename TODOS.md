@@ -31,11 +31,11 @@
   agent first), not in config declaration order. Fine for p1.2; a flag or ordered output mode
   may be desirable in a future increment.
 
-**P3 — Net capability is advisory (p1.4 intentional)**
-- `satisfies()` returns `true` unconditionally for `Net{..}` regardless of the granted set.
-  This is intentional at p1.4 — no Net tools exist yet and Phase 4 network namespaces are
-  the correct enforcement layer. Documents as advisory in the enum docstring.
-- Action: wire real enforcement when the first Net tool lands, or in Phase 4.
+**~~P3 — Net capability is advisory (p1.4 intentional)~~** ✓ Enforced in p4.2.
+- `caps_to_rules()` now adds `IsolateNetwork` when `Net` is absent. Network isolation is
+  enforced at the kernel level via `unshare(CLONE_NEWNET)` for all sandboxed MCP servers
+  that don't declare a `Net` capability. `satisfies()` for `Net` remains advisory (no net
+  tools exist yet), but the sandbox enforces it independently.
 
 **P3 — Net enforcement via Landlock ABI v4 not yet wired (p3.3 deferred)**
 - `Net { hosts }` capability is advisory at the kernel layer. Landlock ABI V4 (Linux 6.7)
@@ -128,6 +128,27 @@
 - Action: run `make clippy-linux` (Docker) from repo root before pushing any branch
   that touches Linux-gated code. Target added to workspace Makefile; rule added to
   CLAUDE.md quality gate.
+
+**P4 — `runsc do` is experimental; full OCI bundle integration deferred (p4.2)**
+- `isolation = "gvisor"` wraps the MCP server command with `runsc do -- <cmd>`. The `do`
+  subcommand is undocumented/experimental in gVisor and may not be stable across versions.
+- Action: build a minimal OCI bundle (config.json + rootfs) on the fly via `runsc run` for
+  production-grade gVisor integration. Deferred because `runsc do` suffices for p4.2 exploration.
+
+**P4 — PID namespace via `unshare()` only affects future children (p4.2)**
+- `unshare(CLONE_NEWPID)` in `pre_exec` makes the *calling* process's future children be in
+  a new PID namespace, but the MCP server itself (after exec) remains in the parent PID namespace.
+  To put the MCP server in a new PID namespace, a second fork is needed before exec.
+- Action: implement double-fork in `McpClient::spawn` using a pipe to propagate the inner PID
+  back to the parent. Deferred to a future Phase 4 increment.
+
+**P4 — `clone3()` bypass remains in namespace-only sandbox path (p4.2)**
+- `DenySpawn` seccomp blocks `fork(57)` + `vfork(58)` but not `clone(56)` or `clone3(435)`.
+  Combined with `IsolateNetwork`, a sandboxed MCP server can still spawn children in the
+  parent PID namespace via `clone3()`. `isolation = "gvisor"` fully fixes this (Sentry intercepts
+  `clone3`); the namespace-only path does not.
+- Action: accept the limitation for namespace-only mode; document in operator guidance.
+  gVisor is the recommended mode for truly adversarial workloads.
 
 **P3 — pre_exec sandbox errors are masked as EPERM (p4.1 red-team)**
 - `apply_compiled()` in `pre_exec` can fail at either the Landlock or seccomp step, but any

@@ -26,6 +26,14 @@ pub enum SandboxRule {
     /// Block fork/vfork via seccomp-bpf (x86_64 only; aarch64 deferred pending clone3 inspection).
     /// Exec is not blocked — Landlock FS rules persist across exec, keeping any re-exec restricted.
     DenySpawn,
+    /// Isolate the process into a new network namespace (no external interfaces by default).
+    /// Applied via unshare(CLONE_NEWUSER | CLONE_NEWNET) in pre_exec. Linux-only; no-op elsewhere.
+    /// BestEffort: degrades silently if user namespaces are disabled by kernel policy.
+    IsolateNetwork,
+    /// Isolate the process into a new mount namespace (prevents propagation of mount changes to host).
+    /// Applied via unshare(CLONE_NEWUSER | CLONE_NEWNS) in pre_exec. Linux-only; no-op elsewhere.
+    /// BestEffort: degrades silently if user namespaces are disabled by kernel policy.
+    IsolateMount,
 }
 
 /// Pre-compiled sandbox: Landlock ruleset fd + optional seccomp BPF program.
@@ -85,7 +93,8 @@ impl From<std::ffi::NulError> for SandboxError {
 /// Summary of what sandbox enforcement was compiled into a `CompiledSandbox`.
 ///
 /// Reflects intended enforcement — kernel outcome at `apply_compiled()` time
-/// may differ (e.g. Landlock degrades silently on kernels < 5.13).
+/// may differ (e.g. Landlock degrades silently on kernels < 5.13, unshare may
+/// be blocked by kernel.unprivileged_userns_clone = 0).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnforcementStatus {
     /// Landlock FS ruleset was compiled (kernel may degrade on old systems).
@@ -96,6 +105,10 @@ pub struct EnforcementStatus {
     /// `"fork_vfork_only"` — fork(57) + vfork(58) blocked on x86_64.
     /// `"none"` — no spawn filtering compiled (non-x86_64 or DenySpawn not in rules).
     pub spawn_enforcement: &'static str,
+    /// Network namespace isolation was requested (IsolateNetwork rule present).
+    pub namespace_net: bool,
+    /// Mount namespace isolation was requested (IsolateMount rule present).
+    pub namespace_mount: bool,
 }
 
 impl CompiledSandbox {
@@ -113,11 +126,23 @@ impl CompiledSandbox {
             };
             #[cfg(not(target_arch = "x86_64"))]
             let spawn_enforcement = "none";
-            EnforcementStatus { landlock, seccomp, spawn_enforcement }
+            EnforcementStatus {
+                landlock,
+                seccomp,
+                spawn_enforcement,
+                namespace_net:   self.inner.isolate_net,
+                namespace_mount: self.inner.isolate_mount,
+            }
         }
         #[cfg(not(target_os = "linux"))]
         {
-            EnforcementStatus { landlock: false, seccomp: false, spawn_enforcement: "none" }
+            EnforcementStatus {
+                landlock: false,
+                seccomp: false,
+                spawn_enforcement: "none",
+                namespace_net: false,
+                namespace_mount: false,
+            }
         }
     }
 }
@@ -217,6 +242,10 @@ mod linux {
         /// `enforcement_status()` to distinguish "not requested" from "not enforceable".
         #[cfg(target_arch = "x86_64")]
         pub deny_spawn_requested: bool,
+        /// IsolateNetwork rule was requested — unshare CLONE_NEWNET in apply_compiled_inner.
+        pub isolate_net: bool,
+        /// IsolateMount rule was requested — unshare CLONE_NEWNS in apply_compiled_inner.
+        pub isolate_mount: bool,
     }
 
     impl Drop for Inner {
@@ -230,6 +259,10 @@ mod linux {
     }
 
     pub fn compile(rules: &[SandboxRule]) -> Result<Inner, SandboxError> {
+        // Scan namespace isolation flags first (no allocation needed).
+        let isolate_net   = rules.iter().any(|r| matches!(r, SandboxRule::IsolateNetwork));
+        let isolate_mount = rules.iter().any(|r| matches!(r, SandboxRule::IsolateMount));
+
         // Collect path-beneath entries, opening each with O_PATH.
         // Allocation (CString) is fine here — we're in the parent process.
         let mut path_entries: Vec<(i32, bool)> = Vec::new(); // (fd, is_write)
@@ -251,7 +284,7 @@ mod linux {
                         break;
                     }
                 },
-                SandboxRule::DenySpawn => {}
+                SandboxRule::DenySpawn | SandboxRule::IsolateNetwork | SandboxRule::IsolateMount => {}
             }
         }
 
@@ -287,12 +320,12 @@ mod linux {
         {
             let deny_spawn_requested = rules.iter().any(|r| matches!(r, SandboxRule::DenySpawn));
             let bpf = if deny_spawn_requested { Some(build_spawn_deny_filter()) } else { None };
-            Ok(Inner { landlock_fd, bpf, deny_spawn_requested })
+            Ok(Inner { landlock_fd, bpf, deny_spawn_requested, isolate_net, isolate_mount })
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
             let bpf: Option<BpfProgram> = None;
-            Ok(Inner { landlock_fd, bpf })
+            Ok(Inner { landlock_fd, bpf, isolate_net, isolate_mount })
         }
     }
 
@@ -432,11 +465,33 @@ mod linux {
     /// Apply the compiled sandbox to the current process.
     ///
     /// Async-signal-safe: only raw syscalls, no allocation, no locking.
-    /// Landlock failures on unsupported kernels are silently ignored (BestEffort).
+    /// Landlock and namespace failures on unsupported kernels are silently ignored (BestEffort).
     pub fn apply_compiled_inner(inner: &Inner) -> Result<(), SandboxError> {
-        let has_anything = inner.landlock_fd >= 0 || inner.bpf.is_some();
+        let has_anything = inner.landlock_fd >= 0
+            || inner.bpf.is_some()
+            || inner.isolate_net
+            || inner.isolate_mount;
         if !has_anything {
             return Ok(());
+        }
+
+        // Namespace unshare must happen before PR_SET_NO_NEW_PRIVS: on some kernel
+        // versions, no-new-privs prevents creating user namespaces.
+        if inner.isolate_net || inner.isolate_mount {
+            // CLONE_NEWUSER grants the capabilities needed to create net/mount
+            // namespaces without CAP_SYS_ADMIN, enabling this to work unprivileged.
+            let mut flags: libc::c_int = libc::CLONE_NEWUSER;
+            if inner.isolate_net   { flags |= libc::CLONE_NEWNET; }
+            if inner.isolate_mount { flags |= libc::CLONE_NEWNS;  }
+            if unsafe { libc::unshare(flags) } != 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                // BestEffort: EPERM = user namespaces disabled by kernel policy
+                // (kernel.unprivileged_userns_clone = 0); ENOSYS = too old.
+                // Degrade silently; the caller can read EnforcementStatus to check.
+                if errno != libc::EPERM && errno != libc::ENOSYS {
+                    return Err(SandboxError::Io(std::io::Error::last_os_error()));
+                }
+            }
         }
 
         // PR_SET_NO_NEW_PRIVS is required before seccomp without CAP_SYS_ADMIN.
@@ -577,6 +632,50 @@ mod tests {
     }
 
     #[test]
+    fn isolate_network_compiles_on_all_platforms() {
+        let result = compile(&[SandboxRule::IsolateNetwork]);
+        assert!(result.is_ok(), "IsolateNetwork should compile on all platforms: {result:?}");
+    }
+
+    #[test]
+    fn isolate_mount_compiles_on_all_platforms() {
+        let result = compile(&[SandboxRule::IsolateMount]);
+        assert!(result.is_ok(), "IsolateMount should compile on all platforms: {result:?}");
+    }
+
+    #[test]
+    fn enforcement_status_empty_has_no_namespace_flags() {
+        let compiled = compile(&[]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(!s.namespace_net,   "no rules → namespace_net false");
+        assert!(!s.namespace_mount, "no rules → namespace_mount false");
+    }
+
+    #[test]
+    fn enforcement_status_isolate_network_sets_flag() {
+        let compiled = compile(&[SandboxRule::IsolateNetwork]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(s.namespace_net,    "IsolateNetwork → namespace_net true");
+        assert!(!s.namespace_mount, "IsolateNetwork alone → namespace_mount false");
+    }
+
+    #[test]
+    fn enforcement_status_isolate_mount_sets_flag() {
+        let compiled = compile(&[SandboxRule::IsolateMount]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(!s.namespace_net,  "IsolateMount alone → namespace_net false");
+        assert!(s.namespace_mount, "IsolateMount → namespace_mount true");
+    }
+
+    #[test]
+    fn enforcement_status_both_namespace_rules() {
+        let compiled = compile(&[SandboxRule::IsolateNetwork, SandboxRule::IsolateMount]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(s.namespace_net,   "IsolateNetwork → namespace_net true");
+        assert!(s.namespace_mount, "IsolateMount → namespace_mount true");
+    }
+
+    #[test]
     fn sandbox_rule_is_clone() {
         let r = SandboxRule::AllowFsRead {
             prefix: "/tmp".to_string(),
@@ -587,6 +686,9 @@ mod tests {
     #[test]
     fn sandbox_rule_partial_eq() {
         assert_eq!(SandboxRule::DenySpawn, SandboxRule::DenySpawn);
+        assert_eq!(SandboxRule::IsolateNetwork, SandboxRule::IsolateNetwork);
+        assert_eq!(SandboxRule::IsolateMount, SandboxRule::IsolateMount);
+        assert_ne!(SandboxRule::IsolateNetwork, SandboxRule::IsolateMount);
         assert_eq!(
             SandboxRule::AllowFsRead { prefix: "/a".into() },
             SandboxRule::AllowFsRead { prefix: "/a".into() },

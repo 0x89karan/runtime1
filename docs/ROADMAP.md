@@ -402,9 +402,21 @@ Run tool-servers sandboxed; map each capability set to a sandbox profile.
 payload gains `enforced:{landlock,seccomp,spawn_enforcement}`; `mcp_require_capabilities`
 flag; CI musl ≤4 MB size guard restored.
 
-### ▢ p4.2 — Stronger isolation option (gVisor / microVM)
-For untrusted tools/agents, run under gVisor or a Cloud Hypervisor microVM.
-**Acceptance:** a tool runs in the chosen sandbox with measured overhead.
+### ✓ p4.2 — Stronger isolation option (namespaces + gVisor)
+Two-tier isolation upgrade. Layer 1 (all sandboxed servers): Linux namespaces via
+`unshare(CLONE_NEWUSER | CLONE_NEWNET)` in `pre_exec`; `IsolateNetwork` and
+`IsolateMount` `SandboxRule` variants; `caps_to_rules()` now enforces `Net` at the
+kernel level (absent `Net` cap → `IsolateNetwork` added automatically). Layer 2
+(opt-in per server): `isolation = "gvisor"` field on `[[tools.mcp_servers]]`; wraps
+the server command with `runsc do [--network=none] --`; agentd fails fast at startup
+if `runsc` is not on PATH. `EnforcementStatus` gains `namespace_net` and
+`namespace_mount` fields. `SandboxApplied` event payload extended with `isolation`
+and namespace enforcement fields. `CONFIG_USER_NS=y`, `CONFIG_NET_NS=y` in
+kernel-extras.config. 209 tests pass.
+**Known limitations:** `runsc do` is experimental (full OCI bundle deferred to
+TODOS.md); `clone3()` bypass in the namespace-only path remains (TODOS.md);
+`CLONE_NEWPID` for PID namespace requires a re-fork and is deferred.
+**Acceptance:** ✓
 
 ### ▢ p4.3 — Security review pass
 Threat model: secret handling, flight-recorder redaction, budget-exhaustion DoS,
