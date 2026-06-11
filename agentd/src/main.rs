@@ -107,8 +107,13 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     // calling exit() while mcp_clients is still in scope.
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
     for server in &cfg.tools.mcp_servers {
-        let sandbox_rules: Option<Vec<SandboxRule>> =
-            server.capabilities.as_deref().map(caps_to_rules);
+        // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn}] only).
+        // Treat empty rules the same as None: no kernel mechanism is installed, so
+        // emitting SandboxApplied would be misleading. filter(non-empty) collapses it.
+        let sandbox_rules: Option<Vec<SandboxRule>> = server.capabilities
+            .as_deref()
+            .map(caps_to_rules)
+            .filter(|r| !r.is_empty());
 
         if sandbox_rules.is_none() {
             tracing::warn!(
