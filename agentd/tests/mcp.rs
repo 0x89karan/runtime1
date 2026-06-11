@@ -279,6 +279,194 @@ command = "/nonexistent/binary-that-does-not-exist"
     );
 }
 
+/// mcp_require_capabilities = true with all servers having capabilities → validation passes.
+/// The run still exits non-zero (no API key), but the error is about the key, not caps.
+#[test]
+fn mcp_require_capabilities_true_all_caps_present_passes() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+    let echo_mcp = echo_mcp_path();
+
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[agent]
+id = "req-caps-pass"
+task = "test"
+
+[tools]
+mcp_require_capabilities = true
+
+[[tools.mcp_servers]]
+name = "echo-srv"
+command = "{echo_mcp}"
+capabilities = []
+"#
+        ),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("failed to spawn agentd");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("mcp_require_capabilities is set"),
+        "validation should pass when all servers have capabilities, got stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ANTHROPIC_API_KEY"),
+        "expected API-key error after passing validation, got: {stderr}"
+    );
+}
+
+/// mcp_require_capabilities = true with a server that has no capabilities field → bail.
+#[test]
+fn mcp_require_capabilities_true_missing_caps_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+
+    std::fs::write(
+        &cfg_path,
+        r#"
+[agent]
+id = "req-caps-fail"
+task = "test"
+
+[tools]
+mcp_require_capabilities = true
+
+[[tools.mcp_servers]]
+name = "uncapped-srv"
+command = "/nonexistent/does-not-matter"
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when mcp_require_capabilities=true and server has no caps"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("uncapped-srv"),
+        "error must name the offending server, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("mcp_require_capabilities"),
+        "error must mention mcp_require_capabilities, got: {stderr}"
+    );
+}
+
+/// mcp_require_capabilities = true with multiple servers missing capabilities → both named.
+#[test]
+fn mcp_require_capabilities_true_multiple_missing_caps_names_all() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+
+    std::fs::write(
+        &cfg_path,
+        r#"
+[agent]
+id = "req-caps-multi"
+task = "test"
+
+[tools]
+mcp_require_capabilities = true
+
+[[tools.mcp_servers]]
+name = "alpha-srv"
+command = "/nonexistent/alpha"
+
+[[tools.mcp_servers]]
+name = "beta-srv"
+command = "/nonexistent/beta"
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit when multiple servers lack capabilities"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("alpha-srv"),
+        "error must name alpha-srv, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("beta-srv"),
+        "error must name beta-srv, got: {stderr}"
+    );
+}
+
+/// mcp_require_capabilities = true with capabilities=[{Spawn}] (produces empty rules) → bail.
+/// Regression test for the bypass: capabilities present but caps_to_rules() returns empty vec.
+#[test]
+fn mcp_require_capabilities_spawn_only_caps_exits_nonzero() {
+    let dir = TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+
+    std::fs::write(
+        &cfg_path,
+        r#"
+[agent]
+id = "req-caps-spawn-bypass"
+task = "test"
+
+[tools]
+mcp_require_capabilities = true
+
+[[tools.mcp_servers]]
+name = "spawn-only-srv"
+command = "/nonexistent/does-not-matter"
+capabilities = ["Spawn"]
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(
+        !output.status.success(),
+        "capabilities=[{{Spawn}}] must not bypass mcp_require_capabilities validation"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("spawn-only-srv"),
+        "error must name the offending server, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("mcp_require_capabilities") || stderr.contains("effective sandbox rules"),
+        "error must mention the policy violation, got: {stderr}"
+    );
+}
+
 /// MCP tools/list pagination: all pages must be loaded and appear in tools_registered.
 /// echo-mcp --paginate returns page 1 (2 tools + nextCursor) then page 2 (1 tool).
 #[test]

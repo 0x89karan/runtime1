@@ -3,6 +3,26 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.1] - 2026-06-11
+
+### Added
+- **`EnforcementStatus` struct** in `sandbox/src/lib.rs`: `{ landlock: bool, seccomp: bool, spawn_enforcement: &'static str }` — returned by `CompiledSandbox::enforcement_status()` and included in `SandboxApplied` flight events, so operators can distinguish kernels where Landlock or seccomp degraded to a no-op.
+- **`mcp_require_capabilities = true`** flag in `[tools]` config: when set, startup fails if any MCP server would run unsandboxed (missing `capabilities` field OR field present but `caps_to_rules()` produces empty rules). Lists all offending server names in the error message.
+- **CI binary size guard**: new workflow step checks that the x86_64-unknown-linux-musl release binary is ≤ 4 MB (4 194 304 bytes); fails with a clear message if exceeded.
+
+### Fixed
+- **aarch64 BPF gate**: seccomp-bpf fork/vfork block is now gated under `#[cfg(target_arch = "x86_64")]`. On aarch64 (and other non-x86_64 arches), `DenySpawn` emits `SandboxSkipped { reason: "deny-spawn-unsupported-arch" }` instead of installing a no-op filter that silently claims enforcement.
+- **`compile()` moved to `main.rs`**: `McpClient::spawn` no longer calls `compile()` internally. The parent compiles rules before fork and passes `Option<CompiledSandbox>` directly, keeping the child's `pre_exec` closure allocation-free.
+- **`mcp_require_capabilities` bypass**: validation now calls `caps_to_rules()` to check for empty effective rules, not just `capabilities.is_none()`. `capabilities = ["Spawn"]` (which maps to zero kernel rules) is correctly rejected.
+- **`SandboxSkipped` on non-Linux with capabilities**: the `had_sandbox` variable is captured before the compiled sandbox is consumed by `McpClient::spawn`, fixing a case where the non-Linux `SandboxSkipped` event was never emitted for servers with capabilities configured.
+- **Misleading sandbox log**: the "MCP server running unsandboxed" warning now distinguishes between "no capabilities field" and "capabilities produce no effective rules".
+
+### Tests
+- **208 tests pass** (macOS + CI).
+- 6 `EnforcementStatus` unit tests in `sandbox/src/lib.rs`.
+- 4 `mcp_require_capabilities` integration tests in `agentd/tests/mcp.rs`, including a regression test for the `capabilities = ["Spawn"]` bypass.
+- `MAX_BYTES` named constant replaces bare `4194304` in the CI size guard script.
+
 ## [p3.3] - 2026-06-11
 
 ### Added

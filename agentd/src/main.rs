@@ -103,19 +103,23 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)))?;
 
     // Pass 1: validate capabilities before spawning any process.
-    // When mcp_require_capabilities is true, refuse to start if any server
-    // omits the capabilities field — running unsandboxed would be a policy violation.
+    // When mcp_require_capabilities is true, refuse to start if any server would
+    // run unsandboxed — either because the field is missing OR because the caps
+    // produce no effective rules (e.g. capabilities=[{Spawn}] yields empty rules).
     if cfg.tools.mcp_require_capabilities {
         let missing: Vec<&str> = cfg.tools.mcp_servers
             .iter()
-            .filter(|s| s.capabilities.is_none())
+            .filter(|s| {
+                s.capabilities.is_none()
+                    || s.capabilities.as_deref().map(|c| caps_to_rules(c).is_empty()).unwrap_or(false)
+            })
             .map(|s| s.name.as_str())
             .collect();
         if !missing.is_empty() {
             anyhow::bail!(
                 "mcp_require_capabilities is set but the following MCP servers have no \
-                 `capabilities` field: {}. Add capabilities or set \
-                 mcp_require_capabilities = false.",
+                 effective sandbox rules: {}. Add capabilities (e.g. `capabilities = []` for \
+                 spawn-deny only) or set mcp_require_capabilities = false.",
                 missing.join(", ")
             );
         }
@@ -135,15 +139,21 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
             .filter(|r| !r.is_empty());
 
         if sandbox_rules.is_none() {
+            let reason = if server.capabilities.is_none() {
+                "no capabilities field"
+            } else {
+                "capabilities produce no effective rules"
+            };
             tracing::warn!(
                 name = %server.name,
-                "MCP server has no `capabilities` field — running unsandboxed"
+                reason,
+                "MCP server running unsandboxed"
             );
             recorder.record(
                 "agentd",
                 None,
                 EventKind::SandboxSkipped,
-                serde_json::json!({ "server": server.name }),
+                serde_json::json!({ "server": server.name, "reason": reason }),
             );
         }
 
@@ -157,17 +167,15 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
             None => None,
         };
 
-        // Read enforcement status before consuming the compiled sandbox.
-        // Available on all platforms; on non-Linux always returns all-false.
+        // Read enforcement status before consuming the compiled sandbox (Linux only).
         #[cfg(target_os = "linux")]
         let enforcement = compiled.as_ref().map(|c| c.enforcement_status());
-        #[cfg(not(target_os = "linux"))]
-        let enforcement: Option<sandbox::EnforcementStatus> = None;
 
+        let had_sandbox = compiled.is_some();
         tracing::info!(
             name = %server.name,
             command = %server.command,
-            sandboxed = compiled.is_some(),
+            sandboxed = had_sandbox,
             "spawning MCP server"
         );
         let (client, specs) = McpClient::spawn(
@@ -198,7 +206,7 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
             );
         }
         #[cfg(not(target_os = "linux"))]
-        if enforcement.is_some() {
+        if had_sandbox {
             recorder.record(
                 "agentd",
                 None,
