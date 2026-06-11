@@ -82,6 +82,46 @@ impl From<std::ffi::NulError> for SandboxError {
     }
 }
 
+/// Summary of what sandbox enforcement was compiled into a `CompiledSandbox`.
+///
+/// Reflects intended enforcement — kernel outcome at `apply_compiled()` time
+/// may differ (e.g. Landlock degrades silently on kernels < 5.13).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnforcementStatus {
+    /// Landlock FS ruleset was compiled (kernel may degrade on old systems).
+    pub landlock: bool,
+    /// seccomp-bpf filter was compiled (x86_64 only, when DenySpawn was requested).
+    pub seccomp: bool,
+    /// Which spawn syscalls the filter targets.
+    /// `"fork_vfork_only"` — fork(57) + vfork(58) blocked on x86_64.
+    /// `"none"` — no spawn filtering compiled (non-x86_64 or DenySpawn not in rules).
+    pub spawn_enforcement: &'static str,
+}
+
+impl CompiledSandbox {
+    /// Returns a summary of what sandbox mechanisms were compiled into this instance.
+    pub fn enforcement_status(&self) -> EnforcementStatus {
+        #[cfg(target_os = "linux")]
+        {
+            let landlock = self.inner.landlock_fd >= 0;
+            let seccomp = self.inner.bpf.is_some();
+            #[cfg(target_arch = "x86_64")]
+            let spawn_enforcement = if self.inner.deny_spawn_requested {
+                "fork_vfork_only"
+            } else {
+                "none"
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let spawn_enforcement = "none";
+            EnforcementStatus { landlock, seccomp, spawn_enforcement }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            EnforcementStatus { landlock: false, seccomp: false, spawn_enforcement: "none" }
+        }
+    }
+}
+
 /// Compile sandbox rules into a `CompiledSandbox` ready for `apply_compiled`.
 ///
 /// May allocate (opens file descriptors, builds Vec); must NOT be called inside
@@ -139,11 +179,16 @@ mod linux {
     const ACCESS_FS_HANDLED: u64 = 0x1FFE; // V1 all except Execute (bit 0)
     const ACCESS_FS_READ_ONLY: u64 = 0x000C; // ReadFile(1<<2) | ReadDir(1<<3)
 
-    // ── seccomp BPF opcodes (classic BPF ABI; stable since 1993) ──────────
+    // ── seccomp BPF opcodes (classic BPF ABI; stable since 1993; x86_64 only) ──
+    #[cfg(target_arch = "x86_64")]
     const BPF_LD_W_ABS: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
+    #[cfg(target_arch = "x86_64")]
     const BPF_JMP_JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
+    #[cfg(target_arch = "x86_64")]
     const BPF_RET_K: u16 = 0x06; // BPF_RET | BPF_K
+    #[cfg(target_arch = "x86_64")]
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    #[cfg(target_arch = "x86_64")]
     const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 
     #[repr(C)]
@@ -165,8 +210,13 @@ mod linux {
         /// Landlock ruleset fd created by `landlock_create_ruleset` + `landlock_add_rule`.
         /// -1 = no FS rules or kernel doesn't support Landlock (BestEffort degradation).
         pub landlock_fd: i32,
-        /// Pre-compiled seccomp BPF. None if DenySpawn rule was not requested.
+        /// Pre-compiled seccomp BPF. None if DenySpawn rule was not requested,
+        /// or if the current arch does not support fork/vfork filtering.
         pub bpf: Option<BpfProgram>,
+        /// True when DenySpawn was in the rule set (x86_64 only). Used by
+        /// `enforcement_status()` to distinguish "not requested" from "not enforceable".
+        #[cfg(target_arch = "x86_64")]
+        pub deny_spawn_requested: bool,
     }
 
     impl Drop for Inner {
@@ -230,13 +280,20 @@ mod linux {
         };
 
         // Build seccomp BPF if DenySpawn was requested.
-        let bpf = if rules.iter().any(|r| matches!(r, SandboxRule::DenySpawn)) {
-            Some(build_spawn_deny_filter())
-        } else {
-            None
-        };
-
-        Ok(Inner { landlock_fd, bpf })
+        // On non-x86_64 arches fork()/vfork() do not exist as distinct syscalls;
+        // building a filter would produce a 2-instruction no-op. Gate compilation
+        // so `bpf.is_some()` reliably means "a real filter was installed".
+        #[cfg(target_arch = "x86_64")]
+        {
+            let deny_spawn_requested = rules.iter().any(|r| matches!(r, SandboxRule::DenySpawn));
+            let bpf = if deny_spawn_requested { Some(build_spawn_deny_filter()) } else { None };
+            Ok(Inner { landlock_fd, bpf, deny_spawn_requested })
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let bpf: Option<BpfProgram> = None;
+            Ok(Inner { landlock_fd, bpf })
+        }
     }
 
     fn open_path_fd(path: &str) -> Result<i32, SandboxError> {
@@ -309,6 +366,7 @@ mod linux {
         Ok(ruleset_fd)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn build_spawn_deny_filter() -> BpfProgram {
         // seccomp_data.nr is at offset 0 on all architectures.
         const NR_OFFSET: u32 = 0;
@@ -482,18 +540,40 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deny_spawn_builds_bpf() {
         let rules = vec![SandboxRule::DenySpawn];
         let compiled = compile(&rules).unwrap();
         assert!(
             compiled.inner.bpf.is_some(),
-            "DenySpawn should produce a BPF program"
+            "DenySpawn should produce a BPF program on x86_64"
         );
         let bpf = compiled.inner.bpf.as_ref().unwrap();
         // Must have at least: load nr, allow
         assert!(bpf.0.len() >= 2, "BPF program too short: {} insns", bpf.0.len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deny_spawn_sets_deny_spawn_requested() {
+        let rules = vec![SandboxRule::DenySpawn];
+        let compiled = compile(&rules).unwrap();
+        assert!(
+            compiled.inner.deny_spawn_requested,
+            "DenySpawn rule must set deny_spawn_requested"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn no_deny_spawn_clears_deny_spawn_requested() {
+        let rules = vec![SandboxRule::AllowFsRead { prefix: "/proc".to_string() }];
+        let compiled = compile(&rules).unwrap();
+        assert!(
+            !compiled.inner.deny_spawn_requested,
+            "deny_spawn_requested must be false when DenySpawn not in rules"
+        );
     }
 
     #[test]
@@ -554,6 +634,52 @@ mod tests {
         ];
         let compiled = compile(&rules).expect("combined rules should compile");
         assert!(compiled.inner.bpf.is_some());
+    }
+
+    // enforcement_status() tests — platform-independent
+
+    #[test]
+    fn enforcement_status_empty_rules() {
+        let compiled = compile(&[]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(!s.landlock);
+        assert!(!s.seccomp);
+        assert_eq!(s.spawn_enforcement, "none");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn enforcement_status_deny_spawn_x86_64() {
+        let compiled = compile(&[SandboxRule::DenySpawn]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(!s.landlock, "no FS rules → landlock false");
+        assert!(s.seccomp, "DenySpawn on x86_64 → seccomp true");
+        assert_eq!(s.spawn_enforcement, "fork_vfork_only");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn enforcement_status_full_rules_x86_64() {
+        let rules = vec![
+            SandboxRule::AllowFsRead { prefix: "/proc".to_string() },
+            SandboxRule::AllowFsWrite { prefix: "/tmp".to_string() },
+            SandboxRule::DenySpawn,
+        ];
+        let compiled = compile(&rules).unwrap();
+        let s = compiled.enforcement_status();
+        // landlock_fd may be -1 on old kernels; accept both
+        assert_eq!(s.seccomp, true, "DenySpawn on x86_64 always sets seccomp");
+        assert_eq!(s.spawn_enforcement, "fork_vfork_only");
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn enforcement_status_fs_only_no_seccomp() {
+        let rules = vec![SandboxRule::AllowFsRead { prefix: "/proc".to_string() }];
+        let compiled = compile(&rules).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(!s.seccomp, "no DenySpawn → seccomp false");
+        assert_eq!(s.spawn_enforcement, "none");
     }
 
     // On x86_64 the filter has 6 instructions:

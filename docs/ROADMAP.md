@@ -394,9 +394,13 @@ Enforce capability scopes (p1.4) at the syscall boundary for tool subprocesses.
 
 Goal: defense-in-depth for tools/agents. See DESIGN.md Part 5.
 
-### ▢ p4.1 — Per-tool sandboxing (seccomp + namespaces)
+### ✓ p4.1 — Per-tool sandboxing (seccomp + namespaces)
 Run tool-servers sandboxed; map each capability set to a sandbox profile.
 **Acceptance:** a tool cannot exceed its capability at the OS level.
+**Completed:** v0.11.0 — BPF arch gate (aarch64 false-positive fixed); `EnforcementStatus`
++ `CompiledSandbox::enforcement_status()`; `compile()` moved to `main.rs`; `SandboxApplied`
+payload gains `enforced:{landlock,seccomp,spawn_enforcement}`; `mcp_require_capabilities`
+flag; CI musl ≤4 MB size guard restored.
 
 ### ▢ p4.2 — Stronger isolation option (gVisor / microVM)
 For untrusted tools/agents, run under gVisor or a Cloud Hypervisor microVM.

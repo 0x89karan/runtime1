@@ -10,7 +10,7 @@ use agentd::tools::{
     native::register_native,
     ToolRegistry,
 };
-use sandbox::SandboxRule;
+use sandbox::{CompiledSandbox, SandboxRule};
 use surfaces::SchedulerSnapshot;
 
 #[tokio::main]
@@ -102,6 +102,29 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     let mut registry = ToolRegistry::new();
     register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)))?;
 
+    // Pass 1: validate capabilities before spawning any process.
+    // When mcp_require_capabilities is true, refuse to start if any server would
+    // run unsandboxed — either because the field is missing OR because the caps
+    // produce no effective rules (e.g. capabilities=[{Spawn}] yields empty rules).
+    if cfg.tools.mcp_require_capabilities {
+        let missing: Vec<&str> = cfg.tools.mcp_servers
+            .iter()
+            .filter(|s| {
+                s.capabilities.is_none()
+                    || s.capabilities.as_deref().map(|c| caps_to_rules(c).is_empty()).unwrap_or(false)
+            })
+            .map(|s| s.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "mcp_require_capabilities is set but the following MCP servers have no \
+                 effective sandbox rules: {}. Add capabilities (e.g. `capabilities = []` for \
+                 spawn-deny only) or set mcp_require_capabilities = false.",
+                missing.join(", ")
+            );
+        }
+    }
+
     // Held for Drop: keeps MCP child processes alive until run_agent returns.
     // std::process::exit() bypasses Drop, so we must return Err instead of
     // calling exit() while mcp_clients is still in scope.
@@ -116,28 +139,49 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
             .filter(|r| !r.is_empty());
 
         if sandbox_rules.is_none() {
+            let reason = if server.capabilities.is_none() {
+                "no capabilities field"
+            } else {
+                "capabilities produce no effective rules"
+            };
             tracing::warn!(
                 name = %server.name,
-                "MCP server has no `capabilities` field — running unsandboxed"
+                reason,
+                "MCP server running unsandboxed"
             );
             recorder.record(
                 "agentd",
                 None,
                 EventKind::SandboxSkipped,
-                serde_json::json!({ "server": server.name }),
+                serde_json::json!({ "server": server.name, "reason": reason }),
             );
         }
 
+        // Compile sandbox rules in the parent before fork so apply_compiled() in
+        // the child's pre_exec closure can be allocation-free (raw syscalls only).
+        let compiled: Option<CompiledSandbox> = match sandbox_rules {
+            Some(ref rules) => Some(
+                sandbox::compile(rules)
+                    .with_context(|| format!("compiling sandbox for '{}'", server.name))?,
+            ),
+            None => None,
+        };
+
+        // Read enforcement status before consuming the compiled sandbox (Linux only).
+        #[cfg(target_os = "linux")]
+        let enforcement = compiled.as_ref().map(|c| c.enforcement_status());
+
+        let had_sandbox = compiled.is_some();
         tracing::info!(
             name = %server.name,
             command = %server.command,
-            sandboxed = sandbox_rules.is_some(),
+            sandboxed = had_sandbox,
             "spawning MCP server"
         );
         let (client, specs) = McpClient::spawn(
             &server.command,
             &server.args,
-            sandbox_rules.as_deref(),
+            compiled,
         )
         .await
         .with_context(|| format!("spawning MCP server '{}'", server.name))?;
@@ -146,20 +190,23 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         // the kernel mechanisms (Landlock + seccomp) are actually applied. On other
         // platforms the sandbox is a no-op and SandboxSkipped is the correct event.
         #[cfg(target_os = "linux")]
-        if let Some(rules) = &sandbox_rules {
-            let rule_descs: Vec<String> = rules.iter().map(|r| format!("{r:?}")).collect();
+        if let Some(ref enf) = enforcement {
             recorder.record(
                 "agentd",
                 None,
                 EventKind::SandboxApplied,
                 serde_json::json!({
                     "server": server.name,
-                    "rules": rule_descs,
+                    "enforced": {
+                        "landlock": enf.landlock,
+                        "seccomp":  enf.seccomp,
+                        "spawn_enforcement": enf.spawn_enforcement,
+                    },
                 }),
             );
         }
         #[cfg(not(target_os = "linux"))]
-        if sandbox_rules.is_some() {
+        if had_sandbox {
             recorder.record(
                 "agentd",
                 None,

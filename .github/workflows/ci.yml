@@ -35,3 +35,19 @@ jobs:
       - name: Test
         run: cargo test --verbose
         working-directory: agentd
+
+      - name: Install musl target + tools
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get install -y musl-tools
+
+      - name: Build static musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+        working-directory: agentd
+
+      - name: Binary size guard (≤ 4 MB)
+        run: |
+          SIZE=$(stat -c %s target/x86_64-unknown-linux-musl/release/agentd)
+          echo "agentd musl binary: ${SIZE} bytes"
+          MAX_BYTES=4194304  # 4 MB = 4 * 1024 * 1024
+          [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 4 MB limit"; exit 1; }

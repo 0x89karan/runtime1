@@ -129,6 +129,29 @@
   that touches Linux-gated code. Target added to workspace Makefile; rule added to
   CLAUDE.md quality gate.
 
+**P3 — pre_exec sandbox errors are masked as EPERM (p4.1 red-team)**
+- `apply_compiled()` in `pre_exec` can fail at either the Landlock or seccomp step, but any
+  failure surfaces to the parent as a generic `EPERM` (`io::Error`). There is no way to distinguish
+  a Landlock `prctl` failure from a seccomp `prctl` failure from any other `pre_exec` error at
+  the point where `McpClient::spawn` calls `child.await`.
+- Action: consider writing a structured errno/step to a pipe before exec (the `pre_exec` trick),
+  or at minimum document that spawn failures while `had_sandbox = true` imply a sandbox error.
+
+**P4 — aarch64 CI runner needed to validate DenySpawn no-op behavior (p4.1 eng review)**
+- The fix in T1 (gate BPF with `#[cfg(target_arch = "x86_64")]`) emits `SandboxSkipped` on
+  non-x86_64 when DenySpawn is requested. There is no aarch64 GitHub Actions runner in CI
+  to verify the behavior. Current `ubuntu-latest` runners are x86_64.
+- Action: add a self-hosted aarch64 runner or QEMU-emulated job to CI when one becomes
+  available; until then the logic is unit-tested but not E2E verified on real hardware.
+
+**P4 — `sandbox_probe` fixture not wired to any integration test (p4.1 eng review)**
+- `agentd/tests/fixtures/sandbox_probe.rs` was added in p3.3 as a probe binary for FS
+  access and exec tests, but no integration test actually spawns it through the MCP path
+  to verify that sandbox rules are enforced end-to-end.
+- Action: add an integration test in `agentd/tests/` that (a) spawns `sandbox_probe` as
+  an MCP tool server with specific `AllowFsRead`/`DenySpawn` caps, (b) issues tool calls
+  that exercise both allowed and denied paths, and (c) asserts the correct outcomes.
+
 **P3 — No `--no-fuse` flag for CI and host dev environments (p3.1)**
 - `surfaces::agents_fs::mount()` is called unconditionally in main.rs. On host Linux dev machines
   without FUSE available (or in CI), the `Err` path logs a warn and continues — correct but
