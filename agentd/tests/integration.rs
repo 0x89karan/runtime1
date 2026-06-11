@@ -206,12 +206,53 @@ fn startup_events_written_to_flight_log() {
     assert!(spawned["turn"].is_null());
     assert!(spawned["ts"].is_string());
     assert_eq!(spawned["data"]["model"], "claude-sonnet-4-6");
+    // task is logged as task_preview (never the full task string verbatim)
+    assert!(spawned["data"]["task_preview"].is_string(), "agent_spawned must have task_preview field");
+    assert_eq!(spawned["data"]["task_preview"], "smoke test");
+    assert!(spawned["data"]["task"].is_null(), "agent_spawned must NOT have bare task field");
 
     let registered = events
         .iter()
         .find(|e| e["kind"] == "tools_registered")
         .expect("tools_registered event missing");
     assert!(registered["data"]["tools"].is_array());
+}
+
+/// Long task strings are truncated to 200 chars in the agent_spawned event.
+#[test]
+fn agent_spawned_truncates_long_task() {
+    let dir = TempDir::new().expect("tempdir");
+    let long_task = "a".repeat(300);
+    let cfg_content = format!(
+        "[agent]\nid = \"trunc-agent\"\ntask = \"{long_task}\"\n"
+    );
+    std::fs::write(dir.path().join("agent.toml"), cfg_content).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let _ = Command::new(bin)
+        .arg(dir.path().join("agent.toml"))
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("failed to spawn agentd");
+
+    let content = std::fs::read_to_string(dir.path().join("flight.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("valid JSON"))
+        .collect();
+
+    let spawned = events
+        .iter()
+        .find(|e| e["kind"] == "agent_spawned")
+        .expect("agent_spawned event missing");
+
+    let preview = spawned["data"]["task_preview"]
+        .as_str()
+        .expect("task_preview must be a string");
+    assert!(preview.ends_with('…'), "long task must end with ellipsis");
+    assert!(preview.chars().count() <= 201, "task_preview must not exceed 200 chars + ellipsis");
 }
 
 /// Live end-to-end agent run — skipped when ANTHROPIC_API_KEY is not set.

@@ -786,6 +786,56 @@ mod tests {
         assert_eq!(truncate(unicode, 5), "áéíóú");
     }
 
+    #[tokio::test]
+    async fn tool_call_event_emits_input_preview_field() {
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap();
+        let registry = crate::tools::ToolRegistry::new();
+
+        let blocks = vec![Block::ToolUse {
+            id:    "call_1".to_string(),
+            name:  "unknown_tool".to_string(),
+            input: serde_json::json!({ "key": "value" }),
+        }];
+        run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|e: &serde_json::Value| e["kind"] == "tool_call")
+            .expect("tool_call event missing");
+
+        assert!(event["data"].get("input_preview").is_some(), "must have input_preview");
+        assert!(event["data"]["input"].is_null(), "must NOT have bare input field");
+    }
+
+    #[tokio::test]
+    async fn tool_call_event_truncates_long_input() {
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap();
+        let registry = crate::tools::ToolRegistry::new();
+
+        let long_val = "x".repeat(300);
+        let blocks = vec![Block::ToolUse {
+            id:    "call_1".to_string(),
+            name:  "unknown_tool".to_string(),
+            input: serde_json::json!({ "content": long_val }),
+        }];
+        run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|e: &serde_json::Value| e["kind"] == "tool_call")
+            .expect("tool_call event missing");
+
+        let preview = event["data"]["input_preview"].as_str().expect("input_preview must be string");
+        assert!(preview.ends_with('…'), "long input must end with ellipsis");
+        assert!(preview.chars().count() <= PREVIEW_CHARS + 1, "preview must not exceed PREVIEW_CHARS");
+    }
+
     // ── State-machine unit tests (sync, no network) ───────────────────────────
 
     #[test]
