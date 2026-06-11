@@ -137,8 +137,10 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("spawning MCP server '{}'", server.name))?;
 
-        // Record SandboxApplied only after spawn succeeds — emit after the fact so
-        // the event is never present in the log for a server that failed to start.
+        // Record SandboxApplied only after spawn succeeds and only on Linux where
+        // the kernel mechanisms (Landlock + seccomp) are actually applied. On other
+        // platforms the sandbox is a no-op and SandboxSkipped is the correct event.
+        #[cfg(target_os = "linux")]
         if let Some(rules) = &sandbox_rules {
             let rule_descs: Vec<String> = rules.iter().map(|r| format!("{r:?}")).collect();
             recorder.record(
@@ -149,6 +151,15 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
                     "server": server.name,
                     "rules": rule_descs,
                 }),
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        if sandbox_rules.is_some() {
+            recorder.record(
+                "agentd",
+                None,
+                EventKind::SandboxSkipped,
+                serde_json::json!({ "server": server.name, "reason": "non-Linux platform" }),
             );
         }
         let n = specs.len();

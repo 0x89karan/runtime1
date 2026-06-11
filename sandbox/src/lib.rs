@@ -241,7 +241,11 @@ mod linux {
 
     fn open_path_fd(path: &str) -> Result<i32, SandboxError> {
         let cpath = CString::new(path.as_bytes())?;
-        let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        // O_NOFOLLOW: reject symlinks at the final path component to prevent a
+        // malicious actor from redirecting the Landlock allowance to an arbitrary dir.
+        let fd = unsafe {
+            libc::open(cpath.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        };
         if fd < 0 {
             Err(SandboxError::Io(std::io::Error::last_os_error()))
         } else {
