@@ -336,9 +336,15 @@ fn invalid_toml_exits_nonzero() {
 
 // ── sandbox_probe integration tests ──────────────────────────────────────────
 //
-// These tests verify that `sandbox::compile()` + `apply_compiled()` actually
-// enforce restrictions end-to-end by spawning the `sandbox_probe` fixture binary
-// under real Landlock / seccomp rules.
+// These tests verify Landlock + seccomp enforcement end-to-end by spawning the
+// `sandbox_probe` fixture binary with sandbox rules applied INSIDE the binary
+// (after exec), not via pre_exec.
+//
+// Applying Landlock via pre_exec (before execve) causes ACCESS_FS_READ_FILE to
+// block the kernel's ELF loader from reading the probe binary itself, since
+// READ_FILE (bit 2) is in ACCESS_FS_HANDLED and the binary lives outside the
+// allowed prefix.  The fix: probe applies rules to itself at startup after exec,
+// at which point all shared libraries are already loaded.
 //
 // Gated to Linux: Landlock and seccomp-bpf are Linux-only mechanisms.
 // The sandbox_probe binary is declared as [[bin]] in Cargo.toml and compiled as
@@ -346,7 +352,6 @@ fn invalid_toml_exits_nonzero() {
 
 #[cfg(target_os = "linux")]
 mod sandbox_probe_tests {
-    use std::os::unix::process::CommandExt as _;
     use tempfile::TempDir;
     use tokio::process::Command;
 
@@ -361,22 +366,16 @@ mod sandbox_probe_tests {
         let file = dir.path().join("allowed.txt");
         std::fs::write(&file, b"hello").unwrap();
 
-        let rules = vec![sandbox::SandboxRule::AllowFsRead {
-            prefix: dir.path().to_str().unwrap().to_owned(),
-        }];
-        let compiled = sandbox::compile(&rules).expect("compile sandbox rules");
-
-        let mut cmd = Command::new(probe_bin());
-        cmd.args(["--path", file.to_str().unwrap()]);
-        // SAFETY: apply_compiled uses only async-signal-safe raw syscalls.
-        unsafe {
-            cmd.pre_exec(move || {
-                sandbox::apply_compiled(&compiled)
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))
-            });
-        }
-
-        let status = cmd.spawn().unwrap().wait().await.unwrap();
+        // The probe applies AllowFsRead{dir} to itself after exec, then reads
+        // the file.  File is inside the allowed prefix → exit 0.
+        let status = Command::new(probe_bin())
+            .arg("--sandbox-read")
+            .arg(dir.path().to_str().unwrap())
+            .arg("--path")
+            .arg(file.to_str().unwrap())
+            .status()
+            .await
+            .unwrap();
         assert_eq!(
             status.code(),
             Some(0),
@@ -389,23 +388,16 @@ mod sandbox_probe_tests {
     async fn denied_path_read_fails() {
         let dir = TempDir::new().unwrap();
 
-        let rules = vec![sandbox::SandboxRule::AllowFsRead {
-            prefix: dir.path().to_str().unwrap().to_owned(),
-        }];
-        let compiled = sandbox::compile(&rules).expect("compile sandbox rules");
-
-        let mut cmd = Command::new(probe_bin());
-        // /etc/hostname is a small, always-present file that our tmpdir prefix doesn't cover.
-        cmd.args(["--path", "/etc/hostname"]);
-        // SAFETY: apply_compiled uses only async-signal-safe raw syscalls.
-        unsafe {
-            cmd.pre_exec(move || {
-                sandbox::apply_compiled(&compiled)
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))
-            });
-        }
-
-        let status = cmd.spawn().unwrap().wait().await.unwrap();
+        // The probe applies AllowFsRead{dir} to itself, then tries to read
+        // /etc/hostname which is outside the allowed prefix → exit 1.
+        let status = Command::new(probe_bin())
+            .arg("--sandbox-read")
+            .arg(dir.path().to_str().unwrap())
+            .arg("--path")
+            .arg("/etc/hostname")
+            .status()
+            .await
+            .unwrap();
         assert_eq!(
             status.code(),
             Some(1),
@@ -413,32 +405,25 @@ mod sandbox_probe_tests {
         );
     }
 
-    /// DenySpawn blocks fork inside the sandboxed process (x86_64 only; seccomp
-    /// BPF only compiles a fork/vfork filter on x86_64 per the existing arch gate).
+    /// DenySpawn blocks fork(2) inside the sandboxed process (x86_64 only).
+    ///
+    /// Uses libc::fork() directly (not Command::new) so we exercise the actual
+    /// fork syscall (57) that the seccomp BPF filter blocks.  Command::new uses
+    /// clone3(435) which bypasses the filter (documented BP-1 in THREAT_MODEL.md).
     #[cfg(target_arch = "x86_64")]
     #[tokio::test]
-    async fn deny_spawn_blocks_exec() {
-        let rules = vec![sandbox::SandboxRule::DenySpawn];
-        let compiled = sandbox::compile(&rules).expect("compile sandbox rules");
-
-        let mut cmd = Command::new(probe_bin());
-        cmd.arg("--exec");
-        // SAFETY: apply_compiled uses only async-signal-safe raw syscalls.
-        unsafe {
-            cmd.pre_exec(move || {
-                sandbox::apply_compiled(&compiled)
-                    .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))
-            });
-        }
-
-        let status = cmd.spawn().unwrap().wait().await.unwrap();
-        // DenySpawn installs a seccomp BPF that kills the process on fork(2)/vfork(2).
-        // sandbox_probe --exec calls Command::new("/bin/true").status() which forks.
-        // The process is killed by SIGSYS → exit code is not 0.
+    async fn deny_spawn_blocks_fork() {
+        // The probe applies DenySpawn to itself, then calls libc::fork() directly.
+        // The seccomp BPF kills the process via SIGSYS → no clean exit code.
+        let status = Command::new(probe_bin())
+            .arg("--sandbox-deny-spawn")
+            .status()
+            .await
+            .unwrap();
         assert_ne!(
             status.code(),
             Some(0),
-            "DenySpawn must prevent exec (process must not exit 0)"
+            "DenySpawn must kill the process on fork() (SIGSYS, no exit code)"
         );
     }
 }
