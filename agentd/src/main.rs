@@ -278,7 +278,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                     && !enf.namespace_net
                     && !enf.namespace_mount
                     && enf.spawn_enforcement == "none"
-                    && sandbox_rules.as_deref().map_or(false, |r| !r.is_empty());
+                    && sandbox_rules.as_deref().is_some_and(|r| !r.is_empty());
                 if noop_deny_spawn {
                     recorder.record(
                         "agentd",
