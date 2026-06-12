@@ -536,15 +536,20 @@ mod sandbox_probe_tests {
     /// AllowFsRead on a tmpdir denies reads outside the granted prefix.
     #[tokio::test]
     async fn denied_path_read_fails() {
-        let dir = TempDir::new().unwrap();
+        let sandbox_dir = TempDir::new().unwrap();
+        // Use a second tmpdir as the denied path — guaranteed to exist (unlike
+        // /etc/hostname which may be absent in containers), and outside the prefix.
+        let outside_dir = TempDir::new().unwrap();
+        let outside_file = outside_dir.path().join("secret.txt");
+        std::fs::write(&outside_file, b"secret").unwrap();
 
-        // The probe applies AllowFsRead{dir} to itself, then tries to read
-        // /etc/hostname which is outside the allowed prefix → exit 1.
+        // The probe applies AllowFsRead{sandbox_dir} to itself, then tries to read
+        // outside_file which is in outside_dir → exit 1.
         let status = Command::new(probe_bin())
             .arg("--sandbox-read")
-            .arg(dir.path().to_str().unwrap())
+            .arg(sandbox_dir.path().to_str().unwrap())
             .arg("--path")
-            .arg("/etc/hostname")
+            .arg(outside_file.to_str().unwrap())
             .status()
             .await
             .unwrap();
@@ -624,10 +629,13 @@ mod sandbox_probe_tests {
             .status()
             .await
             .unwrap();
-        assert_ne!(
-            status.code(),
-            Some(0),
-            "DenySpawn must kill the process on fork() (SIGSYS, no exit code)"
+        // SIGSYS kills the process — it has no exit code (status.code() is None).
+        // assert_ne(code, Some(0)) would pass even for exit 2 (usage error); check
+        // for signal-kill explicitly.
+        assert!(
+            status.code().is_none(),
+            "DenySpawn must kill via SIGSYS (no exit code); got {:?}",
+            status.code()
         );
     }
 }

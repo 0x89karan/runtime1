@@ -21,14 +21,29 @@ pub const FORMAT_VERSION: u32 = 1;
 #[cfg(unix)]
 async fn write_mode_600(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
-    // tokio::fs::OpenOptions::mode() is available natively on Unix targets.
-    let mut f = tokio::fs::OpenOptions::new()
+    // Use O_CREAT|O_EXCL (create_new) so the mode argument is always honoured by
+    // the kernel — on Linux, O_CREAT alone silently ignores mode when the file
+    // already exists at a different permission.  If a stale tmp file exists (e.g.
+    // from a crash), remove it first then retry once.
+    let mut f = match tokio::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
-        .await?;
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tokio::fs::remove_file(path).await?;
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .await?
+        }
+        Err(e) => return Err(e),
+    };
     f.write_all(data).await
 }
 
@@ -321,10 +336,12 @@ mod tests {
         );
     }
 
-    /// rename failure propagates as Err (tmp written, but destination dir is read-only).
+    /// write failure (via read-only directory) propagates as Err.
+    /// Note: save() calls write_mode_600 first, which fails before rename is reached;
+    /// the rename error path is not separately exercised.
     #[cfg(unix)]
     #[tokio::test]
-    async fn save_rename_failure_returns_err() {
+    async fn save_write_failure_ro_dir_returns_err() {
         use std::os::unix::fs::PermissionsExt;
         // Write the checkpoint into a writable subdir, then make the PARENT read-only
         // after the tmp write but before the rename.  We simulate this by writing

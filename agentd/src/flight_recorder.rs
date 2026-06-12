@@ -38,6 +38,8 @@ pub enum EventKind {
     SystemShutdownRequested,
     FuseMounted,
     FuseUnmounted,
+    /// FUSE mount intentionally skipped via --no-fuse / AGENTOS_NO_FUSE.
+    FuseSkipped,
     /// MCP server subprocess sandboxed via Landlock + seccomp before exec.
     SandboxApplied,
     /// MCP server configured without `capabilities`; running unsandboxed.

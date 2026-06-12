@@ -26,8 +26,8 @@ async fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
     // --no-fuse: skip FUSE mount unconditionally (useful in CI and dev environments
     // without the FUSE kernel module). AGENTOS_NO_FUSE env var has the same effect.
-    let no_fuse = raw_args.contains(&"--no-fuse".to_string())
-        || std::env::var("AGENTOS_NO_FUSE").is_ok();
+    let no_fuse = raw_args.iter().any(|a| a == "--no-fuse")
+        || std::env::var("AGENTOS_NO_FUSE").is_ok_and(|v| !v.is_empty());
     let filtered: Vec<&str> = raw_args.iter()
         .filter(|a| a.as_str() != "--no-fuse")
         .map(String::as_str)
@@ -157,7 +157,8 @@ async fn run_agent(path: PathBuf, no_fuse: bool) -> anyhow::Result<()> {
     // calling exit() while mcp_clients is still in scope.
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
     for server in &cfg.tools.mcp_servers {
-        // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn}] only).
+        // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn},{Net}])
+        // when only spawn/net caps are present with no FS rules.
         // Treat empty rules the same as None: no kernel mechanism is installed, so
         // emitting SandboxApplied would be misleading. filter(non-empty) collapses it.
         let sandbox_rules: Option<Vec<SandboxRule>> = server.capabilities
@@ -326,6 +327,12 @@ async fn run_agent(path: PathBuf, no_fuse: bool) -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     let maybe_session = if no_fuse {
         tracing::info!("FUSE mount skipped (--no-fuse / AGENTOS_NO_FUSE)");
+        recorder.record(
+            "agentd",
+            None,
+            EventKind::FuseSkipped,
+            serde_json::json!({ "mountpoint": fuse_mountpoint.display().to_string() }),
+        );
         None
     } else {
         match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot)) {
