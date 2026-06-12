@@ -334,6 +334,156 @@ fn invalid_toml_exits_nonzero() {
     );
 }
 
+// ── --no-fuse / AGENTOS_NO_FUSE tests ────────────────────────────────────────
+//
+// These tests verify the flag and env-var paths added in p4.4.  On macOS the
+// `let _ = no_fuse` branch fires (the FUSE code is Linux-only), so we can
+// exercise flag parsing and arg-stripping without a FUSE kernel module.
+
+#[test]
+fn no_fuse_flag_accepted_with_config_path() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(
+        dir.path().join("agent.toml"),
+        "[agent]\nid = \"no-fuse-test\"\ntask = \"smoke\"\n",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .args(["--no-fuse", dir.path().join("agent.toml").to_str().unwrap()])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AGENTOS_NO_FUSE")
+        .output()
+        .expect("spawn agentd");
+
+    // Should fail on missing API key, not on an unknown argument.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit (no API key)"
+    );
+    assert!(
+        stderr.contains("ANTHROPIC_API_KEY"),
+        "expected API-key error, got: {stderr}"
+    );
+}
+
+#[test]
+fn no_fuse_flag_stripped_before_config_routing() {
+    // --no-fuse must be stripped so the remaining positional arg is still the
+    // config path, not "--no-fuse".  If stripping fails the binary would try to
+    // open a file called "--no-fuse" and emit a different error.
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .args(["--no-fuse", "/nonexistent/agent.toml"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AGENTOS_NO_FUSE")
+        .output()
+        .expect("spawn agentd");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    // The error must mention the nonexistent path (config load failure),
+    // NOT "ANTHROPIC_API_KEY" (which would mean we somehow passed config stage).
+    assert!(
+        stderr.contains("nonexistent") || stderr.contains("agent.toml"),
+        "expected missing-config error, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--no-fuse"),
+        "--no-fuse must not appear in error output (flag must be stripped): {stderr}"
+    );
+}
+
+#[test]
+fn no_fuse_env_var_accepted() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(
+        dir.path().join("agent.toml"),
+        "[agent]\nid = \"env-no-fuse-test\"\ntask = \"smoke\"\n",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg(dir.path().join("agent.toml"))
+        .env("AGENTOS_NO_FUSE", "1")
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("spawn agentd");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ANTHROPIC_API_KEY"),
+        "expected API-key error (AGENTOS_NO_FUSE accepted), got: {stderr}"
+    );
+}
+
+#[test]
+fn no_fuse_with_probe_routes_correctly() {
+    // --no-fuse must be stripped so --probe is still seen as the first arg.
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .args(["--no-fuse", "--probe"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AGENTOS_NO_FUSE")
+        .output()
+        .expect("spawn agentd");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    // Should fail with "requires a prompt argument", not "unknown argument".
+    assert!(
+        stderr.contains("prompt") || stderr.contains("--probe"),
+        "expected probe-arg error, got: {stderr}"
+    );
+}
+
+#[test]
+fn no_fuse_env_var_with_probe_routes_correctly() {
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg("--probe")
+        .env("AGENTOS_NO_FUSE", "1")
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("spawn agentd");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(
+        stderr.contains("prompt") || stderr.contains("--probe"),
+        "expected probe-arg error, got: {stderr}"
+    );
+}
+
+#[test]
+fn no_fuse_with_default_agent_toml() {
+    // --no-fuse with no config path should fall back to agent.toml in CWD.
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(
+        dir.path().join("agent.toml"),
+        "[agent]\nid = \"no-fuse-default\"\ntask = \"smoke\"\n",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .arg("--no-fuse")
+        .current_dir(dir.path())
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AGENTOS_NO_FUSE")
+        .output()
+        .expect("spawn agentd");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ANTHROPIC_API_KEY"),
+        "expected API-key error (fell back to agent.toml), got: {stderr}"
+    );
+}
+
 // ── sandbox_probe integration tests ──────────────────────────────────────────
 //
 // These tests verify Landlock + seccomp enforcement end-to-end by spawning the
@@ -403,6 +553,60 @@ mod sandbox_probe_tests {
             Some(1),
             "read outside AllowFsRead prefix must be denied (exit 1)"
         );
+    }
+
+    /// Running sandbox_probe with no args exits 2 (usage error).
+    #[tokio::test]
+    async fn no_args_exits_usage_error() {
+        let status = Command::new(probe_bin())
+            .status()
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "no args must exit 2 (usage)");
+    }
+
+    /// --sandbox-read with no prefix argument exits 2.
+    #[tokio::test]
+    async fn sandbox_read_missing_prefix_exits_2() {
+        let status = Command::new(probe_bin())
+            .arg("--sandbox-read")
+            .status()
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "--sandbox-read with no prefix must exit 2");
+    }
+
+    /// --sandbox-read with prefix but no --path exits 2.
+    #[tokio::test]
+    async fn sandbox_read_missing_path_flag_exits_2() {
+        let status = Command::new(probe_bin())
+            .args(["--sandbox-read", "/tmp"])
+            .status()
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "--sandbox-read missing --path must exit 2");
+    }
+
+    /// --sandbox-read with --path but no path argument exits 2.
+    #[tokio::test]
+    async fn sandbox_read_missing_path_arg_exits_2() {
+        let status = Command::new(probe_bin())
+            .args(["--sandbox-read", "/tmp", "--path"])
+            .status()
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "--sandbox-read --path with no arg must exit 2");
+    }
+
+    /// --path with no argument exits 2.
+    #[tokio::test]
+    async fn path_flag_missing_arg_exits_2() {
+        let status = Command::new(probe_bin())
+            .arg("--path")
+            .status()
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(2), "--path with no arg must exit 2");
     }
 
     /// DenySpawn blocks fork(2) inside the sandboxed process (x86_64 only).

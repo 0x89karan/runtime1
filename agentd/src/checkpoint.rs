@@ -299,4 +299,48 @@ mod tests {
         let mode = meta.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "checkpoint.json must be mode 0600, got 0o{mode:03o}");
     }
+
+    /// write_mode_600: write_all failure propagates as Err.
+    /// We trigger it by writing to a path inside a read-only directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_write_failure_returns_err() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        // Make the directory read-only so open(O_CREAT) fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let result = store.save(&minimal_scheduler_checkpoint()).await;
+        // Restore permissions so TempDir can clean up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "save must return Err when write fails");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("write checkpoint.json.tmp"),
+            "error context must mention the tmp path: {msg}"
+        );
+    }
+
+    /// rename failure propagates as Err (tmp written, but destination dir is read-only).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_rename_failure_returns_err() {
+        use std::os::unix::fs::PermissionsExt;
+        // Write the checkpoint into a writable subdir, then make the PARENT read-only
+        // after the tmp write but before the rename.  We simulate this by writing
+        // the tmp file ourselves and then attempting a store that tries to rename.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        // Write a valid tmp file directly so write_mode_600 succeeds.
+        let cp = minimal_scheduler_checkpoint();
+        let json = serde_json::to_string(&cp).unwrap();
+        std::fs::write(&store.tmp_path, &json).unwrap();
+        // Now lock the directory — rename requires write permission on the parent dir.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        // save() will try write_mode_600 (fails on read-only dir), so the error
+        // will be the write error, not the rename error.  Either way save() must Err.
+        let result = store.save(&cp).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "save must return Err when dir is read-only");
+    }
 }

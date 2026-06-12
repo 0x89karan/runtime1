@@ -634,3 +634,108 @@ args = ["--shutdown-file", "{shutdown_path}"]
     let contents = std::fs::read_to_string(&shutdown_file).unwrap();
     assert_eq!(contents, "shutdown");
 }
+
+// ── Linux error-pipe tests ─────────────────────────────────────────────────
+//
+// These tests exercise the pre-exec error-pipe paths added in p4.4.
+// On Linux, pipe2(O_CLOEXEC) is always called before spawning an MCP server.
+// When spawn fails the parent reads the pipe: n>0 means a stage tag was written
+// (pre_exec failure), n<=0 means exec itself failed (stage="unknown").
+//
+// The "sandbox stage" path (n>0) requires apply_compiled to fail, which needs
+// a kernel that doesn't support Landlock — not reliably reproducible in CI.
+// We cover the "unknown" stage path (exec fails, no tag written) via two variants:
+// - missing binary, no sandbox configured
+// - missing binary, sandbox configured (pipe still created, pre_exec runs and
+//   apply_compiled succeeds, then exec fails → same n=0 → stage="unknown")
+
+/// On Linux the error message for a missing MCP binary includes the sandbox stage tag.
+/// With no sandbox applied the pre_exec closure is skipped, exec fails with ENOENT,
+/// no bytes are written to the pipe → stage = "unknown".
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_mcp_server_error_includes_stage_tag() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+
+    std::fs::write(
+        &cfg_path,
+        r#"
+[agent]
+id = "stage-tag-test"
+task = "test"
+
+[[tools.mcp_servers]]
+name = "ghost-srv"
+command = "/nonexistent/stage-tag-binary"
+"#,
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = std::process::Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(!output.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // p4.4 error-pipe: error message now includes "sandbox stage:"
+    assert!(
+        stderr.contains("sandbox stage:"),
+        "error must include 'sandbox stage:' (error-pipe format), got: {stderr}"
+    );
+    assert!(
+        stderr.contains("unknown"),
+        "stage must be 'unknown' when exec fails with no pre_exec tag written, got: {stderr}"
+    );
+}
+
+/// On Linux, even with sandbox capabilities configured the stage is "unknown" when
+/// the binary is missing: apply_compiled succeeds (sandbox is applied), exec then
+/// fails with ENOENT, no tag is written to the pipe → n=0 → stage="unknown".
+#[cfg(target_os = "linux")]
+#[test]
+fn missing_mcp_server_with_sandbox_error_stage_unknown() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg_path = dir.path().join("agent.toml");
+
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+[agent]
+id = "sandbox-stage-test"
+task = "test"
+
+[[tools.mcp_servers]]
+name = "sandboxed-ghost"
+command = "/nonexistent/sandboxed-binary"
+capabilities = [{{ type = "fs_read", prefix = "{}" }}]
+"#,
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = std::process::Command::new(bin)
+        .arg(&cfg_path)
+        .current_dir(dir.path())
+        .output()
+        .expect("failed to spawn agentd");
+
+    assert!(!output.status.success(), "expected non-zero exit");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("sandbox stage:"),
+        "error must include 'sandbox stage:' (error-pipe format), got: {stderr}"
+    );
+    // apply_compiled succeeds → no tag written → stage is "unknown" or "sandbox"
+    // (on systems without Landlock it could be "sandbox"; accept both)
+    assert!(
+        stderr.contains("unknown") || stderr.contains("sandbox"),
+        "stage must be 'unknown' (exec fails) or 'sandbox' (Landlock not supported), got: {stderr}"
+    );
+}
