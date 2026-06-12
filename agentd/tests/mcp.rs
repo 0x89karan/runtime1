@@ -708,7 +708,7 @@ task = "test"
 [[tools.mcp_servers]]
 name = "sandboxed-ghost"
 command = "/nonexistent/sandboxed-binary"
-capabilities = [{{ type = "fs_read", prefix = "{}" }}]
+capabilities = [{{ FsRead = {{ prefix = "{}" }} }}]
 "#,
             dir.path().display()
         ),
