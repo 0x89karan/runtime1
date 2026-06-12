@@ -3,6 +3,54 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.6] - 2026-06-13 (v0.16.0)
+
+### Added
+- **Landlock V4 TCP port enforcement**: New `SandboxRule::AllowNetConnect { port: u16 }` enforces
+  per-port TCP connects via Landlock ABI V4 (Linux kernel ≥ 6.7). `Net { hosts, ports: Vec<u16> }`
+  capability gains a `ports` field (`#[serde(default)]` for backward compat). `caps_to_rules()`
+  maps `Net.ports` to `AllowNetConnect` rules. ABI version is detected at runtime via
+  `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`: V4 (≥ 6.7) enables
+  enforcement; older kernels degrade silently (BestEffort). Hostname enforcement remains advisory
+  (Landlock restricts ports, not hostnames).
+- **`EnforcementStatus.landlock_net`**: New boolean field on `EnforcementStatus` and
+  `SandboxApplied { enforced }` payload. Allows operators to distinguish V4 net enforcement
+  (TCP ports restricted) from V3/degraded (no net enforcement).
+- **`run_probe --log-path` fix**: `run_probe` now threads `log_path: PathBuf` through to
+  `FlightRecorder::new` via `resolve_log_path()`, honouring the CLI flag. Previously it always
+  wrote to `"flight.jsonl"` regardless of `--log-path`.
+
+### Fixed
+- **Landlock FS lockout on net-only configs (CRITICAL)**: When only `AllowNetConnect` rules were
+  present and no FS rules, `build_landlock_ruleset` set `handled_access_fs=ACCESS_FS_HANDLED`
+  with zero path-beneath rules. After `landlock_restrict_self`, ALL filesystem access was denied
+  (EACCES on every open/read/write). Fixed in two places:
+  - `compile()`: ABI version is now queried before the `has_landlock_rules` gate. On V3 kernels
+    with only net rules, `has_landlock_rules=false`, so no ruleset is created at all (correct
+    BestEffort degradation).
+  - `build_landlock_ruleset()`: `handled_access_fs = if path_entries.is_empty() { 0 } else
+    { ACCESS_FS_HANDLED }`. A net-only V4 ruleset correctly declares no FS handling.
+- **`is_noop_deny_spawn` false positive for V4 net enforcement**: Added `&& !enf.landlock_net`
+  check so active V4 port enforcement is not treated as a no-op sandbox.
+- **Port 0 validation in `caps_to_rules()`**: Port 0 is not a valid TCP port (kernel returns
+  EINVAL). `caps_to_rules()` now skips port 0 with `tracing::warn` rather than forwarding it to
+  `AllowNetConnect`.
+- **`PREVIEW_CHARS` constant**: Named constant replacing magic numbers `80` and `200` in
+  `run_probe`; ensures truncation lengths are consistent.
+- **Stale `agentd/Cargo.lock`**: Removed nested `agentd/Cargo.lock` (recorded v0.8.0); the
+  workspace-root `Cargo.lock` is authoritative (v0.16.0).
+
+### Tests
+- 253 tests (up from 244 at p4.5). Coverage additions:
+  - `noop_deny_spawn_false_when_landlock_net_active`: V4 net enforcement → not a noop
+  - `caps_to_rules_net_port_zero_is_skipped`: port 0 filtered before AllowNetConnect
+  - `allow_net_connect_only_no_fs_rules_does_not_lock_out_fs`: net-only compile must succeed
+  - `compile_net_only_has_landlock_rules_iff_v4_available`: BestEffort consistency check
+  - `no_fuse_env_var_falsy_values_do_not_activate`: AGENTOS_NO_FUSE=0/false/no/"" are falsy
+  - `log_path_flag_without_value_exits_nonzero`: --probe --log-path (missing arg) exits non-zero
+  - `allow_net_connect_enforcement_status_reflects_abi` (Linux): fd/flag consistency on V3/V4
+  - `allow_net_connect_with_fs_rule_compiles_together` (Linux): combined FS+net compiles
+
 ## [p4.5] - 2026-06-13 (v0.15.0)
 
 ### Added
