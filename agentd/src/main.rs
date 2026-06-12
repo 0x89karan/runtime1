@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
                 .get(1)
                 .copied()
                 .ok_or_else(|| anyhow::anyhow!("--probe requires a prompt argument"))?;
-            run_probe(prompt).await
+            run_probe(prompt, resolve_log_path(log_path_override, None)).await
         }
         Some(path) => run_agent(PathBuf::from(path), no_fuse, log_path_override).await,
         None => run_agent(PathBuf::from("agent.toml"), no_fuse, log_path_override).await,
@@ -294,6 +294,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                                 "spawn_enforcement": enf.spawn_enforcement,
                                 "namespace_net":     enf.namespace_net,
                                 "namespace_mount":   enf.namespace_mount,
+                                "landlock_net":      enf.landlock_net,
                             },
                         }),
                     );
@@ -551,8 +552,15 @@ fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
             Capability::FsWrite { prefix } => {
                 rules.push(SandboxRule::AllowFsWrite { prefix: prefix.clone() });
             }
-            // Mcp is advisory; Spawn and Net are handled above.
-            Capability::Net { .. } | Capability::Mcp { .. } | Capability::Spawn => {}
+            Capability::Net { ports, .. } => {
+                // Non-empty ports → Landlock V4 TCP port enforcement (BestEffort on < 6.7).
+                // Empty ports → no AllowNetConnect rules; network is unrestricted (backward compat).
+                for &port in ports {
+                    rules.push(SandboxRule::AllowNetConnect { port });
+                }
+            }
+            // Mcp is advisory; Spawn is handled above.
+            Capability::Mcp { .. } | Capability::Spawn => {}
         }
     }
     rules
@@ -596,9 +604,9 @@ mod tests {
 
     #[test]
     fn caps_to_rules_net_cap_permits_network() {
-        // Net present → no IsolateNetwork; Mcp is still advisory.
+        // Net present (empty ports) → no IsolateNetwork; Mcp is still advisory.
         let rules = caps_to_rules(&[
-            Capability::Net { hosts: vec!["example.com".into()] },
+            Capability::Net { hosts: vec!["example.com".into()], ports: vec![] },
             Capability::Mcp { server: "echo".into(), tools: vec![] },
         ]);
         assert!(rules.contains(&SandboxRule::DenySpawn),        "no Spawn cap → DenySpawn");
@@ -618,9 +626,43 @@ mod tests {
 
     #[test]
     fn caps_to_rules_net_and_spawn_both_present_no_isolation_no_deny() {
-        let rules = caps_to_rules(&[Capability::Net { hosts: vec![] }, Capability::Spawn]);
+        let rules = caps_to_rules(&[Capability::Net { hosts: vec![], ports: vec![] }, Capability::Spawn]);
         assert!(!rules.contains(&SandboxRule::DenySpawn),      "Spawn → no DenySpawn");
         assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
+    }
+
+    #[test]
+    fn caps_to_rules_net_with_ports_generates_allow_net_connect() {
+        let rules = caps_to_rules(&[Capability::Net {
+            hosts: vec!["api.anthropic.com".into()],
+            ports: vec![443],
+        }]);
+        assert!(
+            rules.contains(&SandboxRule::AllowNetConnect { port: 443 }),
+            "Net {{ ports: [443] }} → AllowNetConnect {{ port: 443 }}"
+        );
+        assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
+    }
+
+    #[test]
+    fn caps_to_rules_net_multiple_ports_generates_multiple_rules() {
+        let rules = caps_to_rules(&[Capability::Net {
+            hosts: vec![],
+            ports: vec![80, 443],
+        }]);
+        assert!(rules.contains(&SandboxRule::AllowNetConnect { port: 80 }));
+        assert!(rules.contains(&SandboxRule::AllowNetConnect { port: 443 }));
+        assert!(!rules.contains(&SandboxRule::IsolateNetwork));
+    }
+
+    #[test]
+    fn caps_to_rules_net_empty_ports_no_allow_net_connect() {
+        // Backward compat: Net with empty ports must not generate AllowNetConnect.
+        let rules = caps_to_rules(&[Capability::Net { hosts: vec![], ports: vec![] }]);
+        assert!(
+            !rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { .. })),
+            "empty ports → no AllowNetConnect rules"
+        );
     }
 
     // ── G1: parse_log_path ────────────────────────────────────────────────────
@@ -700,6 +742,7 @@ mod tests {
             spawn_enforcement: "none",
             namespace_net: false,
             namespace_mount: false,
+            landlock_net: false,
         };
         assert!(is_noop_deny_spawn(&enf, true),
             "all mechanisms false + rules present → noop DenySpawn");
@@ -713,6 +756,7 @@ mod tests {
             spawn_enforcement: "none",
             namespace_net: false,
             namespace_mount: false,
+            landlock_net: false,
         };
         assert!(!is_noop_deny_spawn(&enf, false),
             "no rules present → not a noop DenySpawn case");
@@ -726,6 +770,7 @@ mod tests {
             spawn_enforcement: "fork_vfork_only",
             namespace_net: false,
             namespace_mount: false,
+            landlock_net: false,
         };
         assert!(!is_noop_deny_spawn(&enf, true),
             "seccomp active → not a noop; real enforcement applied");
@@ -739,6 +784,7 @@ mod tests {
             spawn_enforcement: "none",
             namespace_net: false,
             namespace_mount: false,
+            landlock_net: false,
         };
         assert!(!is_noop_deny_spawn(&enf, true),
             "landlock active → not a noop; real enforcement applied");
@@ -752,6 +798,7 @@ mod tests {
             spawn_enforcement: "none",
             namespace_net: true,
             namespace_mount: false,
+            landlock_net: false,
         };
         assert!(!is_noop_deny_spawn(&enf, true),
             "namespace_net active → not a noop; real enforcement applied");
@@ -765,6 +812,7 @@ mod tests {
             spawn_enforcement: "none",
             namespace_net: false,
             namespace_mount: true,
+            landlock_net: false,
         };
         assert!(!is_noop_deny_spawn(&enf, true),
             "namespace_mount active → not a noop; real enforcement applied");
@@ -791,11 +839,11 @@ mod tests {
     }
 }
 
-async fn run_probe(prompt: &str) -> anyhow::Result<()> {
+async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
     use agentd::inference::{Block, InferenceGateway, InferenceRequest, Msg, Role};
 
     let model = "claude-sonnet-4-6";
-    let recorder = FlightRecorder::open()?;
+    let recorder = FlightRecorder::new(&log_path)?;
 
     let gateway = AnthropicGateway::from_env(model).context("initializing Anthropic gateway")?;
 

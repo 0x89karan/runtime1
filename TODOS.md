@@ -34,13 +34,13 @@
   that don't declare a `Net` capability. `satisfies()` for `Net` remains advisory (no net
   tools exist yet), but the sandbox enforces it independently.
 
-**P3 — Net enforcement via Landlock ABI v4 not yet wired (p3.3 deferred)**
-- `Net { hosts }` capability is advisory at the kernel layer. Landlock ABI V4 (Linux 6.7)
-  adds `LANDLOCK_ACCESS_NET_BIND_TCP` / `LANDLOCK_ACCESS_NET_CONNECT_TCP`, which would
-  enforce per-host connection rules. Our kernel (6.6 LTS) supports V4 but the sandbox
-  crate only uses V1 FS rules.
-- Action: extend `SandboxRule` with `AllowNetConnect { host, port }`, bump to V4, and
-  enforce in `sandbox/src/lib.rs` during Phase 4.
+**~~P3 — Net enforcement via Landlock ABI v4 not yet wired (p3.3 deferred)~~** ✓ Done in p4.6.
+- `AllowNetConnect { port: u16 }` added to `SandboxRule`; `Net { hosts, ports: Vec<u16> }`
+  in `Capability` (`#[serde(default)]` for backward compat). `caps_to_rules()` generates
+  `AllowNetConnect` rules from `Net.ports`. Runtime ABI detection: V4 (kernel ≥ 6.7) activates
+  TCP port enforcement; older kernels degrade silently (BestEffort). Port-only (not host) is
+  enforced at the kernel level — hostname restriction is advisory and remains in `hosts`.
+  `EnforcementStatus.landlock_net` and `SandboxApplied enforced.landlock_net` field added.
 
 **~~P3 — MCP server without `capabilities` runs unsandboxed with warn-only (p3.3)~~** ✓ Done in p4.1.
 - `[tools] mcp_require_capabilities = true` flag added in p4.1. When set, startup fails
@@ -101,11 +101,10 @@
   CLI > TOML > default `"flight.jsonl"`. In the VM `log_path` can be set to
   `/run/output/flight.jsonl` to make the destination explicit.
 
-**P4 — `run_probe` ignores `--log-path` (p4.5 review)**
-- `run_probe` calls `FlightRecorder::open()` which hard-codes `"flight.jsonl"`.
-  The `--log-path` override is wired only in `run_agent`. If the CWD is read-only,
-  `--probe` mode fails with an opaque IO error rather than using the specified path.
-- Action: thread `log_path_override` through to `run_probe` and use `FlightRecorder::new(&log_path)`.
+**~~P4 — `run_probe` ignores `--log-path` (p4.5 review)~~** ✓ Done in p4.6.
+- `run_probe` now accepts `log_path: PathBuf`; call site passes
+  `resolve_log_path(log_path_override, None)`; uses `FlightRecorder::new(&log_path)`.
+  `--probe --log-path /path/to/flight.jsonl` now works correctly.
 
 **~~P2 — Linux-gated code not verifiable on macOS dev machines (p3.1 lesson)~~** ✓ Mitigated in p3.1.
 - `make clippy-linux` target added to workspace Makefile; `CLAUDE.md` quality gate updated.

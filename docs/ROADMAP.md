@@ -441,6 +441,45 @@ Four tracked TODOS items addressed in one increment:
   FUSE mount block respects flag — skips mount with `tracing::info!` instead of attempting it.
 **Acceptance:** ✓
 
+### ✓ p4.5 — TODOS cleanup + hardening polish
+Five tracked TODOS items addressed + one red-team finding fixed:
+- **EventKind extraction**: `EventKind` enum moved from `flight_recorder.rs` to `events.rs`;
+  re-exported from `flight_recorder` so all existing import paths remain valid.
+- **aarch64 DenySpawn no-op**: `is_noop_deny_spawn()` helper detects when all enforcement
+  fields are false; emits `SandboxSkipped { reason: "deny-spawn-unsupported-arch" }` instead
+  of misleading `SandboxApplied` with all-false fields. `has_rules` narrowed at the call
+  site to check for `DenySpawn` specifically.
+- **`--log-path` CLI flag**: `parse_log_path` / `resolve_log_path` / `filter_positional_args`
+  helpers; `run_agent` accepts `log_path_override: Option<PathBuf>`; TOML `log_path` field
+  also supported. Precedence: CLI > TOML > default `"flight.jsonl"`.
+- **Buildroot ccache**: `BR2_CCACHE=y` + `BR2_CCACHE_DIR=$(HOME)/.buildroot-ccache`; subsequent
+  clean builds use host cache (~2 min vs ~30 min).
+- **TODOS.md housekeeping**: stale items cross-off pass; P4 item added for `run_probe`.
+- **Red-team LOW — `--log-path` silent swallow**: `anyhow::bail!` when flag present but no
+  value follows.
+244 tests pass. **Acceptance:** ✓
+
+### ✓ p4.6 — Landlock V4 TCP port enforcement + run_probe --log-path fix
+Two items:
+- **run_probe --log-path**: `run_probe` signature updated to accept `log_path: PathBuf`;
+  `resolve_log_path(log_path_override, None)` passed from `main()`; uses `FlightRecorder::new`
+  instead of the hard-coded `FlightRecorder::open`. `--probe --log-path /tmp/out.jsonl` now works.
+- **Landlock V4 net enforcement**:
+  - `AllowNetConnect { port: u16 }` added to `SandboxRule` — port-only (Landlock V4 enforces
+    TCP ports, not hostnames). `Net { hosts, ports: Vec<u16> }` in `Capability` — `ports` field
+    with `#[serde(default)]` (existing configs without `ports` are backward-compatible).
+  - `LandlockRulesetAttrV4 { handled_access_fs, handled_access_net }` and
+    `LandlockNetPortAttr { allowed_access, port }` structs; `LANDLOCK_RULE_NET_PORT = 3`;
+    `LANDLOCK_ACCESS_NET_CONNECT_TCP = 1 << 1`.
+  - Runtime ABI detection: `query_landlock_abi_version()` calls
+    `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION=1)`.
+    V4 (kernel ≥ 6.7) → 16-byte V4 struct + net rules; V3/V1 → 8-byte V1 struct, net rules
+    silently skipped (BestEffort degradation). FS rules unaffected.
+  - `EnforcementStatus.landlock_net: bool`; `SandboxApplied` event payload gains
+    `enforced.landlock_net`. `caps_to_rules()` generates `AllowNetConnect` rules from
+    `Net.ports` (empty ports = no restriction, backward compat).
+249 tests pass. **Acceptance:** ✓
+
 ---
 
 ## Beyond

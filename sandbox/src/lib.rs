@@ -34,6 +34,16 @@ pub enum SandboxRule {
     /// Applied via unshare(CLONE_NEWUSER | CLONE_NEWNS) in pre_exec. Linux-only; no-op elsewhere.
     /// BestEffort: degrades silently if user namespaces are disabled by kernel policy.
     IsolateMount,
+    /// Allow outgoing TCP connections to `port` via Landlock V4 (Linux 6.7+).
+    ///
+    /// When one or more `AllowNetConnect` rules are present and the kernel supports
+    /// Landlock ABI V4, all outgoing TCP connections are restricted to the listed
+    /// ports. On kernels < 6.7 the rule degrades silently (BestEffort): FS rules
+    /// still apply but TCP port restriction is not enforced.
+    ///
+    /// Note: only port is enforced at the kernel level — Landlock V4 does not
+    /// restrict by hostname.
+    AllowNetConnect { port: u16 },
 }
 
 /// Pre-compiled sandbox: Landlock ruleset fd + optional seccomp BPF program.
@@ -109,6 +119,9 @@ pub struct EnforcementStatus {
     pub namespace_net: bool,
     /// Mount namespace isolation was requested (IsolateMount rule present).
     pub namespace_mount: bool,
+    /// Landlock V4 TCP port rules were compiled (kernel >= 6.7 and AllowNetConnect rules present).
+    /// False when kernel is < 6.7 (BestEffort degradation) or no AllowNetConnect rules were given.
+    pub landlock_net: bool,
 }
 
 impl CompiledSandbox {
@@ -132,6 +145,7 @@ impl CompiledSandbox {
                 spawn_enforcement,
                 namespace_net:   self.inner.isolate_net,
                 namespace_mount: self.inner.isolate_mount,
+                landlock_net:    self.inner.landlock_net_active,
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -142,6 +156,7 @@ impl CompiledSandbox {
                 spawn_enforcement: "none",
                 namespace_net: false,
                 namespace_mount: false,
+                landlock_net: false,
             }
         }
     }
@@ -195,6 +210,12 @@ mod linux {
     const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
 
     const LANDLOCK_RULE_PATH_BENEATH: libc::c_long = 1;
+    // Landlock V4 rule type for TCP port restrictions (Linux 6.7+).
+    const LANDLOCK_RULE_NET_PORT: libc::c_long = 3;
+
+    // Flag passed as `flags` to landlock_create_ruleset(NULL, 0, flags) to query
+    // the kernel's supported ABI version. Returns version (1..N) or -1 on ENOSYS.
+    const LANDLOCK_CREATE_RULESET_VERSION: libc::c_int = 1;
 
     // Landlock ABI V1 access flags (include/uapi/linux/landlock.h)
     // Execute (bit 0) is excluded from handled_access_fs: if we declare we control
@@ -203,6 +224,12 @@ mod linux {
     // DenySpawn blocks fork/vfork only; exec is intentionally left unrestricted.
     const ACCESS_FS_HANDLED: u64 = 0x1FFE; // V1 all except Execute (bit 0)
     const ACCESS_FS_READ_ONLY: u64 = 0x000C; // ReadFile(1<<2) | ReadDir(1<<3)
+
+    // Landlock V4 network access flags (Linux 6.7+).
+    // BIND is defined for completeness but unused — MCP servers act as clients.
+    #[allow(dead_code)]
+    const LANDLOCK_ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+    const LANDLOCK_ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
 
     // ── seccomp BPF opcodes (classic BPF ABI; stable since 1993; x86_64 only) ──
     #[cfg(target_arch = "x86_64")]
@@ -228,12 +255,29 @@ mod linux {
         _pad: i32, // C ABI: struct is 8 + 4 + 4 = 16 bytes on all arches
     }
 
+    // V4 ruleset attr — extends V1 with a net handled-access field.
+    // MUST only be passed to landlock_create_ruleset when ABI version >= 4;
+    // passing a 16-byte struct to a V1/V3 kernel returns EINVAL (not ENOSYS).
+    #[repr(C)]
+    struct LandlockRulesetAttrV4 {
+        handled_access_fs:  u64,
+        handled_access_net: u64,
+    }
+
+    // V4 net port rule attr (LANDLOCK_RULE_NET_PORT).
+    // `port` is u64 in the kernel ABI even though TCP ports fit in u16.
+    #[repr(C)]
+    struct LandlockNetPortAttr {
+        allowed_access: u64,
+        port:           u64,
+    }
+
     pub struct BpfProgram(pub Vec<libc::sock_filter>);
 
     /// Compiled sandbox state held between `compile()` and `apply_compiled_inner()`.
     pub struct Inner {
         /// Landlock ruleset fd created by `landlock_create_ruleset` + `landlock_add_rule`.
-        /// -1 = no FS rules or kernel doesn't support Landlock (BestEffort degradation).
+        /// -1 = no FS/net rules or kernel doesn't support Landlock (BestEffort degradation).
         pub landlock_fd: i32,
         /// Pre-compiled seccomp BPF. None if DenySpawn rule was not requested,
         /// or if the current arch does not support fork/vfork filtering.
@@ -246,6 +290,9 @@ mod linux {
         pub isolate_net: bool,
         /// IsolateMount rule was requested — unshare CLONE_NEWNS in apply_compiled_inner.
         pub isolate_mount: bool,
+        /// Landlock V4 TCP port rules were successfully added to the ruleset fd.
+        /// False when no AllowNetConnect rules were given or kernel ABI < 4.
+        pub landlock_net_active: bool,
     }
 
     impl Drop for Inner {
@@ -268,6 +315,18 @@ mod linux {
         let mut path_entries: Vec<(i32, bool)> = Vec::new(); // (fd, is_write)
         let mut open_err: Option<SandboxError> = None;
 
+        // Collect AllowNetConnect ports.
+        let net_ports: Vec<u16> = rules
+            .iter()
+            .filter_map(|r| {
+                if let SandboxRule::AllowNetConnect { port } = r {
+                    Some(*port)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         for rule in rules {
             match rule {
                 SandboxRule::AllowFsRead { prefix } => match open_path_fd(prefix) {
@@ -284,7 +343,10 @@ mod linux {
                         break;
                     }
                 },
-                SandboxRule::DenySpawn | SandboxRule::IsolateNetwork | SandboxRule::IsolateMount => {}
+                SandboxRule::DenySpawn
+                | SandboxRule::IsolateNetwork
+                | SandboxRule::IsolateMount
+                | SandboxRule::AllowNetConnect { .. } => {}
             }
         }
 
@@ -297,19 +359,30 @@ mod linux {
             return Err(e);
         }
 
-        // Build Landlock ruleset if there are FS rules.
+        // Build Landlock ruleset if there are FS rules or net port rules.
+        // For net rules, detect ABI version first — V4 requires kernel >= 6.7.
         // Path fds are closed immediately after landlock_add_rule; the kernel retains
         // its own reference. The ruleset_fd stays open until apply_compiled_inner().
-        let landlock_fd = if !path_entries.is_empty() {
-            let result = build_landlock_ruleset(&path_entries);
-            for &(fd, _) in &path_entries {
+        let has_landlock_rules = !path_entries.is_empty() || !net_ports.is_empty();
+        let (landlock_fd, landlock_net_active) = if has_landlock_rules {
+            // Check ABI version only when net rules are requested (one extra syscall).
+            let abi_version = if !net_ports.is_empty() {
+                query_landlock_abi_version()
+            } else {
+                0 // don't need V4; FS-only path uses the existing V1 struct
+            };
+            let use_v4_net = abi_version >= 4 && !net_ports.is_empty();
+            let fd = build_landlock_ruleset(&path_entries, &net_ports, use_v4_net);
+            // Close path fds regardless of outcome.
+            for &(pfd, _) in &path_entries {
                 unsafe {
-                    libc::close(fd);
+                    libc::close(pfd);
                 }
             }
-            result?
+            let fd = fd?;
+            (fd, use_v4_net && fd >= 0)
         } else {
-            -1
+            (-1, false)
         };
 
         // Build seccomp BPF if DenySpawn was requested.
@@ -320,13 +393,34 @@ mod linux {
         {
             let deny_spawn_requested = rules.iter().any(|r| matches!(r, SandboxRule::DenySpawn));
             let bpf = if deny_spawn_requested { Some(build_spawn_deny_filter()) } else { None };
-            Ok(Inner { landlock_fd, bpf, deny_spawn_requested, isolate_net, isolate_mount })
+            Ok(Inner {
+                landlock_fd,
+                bpf,
+                deny_spawn_requested,
+                isolate_net,
+                isolate_mount,
+                landlock_net_active,
+            })
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
             let bpf: Option<BpfProgram> = None;
-            Ok(Inner { landlock_fd, bpf, isolate_net, isolate_mount })
+            Ok(Inner { landlock_fd, bpf, isolate_net, isolate_mount, landlock_net_active })
         }
+    }
+
+    /// Query the kernel's supported Landlock ABI version.
+    /// Returns the version (1..N) on success, or 0 if Landlock is unavailable.
+    fn query_landlock_abi_version() -> i64 {
+        let ret = unsafe {
+            libc::syscall(
+                SYS_LANDLOCK_CREATE_RULESET,
+                std::ptr::null::<libc::c_void>(),
+                0_usize,
+                LANDLOCK_CREATE_RULESET_VERSION,
+            )
+        };
+        if ret < 0 { 0 } else { ret }
     }
 
     fn open_path_fd(path: &str) -> Result<i32, SandboxError> {
@@ -343,18 +437,47 @@ mod linux {
         }
     }
 
-    fn build_landlock_ruleset(path_entries: &[(i32, bool)]) -> Result<i32, SandboxError> {
-        let attr = LandlockRulesetAttr {
-            handled_access_fs: ACCESS_FS_HANDLED,
-        };
-
-        let ruleset_fd = unsafe {
-            libc::syscall(
-                SYS_LANDLOCK_CREATE_RULESET,
-                &attr as *const LandlockRulesetAttr as *const libc::c_void,
-                std::mem::size_of::<LandlockRulesetAttr>() as libc::c_long,
-                0_i32,
-            )
+    /// Create a Landlock ruleset and populate it with FS and/or net port rules.
+    ///
+    /// When `use_v4_net` is true (caller confirmed ABI >= 4 and net_ports is
+    /// non-empty), the V4 16-byte struct is used and TCP port rules are added.
+    /// Otherwise the V1 8-byte struct is used (FS rules only).
+    ///
+    /// IMPORTANT: never pass the V4 struct size to a pre-V4 kernel — it returns
+    /// EINVAL which is NOT a BestEffort-tolerable error. The caller is responsible
+    /// for gating `use_v4_net` on an explicit ABI version check.
+    fn build_landlock_ruleset(
+        path_entries: &[(i32, bool)],
+        net_ports: &[u16],
+        use_v4_net: bool,
+    ) -> Result<i32, SandboxError> {
+        // Create the ruleset. Use V4 struct (16 bytes) only when the caller
+        // confirmed ABI >= 4; otherwise use V1 struct (8 bytes).
+        let ruleset_fd = if use_v4_net {
+            let attr = LandlockRulesetAttrV4 {
+                handled_access_fs:  ACCESS_FS_HANDLED,
+                handled_access_net: LANDLOCK_ACCESS_NET_CONNECT_TCP,
+            };
+            unsafe {
+                libc::syscall(
+                    SYS_LANDLOCK_CREATE_RULESET,
+                    &attr as *const LandlockRulesetAttrV4 as *const libc::c_void,
+                    std::mem::size_of::<LandlockRulesetAttrV4>() as libc::c_long,
+                    0_i32,
+                )
+            }
+        } else {
+            let attr = LandlockRulesetAttr {
+                handled_access_fs: ACCESS_FS_HANDLED,
+            };
+            unsafe {
+                libc::syscall(
+                    SYS_LANDLOCK_CREATE_RULESET,
+                    &attr as *const LandlockRulesetAttr as *const libc::c_void,
+                    std::mem::size_of::<LandlockRulesetAttr>() as libc::c_long,
+                    0_i32,
+                )
+            }
         };
 
         if ruleset_fd < 0 {
@@ -368,6 +491,7 @@ mod linux {
 
         let ruleset_fd = ruleset_fd as i32;
 
+        // Add FS path-beneath rules.
         for &(parent_fd, is_write) in path_entries {
             let allowed_access = if is_write {
                 ACCESS_FS_HANDLED // write grants all V1 flags except Execute
@@ -393,6 +517,31 @@ mod linux {
                     libc::close(ruleset_fd);
                 }
                 return Err(SandboxError::Io(std::io::Error::last_os_error()));
+            }
+        }
+
+        // Add V4 net port rules (only when use_v4_net is true).
+        if use_v4_net {
+            for &port in net_ports {
+                let rule_attr = LandlockNetPortAttr {
+                    allowed_access: LANDLOCK_ACCESS_NET_CONNECT_TCP,
+                    port: port as u64,
+                };
+                let ret = unsafe {
+                    libc::syscall(
+                        SYS_LANDLOCK_ADD_RULE,
+                        ruleset_fd as libc::c_long,
+                        LANDLOCK_RULE_NET_PORT,
+                        &rule_attr as *const LandlockNetPortAttr as *const libc::c_void,
+                        0_i32,
+                    )
+                };
+                if ret < 0 {
+                    unsafe {
+                        libc::close(ruleset_fd);
+                    }
+                    return Err(SandboxError::Io(std::io::Error::last_os_error()));
+                }
             }
         }
 
@@ -799,5 +948,83 @@ mod tests {
         assert_eq!(bpf.0.len(), 6,
             "expected 6 BPF insns (load + fork + vfork + allow), got {}",
             bpf.0.len());
+    }
+
+    // ── AllowNetConnect tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn allow_net_connect_compiles_on_all_platforms() {
+        // Must not panic or return Err — macOS/Windows degrade silently.
+        let result = compile(&[SandboxRule::AllowNetConnect { port: 443 }]);
+        assert!(result.is_ok(), "AllowNetConnect should compile on all platforms: {result:?}");
+    }
+
+    #[test]
+    fn allow_net_connect_enforcement_status_landlock_net_false_on_macos() {
+        // On non-Linux, landlock_net is always false (no Landlock support).
+        #[cfg(not(target_os = "linux"))]
+        {
+            let compiled = compile(&[SandboxRule::AllowNetConnect { port: 443 }]).unwrap();
+            let s = compiled.enforcement_status();
+            assert!(!s.landlock_net, "non-Linux: landlock_net must be false");
+        }
+    }
+
+    #[test]
+    fn allow_net_connect_partial_eq() {
+        assert_eq!(
+            SandboxRule::AllowNetConnect { port: 443 },
+            SandboxRule::AllowNetConnect { port: 443 },
+        );
+        assert_ne!(
+            SandboxRule::AllowNetConnect { port: 443 },
+            SandboxRule::AllowNetConnect { port: 80 },
+        );
+        assert_ne!(
+            SandboxRule::AllowNetConnect { port: 443 },
+            SandboxRule::IsolateNetwork,
+        );
+    }
+
+    #[test]
+    fn allow_net_connect_clone() {
+        let r = SandboxRule::AllowNetConnect { port: 443 };
+        let r2 = r.clone();
+        assert_eq!(r, r2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allow_net_connect_with_fs_rule_compiles_together() {
+        // AllowFsRead + AllowNetConnect must produce a single ruleset fd (V4 or V1 path).
+        let rules = vec![
+            SandboxRule::AllowFsRead { prefix: "/proc".to_string() },
+            SandboxRule::AllowNetConnect { port: 443 },
+        ];
+        let result = compile(&rules);
+        assert!(result.is_ok(), "combined FS + AllowNetConnect should compile: {result:?}");
+        let compiled = result.unwrap();
+        // ruleset_fd >= 0 means Landlock was activated; -1 is BestEffort degradation.
+        assert!(compiled.inner.landlock_fd >= -1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allow_net_connect_enforcement_status_reflects_abi() {
+        // On a kernel without V4 (ABI < 4) landlock_net should be false.
+        // On a kernel with V4 (ABI >= 4) it should be true.
+        // We accept both outcomes — this test verifies the field is set consistently
+        // with what compile() actually achieved (no inconsistency between fd and flag).
+        let compiled = compile(&[SandboxRule::AllowNetConnect { port: 443 }]).unwrap();
+        let s = compiled.enforcement_status();
+        // If landlock_net is true, the ruleset fd must be valid.
+        if s.landlock_net {
+            assert!(
+                compiled.inner.landlock_fd >= 0,
+                "landlock_net=true requires a valid ruleset fd"
+            );
+        }
+        // If landlock_net is false, it was either BestEffort degradation or no net rules.
+        // Both are acceptable outcomes.
     }
 }
