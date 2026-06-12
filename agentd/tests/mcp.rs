@@ -638,23 +638,19 @@ args = ["--shutdown-file", "{shutdown_path}"]
 // ── Linux error-pipe tests ─────────────────────────────────────────────────
 //
 // These tests exercise the pre-exec error-pipe paths added in p4.4.
-// On Linux, pipe2(O_CLOEXEC) is always called before spawning an MCP server.
-// When spawn fails the parent reads the pipe: n>0 means a stage tag was written
-// (pre_exec failure), n<=0 means exec itself failed (stage="unknown").
+// pipe2(O_CLOEXEC) is only created when sandbox=Some (capabilities configured).
+// When sandbox=None the spawn path is plain: error message has no stage suffix.
+// When sandbox=Some and exec fails: no tag is written → stage="unknown".
+// When sandbox=Some and apply_compiled fails: "sandbox" tag written → stage="sandbox".
 //
-// The "sandbox stage" path (n>0) requires apply_compiled to fail, which needs
-// a kernel that doesn't support Landlock — not reliably reproducible in CI.
-// We cover the "unknown" stage path (exec fails, no tag written) via two variants:
-// - missing binary, no sandbox configured
-// - missing binary, sandbox configured (pipe still created, pre_exec runs and
-//   apply_compiled succeeds, then exec fails → same n=0 → stage="unknown")
+// The "sandbox" stage path requires apply_compiled to fail (unsupported kernel) —
+// not reliably reproducible in CI; accepted as untestable in portable tests.
 
-/// On Linux the error message for a missing MCP binary includes the sandbox stage tag.
-/// With no sandbox applied the pre_exec closure is skipped, exec fails with ENOENT,
-/// no bytes are written to the pipe → stage = "unknown".
+/// On Linux, a missing MCP binary with no sandbox configured produces a clean error
+/// message without a "sandbox stage:" suffix (sandbox=None takes the plain spawn path).
 #[cfg(target_os = "linux")]
 #[test]
-fn missing_mcp_server_error_includes_stage_tag() {
+fn missing_mcp_server_error_no_sandbox_clean_format() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg_path = dir.path().join("agent.toml");
 
@@ -681,14 +677,14 @@ command = "/nonexistent/stage-tag-binary"
 
     assert!(!output.status.success(), "expected non-zero exit");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // p4.4 error-pipe: error message now includes "sandbox stage:"
+    // No sandbox → plain error format, no stage suffix.
     assert!(
-        stderr.contains("sandbox stage:"),
-        "error must include 'sandbox stage:' (error-pipe format), got: {stderr}"
+        stderr.contains("stage-tag-binary") || stderr.contains("ghost-srv"),
+        "error must mention the binary or server name, got: {stderr}"
     );
     assert!(
-        stderr.contains("unknown"),
-        "stage must be 'unknown' when exec fails with no pre_exec tag written, got: {stderr}"
+        !stderr.contains("sandbox stage:"),
+        "unsandboxed server must NOT include 'sandbox stage:' in error, got: {stderr}"
     );
 }
 

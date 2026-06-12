@@ -27,7 +27,8 @@ async fn main() -> anyhow::Result<()> {
     // --no-fuse: skip FUSE mount unconditionally (useful in CI and dev environments
     // without the FUSE kernel module). AGENTOS_NO_FUSE env var has the same effect.
     let no_fuse = raw_args.iter().any(|a| a == "--no-fuse")
-        || std::env::var("AGENTOS_NO_FUSE").is_ok_and(|v| !v.is_empty());
+        || std::env::var("AGENTOS_NO_FUSE")
+            .is_ok_and(|v| !matches!(v.to_lowercase().as_str(), "" | "0" | "false" | "no"));
     let filtered: Vec<&str> = raw_args.iter()
         .filter(|a| a.as_str() != "--no-fuse")
         .map(String::as_str)
