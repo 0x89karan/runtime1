@@ -68,10 +68,10 @@ fn main() {
     }
 
     // --sandbox-deny-spawn
-    // Apply DenySpawn to self, then call libc::fork() directly to trigger the
-    // seccomp filter. On x86_64, fork(57) IS in the filter; SIGSYS kills the
-    // process before fork() returns. Uses libc::fork(), not Command::new(), so
-    // we exercise the actual blocked syscall (not clone3 which bypasses the filter).
+    // Apply DenySpawn to self, then invoke the raw fork() syscall (57) via
+    // libc::syscall(SYS_fork) to trigger the seccomp filter.  Must use the raw
+    // syscall — both libc::fork() and Command::new() use clone() in modern glibc,
+    // bypassing the fork/vfork filter (same class as BP-1 documented in THREAT_MODEL).
     if args.contains(&"--sandbox-deny-spawn".to_string()) {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -80,10 +80,12 @@ fn main() {
                 eprintln!("sandbox-probe: apply_sandbox: {e}");
                 process::exit(2);
             }
-            // fork() directly — seccomp kills via SIGSYS if DenySpawn is working.
-            // If we reach the line after fork(), the filter did NOT block it.
-            let _pid = unsafe { libc::fork() };
-            // Reaching here: fork was not blocked by seccomp.
+            // Use the raw fork() SYSCALL directly (not libc::fork() which uses
+            // clone() in modern glibc, bypassing the BPF filter).
+            // libc::syscall(SYS_fork=57) exercises exactly the syscall our filter
+            // blocks.  SECCOMP_RET_KILL_PROCESS kills via SIGSYS before returning.
+            let _ret = unsafe { libc::syscall(libc::SYS_fork) };
+            // Reaching here means syscall 57 was NOT killed.
             process::exit(0);
         }
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
