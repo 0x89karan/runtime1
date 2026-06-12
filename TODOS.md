@@ -101,6 +101,12 @@
   CLI > TOML > default `"flight.jsonl"`. In the VM `log_path` can be set to
   `/run/output/flight.jsonl` to make the destination explicit.
 
+**P4 — `run_probe` ignores `--log-path` (p4.5 review)**
+- `run_probe` calls `FlightRecorder::open()` which hard-codes `"flight.jsonl"`.
+  The `--log-path` override is wired only in `run_agent`. If the CWD is read-only,
+  `--probe` mode fails with an opaque IO error rather than using the specified path.
+- Action: thread `log_path_override` through to `run_probe` and use `FlightRecorder::new(&log_path)`.
+
 **~~P2 — Linux-gated code not verifiable on macOS dev machines (p3.1 lesson)~~** ✓ Mitigated in p3.1.
 - `make clippy-linux` target added to workspace Makefile; `CLAUDE.md` quality gate updated.
   Required before pushing any branch touching `#[cfg(target_os = "linux")]` code.

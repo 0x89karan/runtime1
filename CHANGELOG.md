@@ -3,6 +3,38 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.5] - 2026-06-13 (v0.15.0)
+
+### Added
+- **`--log-path <file>` CLI flag and `log_path` TOML field**: Override the flight
+  recorder destination. Precedence: CLI `--log-path` > TOML `log_path` > default
+  `"flight.jsonl"`. `--log-path` missing its value argument now fails with a clear
+  error instead of silently falling back. `run_agent` helper `resolve_log_path`
+  encapsulates the precedence chain.
+- **aarch64 DenySpawn noop detection**: On non-x86_64 targets where seccomp is not
+  compiled, a sandbox with only `DenySpawn` produces no kernel mechanism. The runtime
+  now detects this and emits `SandboxSkipped { reason: "deny-spawn-unsupported-arch" }`
+  instead of a misleading `SandboxApplied` with all-false fields. Detection is gated
+  on `DenySpawn` specifically in the rule set (not `!is_empty()`) to avoid false
+  positives when FS rules were also present but Landlock is unavailable.
+- **`EventKind` extracted to `events.rs`**: The `EventKind` enum moved from
+  `flight_recorder.rs` into its own `events.rs` module and is re-exported from
+  `flight_recorder` for backward compat. Makes the event taxonomy a first-class module.
+- **`BR2_CCACHE`**: Buildroot ccache enabled in `distro/buildroot.config`. Subsequent
+  clean builds use the host cache (~2 min vs ~30 min).
+
+### Fixed
+- `is_noop_deny_spawn` call site now checks specifically for `SandboxRule::DenySpawn`
+  in the rule set rather than `!is_empty()`, preventing a misleading
+  `"deny-spawn-unsupported-arch"` diagnostic when FS or network rules were present.
+
+### Tests
+- 244 tests (up from 225 at p4.4). Coverage additions:
+  - `parse_log_path`: 4 cases including trailing-flag-no-value (documents silent-None contract)
+  - `filter_positional_args`: 4 cases including both flags together
+  - `resolve_log_path`: 3 precedence-chain cases
+  - `is_noop_deny_spawn`: 6 cases covering all 4 enforcement fields + has_rules variants
+
 ## [p4.4] - 2026-06-13 (v0.14.0)
 
 ### Added
