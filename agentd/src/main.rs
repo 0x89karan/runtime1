@@ -31,21 +31,11 @@ async fn main() -> anyhow::Result<()> {
             .is_ok_and(|v| !matches!(v.to_lowercase().as_str(), "" | "0" | "false" | "no"));
 
     // --log-path <path>: override the flight log destination (default: flight.jsonl in CWD).
-    let log_path_override: Option<PathBuf> = raw_args
-        .windows(2)
-        .find(|w| w[0] == "--log-path")
-        .map(|w| PathBuf::from(&w[1]));
+    let log_path_override = parse_log_path(&raw_args);
 
     // Strip recognised flags (and their value arguments) from the positional args.
-    let mut skip_next = false;
-    let filtered: Vec<&str> = raw_args.iter()
-        .filter_map(|a| {
-            if skip_next { skip_next = false; return None; }
-            if a == "--no-fuse" { return None; }
-            if a == "--log-path" { skip_next = true; return None; }
-            Some(a.as_str())
-        })
-        .collect();
+    let filtered_strings = filter_positional_args(&raw_args);
+    let filtered: Vec<&str> = filtered_strings.iter().map(|s| s.as_str()).collect();
 
     let result = match filtered.first().copied() {
         Some("--probe") => {
@@ -74,9 +64,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         toml::from_str(&raw).with_context(|| format!("parsing config from {path:?}"))?;
 
     // Resolve flight log path: CLI flag > TOML field > default "flight.jsonl".
-    let log_path = log_path_override
-        .or_else(|| cfg.log_path.as_deref().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("flight.jsonl"));
+    let log_path = resolve_log_path(log_path_override, cfg.log_path.as_deref());
     let recorder = Arc::new(FlightRecorder::new(&log_path)?);
 
     let mut agent_cfgs = cfg.agent_configs()?;
@@ -273,12 +261,10 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                 // If DenySpawn was the only effective rule, the compiled sandbox is a
                 // complete no-op — emitting SandboxApplied with all-false fields would
                 // mislead operators. Emit SandboxSkipped instead.
-                let noop_deny_spawn = !enf.landlock
-                    && !enf.seccomp
-                    && !enf.namespace_net
-                    && !enf.namespace_mount
-                    && enf.spawn_enforcement == "none"
-                    && sandbox_rules.as_deref().is_some_and(|r| !r.is_empty());
+                let noop_deny_spawn = is_noop_deny_spawn(
+                    enf,
+                    sandbox_rules.as_deref().is_some_and(|r| !r.is_empty()),
+                );
                 if noop_deny_spawn {
                     recorder.record(
                         "agentd",
@@ -491,6 +477,51 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     Ok(())
 }
 
+/// Extract the value of `--log-path <path>` from raw CLI args, if present.
+fn parse_log_path(args: &[String]) -> Option<PathBuf> {
+    args.windows(2)
+        .find(|w| w[0] == "--log-path")
+        .map(|w| PathBuf::from(&w[1]))
+}
+
+/// Strip recognised flag/value pairs from args and return the positional remainder.
+/// Flags consumed: `--no-fuse` (bare), `--log-path <value>` (consumes two tokens).
+fn filter_positional_args(args: &[String]) -> Vec<String> {
+    let mut skip_next = false;
+    args.iter()
+        .filter_map(|a| {
+            if skip_next { skip_next = false; return None; }
+            if a == "--no-fuse" { return None; }
+            if a == "--log-path" { skip_next = true; return None; }
+            Some(a.clone())
+        })
+        .collect()
+}
+
+/// Resolve the flight log path: CLI override > TOML `log_path` field > default.
+fn resolve_log_path(cli_override: Option<PathBuf>, toml_path: Option<&str>) -> PathBuf {
+    cli_override
+        .or_else(|| toml_path.map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("flight.jsonl"))
+}
+
+/// Return true when a compiled sandbox is a complete no-op because the only
+/// requested rule was `DenySpawn` on a non-x86_64 arch (seccomp is x86_64-only,
+/// so nothing was actually installed). Emitting `SandboxApplied` with all-false
+/// fields in that case would mislead operators; callers should emit `SandboxSkipped`.
+///
+/// `has_rules` should be `true` when the original `sandbox_rules` slice was
+/// non-empty (i.e. DenySpawn was requested but produced no kernel mechanism).
+#[cfg(any(test, target_os = "linux"))]
+fn is_noop_deny_spawn(enf: &sandbox::EnforcementStatus, has_rules: bool) -> bool {
+    !enf.landlock
+        && !enf.seccomp
+        && !enf.namespace_net
+        && !enf.namespace_mount
+        && enf.spawn_enforcement == "none"
+        && has_rules
+}
+
 /// Convert an agent capability set into sandbox rules for an MCP server subprocess.
 ///
 /// Landlock FS rules map 1:1 from FsRead/FsWrite capabilities. DenySpawn is
@@ -585,6 +616,127 @@ mod tests {
         let rules = caps_to_rules(&[Capability::Net { hosts: vec![] }, Capability::Spawn]);
         assert!(!rules.contains(&SandboxRule::DenySpawn),      "Spawn → no DenySpawn");
         assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
+    }
+
+    // ── G1: parse_log_path ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_log_path_returns_value_when_flag_present() {
+        let args: Vec<String> = ["--log-path", "/tmp/run.jsonl"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_log_path(&args), Some(PathBuf::from("/tmp/run.jsonl")));
+    }
+
+    #[test]
+    fn parse_log_path_returns_none_when_flag_absent() {
+        let args: Vec<String> = ["agent.toml"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_log_path(&args), None);
+    }
+
+    #[test]
+    fn parse_log_path_returns_none_for_empty_args() {
+        assert_eq!(parse_log_path(&[]), None);
+    }
+
+    // ── G2: filter_positional_args ────────────────────────────────────────────
+
+    #[test]
+    fn filter_positional_args_strips_log_path_and_its_value() {
+        let args: Vec<String> = ["--log-path", "/tmp/x.jsonl", "agent.toml"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    #[test]
+    fn filter_positional_args_strips_no_fuse() {
+        let args: Vec<String> = ["--no-fuse", "agent.toml"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    #[test]
+    fn filter_positional_args_preserves_positional_when_no_flags() {
+        let args: Vec<String> = ["agent.toml"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    // ── G3: resolve_log_path precedence chain ─────────────────────────────────
+
+    #[test]
+    fn resolve_log_path_cli_overrides_toml() {
+        let result = resolve_log_path(
+            Some(PathBuf::from("/cli/path.jsonl")),
+            Some("/toml/path.jsonl"),
+        );
+        assert_eq!(result, PathBuf::from("/cli/path.jsonl"));
+    }
+
+    #[test]
+    fn resolve_log_path_toml_used_when_no_cli_override() {
+        let result = resolve_log_path(None, Some("/toml/path.jsonl"));
+        assert_eq!(result, PathBuf::from("/toml/path.jsonl"));
+    }
+
+    #[test]
+    fn resolve_log_path_default_when_neither_set() {
+        let result = resolve_log_path(None, None);
+        assert_eq!(result, PathBuf::from("flight.jsonl"));
+    }
+
+    // ── G4: is_noop_deny_spawn ────────────────────────────────────────────────
+    // EnforcementStatus has all pub fields and is available on all platforms,
+    // so these tests run on macOS and Linux alike.
+
+    #[test]
+    fn noop_deny_spawn_true_when_all_false_and_has_rules() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+        };
+        assert!(is_noop_deny_spawn(&enf, true),
+            "all mechanisms false + rules present → noop DenySpawn");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_has_rules_is_false() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, false),
+            "no rules present → not a noop DenySpawn case");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_seccomp_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: true,
+            spawn_enforcement: "fork_vfork_only",
+            namespace_net: false,
+            namespace_mount: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "seccomp active → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_landlock_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: true,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "landlock active → not a noop; real enforcement applied");
     }
 }
 
