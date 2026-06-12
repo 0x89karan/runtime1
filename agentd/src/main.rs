@@ -29,9 +29,22 @@ async fn main() -> anyhow::Result<()> {
     let no_fuse = raw_args.iter().any(|a| a == "--no-fuse")
         || std::env::var("AGENTOS_NO_FUSE")
             .is_ok_and(|v| !matches!(v.to_lowercase().as_str(), "" | "0" | "false" | "no"));
+
+    // --log-path <path>: override the flight log destination (default: flight.jsonl in CWD).
+    let log_path_override: Option<PathBuf> = raw_args
+        .windows(2)
+        .find(|w| w[0] == "--log-path")
+        .map(|w| PathBuf::from(&w[1]));
+
+    // Strip recognised flags (and their value arguments) from the positional args.
+    let mut skip_next = false;
     let filtered: Vec<&str> = raw_args.iter()
-        .filter(|a| a.as_str() != "--no-fuse")
-        .map(String::as_str)
+        .filter_map(|a| {
+            if skip_next { skip_next = false; return None; }
+            if a == "--no-fuse" { return None; }
+            if a == "--log-path" { skip_next = true; return None; }
+            Some(a.as_str())
+        })
         .collect();
 
     let result = match filtered.first().copied() {
@@ -42,8 +55,8 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--probe requires a prompt argument"))?;
             run_probe(prompt).await
         }
-        Some(path) => run_agent(PathBuf::from(path), no_fuse).await,
-        None => run_agent(PathBuf::from("agent.toml"), no_fuse).await,
+        Some(path) => run_agent(PathBuf::from(path), no_fuse, log_path_override).await,
+        None => run_agent(PathBuf::from("agent.toml"), no_fuse, log_path_override).await,
     };
 
     if let Err(e) = result {
@@ -54,13 +67,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_agent(path: PathBuf, no_fuse: bool) -> anyhow::Result<()> {
+async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathBuf>) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("loading config from {path:?}"))?;
     let cfg: config::Config =
         toml::from_str(&raw).with_context(|| format!("parsing config from {path:?}"))?;
 
-    let recorder = Arc::new(FlightRecorder::open()?);
+    // Resolve flight log path: CLI flag > TOML field > default "flight.jsonl".
+    let log_path = log_path_override
+        .or_else(|| cfg.log_path.as_deref().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("flight.jsonl"));
+    let recorder = Arc::new(FlightRecorder::new(&log_path)?);
 
     let mut agent_cfgs = cfg.agent_configs()?;
 
@@ -252,22 +269,44 @@ async fn run_agent(path: PathBuf, no_fuse: bool) -> anyhow::Result<()> {
                     }),
                 );
             } else if let Some(ref enf) = enforcement {
-                recorder.record(
-                    "agentd",
-                    None,
-                    EventKind::SandboxApplied,
-                    serde_json::json!({
-                        "server":    server.name,
-                        "isolation": isolation_str,
-                        "enforced": {
-                            "landlock":          enf.landlock,
-                            "seccomp":           enf.seccomp,
-                            "spawn_enforcement": enf.spawn_enforcement,
-                            "namespace_net":     enf.namespace_net,
-                            "namespace_mount":   enf.namespace_mount,
-                        },
-                    }),
-                );
+                // On non-x86_64, DenySpawn compiles to nothing (seccomp is x86_64-only).
+                // If DenySpawn was the only effective rule, the compiled sandbox is a
+                // complete no-op — emitting SandboxApplied with all-false fields would
+                // mislead operators. Emit SandboxSkipped instead.
+                let noop_deny_spawn = !enf.landlock
+                    && !enf.seccomp
+                    && !enf.namespace_net
+                    && !enf.namespace_mount
+                    && enf.spawn_enforcement == "none"
+                    && sandbox_rules.as_deref().map_or(false, |r| !r.is_empty());
+                if noop_deny_spawn {
+                    recorder.record(
+                        "agentd",
+                        None,
+                        EventKind::SandboxSkipped,
+                        serde_json::json!({
+                            "server": server.name,
+                            "reason": "deny-spawn-unsupported-arch",
+                        }),
+                    );
+                } else {
+                    recorder.record(
+                        "agentd",
+                        None,
+                        EventKind::SandboxApplied,
+                        serde_json::json!({
+                            "server":    server.name,
+                            "isolation": isolation_str,
+                            "enforced": {
+                                "landlock":          enf.landlock,
+                                "seccomp":           enf.seccomp,
+                                "spawn_enforcement": enf.spawn_enforcement,
+                                "namespace_net":     enf.namespace_net,
+                                "namespace_mount":   enf.namespace_mount,
+                            },
+                        }),
+                    );
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]

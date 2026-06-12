@@ -14,8 +14,17 @@ use serde::{Deserialize, Serialize};
 ///
 /// `satisfies` tests `normalize(actual).starts_with(normalize(granted_prefix))`.
 ///
-/// Symlinks are NOT resolved — a symlink inside a granted prefix can point
-/// outside it. OS-level isolation (Phase 4 sandbox) is the correct fix.
+/// **Absolute paths assumed.** Relative paths fail-safe to deny (no prefix match
+/// since `normalize` does not resolve relative roots). Callers should pass
+/// absolute paths; `~` expansion is not performed.
+///
+/// **Case-sensitive.** `starts_with` is byte-exact. On case-insensitive
+/// filesystems (macOS HFS+) a grant of `/Workspace` will not match
+/// `/workspace/file`. Production target is Linux ext4/btrfs (case-sensitive),
+/// so this is a dev-environment edge case, not a security gap.
+///
+/// **Symlinks not resolved.** A symlink inside a granted prefix can point
+/// outside it. OS-level isolation (Phase 4 sandbox) is the correct enforcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Capability {

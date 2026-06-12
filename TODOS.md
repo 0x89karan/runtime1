@@ -9,16 +9,13 @@
 
 **~~P3 — Per-agent capability scoping for native file tools (p1.4)~~** ✓ Done in p1.4.
 
-**P3 — FsRead/FsWrite enforcement assumes absolute paths (p1.4)**
-- `normalize_path` handles `..` components but does not resolve symlinks or expand `~`.
-  Relative paths fail-safe to deny (no prefix match), but are not explicitly rejected.
-- Action: validate absolute paths at invocation, or document the assumption; symlink
-  traversal prevention requires Phase 4 sandbox.
+**~~P3 — FsRead/FsWrite enforcement assumes absolute paths (p1.4)~~** ✓ Documented in p4.5.
+- Assumption documented in `Capability` enum doc comment: relative paths fail-safe
+  to deny; `~` not expanded. Production target is Linux with absolute paths.
 
-**P3 — Symlink traversal not blocked by capability prefix check (p1.4)**
-- A symlink inside a granted prefix can point outside it. `normalize_path` uses
-  `Path::components()` — no filesystem access, so symlinks are not resolved.
-- Action: Phase 4 sandbox (seccomp/namespaces) is the correct enforcement layer.
+**~~P3 — Symlink traversal not blocked by capability prefix check (p1.4)~~** ✓ Documented in p4.5.
+- Documented in `Capability` enum doc comment. Phase 4 namespace sandbox (p4.2)
+  is the correct enforcement layer; IsolateMount/IsolateNetwork mitigate escalation paths.
 
 **~~P3 — 2 MB binary target needs re-evaluation at p0.2~~** ✓ Done in p2.1.
 - Switched to `rustls-tls`; static musl binary is 3.1 MB (vs ~1.4 MB macOS debug).
@@ -45,47 +42,35 @@
 - Action: extend `SandboxRule` with `AllowNetConnect { host, port }`, bump to V4, and
   enforce in `sandbox/src/lib.rs` during Phase 4.
 
-**P3 — MCP server without `capabilities` runs unsandboxed with warn-only (p3.3)**
-- `McpServerConfig.capabilities = None` (the default, for backward compat) bypasses
-  all kernel enforcement. Only a `tracing::warn!` and `SandboxSkipped` flight event are
-  emitted. A malicious or buggy MCP server with no capabilities field has full OS access.
-- Action: Phase 4 — add a `[tools] mcp_require_capabilities = true` global flag that
-  makes sandboxing mandatory and rejects startup when any server omits `capabilities`.
+**~~P3 — MCP server without `capabilities` runs unsandboxed with warn-only (p3.3)~~** ✓ Done in p4.1.
+- `[tools] mcp_require_capabilities = true` flag added in p4.1. When set, startup fails
+  if any MCP server has no effective sandbox rules. Default remains `false` for backward compat.
 
 **P3 — DenySpawn does not block `clone()`/`clone3()` on x86_64 (p3.3 adversarial review)**
 - seccomp filter blocks `fork(57)` and `vfork(58)` but not `clone(56)` or `clone3(435)`.
   A sandboxed MCP server can spawn child processes via `clone(SIGCHLD)`. Classic BPF cannot
   inspect `clone` flags to distinguish thread-create vs. process-create without SECCOMP_DATA_ARGS.
-- Action: Phase 4 — either accept the limitation and document it, or switch to `seccomp(2)`
-  with `SECCOMP_FILTER_FLAG_NEW_LISTENER` for args-aware filtering.
+- **Accepted limitation.** `gVisor` (`isolation = "gvisor"`) fully mitigates this — the Sentry
+  intercepts `clone3`. For namespace-only mode, this gap is documented in THREAT_MODEL.md.
+  Switching to `SECCOMP_FILTER_FLAG_NEW_LISTENER` is deferred to Phase 5 if needed.
 
-**P3 — DenySpawn is a no-op on aarch64 (p3.3 adversarial review)**
-- The BPF filter only adds fork/vfork instructions under `#[cfg(target_arch = "x86_64")]`.
-  On aarch64 the compiled filter is two instructions (load + allow) and enforces nothing.
-  `SandboxApplied` still fires, giving a false signal on aarch64 hosts.
-- Action: emit `SandboxSkipped { reason: "deny-spawn-unsupported-arch" }` on non-x86_64
-  when `DenySpawn` is the only active rule; update docs.
+**~~P3 — DenySpawn is a no-op on aarch64 (p3.3 adversarial review)~~** ✓ Fixed in p4.5.
+- `main.rs` now detects when all enforcement fields are false/none with non-empty rules
+  and emits `SandboxSkipped { reason: "deny-spawn-unsupported-arch" }` instead of a
+  misleading `SandboxApplied` with all-false fields.
 
-**P3 — SandboxApplied fires even when Landlock degrades to no-op (p3.3 adversarial review)**
-- On kernels < 5.13 without CONFIG_SECURITY_LANDLOCK, `compile()` returns `landlock_fd = -1`
-  (BestEffort). If `DenySpawn` is also absent, `apply_compiled_inner` is a complete no-op but
-  the parent still emits `sandbox_applied`. An operator trusting the flight log believes FS
-  isolation is active when it isn't.
-- Action: return an `enforced: bool` (or `{ landlock: bool, seccomp: bool }`) from
-  `apply_compiled_inner` and include it in the `SandboxApplied` flight event payload.
+**~~P3 — SandboxApplied fires even when Landlock degrades to no-op (p3.3 adversarial review)~~** ✓ Done in p4.1.
+- `SandboxApplied` payload includes `enforced.landlock` and `enforced.seccomp` booleans
+  since p4.1. Operators can inspect the event to see exactly what was active.
 
-**P3 — `required_capability_for → None` tools are always visible (p1.4 design)**
-- Tools that return `None` from `required_capability_for` appear in `filtered_specs` even
-  when `cap_set = Some([])`. This is the documented contract ("tools that require no cap
-  gating"). All current tools (read_file, write_file, list_dir, MCP) do declare a cap.
-- Action: revisit if a tool with `None` should be hidden under deny-all; update the docstring
-  and `filtered_specs` comment to make the policy explicit.
+**~~P3 — `required_capability_for → None` tools are always visible (p1.4 design)~~** ✓ Documented in p4.5.
+- Policy documented in `Tool::required_capability_for` doc comment: `None` tools are
+  control-plane primitives (list_agents, send_message) intentionally visible under any
+  cap-set, including deny-all. Future tools that should be suppressed must return `Some`.
 
-**P3 — Case-sensitive path prefix matching on case-insensitive filesystems (p1.4)**
-- `normalize_path` + `starts_with` are case-sensitive. On macOS (HFS+ case-insensitive)
-  a grant of `/Workspace` does not match `/workspace/file`. Production target is Linux
-  (case-sensitive ext4/btrfs) so this is a dev-environment edge case, not a security gap.
-- Action: document the Linux-only assumption or add a config flag for CI on macOS.
+**~~P3 — Case-sensitive path prefix matching on case-insensitive filesystems (p1.4)~~** ✓ Documented in p4.5.
+- Assumption documented in `Capability` enum doc comment. Linux production target is
+  case-sensitive; macOS is a dev-environment edge case, not a security gap.
 
 **~~P3 — SchedulerState refactor (p1.5)~~** ✓ Done in p1.5.
 
@@ -94,10 +79,9 @@
   checks the flag and emits `agent_admission_denied { reason: "shutdown" }`
   instead of re-enqueueing onto the already-exited poll loop.
 
-**P3 — EventKind enum in flight_recorder.rs → events.rs at p0.4**
-- Once all 11 Phase-0 kinds are actively emitted, extract to its own module.
-- Keeps `flight_recorder.rs` focused on I/O, not taxonomy.
-- Action: extract during p0.4 implementation.
+**~~P3 — EventKind enum in flight_recorder.rs → events.rs at p0.4~~** ✓ Done in p4.5.
+- `EventKind` extracted to `agentd/src/events.rs`; re-exported from `flight_recorder`
+  so all existing import paths (`agentd::flight_recorder::EventKind`) remain valid.
 
 **~~P2 — MCP tools/list pagination not followed (p0.5 adversarial review)~~** ✓ Done in p2.5.
 - `McpClient::spawn` now follows `nextCursor` in a loop until all pages are loaded.
@@ -108,26 +92,18 @@
 **~~P2 — StopReason::MaxTokens produces empty Ok("") (pre-existing, p0.4)~~** ✓ Done in p2.5.
 - `StopReason::MaxTokens` now emits `BudgetExceeded` flight event and returns `AgentEffect::Failed`.
 
-**P3 — Buildroot ccache volume not wired (p2.2)**
-- `make build` recompiles the toolchain from source on every `distclean`. Buildroot
-  supports ccache via `BR2_CCACHE=y`; wiring a persistent Docker volume or host cache
-  dir would cut rebuild time from ~30 min to ~2 min on subsequent clean builds.
-- Action: add `BR2_CCACHE=y` + cache-dir Makefile variable in a future p2.x hardening pass.
+**~~P3 — Buildroot ccache volume not wired (p2.2)~~** ✓ Done in p4.5.
+- `BR2_CCACHE=y` and `BR2_CCACHE_DIR=$(HOME)/.buildroot-ccache` added to
+  `distro/buildroot.config`. Subsequent clean builds use the host ccache (~2 min vs ~30 min).
 
-**P3 — agentd flight log path is hard-coded to CWD (p2.2)**
-- `flight.jsonl` is always written to the process CWD. In the VM this is `/run/output`
-  (the host-visible 9p mount), which works. On the host it depends on the user's shell CWD.
-- Action: add a `--log-path <file>` CLI flag (or `[agent] log_path` TOML field) in p2.3
-  or a dedicated increment so the log destination is explicit in all environments.
+**~~P3 — agentd flight log path is hard-coded to CWD (p2.2)~~** ✓ Done in p4.5.
+- `--log-path <file>` CLI flag and `log_path` top-level TOML field added. Precedence:
+  CLI > TOML > default `"flight.jsonl"`. In the VM `log_path` can be set to
+  `/run/output/flight.jsonl` to make the destination explicit.
 
-**P2 — Linux-gated code not verifiable on macOS dev machines (p3.1 lesson)**
-- `#[cfg(target_os = "linux")]` blocks (fuser, libc usage in surfaces/) are never
-  compiled locally on macOS, so `cargo clippy -- -D warnings` is a false green.
-  Three CI failures on p3.1 (getattr signature, missing libc dep, two clippy lints)
-  all came from this blind spot.
-- Action: run `make clippy-linux` (Docker) from repo root before pushing any branch
-  that touches Linux-gated code. Target added to workspace Makefile; rule added to
-  CLAUDE.md quality gate.
+**~~P2 — Linux-gated code not verifiable on macOS dev machines (p3.1 lesson)~~** ✓ Mitigated in p3.1.
+- `make clippy-linux` target added to workspace Makefile; `CLAUDE.md` quality gate updated.
+  Required before pushing any branch touching `#[cfg(target_os = "linux")]` code.
 
 **~~P3 — checkpoint.json has no access-control or encryption (p4.3)~~** ✓ Mode restriction done in p4.4.
 - `checkpoint.json` is now created with mode 0600 via `write_mode_600()` in `checkpoint.rs`.
