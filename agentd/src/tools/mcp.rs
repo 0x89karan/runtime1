@@ -113,7 +113,7 @@ impl McpClient {
             // CompiledSandbox is Send + Sync.
             unsafe {
                 cmd.pre_exec(move || {
-                    if let Err(_) = sandbox::apply_compiled(&compiled) {
+                    if sandbox::apply_compiled(&compiled).is_err() {
                         let tag = b"sandbox";
                         // Write stage tag before returning Err so the parent can
                         // distinguish a sandbox failure from a missing-binary error.
