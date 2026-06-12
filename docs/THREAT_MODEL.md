@@ -124,13 +124,17 @@ successful completion or restore, `CheckpointStore::remove()` deletes it via
 - File is written atomically (tmp → rename) — no partial writes readable by
   concurrent processes.
 - File is deleted immediately after successful restore.
+- Tmp file is created with mode 0600 (`O_CREAT | 0600` via `OpenOptions::mode()`);
+  `rename(2)` preserves those permissions on the final `checkpoint.json`. On Unix
+  the file is never world-readable regardless of the process umask.
 
 ### 3.3 Known gap (tracked in TODOS.md)
 
-`checkpoint.json` has no encryption and is written with the default umask. On a
-shared filesystem this is a data-leakage risk. A future increment should either:
-(a) set `O_CREAT | 0600` permissions on the checkpoint file, or
-(b) encrypt the checkpoint at rest with a key derived from the agent's identity.
+`checkpoint.json` has no encryption. Mode restriction (0600) was added in p4.4,
+which prevents world-readable leaks on shared filesystems. The remaining gap is
+at-rest encryption: a future increment should encrypt the checkpoint with a key
+derived from the agent's identity so that even a user with read access to the file
+cannot recover the conversation history.
 
 ---
 
@@ -286,7 +290,7 @@ capability check is the weaker of the two layers.
 |---|---|---|
 | API key leakage via logs | Never logged; no Debug impl | Short secrets in tool args still appear if ≤200 chars |
 | Large content in flight.jsonl | 200-char preview on all user/tool text fields | — |
-| Checkpoint file on disk | Deleted after restore; atomic write | No encryption; world-readable without umask restriction |
+| Checkpoint file on disk | Deleted after restore; atomic write; mode 0600 | No encryption; readable by root or file owner only |
 | Token cost DoS | Per-agent + global budget + max turns | Global budget must be set explicitly; spawn tree can multiply costs |
 | MCP server filesystem escape | Landlock path-beneath rules | Symlink traversal; degrades on kernels < 5.13 |
 | MCP server spawn | seccomp fork/vfork block | clone/clone3 bypass on namespace-only path; no-op on aarch64 |

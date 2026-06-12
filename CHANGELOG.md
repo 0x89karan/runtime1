@@ -3,6 +3,27 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.4] - 2026-06-12 (v0.14.0)
+
+### Added
+- **`checkpoint.json` mode 0600**: tmp file is created with `O_CREAT | mode(0o600)`
+  via `write_mode_600()` helper; `rename(2)` preserves permissions on the final file.
+  Checkpoint is now owner-readable only regardless of process umask. Test added.
+- **pre_exec sandbox error pipe**: `McpClient::spawn` on Linux now uses a
+  `pipe2(O_CLOEXEC)` pre-exec pipe to propagate sandbox failure stage. On spawn
+  failure, the error message now includes "(sandbox stage: 'sandbox')" instead of
+  surfacing as a generic EPERM with no context.
+- **`--no-fuse` CLI flag + `AGENTOS_NO_FUSE` env var**: `agentd --no-fuse agent.toml`
+  or `AGENTOS_NO_FUSE=1 agentd agent.toml` skips the FUSE mount entirely with
+  `tracing::info!` instead of attempting it. Makes CI output clean.
+- **`sandbox_probe` integration tests (Linux)**: 3 tests in `tests/integration.rs`
+  — `allowed_path_read_succeeds`, `denied_path_read_fails`, `deny_spawn_blocks_exec`
+  (x86_64 only) — verify Landlock + seccomp enforcement end-to-end using the
+  `sandbox_probe` fixture binary.
+
+### Fixed
+- THREAT_MODEL.md §3.2–3.3: updated to reflect checkpoint mode restriction.
+
 ## [p4.3] - 2026-06-12 (v0.13.0)
 
 ### Added

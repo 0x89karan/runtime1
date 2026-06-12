@@ -426,6 +426,21 @@ supply chain. `docs/THREAT_MODEL.md` written. `ToolCall.input` → `input_previe
 `truncate()` + `PREVIEW_CHARS` made `pub` in `agent/mod.rs`. TODOS entry for
 checkpoint.json encryption. **Acceptance:** ✓
 
+### ✓ p4.4 — TODOS cleanup sprint
+Four tracked TODOS items addressed in one increment:
+- **checkpoint.json mode 0600**: `write_mode_600()` helper in `checkpoint.rs` creates the
+  tmp file with `O_CREAT | 0600`; `rename()` preserves permissions on final file. Test added.
+  THREAT_MODEL.md §3.2–3.3 updated.
+- **pre_exec error propagation**: pre-exec error pipe (`pipe2 + O_CLOEXEC`) in `mcp.rs`;
+  on sandbox failure the child writes "sandbox" tag; parent reads the tag and includes it
+  in the spawn error message — "sandbox stage: 'sandbox'" — replacing silent EPERM.
+- **sandbox_probe integration tests (Linux)**: 3 tests gated `#[cfg(target_os = "linux")]`
+  in `tests/integration.rs` — AllowFsRead grants access, AllowFsRead denies out-of-prefix reads,
+  DenySpawn blocks fork (x86_64 only, gated `#[cfg(target_arch = "x86_64")]`).
+- **--no-fuse / AGENTOS_NO_FUSE**: `main.rs` args parsing extended; `run_agent(no_fuse: bool)`;
+  FUSE mount block respects flag — skips mount with `tracing::info!` instead of attempting it.
+**Acceptance:** ✓
+
 ---
 
 ## Beyond

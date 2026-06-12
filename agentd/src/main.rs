@@ -23,16 +23,26 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let mut args = std::env::args().skip(1);
-    let result = match args.next().as_deref() {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // --no-fuse: skip FUSE mount unconditionally (useful in CI and dev environments
+    // without the FUSE kernel module). AGENTOS_NO_FUSE env var has the same effect.
+    let no_fuse = raw_args.contains(&"--no-fuse".to_string())
+        || std::env::var("AGENTOS_NO_FUSE").is_ok();
+    let filtered: Vec<&str> = raw_args.iter()
+        .filter(|a| a.as_str() != "--no-fuse")
+        .map(String::as_str)
+        .collect();
+
+    let result = match filtered.first().copied() {
         Some("--probe") => {
-            let prompt = args
-                .next()
+            let prompt = filtered
+                .get(1)
+                .copied()
                 .ok_or_else(|| anyhow::anyhow!("--probe requires a prompt argument"))?;
-            run_probe(&prompt).await
+            run_probe(prompt).await
         }
-        Some(path) => run_agent(PathBuf::from(path)).await,
-        None => run_agent(PathBuf::from("agent.toml")).await,
+        Some(path) => run_agent(PathBuf::from(path), no_fuse).await,
+        None => run_agent(PathBuf::from("agent.toml"), no_fuse).await,
     };
 
     if let Err(e) = result {
@@ -43,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
+async fn run_agent(path: PathBuf, no_fuse: bool) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("loading config from {path:?}"))?;
     let cfg: config::Config =
@@ -314,7 +324,10 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     let fuse_mountpoint = PathBuf::from("/agents");
 
     #[cfg(target_os = "linux")]
-    let maybe_session = {
+    let maybe_session = if no_fuse {
+        tracing::info!("FUSE mount skipped (--no-fuse / AGENTOS_NO_FUSE)");
+        None
+    } else {
         match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot)) {
             Ok(session) => {
                 recorder.record(
@@ -331,6 +344,8 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
             }
         }
     };
+    #[cfg(not(target_os = "linux"))]
+    let _ = no_fuse;
     #[cfg(not(target_os = "linux"))]
     let _maybe_session: Option<()> = None;
 

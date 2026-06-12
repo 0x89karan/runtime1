@@ -14,6 +14,29 @@ use crate::{
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Create `path` with mode 0600 on Unix, then write `data`.
+///
+/// On non-Unix (Windows) falls back to `tokio::fs::write` (different ACL model).
+/// Used for checkpoint tmp files so the final `checkpoint.json` is never world-readable.
+#[cfg(unix)]
+async fn write_mode_600(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    // tokio::fs::OpenOptions::mode() is available natively on Unix targets.
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .await?;
+    f.write_all(data).await
+}
+
+#[cfg(not(unix))]
+async fn write_mode_600(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    tokio::fs::write(path, data).await
+}
+
 /// Serializable snapshot of a single `AgentTask`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentCheckpoint {
@@ -68,9 +91,12 @@ impl CheckpointStore {
     /// Write `cp` atomically. Calls `tokio::fs::write` so the scheduler's async
     /// executor is not blocked; a crash after rename leaves the previous good
     /// checkpoint intact because the tmp file was written first.
+    ///
+    /// On Unix the tmp file is created with mode 0600 (owner read/write only).
+    /// `rename(2)` preserves those permissions on the final `checkpoint.json`.
     pub async fn save(&self, cp: &SchedulerCheckpoint) -> Result<()> {
         let json = serde_json::to_string(cp).context("serialize checkpoint")?;
-        tokio::fs::write(&self.tmp_path, &json)
+        write_mode_600(&self.tmp_path, json.as_bytes())
             .await
             .context("write checkpoint.json.tmp")?;
         tokio::fs::rename(&self.tmp_path, &self.path)
@@ -260,5 +286,17 @@ mod tests {
         assert_eq!(loaded.agents.len(), 1);
         assert_eq!(loaded.agents[0].agent_id, "agent-a");
         assert_eq!(loaded.tokens_spent, 15);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_sets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        store.save(&minimal_scheduler_checkpoint()).await.unwrap();
+        let meta = std::fs::metadata(&store.path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "checkpoint.json must be mode 0600, got 0o{mode:03o}");
     }
 }

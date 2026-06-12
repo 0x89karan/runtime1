@@ -129,12 +129,10 @@
   that touches Linux-gated code. Target added to workspace Makefile; rule added to
   CLAUDE.md quality gate.
 
-**P3 — checkpoint.json has no access-control or encryption (p4.3)**
-- `checkpoint.json` is written to CWD with the process umask (typically 0644 → world-readable).
-  It contains the full, unredacted conversation history of each agent for the duration of the run.
-  File is deleted after successful restore; risk window is crash-only (or during active run).
-- Action: set `O_CREAT | 0600` permissions on the checkpoint file at write time, or add at-rest
-  encryption keyed to the agent identity. Either should land in a future p4.x increment.
+**~~P3 — checkpoint.json has no access-control or encryption (p4.3)~~** ✓ Mode restriction done in p4.4.
+- `checkpoint.json` is now created with mode 0600 via `write_mode_600()` in `checkpoint.rs`.
+  `rename(2)` preserves those permissions on the final file. Test `save_sets_mode_0600` added.
+- Encryption at rest remains a future item (THREAT_MODEL.md §3.3).
 
 **P4 — `runsc do` is experimental; full OCI bundle integration deferred (p4.2)**
 - `isolation = "gvisor"` wraps the MCP server command with `runsc do -- <cmd>`. The `do`
@@ -157,13 +155,10 @@
 - Action: accept the limitation for namespace-only mode; document in operator guidance.
   gVisor is the recommended mode for truly adversarial workloads.
 
-**P3 — pre_exec sandbox errors are masked as EPERM (p4.1 red-team)**
-- `apply_compiled()` in `pre_exec` can fail at either the Landlock or seccomp step, but any
-  failure surfaces to the parent as a generic `EPERM` (`io::Error`). There is no way to distinguish
-  a Landlock `prctl` failure from a seccomp `prctl` failure from any other `pre_exec` error at
-  the point where `McpClient::spawn` calls `child.await`.
-- Action: consider writing a structured errno/step to a pipe before exec (the `pre_exec` trick),
-  or at minimum document that spawn failures while `had_sandbox = true` imply a sandbox error.
+**~~P3 — pre_exec sandbox errors are masked as EPERM (p4.1 red-team)~~** ✓ Done in p4.4.
+- `mcp.rs::McpClient::spawn` now uses a pre-exec error pipe (`pipe2 + O_CLOEXEC`) on Linux.
+  On pre_exec failure, the child writes "sandbox" to the pipe; the parent reads it and includes
+  "(sandbox stage: 'sandbox')" in the error message. Previously all failures surfaced as EPERM.
 
 **P4 — aarch64 CI runner needed to validate DenySpawn no-op behavior (p4.1 eng review)**
 - The fix in T1 (gate BPF with `#[cfg(target_arch = "x86_64")]`) emits `SandboxSkipped` on
@@ -172,21 +167,14 @@
 - Action: add a self-hosted aarch64 runner or QEMU-emulated job to CI when one becomes
   available; until then the logic is unit-tested but not E2E verified on real hardware.
 
-**P4 — `sandbox_probe` fixture not wired to any integration test (p4.1 eng review)**
-- `agentd/tests/fixtures/sandbox_probe.rs` was added in p3.3 as a probe binary for FS
-  access and exec tests, but no integration test actually spawns it through the MCP path
-  to verify that sandbox rules are enforced end-to-end.
-- Action: add an integration test in `agentd/tests/` that (a) spawns `sandbox_probe` as
-  an MCP tool server with specific `AllowFsRead`/`DenySpawn` caps, (b) issues tool calls
-  that exercise both allowed and denied paths, and (c) asserts the correct outcomes.
+**~~P4 — `sandbox_probe` fixture not wired to any integration test (p4.1 eng review)~~** ✓ Done in p4.4.
+- 3 integration tests added in `tests/integration.rs` (Linux-gated): `allowed_path_read_succeeds`,
+  `denied_path_read_fails`, `deny_spawn_blocks_exec` (x86_64-only). Tests spawn sandbox_probe
+  directly with `pre_exec` + compiled sandbox rules; verify exit codes 0/1/non-0.
 
-**P3 — No `--no-fuse` flag for CI and host dev environments (p3.1)**
-- `surfaces::agents_fs::mount()` is called unconditionally in main.rs. On host Linux dev machines
-  without FUSE available (or in CI), the `Err` path logs a warn and continues — correct but
-  noisy. A `--no-fuse` CLI flag (or `AGENTOS_NO_FUSE` env var) would explicitly skip mount()
-  without a warning, making CI output clean and intentional.
-- Blocked by: nothing. Pure main.rs change.
-- Action: add `--no-fuse` flag alongside the existing CLI args in a future p3.x increment.
+**~~P3 — No `--no-fuse` flag for CI and host dev environments (p3.1)~~** ✓ Done in p4.4.
+- `--no-fuse` CLI flag and `AGENTOS_NO_FUSE` env var added to `main.rs`. When either is set,
+  the FUSE mount is skipped with `tracing::info!` instead of attempted (no warning on CI).
 
 ## Completed
 
