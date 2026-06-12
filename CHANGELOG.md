@@ -3,21 +3,27 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [p4.4] - 2026-06-12 (v0.14.0)
+## [p4.4] - 2026-06-13 (v0.14.0)
 
 ### Added
-- **`checkpoint.json` mode 0600**: tmp file is created with `O_CREAT | mode(0o600)`
-  via `write_mode_600()` helper; `rename(2)` preserves permissions on the final file.
-  Checkpoint is now owner-readable only regardless of process umask. Test added.
-- **pre_exec sandbox error pipe**: `McpClient::spawn` on Linux now uses a
-  `pipe2(O_CLOEXEC)` pre-exec pipe to propagate sandbox failure stage. On spawn
-  failure, the error message now includes "(sandbox stage: 'sandbox')" instead of
-  surfacing as a generic EPERM with no context.
+- **`checkpoint.json` mode 0600**: `write_mode_600()` creates the tmp file with
+  `O_CREAT|O_EXCL|mode(0o600)` plus unlink-retry, guaranteeing 0600 even if a
+  stale tmp file exists at a different mode. `rename(2)` atomically replaces the
+  final `checkpoint.json`. Checkpoint is now owner-readable only regardless of umask.
+- **pre_exec sandbox error pipe**: `McpClient::spawn` on Linux creates a
+  `pipe2(O_CLOEXEC)` error pipe *only* when a sandbox is configured. On spawn
+  failure the error message includes `"(sandbox stage: 'sandbox'|'unknown')"` so
+  operators can distinguish a sandbox-apply failure from a missing-binary error.
+  Unsandboxed servers produce a clean error without the stage suffix.
 - **`--no-fuse` CLI flag + `AGENTOS_NO_FUSE` env var**: `agentd --no-fuse agent.toml`
-  or `AGENTOS_NO_FUSE=1 agentd agent.toml` skips the FUSE mount entirely with
-  `tracing::info!` instead of attempting it. Makes CI output clean.
+  or `AGENTOS_NO_FUSE=1 agentd agent.toml` skips the FUSE mount and emits a
+  `FuseSkipped` flight event. `AGENTOS_NO_FUSE=0/false/no` correctly disables the
+  flag (any other non-empty value enables it). Makes CI output clean.
+- **`EventKind::FuseSkipped`**: new flight event kind emitted when `--no-fuse` is
+  active; preserves the CONVENTIONS.md invariant that every meaningful step is
+  recorded (analogous to `SandboxSkipped`).
 - **`sandbox_probe` integration tests (Linux)**: 3 tests in `tests/integration.rs`
-  — `allowed_path_read_succeeds`, `denied_path_read_fails`, `deny_spawn_blocks_exec`
+  — `allowed_path_read_succeeds`, `denied_path_read_fails`, `deny_spawn_blocks_fork`
   (x86_64 only) — verify Landlock + seccomp enforcement end-to-end using the
   `sandbox_probe` fixture binary.
 
