@@ -32,6 +32,9 @@ async fn main() -> anyhow::Result<()> {
 
     // --log-path <path>: override the flight log destination (default: flight.jsonl in CWD).
     let log_path_override = parse_log_path(&raw_args);
+    if raw_args.iter().any(|a| a == "--log-path") && log_path_override.is_none() {
+        anyhow::bail!("--log-path requires a value (e.g. --log-path /path/to/flight.jsonl)");
+    }
 
     // Strip recognised flags (and their value arguments) from the positional args.
     let filtered_strings = filter_positional_args(&raw_args);
@@ -263,7 +266,9 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                 // mislead operators. Emit SandboxSkipped instead.
                 let noop_deny_spawn = is_noop_deny_spawn(
                     enf,
-                    sandbox_rules.as_deref().is_some_and(|r| !r.is_empty()),
+                    sandbox_rules.as_deref().is_some_and(|r| {
+                        r.iter().any(|rule| matches!(rule, SandboxRule::DenySpawn))
+                    }),
                 );
                 if noop_deny_spawn {
                     recorder.record(
@@ -737,6 +742,52 @@ mod tests {
         };
         assert!(!is_noop_deny_spawn(&enf, true),
             "landlock active → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_namespace_net_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: true,
+            namespace_mount: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "namespace_net active → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_namespace_mount_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: true,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "namespace_mount active → not a noop; real enforcement applied");
+    }
+
+    // ── G2 extension: both flags together ────────────────────────────────────
+
+    #[test]
+    fn filter_positional_args_handles_both_flags_together() {
+        let args: Vec<String> = ["--no-fuse", "--log-path", "/tmp/x.jsonl", "agent.toml"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    // ── G1 extension: trailing flag with no value ─────────────────────────────
+
+    #[test]
+    fn parse_log_path_returns_none_when_flag_is_last_arg() {
+        // --log-path as the final token with no following value: windows(2) won't
+        // match, so None is returned silently. This documents the contract.
+        let args: Vec<String> = ["agent.toml", "--log-path"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_log_path(&args), None);
     }
 }
 
