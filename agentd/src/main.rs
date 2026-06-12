@@ -521,6 +521,7 @@ fn resolve_log_path(cli_override: Option<PathBuf>, toml_path: Option<&str>) -> P
 #[cfg(any(test, target_os = "linux"))]
 fn is_noop_deny_spawn(enf: &sandbox::EnforcementStatus, has_rules: bool) -> bool {
     !enf.landlock
+        && !enf.landlock_net
         && !enf.seccomp
         && !enf.namespace_net
         && !enf.namespace_mount
@@ -555,7 +556,12 @@ fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
             Capability::Net { ports, .. } => {
                 // Non-empty ports → Landlock V4 TCP port enforcement (BestEffort on < 6.7).
                 // Empty ports → no AllowNetConnect rules; network is unrestricted (backward compat).
+                // Port 0 is not a valid TCP port; Landlock returns EINVAL for it.
                 for &port in ports {
+                    if port == 0 {
+                        tracing::warn!("Net capability: port 0 is not a valid TCP port and will be ignored");
+                        continue;
+                    }
                     rules.push(SandboxRule::AllowNetConnect { port });
                 }
             }
@@ -818,6 +824,33 @@ mod tests {
             "namespace_mount active → not a noop; real enforcement applied");
     }
 
+    #[test]
+    fn noop_deny_spawn_false_when_landlock_net_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+            landlock_net: true,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "landlock_net active (V4 port enforcement) → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn caps_to_rules_net_port_zero_is_skipped() {
+        let caps = vec![Capability::Spawn, Capability::Net {
+            hosts: vec![],
+            ports: vec![0, 443],
+        }];
+        let rules = caps_to_rules(&caps);
+        assert!(!rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 0 })),
+            "port 0 must be skipped (invalid TCP port)");
+        assert!(rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 443 })),
+            "valid port 443 must still be included");
+    }
+
     // ── G2 extension: both flags together ────────────────────────────────────
 
     #[test]
@@ -860,7 +893,7 @@ async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
 
     tracing::info!(
         model,
-        prompt = %prompt.chars().take(80).collect::<String>(),
+        prompt = %prompt.chars().take(PREVIEW_CHARS).collect::<String>(),
         "probe: sending request"
     );
 
@@ -894,7 +927,7 @@ async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
         .iter()
         .find_map(|b| {
             if let Block::Text { text } = b {
-                Some(text.chars().take(200).collect())
+                Some(text.chars().take(PREVIEW_CHARS).collect())
             } else {
                 None
             }

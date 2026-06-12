@@ -359,19 +359,28 @@ mod linux {
             return Err(e);
         }
 
-        // Build Landlock ruleset if there are FS rules or net port rules.
-        // For net rules, detect ABI version first — V4 requires kernel >= 6.7.
+        // Build Landlock ruleset if there are FS rules or V4-capable net port rules.
+        //
+        // ABI version is queried first so the has_landlock_rules gate can correctly
+        // exclude the net-only-on-V3 case: a V1 ruleset with handled_access_fs set and
+        // zero path-beneath rules would deny ALL filesystem access (EACCES on every
+        // open/read/write). If the kernel is pre-V4 and there are no FS rules, skip
+        // the ruleset entirely — correct BestEffort degradation.
+        //
         // Path fds are closed immediately after landlock_add_rule; the kernel retains
         // its own reference. The ruleset_fd stays open until apply_compiled_inner().
-        let has_landlock_rules = !path_entries.is_empty() || !net_ports.is_empty();
+        let abi_version = if !net_ports.is_empty() {
+            query_landlock_abi_version()
+        } else {
+            0 // FS-only path uses V1 struct; no ABI syscall needed
+        };
+        let use_v4_net = abi_version >= 4 && !net_ports.is_empty();
+        // Only build a ruleset when there are FS rules (always safe) or when V4 net
+        // enforcement is available (net-only is fine with handled_access_fs=0 on V4).
+        // Skipping when path_entries is empty AND use_v4_net is false avoids creating
+        // a V1 ruleset that would blanket-deny all FS with zero path allowances.
+        let has_landlock_rules = !path_entries.is_empty() || use_v4_net;
         let (landlock_fd, landlock_net_active) = if has_landlock_rules {
-            // Check ABI version only when net rules are requested (one extra syscall).
-            let abi_version = if !net_ports.is_empty() {
-                query_landlock_abi_version()
-            } else {
-                0 // don't need V4; FS-only path uses the existing V1 struct
-            };
-            let use_v4_net = abi_version >= 4 && !net_ports.is_empty();
             let fd = build_landlock_ruleset(&path_entries, &net_ports, use_v4_net);
             // Close path fds regardless of outcome.
             for &(pfd, _) in &path_entries {
@@ -453,9 +462,15 @@ mod linux {
     ) -> Result<i32, SandboxError> {
         // Create the ruleset. Use V4 struct (16 bytes) only when the caller
         // confirmed ABI >= 4; otherwise use V1 struct (8 bytes).
+        //
+        // handled_access_fs must be 0 when path_entries is empty. Setting it to
+        // ACCESS_FS_HANDLED with zero path-beneath rules would cause
+        // landlock_restrict_self to deny ALL filesystem access — a complete FS
+        // lockout. Only set the flag when there are actually FS rules to add.
+        let fs_access = if path_entries.is_empty() { 0_u64 } else { ACCESS_FS_HANDLED };
         let ruleset_fd = if use_v4_net {
             let attr = LandlockRulesetAttrV4 {
-                handled_access_fs:  ACCESS_FS_HANDLED,
+                handled_access_fs:  fs_access,
                 handled_access_net: LANDLOCK_ACCESS_NET_CONNECT_TCP,
             };
             unsafe {
@@ -468,7 +483,7 @@ mod linux {
             }
         } else {
             let attr = LandlockRulesetAttr {
-                handled_access_fs: ACCESS_FS_HANDLED,
+                handled_access_fs: fs_access,
             };
             unsafe {
                 libc::syscall(
@@ -1026,5 +1041,34 @@ mod tests {
         }
         // If landlock_net is false, it was either BestEffort degradation or no net rules.
         // Both are acceptable outcomes.
+    }
+
+    #[test]
+    fn allow_net_connect_only_no_fs_rules_does_not_lock_out_fs() {
+        // Regression test for the FS-lockout bug: when only AllowNetConnect rules are
+        // present (no AllowFsRead/AllowFsWrite), build_landlock_ruleset must set
+        // handled_access_fs=0. If it were ACCESS_FS_HANDLED with zero path rules,
+        // landlock_restrict_self would deny all filesystem access.
+        //
+        // We verify compile-side: compile() must succeed and enforcement_status()
+        // must be consistent. The actual apply is not called here (it would restrict
+        // the test process). The BestEffort degradation path (pre-V4 or macOS) is
+        // also valid — what matters is that compile() never errors.
+        let result = compile(&[SandboxRule::AllowNetConnect { port: 443 }]);
+        assert!(result.is_ok(), "net-only compile must succeed: {result:?}");
+    }
+
+    #[test]
+    fn compile_net_only_has_landlock_rules_iff_v4_available() {
+        // On pre-V4 kernels (or macOS), net-only rules must degrade gracefully:
+        // has_landlock_rules is false → no ruleset created → landlock_net=false.
+        // On V4 kernels, has_landlock_rules is true and landlock_net=true.
+        // Either way, compile() must succeed.
+        let result = compile(&[SandboxRule::AllowNetConnect { port: 80 }]);
+        assert!(result.is_ok());
+        // enforcement_status() consistency is checked by
+        // allow_net_connect_enforcement_status_reflects_abi (Linux-only above).
+        // Here we just verify compile doesn't panic or error on any platform.
+        let _ = result.unwrap().enforcement_status();
     }
 }

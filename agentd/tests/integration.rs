@@ -484,6 +484,56 @@ fn no_fuse_with_default_agent_toml() {
     );
 }
 
+/// AGENTOS_NO_FUSE falsy values ("0", "false", "no", "") must NOT activate the
+/// no-fuse path — they should behave as if the variable is unset.
+#[test]
+fn no_fuse_env_var_falsy_values_do_not_activate() {
+    let dir = TempDir::new().expect("tempdir");
+    std::fs::write(
+        dir.path().join("agent.toml"),
+        "[agent]\nid = \"falsy-no-fuse\"\ntask = \"smoke\"\n",
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    for falsy in &["0", "false", "no", ""] {
+        let output = Command::new(bin)
+            .arg(dir.path().join("agent.toml"))
+            .env("AGENTOS_NO_FUSE", falsy)
+            .env_remove("ANTHROPIC_API_KEY")
+            .output()
+            .unwrap_or_else(|e| panic!("spawn agentd (AGENTOS_NO_FUSE={falsy}): {e}"));
+
+        // The process should still attempt to run (fails only on missing API key).
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ANTHROPIC_API_KEY"),
+            "AGENTOS_NO_FUSE={falsy:?} must not suppress normal startup; got: {stderr}"
+        );
+    }
+}
+
+/// --log-path without a following value must exit non-zero with an error message.
+#[test]
+fn log_path_flag_without_value_exits_nonzero() {
+    let bin = env!("CARGO_BIN_EXE_agentd");
+    let output = Command::new(bin)
+        .args(["--probe", "--log-path"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .output()
+        .expect("spawn agentd");
+
+    assert!(
+        !output.status.success(),
+        "--log-path without value must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--log-path") && stderr.contains("requires"),
+        "expected '--log-path requires a value' in stderr, got: {stderr}"
+    );
+}
+
 // ── sandbox_probe integration tests ──────────────────────────────────────────
 //
 // These tests verify Landlock + seccomp enforcement end-to-end by spawning the
