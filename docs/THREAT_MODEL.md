@@ -54,6 +54,15 @@ There are no other credentials in the current codebase. MCP servers that need
 their own credentials receive them via their own environment (configured at the OS
 level, not by agentd).
 
+### 1.3 MCP subprocess environment isolation
+
+MCP server subprocesses are spawned with `env_clear()`: the parent process's full
+environment, including `ANTHROPIC_API_KEY`, is **not** inherited. Each subprocess
+receives only a vetted allowlist (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`)
+plus any explicit `env` key-value pairs declared in the server's `[[tools.mcp_servers]]`
+config entry. This containment is independent of Landlock/seccomp (which operate on
+filesystem/syscall access) and applies even to unsandboxed servers.
+
 ---
 
 ## 2. Flight recorder (flight.jsonl)
@@ -264,6 +273,15 @@ namespace. Deferred to a future increment.
 On kernels without `CONFIG_SECURITY_LANDLOCK`, Landlock compiles to a BestEffort
 no-op. The `EnforcementStatus` struct (added in p4.1) reports `landlock: false` in
 the `SandboxApplied` flight event so operators can detect degraded enforcement.
+
+**BP-4a: `Net{ports}` with Landlock ABI < V4 (kernel < 6.7)**
+
+TCP port enforcement (`AllowNetConnect`) requires Landlock ABI V4 (Linux ≥ 6.7).
+On kernels < 6.7, if an MCP server declares `Net{ports:[...]}`, agentd falls back
+to `IsolateNetwork` (deny-all network), emits a `tracing::warn!`, and logs
+`landlock_net: false` in `SandboxApplied`. This is intentionally conservative:
+deny-all is safer than silently granting unrestricted network access when
+per-port enforcement is unavailable.
 
 **BP-5: MCP server without `capabilities` runs fully unsandboxed**
 — Severity: Medium (mitigated by `mcp_require_capabilities = true`)

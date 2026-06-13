@@ -238,6 +238,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             effective_cmd,
             &effective_args,
             effective_compiled,
+            &server.env,
         )
         .await
         .with_context(|| format!("spawning MCP server '{}'", server.name))?;
@@ -535,7 +536,17 @@ fn is_noop_deny_spawn(enf: &sandbox::EnforcementStatus, has_rules: bool) -> bool
 /// added whenever the Spawn capability is absent. IsolateNetwork is added
 /// whenever the Net capability is absent — enforcing network isolation at the
 /// Linux namespace level for servers that don't need outbound access.
+///
+/// When `Net{ports}` is declared but the kernel does not support Landlock V4
+/// (< Linux 6.7), port-level enforcement is impossible. The safe fallback is
+/// `IsolateNetwork` (deny-all) rather than no restriction, so the operator's
+/// intent (controlled egress) is approximated rather than silently inverted.
 fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
+    let v4_available = sandbox::landlock_v4_available();
+    caps_to_rules_inner(caps, v4_available)
+}
+
+fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRule> {
     let mut rules = Vec::new();
     let has_spawn = caps.iter().any(|c| matches!(c, Capability::Spawn));
     let has_net   = caps.iter().any(|c| matches!(c, Capability::Net { .. }));
@@ -554,8 +565,23 @@ fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
                 rules.push(SandboxRule::AllowFsWrite { prefix: prefix.clone() });
             }
             Capability::Net { ports, .. } => {
-                // Non-empty ports → Landlock V4 TCP port enforcement (BestEffort on < 6.7).
-                // Empty ports → no AllowNetConnect rules; network is unrestricted (backward compat).
+                if ports.is_empty() {
+                    // Net{} with no ports: network unrestricted (explicit no-isolation).
+                    continue;
+                }
+                if !v4_available {
+                    // Kernel < 6.7: Landlock V4 TCP port enforcement unavailable.
+                    // Fall back to full network isolation (deny-all) — safer than
+                    // silently allowing unrestricted access.
+                    tracing::warn!(
+                        "Net{{ports}} declared but Landlock ABI V4 is unavailable on this kernel; \
+                         falling back to IsolateNetwork (deny-all). \
+                         Upgrade to Linux ≥ 6.7 for per-port enforcement."
+                    );
+                    rules.push(SandboxRule::IsolateNetwork);
+                    continue;
+                }
+                // V4 available: emit per-port AllowNetConnect rules.
                 // Port 0 is not a valid TCP port; Landlock returns EINVAL for it.
                 for &port in ports {
                     if port == 0 {
@@ -638,24 +664,43 @@ mod tests {
     }
 
     #[test]
-    fn caps_to_rules_net_with_ports_generates_allow_net_connect() {
-        let rules = caps_to_rules(&[Capability::Net {
+    fn caps_to_rules_net_with_ports_v4_generates_allow_net_connect() {
+        // Simulate a V4-capable kernel.
+        let rules = caps_to_rules_inner(&[Capability::Net {
             hosts: vec!["api.anthropic.com".into()],
             ports: vec![443],
-        }]);
+        }], true);
         assert!(
             rules.contains(&SandboxRule::AllowNetConnect { port: 443 }),
-            "Net {{ ports: [443] }} → AllowNetConnect {{ port: 443 }}"
+            "Net {{ ports: [443] }} on V4 kernel → AllowNetConnect {{ port: 443 }}"
         );
         assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
     }
 
     #[test]
+    fn caps_to_rules_net_with_ports_pre_v4_falls_back_to_isolate_network() {
+        // Simulate a pre-V4 kernel: Net{ports} must fall back to IsolateNetwork, not allow-all.
+        let rules = caps_to_rules_inner(&[Capability::Net {
+            hosts: vec!["api.anthropic.com".into()],
+            ports: vec![443],
+        }], false);
+        assert!(
+            rules.contains(&SandboxRule::IsolateNetwork),
+            "Net {{ ports: [443] }} on pre-V4 kernel → IsolateNetwork (deny-all fallback)"
+        );
+        assert!(
+            !rules.contains(&SandboxRule::AllowNetConnect { port: 443 }),
+            "pre-V4 must NOT emit AllowNetConnect (unenforced on this kernel)"
+        );
+    }
+
+    #[test]
     fn caps_to_rules_net_multiple_ports_generates_multiple_rules() {
-        let rules = caps_to_rules(&[Capability::Net {
+        // Simulate V4-capable kernel.
+        let rules = caps_to_rules_inner(&[Capability::Net {
             hosts: vec![],
             ports: vec![80, 443],
-        }]);
+        }], true);
         assert!(rules.contains(&SandboxRule::AllowNetConnect { port: 80 }));
         assert!(rules.contains(&SandboxRule::AllowNetConnect { port: 443 }));
         assert!(!rules.contains(&SandboxRule::IsolateNetwork));
@@ -840,11 +885,12 @@ mod tests {
 
     #[test]
     fn caps_to_rules_net_port_zero_is_skipped() {
+        // Simulate V4-capable kernel so port filtering logic is exercised.
         let caps = vec![Capability::Spawn, Capability::Net {
             hosts: vec![],
             ports: vec![0, 443],
         }];
-        let rules = caps_to_rules(&caps);
+        let rules = caps_to_rules_inner(&caps, true);
         assert!(!rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 0 })),
             "port 0 must be skipped (invalid TCP port)");
         assert!(rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 443 })),

@@ -3,6 +3,79 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.7] - 2026-06-13 (v0.17.0)
+
+Pre-Phase-5 cleanup sprint. Addresses all P0/P1 findings from
+`docs/AUDIT-phase-4-6.md`. No new features.
+
+### Security
+- **F-001 (P0): MCP subprocesses no longer inherit parent environment.**
+  `McpClient::spawn` now calls `env_clear()` then re-adds a vetted allowlist
+  (`PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`) plus any explicit
+  `env` map declared in `[[tools.mcp_servers]]`. `ANTHROPIC_API_KEY` and all
+  other secrets are no longer passed to MCP server subprocesses.
+  `McpServerConfig` gains an `env: HashMap<String, String>` field (default empty).
+  `docs/THREAT_MODEL.md §1.3` documents the env isolation contract.
+- **F-002 (P1): `Net{ports}` on pre-V4 kernel falls back to `IsolateNetwork`.**
+  Previously, declaring `Net{ports:[443]}` on a kernel < 6.7 silently resulted in
+  no network isolation at all (worse than declaring no `Net` capability).
+  Now `caps_to_rules` detects V4 availability via a new public `sandbox::landlock_v4_available()`
+  function and emits `IsolateNetwork` (deny-all) with a `tracing::warn!` on pre-V4 kernels.
+  Documented in `THREAT_MODEL.md BP-4a`.
+- **F-003 (P1): uid/gid_map written after `unshare(CLONE_NEWUSER)`.**
+  `apply_compiled_inner` now writes `/proc/self/setgroups=deny`, `uid_map`, and
+  `gid_map` (1:1 mapping of the real uid) after a successful `unshare`. Without
+  this, the subprocess ran as the overflow uid (`nobody`/65534) for DAC purposes,
+  silently defeating `AllowFsRead`/`AllowFsWrite` Landlock grants for user-owned
+  files with modes < 0644.
+
+### Fixed
+- **F-004 (P1): FUSE `read()` `offset + size` overflow fixed.**
+  `agents_fs.rs:305` now uses `offset.saturating_add(size as usize)` to prevent
+  a panic in debug mode on kernel-supplied offsets near `usize::MAX`.
+- **F-005 (P1): Mailbox drain moved to after `step_with_response`.**
+  Previously `drain_mailbox` ran between `provide_inference` (stores response but
+  doesn't push it to messages) and `step_with_response` (pushes the assistant turn).
+  Injected messages were silently stitched before the assistant reply they were
+  conceptually delivered after. Now the drain runs after `step_with_response` so
+  injected messages land on the *next* turn's user message.
+- **F-010 (P2): MCP UTF-8 validated once at newline, not per fill-chunk.**
+  `read_line_bounded` now accumulates raw bytes in a `Vec<u8>` and calls
+  `String::from_utf8` once at the newline. Per-chunk `str::from_utf8` failed on
+  multi-byte codepoints spanning the 8 KB BufReader boundary.
+- **F-011 (P1): Checkpoint version probed before full deserialization.**
+  `CheckpointStore::load` now deserializes a `VersionProbe { format_version }`
+  stub first, distinguishing "too new" (explicit refusal with a clear message) from
+  "corrupt" (serde error). Tmp files now use a unique name
+  (`checkpoint.json.<pid>.<nanos>.tmp`) to prevent races between concurrent agentd
+  processes sharing a working directory.
+- **F-014 (P1): README `##Status` updated to reflect Phases 0–4 complete (v0.16.0).**
+- **Ship-review: `apply_compiled_inner` no longer heap-allocates in fork child.**
+  `format!("0 {uid} 1\n")` inside `apply_compiled_inner` violated the function's
+  async-signal-safe contract — `format!` calls `malloc`, which can deadlock in a
+  multi-threaded process (Tokio runtime) if the allocator mutex is held by another
+  thread at the moment of `fork`. Replaced with a stack-allocated `id_map_entry`
+  helper that writes "0 {id} 1\n" into a `[u8; 16]` without any allocation.
+- **Ship-review: checkpoint tmp-name uniqueness window fixed.**
+  `tmp_path()` used `subsec_nanos()` (wraps 0–999,999,999 every second) instead of
+  `as_nanos()` (monotonically increasing since UNIX epoch). Two saves within the same
+  process in the same wall-clock second could produce the same tmp filename. Changed to
+  `d.as_nanos() as u64` for true monotonic uniqueness.
+
+### Documentation
+- **F-013 (P1): CONVENTIONS.md event taxonomy completed.**
+  Added 6 missing `EventKind` rows (`tools_registered`, `agent_child_result_delivered`,
+  `agent_checkpointed`, `agent_restored`, `system_shutdown_requested`, `fuse_skipped`)
+  and added `events.rs` to the module boundary table. Added an assertion test in
+  `events.rs` that pins every variant's serialized string so the table can't drift.
+- Updated `THREAT_MODEL.md`: new §1.3 (env isolation), BP-4a (port→deny-all fallback),
+  log-injection note.
+- **Demo config (`agents.toml`) now exercises admission control and per-agent capability grants.**
+  `global_token_budget = 200_000`, `max_concurrent_inferences = 4`, both agents
+  have `capabilities = [{ FsRead = { prefix = "." } }]`. Commented MCP example included.
+- **CI**: Added `audit` job running `cargo audit` on every push.
+- **TODOS.md**: Added TODOS entries for F-006, F-007, F-008, F-009, F-012 (deferred P2 findings).
+
 ## [p4.6] - 2026-06-13 (v0.16.0)
 
 ### Added

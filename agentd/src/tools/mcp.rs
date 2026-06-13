@@ -76,6 +76,7 @@ impl McpClient {
         command: &str,
         args: &[String],
         sandbox: Option<sandbox::CompiledSandbox>,
+        extra_env: &std::collections::HashMap<String, String>,
     ) -> Result<(Arc<Self>, Vec<ToolSpec>)> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -86,6 +87,19 @@ impl McpClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Clear the full parent environment so secrets (ANTHROPIC_API_KEY, etc.)
+        // are never inherited by MCP subprocess. Re-add a vetted allowlist only.
+        cmd.env_clear();
+        for key in &["PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR"] {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+        // Per-server env overrides from config (mcp_server.env map).
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
 
         // Apply pre-compiled sandbox in the child process before exec().
         // apply_compiled() is async-signal-safe: raw syscalls only, no allocation.
@@ -395,12 +409,15 @@ impl McpClient {
 /// Read one newline-terminated line from `reader`, counting bytes before
 /// appending to avoid allocating more than `limit` bytes. Returns `None` at
 /// EOF with no bytes read; returns an error if `limit` is exceeded.
+///
+/// Bytes are accumulated raw and UTF-8 is validated once at the newline boundary.
+/// Per-chunk validation on fill_buf slices would fail on multibyte codepoints
+/// that span the 8 KB BufReader fill boundary (F-010).
 async fn read_line_bounded(
     reader: &mut BufReader<ChildStdout>,
     limit: usize,
 ) -> Result<Option<String>> {
-    let mut buf = String::new();
-    let mut total = 0usize;
+    let mut raw: Vec<u8> = Vec::new();
 
     loop {
         let available = reader
@@ -409,24 +426,27 @@ async fn read_line_bounded(
             .context("reading from MCP server stdout")?;
 
         if available.is_empty() {
-            return Ok(if total == 0 { None } else { Some(buf) });
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            // EOF mid-line: validate and return what we have.
+            let s = String::from_utf8(raw).context("MCP server response is not valid UTF-8")?;
+            return Ok(Some(s));
         }
 
         let newline = available.iter().position(|&b| b == b'\n');
         let end = newline.map(|p| p + 1).unwrap_or(available.len());
 
-        total += end;
-        if total > limit {
+        if raw.len() + end > limit {
             return Err(anyhow::anyhow!("MCP server response exceeded {limit} bytes"));
         }
 
-        let chunk =
-            std::str::from_utf8(&available[..end]).context("MCP server response is not valid UTF-8")?;
-        buf.push_str(chunk);
+        raw.extend_from_slice(&available[..end]);
         reader.consume(end);
 
         if newline.is_some() {
-            return Ok(Some(buf));
+            let s = String::from_utf8(raw).context("MCP server response is not valid UTF-8")?;
+            return Ok(Some(s));
         }
     }
 }

@@ -302,7 +302,7 @@ impl fuser::Filesystem for AgentsFs {
         };
         let offset = if offset < 0 { 0usize } else { offset as usize };
         let start = offset.min(content.len());
-        let end   = (offset + size as usize).min(content.len());
+        let end   = offset.saturating_add(size as usize).min(content.len());
         reply.data(&content[start..end]);
     }
 
@@ -585,6 +585,26 @@ mod tests {
         let content = b"done\n";
         let offset = 999_usize.min(content.len());
         assert_eq!(&content[offset..content.len()], b"");
+    }
+
+    /// Regression: saturating_add must never overflow when offset or size is
+    /// near usize::MAX.  The real FUSE read() path uses:
+    ///   let end = offset.saturating_add(size as usize).min(content.len());
+    /// Verify this arithmetic is correct for extreme inputs.
+    #[test]
+    fn read_saturating_add_does_not_overflow() {
+        let content = b"hello\n";
+        // offset = content.len() - 1, size = usize::MAX — should yield 1 byte
+        let offset = content.len() - 1;
+        let size: usize = usize::MAX;
+        let end = offset.saturating_add(size).min(content.len());
+        assert_eq!(&content[offset..end], b"\n");
+
+        // offset past end, huge size — should yield empty slice
+        let offset2: usize = content.len() + 100;
+        let start2 = offset2.min(content.len());
+        let end2 = offset2.saturating_add(size).min(content.len());
+        assert_eq!(&content[start2..end2], b"");
     }
 
     // ── Flight tail helpers ───────────────────────────────────────────────────

@@ -54,7 +54,7 @@ Phase 3 (Surfaces + Sandbox):
   `SandboxApplied`/`SandboxSkipped` flight events; `CONFIG_SECCOMP=y` in
   kernel-extras.config; 180 tests pass.
 
-**Phases 0–4 complete (p4.6 landed). Phase 4 (Isolation & hardening) is done. Next: Phase 5 — see `docs/ROADMAP.md`.**
+**Phases 0–4 complete (p4.7 landed). Phase 4 (Isolation & hardening) + pre-Phase-5 cleanup complete. Next: Phase 5 — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

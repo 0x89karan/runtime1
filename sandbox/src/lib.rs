@@ -162,6 +162,21 @@ impl CompiledSandbox {
     }
 }
 
+/// Returns true if the running kernel supports Landlock ABI version 4 (Linux ≥ 6.7),
+/// which is required for TCP port enforcement via `AllowNetConnect`.
+///
+/// On non-Linux or if Landlock is unavailable, always returns false.
+pub fn landlock_v4_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::query_landlock_abi_version() >= 4
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Compile sandbox rules into a `CompiledSandbox` ready for `apply_compiled`.
 ///
 /// May allocate (opens file descriptors, builds Vec); must NOT be called inside
@@ -420,7 +435,7 @@ mod linux {
 
     /// Query the kernel's supported Landlock ABI version.
     /// Returns the version (1..N) on success, or 0 if Landlock is unavailable.
-    fn query_landlock_abi_version() -> i64 {
+    pub(super) fn query_landlock_abi_version() -> i64 {
         let ret = unsafe {
             libc::syscall(
                 SYS_LANDLOCK_CREATE_RULESET,
@@ -626,6 +641,35 @@ mod linux {
         BpfProgram(filter)
     }
 
+    /// Format "0 {id} 1\n" into a stack-allocated byte buffer — no heap allocation.
+    /// Used instead of format!() inside the fork child where malloc is unsafe.
+    fn id_map_entry(id: u32) -> ([u8; 16], usize) {
+        let mut buf = [0u8; 16];
+        let mut pos = 0usize;
+        buf[pos] = b'0'; pos += 1;
+        buf[pos] = b' '; pos += 1;
+        let mut tmp = [0u8; 10];
+        let mut tlen = 0usize;
+        let mut n = id;
+        if n == 0 {
+            tmp[0] = b'0';
+            tlen = 1;
+        } else {
+            while n > 0 {
+                tmp[tlen] = b'0' + (n % 10) as u8;
+                n /= 10;
+                tlen += 1;
+            }
+            tmp[..tlen].reverse();
+        }
+        buf[pos..pos + tlen].copy_from_slice(&tmp[..tlen]);
+        pos += tlen;
+        buf[pos] = b' '; pos += 1;
+        buf[pos] = b'1'; pos += 1;
+        buf[pos] = b'\n'; pos += 1;
+        (buf, pos)
+    }
+
     /// Apply the compiled sandbox to the current process.
     ///
     /// Async-signal-safe: only raw syscalls, no allocation, no locking.
@@ -647,7 +691,27 @@ mod linux {
             let mut flags: libc::c_int = libc::CLONE_NEWUSER;
             if inner.isolate_net   { flags |= libc::CLONE_NEWNET; }
             if inner.isolate_mount { flags |= libc::CLONE_NEWNS;  }
-            if unsafe { libc::unshare(flags) } != 0 {
+            let unshare_ok = unsafe { libc::unshare(flags) } == 0;
+            if unshare_ok {
+                // Write uid_map and gid_map to preserve DAC identity inside the
+                // user namespace. Without these mappings, the process runs as the
+                // overflow uid (nobody/65534), breaking Landlock FS grants via DAC
+                // for user-owned files with modes < 0644.
+                //
+                // "deny" must be written to setgroups before gid_map on kernels ≥ 3.19
+                // to prevent privilege escalation via supplementary group removal.
+                let uid = unsafe { libc::getuid() };
+                let gid = unsafe { libc::getgid() };
+                let _ = std::fs::write("/proc/self/setgroups", "deny");
+                // Use stack-allocated byte buffers instead of format!() to avoid
+                // heap allocation in the fork child where malloc is not safe.
+                let (uid_buf, uid_len) = id_map_entry(uid);
+                let (gid_buf, gid_len) = id_map_entry(gid);
+                // BestEffort: write errors here mean uid_map is already set or the
+                // namespace was not actually created; don't fail the whole sandbox.
+                let _ = std::fs::write("/proc/self/uid_map", &uid_buf[..uid_len]);
+                let _ = std::fs::write("/proc/self/gid_map", &gid_buf[..gid_len]);
+            } else {
                 let errno = unsafe { *libc::__errno_location() };
                 // BestEffort: EPERM = user namespaces disabled by kernel policy
                 // (kernel.unprivileged_userns_clone = 0); ENOSYS = too old.
@@ -1070,5 +1134,14 @@ mod tests {
         // allow_net_connect_enforcement_status_reflects_abi (Linux-only above).
         // Here we just verify compile doesn't panic or error on any platform.
         let _ = result.unwrap().enforcement_status();
+    }
+
+    /// On non-Linux platforms there are no Landlock kernel ABIs, so
+    /// `landlock_v4_available()` must always return `false`.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn landlock_v4_available_returns_false_on_non_linux() {
+        assert!(!landlock_v4_available(),
+            "landlock_v4_available must be false on non-Linux");
     }
 }

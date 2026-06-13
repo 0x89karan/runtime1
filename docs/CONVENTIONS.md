@@ -26,7 +26,8 @@ subsystem, tool, or provider. (For *what* to build, see `ROADMAP.md`; for *why*,
 | `tools` | the `Tool` ABI, native tools, MCP client | agent/loop logic |
 | `capability` | what an agent is allowed to do | enforcement of unrelated concerns |
 | `bus` | agent addressing, messaging, spawn | scheduling internals |
-| `flight_recorder` | the event log | business logic |
+| `events` | `EventKind` enum + stable string serialization | business logic |
+| `flight_recorder` | the event log (append-only JSONL writer) | business logic |
 | `config` | the TOML spec | runtime state |
 
 When a new subsystem appears in the roadmap, add a module; don't bolt it onto an
@@ -75,8 +76,14 @@ Phase 0 kinds (canonical — do not rename):
 | `agent_card_registered` | agent card recorded at scheduler seed (id, name, skills) (p1.6+) |
 | `fuse_mounted` | `/agents` FUSE filesystem mounted (mount_point) (p3.1+) |
 | `fuse_unmounted` | `/agents` FUSE filesystem unmounted (p3.1+) |
+| `fuse_skipped` | FUSE mount skipped (non-Linux or `NO_FUSE` set) (p3.1+) |
 | `sandbox_applied` | kernel sandbox applied to MCP server subprocess (server, rules) (p3.3+) |
 | `sandbox_skipped` | MCP server spawned without sandbox (server, reason) (p3.3+) |
+| `tools_registered` | tool registry populated at boot (tool_count) (p0+) |
+| `agent_child_result_delivered` | child agent result delivered to spawning parent (parent_id, child_id) (p1.5+) |
+| `agent_checkpointed` | agent state checkpointed to disk (agent_id, turn) (p3.2+) |
+| `agent_restored` | agent state restored from checkpoint (agent_id, turn) (p3.2+) |
+| `system_shutdown_requested` | SIGTERM or SIGINT received; graceful shutdown initiated (p2.3+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it
