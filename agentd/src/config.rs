@@ -36,6 +36,9 @@ pub struct Config {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    /// Path for the flight log (JSONL). Defaults to "flight.jsonl" in the CWD.
+    /// The --log-path CLI flag takes precedence over this field.
+    pub log_path: Option<String>,
 }
 
 impl Config {
@@ -660,6 +663,32 @@ mcp_require_capabilities = true
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert!(cfg.tools.mcp_require_capabilities);
+    }
+
+    // ── p4.5: log_path config field tests ────────────────────────────────────
+
+    #[test]
+    fn log_path_absent_defaults_to_none() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.log_path.is_none(), "absent log_path must default to None");
+    }
+
+    #[test]
+    fn log_path_parses_when_set() {
+        let raw = r#"
+log_path = "/var/log/agentd/flight.jsonl"
+
+[agent]
+id = "a"
+task = "t"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.log_path.as_deref(), Some("/var/log/agentd/flight.jsonl"));
     }
 
     // ── p1.6: AgentCard tests ─────────────────────────────────────────────────

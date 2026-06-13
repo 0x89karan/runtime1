@@ -92,20 +92,89 @@ impl McpClient {
         // Gated to Linux: Landlock + seccomp are Linux-only mechanisms.
         #[cfg(not(target_os = "linux"))]
         let _ = sandbox;
-        #[cfg(target_os = "linux")]
-        if let Some(compiled) = sandbox {
-            // SAFETY: apply_compiled() uses only async-signal-safe operations.
-            // CompiledSandbox is Send + Sync, so the closure satisfies pre_exec bounds.
-            unsafe {
-                cmd.pre_exec(move || {
-                    sandbox::apply_compiled(&compiled)
-                        .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))
-                });
-            }
-        }
 
-        let mut child = cmd
-            .spawn()
+        // Spawn the child. On Linux with a sandbox, use a pre-exec error pipe to
+        // propagate sandbox failure stage back to the parent. On Linux without a
+        // sandbox (or on non-Linux), use a plain spawn with a clean error message.
+        #[cfg(target_os = "linux")]
+        let mut child = {
+            if let Some(compiled) = sandbox {
+                // Pre-exec error pipe: only created when a sandbox is configured.
+                // O_CLOEXEC on both ends: write_fd closed by exec() on success →
+                // parent reads EOF. On pre_exec failure, child writes stage tag before
+                // returning EPERM (exec doesn't run, so O_CLOEXEC does not fire).
+                let mut fds: [libc::c_int; 2] = [-1; 2];
+                let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("sandbox error pipe");
+                }
+                let (read_fd, write_fd) = (fds[0], fds[1]);
+
+                // SAFETY: apply_compiled() uses only async-signal-safe operations (raw
+                // syscalls). libc::write on write_fd is also async-signal-safe.
+                // CompiledSandbox is Send + Sync.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if sandbox::apply_compiled(&compiled).is_err() {
+                            let tag = b"sandbox";
+                            // Write stage tag so the parent can distinguish a sandbox
+                            // failure from a missing-binary error.
+                            let _ = libc::write(
+                                write_fd,
+                                tag.as_ptr() as *const libc::c_void,
+                                tag.len(),
+                            );
+                            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                        }
+                        Ok(())
+                    });
+                }
+
+                let spawn_result = cmd.spawn();
+
+                // Parent closes write end: once the child either exec'd (O_CLOEXEC
+                // fired) or exited after a pre_exec error, read(read_fd) returns EOF.
+                unsafe { libc::close(write_fd) };
+
+                match spawn_result {
+                    Ok(c) => {
+                        unsafe { libc::close(read_fd) };
+                        c
+                    }
+                    Err(e) => {
+                        // Read the stage tag written by pre_exec (if any).
+                        let mut buf = [0u8; 16];
+                        let n = unsafe {
+                            libc::read(
+                                read_fd,
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                buf.len(),
+                            )
+                        };
+                        unsafe { libc::close(read_fd) };
+                        // Allowlist: only accept the literal tags written by pre_exec.
+                        let stage = if n > 0 {
+                            let tag = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+                            if tag == "sandbox" { "sandbox" } else { "unknown" }
+                        } else {
+                            "unknown"
+                        };
+                        return Err(anyhow::anyhow!(
+                            "spawning MCP server '{}' failed (sandbox stage: '{}'): {}",
+                            command, stage, e
+                        ));
+                    }
+                }
+            } else {
+                // No sandbox configured — plain spawn with a clean error message.
+                cmd.spawn()
+                    .with_context(|| format!("spawning MCP server '{command}'"))?
+            }
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let mut child = cmd.spawn()
             .with_context(|| format!("spawning MCP server '{command}'"))?;
 
         let stdin = child.stdin.take().context("child stdin unavailable")?;

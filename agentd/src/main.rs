@@ -23,16 +23,33 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let mut args = std::env::args().skip(1);
-    let result = match args.next().as_deref() {
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // --no-fuse: skip FUSE mount unconditionally (useful in CI and dev environments
+    // without the FUSE kernel module). AGENTOS_NO_FUSE env var has the same effect.
+    let no_fuse = raw_args.iter().any(|a| a == "--no-fuse")
+        || std::env::var("AGENTOS_NO_FUSE")
+            .is_ok_and(|v| !matches!(v.to_lowercase().as_str(), "" | "0" | "false" | "no"));
+
+    // --log-path <path>: override the flight log destination (default: flight.jsonl in CWD).
+    let log_path_override = parse_log_path(&raw_args);
+    if raw_args.iter().any(|a| a == "--log-path") && log_path_override.is_none() {
+        anyhow::bail!("--log-path requires a value (e.g. --log-path /path/to/flight.jsonl)");
+    }
+
+    // Strip recognised flags (and their value arguments) from the positional args.
+    let filtered_strings = filter_positional_args(&raw_args);
+    let filtered: Vec<&str> = filtered_strings.iter().map(|s| s.as_str()).collect();
+
+    let result = match filtered.first().copied() {
         Some("--probe") => {
-            let prompt = args
-                .next()
+            let prompt = filtered
+                .get(1)
+                .copied()
                 .ok_or_else(|| anyhow::anyhow!("--probe requires a prompt argument"))?;
-            run_probe(&prompt).await
+            run_probe(prompt, resolve_log_path(log_path_override, None)).await
         }
-        Some(path) => run_agent(PathBuf::from(path)).await,
-        None => run_agent(PathBuf::from("agent.toml")).await,
+        Some(path) => run_agent(PathBuf::from(path), no_fuse, log_path_override).await,
+        None => run_agent(PathBuf::from("agent.toml"), no_fuse, log_path_override).await,
     };
 
     if let Err(e) = result {
@@ -43,13 +60,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
+async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathBuf>) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("loading config from {path:?}"))?;
     let cfg: config::Config =
         toml::from_str(&raw).with_context(|| format!("parsing config from {path:?}"))?;
 
-    let recorder = Arc::new(FlightRecorder::open()?);
+    // Resolve flight log path: CLI flag > TOML field > default "flight.jsonl".
+    let log_path = resolve_log_path(log_path_override, cfg.log_path.as_deref());
+    let recorder = Arc::new(FlightRecorder::new(&log_path)?);
 
     let mut agent_cfgs = cfg.agent_configs()?;
 
@@ -147,7 +166,8 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     // calling exit() while mcp_clients is still in scope.
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
     for server in &cfg.tools.mcp_servers {
-        // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn}] only).
+        // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn},{Net}])
+        // when only spawn/net caps are present with no FS rules.
         // Treat empty rules the same as None: no kernel mechanism is installed, so
         // emitting SandboxApplied would be misleading. filter(non-empty) collapses it.
         let sandbox_rules: Option<Vec<SandboxRule>> = server.capabilities
@@ -240,22 +260,45 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
                     }),
                 );
             } else if let Some(ref enf) = enforcement {
-                recorder.record(
-                    "agentd",
-                    None,
-                    EventKind::SandboxApplied,
-                    serde_json::json!({
-                        "server":    server.name,
-                        "isolation": isolation_str,
-                        "enforced": {
-                            "landlock":          enf.landlock,
-                            "seccomp":           enf.seccomp,
-                            "spawn_enforcement": enf.spawn_enforcement,
-                            "namespace_net":     enf.namespace_net,
-                            "namespace_mount":   enf.namespace_mount,
-                        },
+                // On non-x86_64, DenySpawn compiles to nothing (seccomp is x86_64-only).
+                // If DenySpawn was the only effective rule, the compiled sandbox is a
+                // complete no-op — emitting SandboxApplied with all-false fields would
+                // mislead operators. Emit SandboxSkipped instead.
+                let noop_deny_spawn = is_noop_deny_spawn(
+                    enf,
+                    sandbox_rules.as_deref().is_some_and(|r| {
+                        r.iter().any(|rule| matches!(rule, SandboxRule::DenySpawn))
                     }),
                 );
+                if noop_deny_spawn {
+                    recorder.record(
+                        "agentd",
+                        None,
+                        EventKind::SandboxSkipped,
+                        serde_json::json!({
+                            "server": server.name,
+                            "reason": "deny-spawn-unsupported-arch",
+                        }),
+                    );
+                } else {
+                    recorder.record(
+                        "agentd",
+                        None,
+                        EventKind::SandboxApplied,
+                        serde_json::json!({
+                            "server":    server.name,
+                            "isolation": isolation_str,
+                            "enforced": {
+                                "landlock":          enf.landlock,
+                                "seccomp":           enf.seccomp,
+                                "spawn_enforcement": enf.spawn_enforcement,
+                                "namespace_net":     enf.namespace_net,
+                                "namespace_mount":   enf.namespace_mount,
+                                "landlock_net":      enf.landlock_net,
+                            },
+                        }),
+                    );
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -314,7 +357,16 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     let fuse_mountpoint = PathBuf::from("/agents");
 
     #[cfg(target_os = "linux")]
-    let maybe_session = {
+    let maybe_session = if no_fuse {
+        tracing::info!("FUSE mount skipped (--no-fuse / AGENTOS_NO_FUSE)");
+        recorder.record(
+            "agentd",
+            None,
+            EventKind::FuseSkipped,
+            serde_json::json!({ "mountpoint": fuse_mountpoint.display().to_string() }),
+        );
+        None
+    } else {
         match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot)) {
             Ok(session) => {
                 recorder.record(
@@ -331,6 +383,8 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
             }
         }
     };
+    #[cfg(not(target_os = "linux"))]
+    let _ = no_fuse;
     #[cfg(not(target_os = "linux"))]
     let _maybe_session: Option<()> = None;
 
@@ -429,6 +483,52 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Extract the value of `--log-path <path>` from raw CLI args, if present.
+fn parse_log_path(args: &[String]) -> Option<PathBuf> {
+    args.windows(2)
+        .find(|w| w[0] == "--log-path")
+        .map(|w| PathBuf::from(&w[1]))
+}
+
+/// Strip recognised flag/value pairs from args and return the positional remainder.
+/// Flags consumed: `--no-fuse` (bare), `--log-path <value>` (consumes two tokens).
+fn filter_positional_args(args: &[String]) -> Vec<String> {
+    let mut skip_next = false;
+    args.iter()
+        .filter_map(|a| {
+            if skip_next { skip_next = false; return None; }
+            if a == "--no-fuse" { return None; }
+            if a == "--log-path" { skip_next = true; return None; }
+            Some(a.clone())
+        })
+        .collect()
+}
+
+/// Resolve the flight log path: CLI override > TOML `log_path` field > default.
+fn resolve_log_path(cli_override: Option<PathBuf>, toml_path: Option<&str>) -> PathBuf {
+    cli_override
+        .or_else(|| toml_path.map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("flight.jsonl"))
+}
+
+/// Return true when a compiled sandbox is a complete no-op because the only
+/// requested rule was `DenySpawn` on a non-x86_64 arch (seccomp is x86_64-only,
+/// so nothing was actually installed). Emitting `SandboxApplied` with all-false
+/// fields in that case would mislead operators; callers should emit `SandboxSkipped`.
+///
+/// `has_rules` should be `true` when the original `sandbox_rules` slice was
+/// non-empty (i.e. DenySpawn was requested but produced no kernel mechanism).
+#[cfg(any(test, target_os = "linux"))]
+fn is_noop_deny_spawn(enf: &sandbox::EnforcementStatus, has_rules: bool) -> bool {
+    !enf.landlock
+        && !enf.landlock_net
+        && !enf.seccomp
+        && !enf.namespace_net
+        && !enf.namespace_mount
+        && enf.spawn_enforcement == "none"
+        && has_rules
+}
+
 /// Convert an agent capability set into sandbox rules for an MCP server subprocess.
 ///
 /// Landlock FS rules map 1:1 from FsRead/FsWrite capabilities. DenySpawn is
@@ -453,8 +553,20 @@ fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
             Capability::FsWrite { prefix } => {
                 rules.push(SandboxRule::AllowFsWrite { prefix: prefix.clone() });
             }
-            // Mcp is advisory; Spawn and Net are handled above.
-            Capability::Net { .. } | Capability::Mcp { .. } | Capability::Spawn => {}
+            Capability::Net { ports, .. } => {
+                // Non-empty ports → Landlock V4 TCP port enforcement (BestEffort on < 6.7).
+                // Empty ports → no AllowNetConnect rules; network is unrestricted (backward compat).
+                // Port 0 is not a valid TCP port; Landlock returns EINVAL for it.
+                for &port in ports {
+                    if port == 0 {
+                        tracing::warn!("Net capability: port 0 is not a valid TCP port and will be ignored");
+                        continue;
+                    }
+                    rules.push(SandboxRule::AllowNetConnect { port });
+                }
+            }
+            // Mcp is advisory; Spawn is handled above.
+            Capability::Mcp { .. } | Capability::Spawn => {}
         }
     }
     rules
@@ -498,9 +610,9 @@ mod tests {
 
     #[test]
     fn caps_to_rules_net_cap_permits_network() {
-        // Net present → no IsolateNetwork; Mcp is still advisory.
+        // Net present (empty ports) → no IsolateNetwork; Mcp is still advisory.
         let rules = caps_to_rules(&[
-            Capability::Net { hosts: vec!["example.com".into()] },
+            Capability::Net { hosts: vec!["example.com".into()], ports: vec![] },
             Capability::Mcp { server: "echo".into(), tools: vec![] },
         ]);
         assert!(rules.contains(&SandboxRule::DenySpawn),        "no Spawn cap → DenySpawn");
@@ -520,17 +632,251 @@ mod tests {
 
     #[test]
     fn caps_to_rules_net_and_spawn_both_present_no_isolation_no_deny() {
-        let rules = caps_to_rules(&[Capability::Net { hosts: vec![] }, Capability::Spawn]);
+        let rules = caps_to_rules(&[Capability::Net { hosts: vec![], ports: vec![] }, Capability::Spawn]);
         assert!(!rules.contains(&SandboxRule::DenySpawn),      "Spawn → no DenySpawn");
         assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
     }
+
+    #[test]
+    fn caps_to_rules_net_with_ports_generates_allow_net_connect() {
+        let rules = caps_to_rules(&[Capability::Net {
+            hosts: vec!["api.anthropic.com".into()],
+            ports: vec![443],
+        }]);
+        assert!(
+            rules.contains(&SandboxRule::AllowNetConnect { port: 443 }),
+            "Net {{ ports: [443] }} → AllowNetConnect {{ port: 443 }}"
+        );
+        assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
+    }
+
+    #[test]
+    fn caps_to_rules_net_multiple_ports_generates_multiple_rules() {
+        let rules = caps_to_rules(&[Capability::Net {
+            hosts: vec![],
+            ports: vec![80, 443],
+        }]);
+        assert!(rules.contains(&SandboxRule::AllowNetConnect { port: 80 }));
+        assert!(rules.contains(&SandboxRule::AllowNetConnect { port: 443 }));
+        assert!(!rules.contains(&SandboxRule::IsolateNetwork));
+    }
+
+    #[test]
+    fn caps_to_rules_net_empty_ports_no_allow_net_connect() {
+        // Backward compat: Net with empty ports must not generate AllowNetConnect.
+        let rules = caps_to_rules(&[Capability::Net { hosts: vec![], ports: vec![] }]);
+        assert!(
+            !rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { .. })),
+            "empty ports → no AllowNetConnect rules"
+        );
+    }
+
+    // ── G1: parse_log_path ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_log_path_returns_value_when_flag_present() {
+        let args: Vec<String> = ["--log-path", "/tmp/run.jsonl"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_log_path(&args), Some(PathBuf::from("/tmp/run.jsonl")));
+    }
+
+    #[test]
+    fn parse_log_path_returns_none_when_flag_absent() {
+        let args: Vec<String> = ["agent.toml"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_log_path(&args), None);
+    }
+
+    #[test]
+    fn parse_log_path_returns_none_for_empty_args() {
+        assert_eq!(parse_log_path(&[]), None);
+    }
+
+    // ── G2: filter_positional_args ────────────────────────────────────────────
+
+    #[test]
+    fn filter_positional_args_strips_log_path_and_its_value() {
+        let args: Vec<String> = ["--log-path", "/tmp/x.jsonl", "agent.toml"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    #[test]
+    fn filter_positional_args_strips_no_fuse() {
+        let args: Vec<String> = ["--no-fuse", "agent.toml"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    #[test]
+    fn filter_positional_args_preserves_positional_when_no_flags() {
+        let args: Vec<String> = ["agent.toml"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    // ── G3: resolve_log_path precedence chain ─────────────────────────────────
+
+    #[test]
+    fn resolve_log_path_cli_overrides_toml() {
+        let result = resolve_log_path(
+            Some(PathBuf::from("/cli/path.jsonl")),
+            Some("/toml/path.jsonl"),
+        );
+        assert_eq!(result, PathBuf::from("/cli/path.jsonl"));
+    }
+
+    #[test]
+    fn resolve_log_path_toml_used_when_no_cli_override() {
+        let result = resolve_log_path(None, Some("/toml/path.jsonl"));
+        assert_eq!(result, PathBuf::from("/toml/path.jsonl"));
+    }
+
+    #[test]
+    fn resolve_log_path_default_when_neither_set() {
+        let result = resolve_log_path(None, None);
+        assert_eq!(result, PathBuf::from("flight.jsonl"));
+    }
+
+    // ── G4: is_noop_deny_spawn ────────────────────────────────────────────────
+    // EnforcementStatus has all pub fields and is available on all platforms,
+    // so these tests run on macOS and Linux alike.
+
+    #[test]
+    fn noop_deny_spawn_true_when_all_false_and_has_rules() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+            landlock_net: false,
+        };
+        assert!(is_noop_deny_spawn(&enf, true),
+            "all mechanisms false + rules present → noop DenySpawn");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_has_rules_is_false() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+            landlock_net: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, false),
+            "no rules present → not a noop DenySpawn case");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_seccomp_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: true,
+            spawn_enforcement: "fork_vfork_only",
+            namespace_net: false,
+            namespace_mount: false,
+            landlock_net: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "seccomp active → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_landlock_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: true,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+            landlock_net: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "landlock active → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_namespace_net_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: true,
+            namespace_mount: false,
+            landlock_net: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "namespace_net active → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_namespace_mount_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: true,
+            landlock_net: false,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "namespace_mount active → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn noop_deny_spawn_false_when_landlock_net_active() {
+        let enf = sandbox::EnforcementStatus {
+            landlock: false,
+            seccomp: false,
+            spawn_enforcement: "none",
+            namespace_net: false,
+            namespace_mount: false,
+            landlock_net: true,
+        };
+        assert!(!is_noop_deny_spawn(&enf, true),
+            "landlock_net active (V4 port enforcement) → not a noop; real enforcement applied");
+    }
+
+    #[test]
+    fn caps_to_rules_net_port_zero_is_skipped() {
+        let caps = vec![Capability::Spawn, Capability::Net {
+            hosts: vec![],
+            ports: vec![0, 443],
+        }];
+        let rules = caps_to_rules(&caps);
+        assert!(!rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 0 })),
+            "port 0 must be skipped (invalid TCP port)");
+        assert!(rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 443 })),
+            "valid port 443 must still be included");
+    }
+
+    // ── G2 extension: both flags together ────────────────────────────────────
+
+    #[test]
+    fn filter_positional_args_handles_both_flags_together() {
+        let args: Vec<String> = ["--no-fuse", "--log-path", "/tmp/x.jsonl", "agent.toml"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(filter_positional_args(&args), vec!["agent.toml".to_string()]);
+    }
+
+    // ── G1 extension: trailing flag with no value ─────────────────────────────
+
+    #[test]
+    fn parse_log_path_returns_none_when_flag_is_last_arg() {
+        // --log-path as the final token with no following value: windows(2) won't
+        // match, so None is returned silently. This documents the contract.
+        let args: Vec<String> = ["agent.toml", "--log-path"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(parse_log_path(&args), None);
+    }
 }
 
-async fn run_probe(prompt: &str) -> anyhow::Result<()> {
+async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
     use agentd::inference::{Block, InferenceGateway, InferenceRequest, Msg, Role};
 
     let model = "claude-sonnet-4-6";
-    let recorder = FlightRecorder::open()?;
+    let recorder = FlightRecorder::new(&log_path)?;
 
     let gateway = AnthropicGateway::from_env(model).context("initializing Anthropic gateway")?;
 
@@ -547,7 +893,7 @@ async fn run_probe(prompt: &str) -> anyhow::Result<()> {
 
     tracing::info!(
         model,
-        prompt = %prompt.chars().take(80).collect::<String>(),
+        prompt = %prompt.chars().take(PREVIEW_CHARS).collect::<String>(),
         "probe: sending request"
     );
 
@@ -581,7 +927,7 @@ async fn run_probe(prompt: &str) -> anyhow::Result<()> {
         .iter()
         .find_map(|b| {
             if let Block::Text { text } = b {
-                Some(text.chars().take(200).collect())
+                Some(text.chars().take(PREVIEW_CHARS).collect())
             } else {
                 None
             }

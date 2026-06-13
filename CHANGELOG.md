@@ -3,6 +3,113 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p4.6] - 2026-06-13 (v0.16.0)
+
+### Added
+- **Landlock V4 TCP port enforcement**: New `SandboxRule::AllowNetConnect { port: u16 }` enforces
+  per-port TCP connects via Landlock ABI V4 (Linux kernel ≥ 6.7). `Net { hosts, ports: Vec<u16> }`
+  capability gains a `ports` field (`#[serde(default)]` for backward compat). `caps_to_rules()`
+  maps `Net.ports` to `AllowNetConnect` rules. ABI version is detected at runtime via
+  `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`: V4 (≥ 6.7) enables
+  enforcement; older kernels degrade silently (BestEffort). Hostname enforcement remains advisory
+  (Landlock restricts ports, not hostnames).
+- **`EnforcementStatus.landlock_net`**: New boolean field on `EnforcementStatus` and
+  `SandboxApplied { enforced }` payload. Allows operators to distinguish V4 net enforcement
+  (TCP ports restricted) from V3/degraded (no net enforcement).
+- **`run_probe --log-path` fix**: `run_probe` now threads `log_path: PathBuf` through to
+  `FlightRecorder::new` via `resolve_log_path()`, honouring the CLI flag. Previously it always
+  wrote to `"flight.jsonl"` regardless of `--log-path`.
+
+### Fixed
+- **Landlock FS lockout on net-only configs (CRITICAL)**: When only `AllowNetConnect` rules were
+  present and no FS rules, `build_landlock_ruleset` set `handled_access_fs=ACCESS_FS_HANDLED`
+  with zero path-beneath rules. After `landlock_restrict_self`, ALL filesystem access was denied
+  (EACCES on every open/read/write). Fixed in two places:
+  - `compile()`: ABI version is now queried before the `has_landlock_rules` gate. On V3 kernels
+    with only net rules, `has_landlock_rules=false`, so no ruleset is created at all (correct
+    BestEffort degradation).
+  - `build_landlock_ruleset()`: `handled_access_fs = if path_entries.is_empty() { 0 } else
+    { ACCESS_FS_HANDLED }`. A net-only V4 ruleset correctly declares no FS handling.
+- **`is_noop_deny_spawn` false positive for V4 net enforcement**: Added `&& !enf.landlock_net`
+  check so active V4 port enforcement is not treated as a no-op sandbox.
+- **Port 0 validation in `caps_to_rules()`**: Port 0 is not a valid TCP port (kernel returns
+  EINVAL). `caps_to_rules()` now skips port 0 with `tracing::warn` rather than forwarding it to
+  `AllowNetConnect`.
+- **`PREVIEW_CHARS` constant**: Named constant replacing magic numbers `80` and `200` in
+  `run_probe`; ensures truncation lengths are consistent.
+- **Stale `agentd/Cargo.lock`**: Removed nested `agentd/Cargo.lock` (recorded v0.8.0); the
+  workspace-root `Cargo.lock` is authoritative (v0.16.0).
+
+### Tests
+- 253 tests (up from 244 at p4.5). Coverage additions:
+  - `noop_deny_spawn_false_when_landlock_net_active`: V4 net enforcement → not a noop
+  - `caps_to_rules_net_port_zero_is_skipped`: port 0 filtered before AllowNetConnect
+  - `allow_net_connect_only_no_fs_rules_does_not_lock_out_fs`: net-only compile must succeed
+  - `compile_net_only_has_landlock_rules_iff_v4_available`: BestEffort consistency check
+  - `no_fuse_env_var_falsy_values_do_not_activate`: AGENTOS_NO_FUSE=0/false/no/"" are falsy
+  - `log_path_flag_without_value_exits_nonzero`: --probe --log-path (missing arg) exits non-zero
+  - `allow_net_connect_enforcement_status_reflects_abi` (Linux): fd/flag consistency on V3/V4
+  - `allow_net_connect_with_fs_rule_compiles_together` (Linux): combined FS+net compiles
+
+## [p4.5] - 2026-06-13 (v0.15.0)
+
+### Added
+- **`--log-path <file>` CLI flag and `log_path` TOML field**: Override the flight
+  recorder destination. Precedence: CLI `--log-path` > TOML `log_path` > default
+  `"flight.jsonl"`. `--log-path` missing its value argument now fails with a clear
+  error instead of silently falling back. `run_agent` helper `resolve_log_path`
+  encapsulates the precedence chain.
+- **aarch64 DenySpawn noop detection**: On non-x86_64 targets where seccomp is not
+  compiled, a sandbox with only `DenySpawn` produces no kernel mechanism. The runtime
+  now detects this and emits `SandboxSkipped { reason: "deny-spawn-unsupported-arch" }`
+  instead of a misleading `SandboxApplied` with all-false fields. Detection is gated
+  on `DenySpawn` specifically in the rule set (not `!is_empty()`) to avoid false
+  positives when FS rules were also present but Landlock is unavailable.
+- **`EventKind` extracted to `events.rs`**: The `EventKind` enum moved from
+  `flight_recorder.rs` into its own `events.rs` module and is re-exported from
+  `flight_recorder` for backward compat. Makes the event taxonomy a first-class module.
+- **`BR2_CCACHE`**: Buildroot ccache enabled in `distro/buildroot.config`. Subsequent
+  clean builds use the host cache (~2 min vs ~30 min).
+
+### Fixed
+- `is_noop_deny_spawn` call site now checks specifically for `SandboxRule::DenySpawn`
+  in the rule set rather than `!is_empty()`, preventing a misleading
+  `"deny-spawn-unsupported-arch"` diagnostic when FS or network rules were present.
+
+### Tests
+- 244 tests (up from 225 at p4.4). Coverage additions:
+  - `parse_log_path`: 4 cases including trailing-flag-no-value (documents silent-None contract)
+  - `filter_positional_args`: 4 cases including both flags together
+  - `resolve_log_path`: 3 precedence-chain cases
+  - `is_noop_deny_spawn`: 6 cases covering all 4 enforcement fields + has_rules variants
+
+## [p4.4] - 2026-06-13 (v0.14.0)
+
+### Added
+- **`checkpoint.json` mode 0600**: `write_mode_600()` creates the tmp file with
+  `O_CREAT|O_EXCL|mode(0o600)` plus unlink-retry, guaranteeing 0600 even if a
+  stale tmp file exists at a different mode. `rename(2)` atomically replaces the
+  final `checkpoint.json`. Checkpoint is now owner-readable only regardless of umask.
+- **pre_exec sandbox error pipe**: `McpClient::spawn` on Linux creates a
+  `pipe2(O_CLOEXEC)` error pipe *only* when a sandbox is configured. On spawn
+  failure the error message includes `"(sandbox stage: 'sandbox'|'unknown')"` so
+  operators can distinguish a sandbox-apply failure from a missing-binary error.
+  Unsandboxed servers produce a clean error without the stage suffix.
+- **`--no-fuse` CLI flag + `AGENTOS_NO_FUSE` env var**: `agentd --no-fuse agent.toml`
+  or `AGENTOS_NO_FUSE=1 agentd agent.toml` skips the FUSE mount and emits a
+  `FuseSkipped` flight event. `AGENTOS_NO_FUSE=0/false/no` correctly disables the
+  flag (any other non-empty value enables it). Makes CI output clean.
+- **`EventKind::FuseSkipped`**: new flight event kind emitted when `--no-fuse` is
+  active; preserves the CONVENTIONS.md invariant that every meaningful step is
+  recorded (analogous to `SandboxSkipped`).
+- **`sandbox_probe` integration tests (Linux)**: 3 tests in `tests/integration.rs`
+  — `allowed_path_read_succeeds`, `denied_path_read_fails`, `deny_spawn_blocks_fork`
+  (x86_64 only) — verify Landlock + seccomp enforcement end-to-end using the
+  `sandbox_probe` fixture binary.
+
+### Fixed
+- THREAT_MODEL.md §3.2–3.3: updated to reflect checkpoint mode restriction.
+
 ## [p4.3] - 2026-06-12 (v0.13.0)
 
 ### Added

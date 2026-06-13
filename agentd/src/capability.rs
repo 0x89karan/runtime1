@@ -14,16 +14,32 @@ use serde::{Deserialize, Serialize};
 ///
 /// `satisfies` tests `normalize(actual).starts_with(normalize(granted_prefix))`.
 ///
-/// Symlinks are NOT resolved — a symlink inside a granted prefix can point
-/// outside it. OS-level isolation (Phase 4 sandbox) is the correct fix.
+/// **Absolute paths assumed.** Relative paths fail-safe to deny (no prefix match
+/// since `normalize` does not resolve relative roots). Callers should pass
+/// absolute paths; `~` expansion is not performed.
+///
+/// **Case-sensitive.** `starts_with` is byte-exact. On case-insensitive
+/// filesystems (macOS HFS+) a grant of `/Workspace` will not match
+/// `/workspace/file`. Production target is Linux ext4/btrfs (case-sensitive),
+/// so this is a dev-environment edge case, not a security gap.
+///
+/// **Symlinks not resolved.** A symlink inside a granted prefix can point
+/// outside it. OS-level isolation (Phase 4 sandbox) is the correct enforcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Capability {
     FsRead { prefix: String },
     FsWrite { prefix: String },
-    /// Advisory — recorded but not enforced at p1.4. Phase 4 network namespace
-    /// handles real enforcement. `hosts` is reserved for future use.
-    Net { hosts: Vec<String> },
+    /// Network access grant. `hosts` is advisory (not kernel-enforced at the
+    /// capability layer). `ports`, when non-empty, drives Landlock V4 TCP port
+    /// enforcement via `caps_to_rules()` → `AllowNetConnect` sandbox rules.
+    /// Empty `ports` means no port restriction (all outgoing TCP allowed, same as
+    /// pre-p4.6 behaviour). Configs without a `ports` field deserialise as empty.
+    Net {
+        hosts: Vec<String>,
+        #[serde(default)]
+        ports: Vec<u16>,
+    },
     Mcp { server: String, tools: Vec<String> },
     /// Reserved — no tool declares Spawn yet; always denied.
     Spawn,
@@ -77,7 +93,8 @@ pub fn satisfies_type(granted: &[Capability], required: &Capability) -> bool {
 /// - `Mcp`: server names must match and every required tool must appear in the
 ///   granted tools list. An empty granted tools list (`[]`) grants all tools on
 ///   that server (wildcard).
-/// - `Net`: advisory — always `true` (real enforcement is Phase 4).
+/// - `Net`: advisory at this layer — always `true`. Kernel-level TCP port
+///   enforcement is handled by `caps_to_rules()` → `AllowNetConnect` (p4.6+).
 /// - `Spawn`: always `false` — no tool declares this capability yet.
 pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
     match required {
@@ -318,9 +335,33 @@ mod tests {
         assert!(satisfies(
             &[],
             &Capability::Net {
-                hosts: vec!["api.example.com".to_string()]
+                hosts: vec!["api.example.com".to_string()],
+                ports: vec![],
             }
         ));
+    }
+
+    #[test]
+    fn net_ports_field_defaults_empty_on_deserialize() {
+        // Existing TOML without `ports` must deserialise cleanly (backward compat).
+        let toml_str = r#"Net = { hosts = ["api.example.com"] }"#;
+        let cap: Capability = toml::from_str(toml_str).expect("deserialise Net without ports");
+        if let Capability::Net { ports, .. } = cap {
+            assert!(ports.is_empty(), "ports should default to empty");
+        } else {
+            panic!("expected Net capability");
+        }
+    }
+
+    #[test]
+    fn net_ports_parses_when_present() {
+        let toml_str = r#"Net = { hosts = [], ports = [443, 80] }"#;
+        let cap: Capability = toml::from_str(toml_str).expect("deserialise Net with ports");
+        if let Capability::Net { ports, .. } = cap {
+            assert_eq!(ports, vec![443u16, 80]);
+        } else {
+            panic!("expected Net capability");
+        }
     }
 
     // ── satisfies_type direct tests ──────────────────────────────────────────

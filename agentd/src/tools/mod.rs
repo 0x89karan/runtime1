@@ -21,7 +21,13 @@ pub trait Tool: Send + Sync {
     /// `input`. Called at invocation time so path-based tools can return the
     /// actual access path (e.g. `FsRead { prefix: input["path"] }`).
     ///
-    /// Returns `None` for tools that require no capability gating.
+    /// Returns `None` for tools that require no capability gating. Such tools
+    /// are always visible in `filtered_specs` and always invocable, even when
+    /// the agent's cap-set is `Some([])` (deny-all). This is intentional: tools
+    /// like `list_agents` and `send_message` are control-plane primitives that
+    /// should not be suppressible by a FS/Net capability scope. If a future
+    /// tool should be hidden under a deny-all cap-set, it must declare a
+    /// synthetic capability and return `Some(...)` here.
     fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
         None
     }

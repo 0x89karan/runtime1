@@ -8,42 +8,9 @@ use std::{
 use anyhow::Context;
 use serde::Serialize;
 
-const FLIGHT_LOG: &str = "flight.jsonl";
+pub use crate::events::EventKind;
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EventKind {
-    AgentSpawned,
-    ToolsRegistered,
-    Perceive,
-    InferenceRequest,
-    InferenceResponse,
-    ToolCall,
-    ToolResult,
-    Observe,
-    AgentCompleted,
-    AgentFailed,
-    AgentScheduled,
-    AgentDeferred,
-    AgentAdmissionDenied,
-    BudgetExceeded,
-    MaxTurnsReached,
-    CapabilityDenied,
-    AgentChildResultDelivered,
-    AgentCardRegistered,
-    AgentCheckpointed,
-    AgentRestored,
-    MessageSent,
-    MessageReceived,
-    SystemShutdownRequested,
-    FuseMounted,
-    FuseUnmounted,
-    /// MCP server subprocess sandboxed via Landlock + seccomp before exec.
-    SandboxApplied,
-    /// MCP server configured without `capabilities`; running unsandboxed.
-    SandboxSkipped,
-    Error,
-}
+const FLIGHT_LOG: &str = "flight.jsonl";
 
 pub struct FlightRecorder {
     file: Mutex<File>,

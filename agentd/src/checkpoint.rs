@@ -14,6 +14,44 @@ use crate::{
 
 pub const FORMAT_VERSION: u32 = 1;
 
+/// Create `path` with mode 0600 on Unix, then write `data`.
+///
+/// On non-Unix (Windows) falls back to `tokio::fs::write` (different ACL model).
+/// Used for checkpoint tmp files so the final `checkpoint.json` is never world-readable.
+#[cfg(unix)]
+async fn write_mode_600(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+    // Use O_CREAT|O_EXCL (create_new) so the mode argument is always honoured by
+    // the kernel — on Linux, O_CREAT alone silently ignores mode when the file
+    // already exists at a different permission.  If a stale tmp file exists (e.g.
+    // from a crash), remove it first then retry once.
+    let mut f = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            tokio::fs::remove_file(path).await?;
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .await?
+        }
+        Err(e) => return Err(e),
+    };
+    f.write_all(data).await
+}
+
+#[cfg(not(unix))]
+async fn write_mode_600(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    tokio::fs::write(path, data).await
+}
+
 /// Serializable snapshot of a single `AgentTask`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentCheckpoint {
@@ -68,9 +106,12 @@ impl CheckpointStore {
     /// Write `cp` atomically. Calls `tokio::fs::write` so the scheduler's async
     /// executor is not blocked; a crash after rename leaves the previous good
     /// checkpoint intact because the tmp file was written first.
+    ///
+    /// On Unix the tmp file is created with mode 0600 (owner read/write only).
+    /// `rename(2)` preserves those permissions on the final `checkpoint.json`.
     pub async fn save(&self, cp: &SchedulerCheckpoint) -> Result<()> {
         let json = serde_json::to_string(cp).context("serialize checkpoint")?;
-        tokio::fs::write(&self.tmp_path, &json)
+        write_mode_600(&self.tmp_path, json.as_bytes())
             .await
             .context("write checkpoint.json.tmp")?;
         tokio::fs::rename(&self.tmp_path, &self.path)
@@ -260,5 +301,63 @@ mod tests {
         assert_eq!(loaded.agents.len(), 1);
         assert_eq!(loaded.agents[0].agent_id, "agent-a");
         assert_eq!(loaded.tokens_spent, 15);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_sets_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        store.save(&minimal_scheduler_checkpoint()).await.unwrap();
+        let meta = std::fs::metadata(&store.path).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "checkpoint.json must be mode 0600, got 0o{mode:03o}");
+    }
+
+    /// write_mode_600: write_all failure propagates as Err.
+    /// We trigger it by writing to a path inside a read-only directory.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_write_failure_returns_err() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        // Make the directory read-only so open(O_CREAT) fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let result = store.save(&minimal_scheduler_checkpoint()).await;
+        // Restore permissions so TempDir can clean up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "save must return Err when write fails");
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("write checkpoint.json.tmp"),
+            "error context must mention the tmp path: {msg}"
+        );
+    }
+
+    /// write failure (via read-only directory) propagates as Err.
+    /// Note: save() calls write_mode_600 first, which fails before rename is reached;
+    /// the rename error path is not separately exercised.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_write_failure_ro_dir_returns_err() {
+        use std::os::unix::fs::PermissionsExt;
+        // Write the checkpoint into a writable subdir, then make the PARENT read-only
+        // after the tmp write but before the rename.  We simulate this by writing
+        // the tmp file ourselves and then attempting a store that tries to rename.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        // Write a valid tmp file directly so write_mode_600 succeeds.
+        let cp = minimal_scheduler_checkpoint();
+        let json = serde_json::to_string(&cp).unwrap();
+        std::fs::write(&store.tmp_path, &json).unwrap();
+        // Now lock the directory — rename requires write permission on the parent dir.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        // save() will try write_mode_600 (fails on read-only dir), so the error
+        // will be the write error, not the rename error.  Either way save() must Err.
+        let result = store.save(&cp).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err(), "save must return Err when dir is read-only");
     }
 }
