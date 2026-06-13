@@ -150,7 +150,37 @@ impl ToolRegistry {
             }
         }
 
-        tool.invoke(input).await
+        let result = tool.invoke(input).await?;
+
+        // Post-call hook: emit memory events for kv tools.
+        // Tool::invoke has no agent_id or recorder; we emit here where both are available.
+        match name {
+            "kv_get" => {
+                recorder.record(
+                    agent_id,
+                    None,
+                    EventKind::MemoryRead,
+                    serde_json::json!({
+                        "agent": agent_id,
+                        "found": !result.is_empty(),
+                    }),
+                );
+            }
+            "kv_set" => {
+                recorder.record(
+                    agent_id,
+                    None,
+                    EventKind::MemoryWrite,
+                    serde_json::json!({
+                        "agent": agent_id,
+                        "bytes": result.len(),
+                    }),
+                );
+            }
+            _ => {}
+        }
+
+        Ok(result)
     }
 }
 
@@ -186,8 +216,8 @@ mod tests {
     #[test]
     fn duplicate_registration_returns_error() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()], None).unwrap();
-        let err = register_native(&mut reg, &["read_file".to_string()], None).unwrap_err();
+        register_native(&mut reg, &["read_file".to_string()], None, None).unwrap();
+        let err = register_native(&mut reg, &["read_file".to_string()], None, None).unwrap_err();
         assert!(err.to_string().contains("read_file"));
         assert!(err.to_string().contains("already registered"));
     }
@@ -195,7 +225,7 @@ mod tests {
     #[tokio::test]
     async fn registry_specs_and_names_are_sorted() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
         let names = reg.tool_names();
         let mut sorted = names.clone();
         sorted.sort();
@@ -210,14 +240,14 @@ mod tests {
     #[test]
     fn filtered_specs_none_cap_set_returns_all() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
         assert_eq!(reg.filtered_specs(None).len(), reg.specs().len());
     }
 
     #[test]
     fn filtered_specs_empty_cap_set_returns_only_no_cap_tools() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
         let specs = reg.filtered_specs(Some(&[]));
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         // list_agents and send_message require no capability; they remain visible.
@@ -233,7 +263,7 @@ mod tests {
     #[test]
     fn filtered_specs_fs_read_only_excludes_write() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
         let caps = [Capability::FsRead { prefix: "/".to_string() }];
         let specs = reg.filtered_specs(Some(&caps));
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
@@ -245,7 +275,7 @@ mod tests {
     #[tokio::test]
     async fn capability_denied_event_emitted_and_error_returned() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()], None).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None, None).unwrap();
         let (rec, tmp) = recorder();
 
         // Grant only FsRead — write_file requires FsWrite, so it should be denied.
@@ -278,7 +308,7 @@ mod tests {
         // An agent with the matching FsWrite cap MUST be able to invoke write_file.
         // This is the "granted agent succeeds" half of the p1.4 acceptance criterion.
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()], None).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None, None).unwrap();
         let (rec, _tmp) = recorder();
         let tmp_dir = tempfile::TempDir::new_in("/tmp").unwrap();
         let path = tmp_dir.path().join("test.txt").to_string_lossy().to_string();
@@ -299,7 +329,7 @@ mod tests {
     #[test]
     fn filtered_specs_spawn_visible_with_cap_hidden_without() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
 
         // With Spawn capability: spawn_agent should appear in specs.
         let caps_with_spawn = [Capability::Spawn];
@@ -312,5 +342,115 @@ mod tests {
         let specs_without = reg.filtered_specs(Some(&caps_no_spawn));
         let names_without: Vec<&str> = specs_without.iter().map(|s| s.name.as_str()).collect();
         assert!(!names_without.contains(&"spawn_agent"), "spawn_agent must be hidden without Spawn cap");
+    }
+
+    // ── Gap ⑧: post-call hook emits MemoryRead / MemoryWrite events ──────────
+
+    use std::sync::{Arc, Mutex};
+    use crate::memory::MemoryStore;
+
+    struct SimpleStore(Mutex<HashMap<String, String>>);
+    impl SimpleStore {
+        fn new_arc() -> Arc<Self> {
+            Arc::new(SimpleStore(Mutex::new(HashMap::new())))
+        }
+    }
+    impl MemoryStore for SimpleStore {
+        fn get(&self, ns: &str, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(&format!("{}\x00{}", ns, key)).cloned())
+        }
+        fn put(&self, ns: &str, key: &str, value: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().insert(format!("{}\x00{}", ns, key), value.to_string());
+            Ok(())
+        }
+        fn append(&self, _ns: &str, _key: &str, _value: &str) -> anyhow::Result<()> { Ok(()) }
+        fn delete(&self, _ns: &str, _key: &str) -> anyhow::Result<bool> { Ok(false) }
+        fn iter(&self, _ns: &str) -> anyhow::Result<Vec<(String, String)>> { Ok(vec![]) }
+        fn meta_version(&self) -> anyhow::Result<u64> { Ok(1) }
+    }
+
+    #[test]
+    fn filtered_specs_kv_tools_visible_with_kb_caps_hidden_without() {
+        let mut reg = ToolRegistry::new();
+        register_native(
+            &mut reg,
+            &["kv_get".to_string(), "kv_set".to_string()],
+            None,
+            Some(SimpleStore::new_arc()),
+        )
+        .unwrap();
+
+        // With KbRead + KbWrite: kv_get and kv_set must be visible.
+        let caps = [
+            Capability::KbRead { segment: "agent:scratch".to_string() },
+            Capability::KbWrite { segment: "agent:scratch".to_string() },
+        ];
+        let specs_with_kb = reg.filtered_specs(Some(&caps));
+        let names: Vec<&str> = specs_with_kb.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"kv_get"), "kv_get must be visible with KbRead cap");
+        assert!(names.contains(&"kv_set"), "kv_set must be visible with KbWrite cap");
+
+        // Without any kb cap (e.g. only FsRead): kv tools must be hidden.
+        let no_kb_caps = [Capability::FsRead { prefix: "/".to_string() }];
+        let specs_no_kb = reg.filtered_specs(Some(&no_kb_caps));
+        let names_no_kb: Vec<&str> = specs_no_kb.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names_no_kb.contains(&"kv_get"), "kv_get must be hidden without KbRead cap");
+        assert!(!names_no_kb.contains(&"kv_set"), "kv_set must be hidden without KbWrite cap");
+    }
+
+    #[tokio::test]
+    async fn kv_get_invoke_emits_memory_read_event() {
+        let mut reg = ToolRegistry::new();
+        register_native(
+            &mut reg,
+            &["kv_get".to_string()],
+            None,
+            Some(SimpleStore::new_arc()),
+        )
+        .unwrap();
+        let (rec, tmp) = recorder();
+        let caps = [Capability::KbRead { segment: "agent:scratch".to_string() }];
+        reg.invoke(
+            "kv_get",
+            serde_json::json!({"namespace": "agent:scratch", "key": "absent"}),
+            "agent1",
+            Some(&caps),
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["kind"], "memory_read");
+        assert_eq!(event["data"]["agent"], "agent1");
+        assert_eq!(event["data"]["found"], false); // key absent → result is ""
+    }
+
+    #[tokio::test]
+    async fn kv_set_invoke_emits_memory_write_event() {
+        let mut reg = ToolRegistry::new();
+        register_native(
+            &mut reg,
+            &["kv_set".to_string()],
+            None,
+            Some(SimpleStore::new_arc()),
+        )
+        .unwrap();
+        let (rec, tmp) = recorder();
+        let caps = [Capability::KbWrite { segment: "agent:scratch".to_string() }];
+        reg.invoke(
+            "kv_set",
+            serde_json::json!({"namespace": "agent:scratch", "key": "k", "value": "hello"}),
+            "agent1",
+            Some(&caps),
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["kind"], "memory_write");
+        assert_eq!(event["data"]["agent"], "agent1");
+        assert!(event["data"]["bytes"].as_u64().unwrap() > 0);
     }
 }

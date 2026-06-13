@@ -1,5 +1,36 @@
 # TODOS
 
+## Phase 5 — Open (deferred from p5.1 adversarial review)
+
+**kv-ar-01 (P2) — `kv_get` returns `""` for both missing key and empty stored value**
+- `tools/native.rs:KvGet::invoke`: `None` and `Some("")` both return `Ok(String::new())`.
+  The `MemoryRead` flight event's `found` field uses a non-empty heuristic (`!result.is_empty()`),
+  misclassifying an empty stored value as a cache miss.
+- Fix: return a sentinel (or a separate `exists()` call) to distinguish miss from empty-value hit.
+  Requires ABI change; defer to p5.2 or next tool-ABI revision.
+
+**kv-ar-02 (P2) — `try_open` TOCTOU: `path.exists()` check before `open`/`create`**
+- `memory/store.rs:try_open`: the exists check and the subsequent `open`/`create` are not atomic.
+  On a concurrent `rm`, the path could disappear between the check and the open.
+  Low risk for single-tenant use; note for p5.x when multi-process agents share a store path.
+
+**kv-ar-03 (P2) — AlreadyOpen detection uses `format!("{e:?}")` string matching**
+- `memory/store.rs:open`: the code matches `"AlreadyOpen"` / `"already open"` / `"already locked"` in
+  the debug-formatted error string. Fragile if redb renames the variant.
+- Fix: downcast `anyhow::Error` to `redb::DatabaseError` and match the typed variant.
+  Safe to defer while redb is pinned to `= "4.1.0"` in Cargo.toml.
+
+**kv-ar-04 (P2) — Silent kv tool skip when `store=None` emits no flight event**
+- `tools/native.rs:register_native`: when `kv_get`/`kv_set` are listed but `store` is `None`,
+  the tools are silently skipped (no registration, no warning). An agent that expects the tools
+  will see `unknown tool` errors at runtime with no log to explain why.
+- Fix: emit a `MemoryStoreOpened`-equivalent warning event (or `MemoryError`) in the skip branch.
+
+**kv-ar-05 (P2) — Corrupt-quarantine overwrites previous `.corrupt` file**
+- `memory/store.rs:try_open`: rename to `<path>.corrupt` silently discards a previous quarantine
+  if a second corruption event occurs before the user investigates.
+- Fix: include a timestamp or counter in the quarantine name (e.g. `memory.redb.corrupt.1234567890`).
+
 ## Phase 4 — Open (deferred from p4.7 audit)
 
 Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phase 5:

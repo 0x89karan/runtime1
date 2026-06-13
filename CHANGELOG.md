@@ -3,6 +3,34 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.1] - 2026-06-14 (v0.18.0)
+
+Storage Primitive: durable key/value store backed by redb 4.1.0.
+
+### Added
+- **`MemoryStore` trait** (`memory/store.rs`): `get`, `put`, `append`, `delete`,
+  `iter`, `meta_version`. Sync methods; `Send + Sync`.
+- **`RedbStore`** (`memory/redb_store.rs`): redb 4.1.0 implementation.
+  Namespace+key encoding: `"{ns}\x00{key}"`. Handles `DatabaseAlreadyOpen`
+  (retry with fresh open after brief delay), corrupt db (renamed to `.corrupt`
+  and recreated). `RedbStore::open()` on macOS / `RedbStore::try_open()` internal.
+- **`[memory]` config block** (`config.rs`): `store_path` (default `"memory.redb"`)
+  and `enabled` (default `true`).
+- **`kv_get` / `kv_set` tools** (`tools/native.rs`): structured namespace + key
+  fields; `spawn_blocking` for sync redb calls; `MAX_KV_VALUE_BYTES = 256 KiB`
+  per-value limit enforced in `kv_set`. **Not** included in `native = ["all"]`;
+  require explicit listing.
+- **`KbRead` / `KbWrite` capabilities** (`capability.rs`): `segment` field with
+  `:` / `/` delimiter-boundary validation; `satisfies()` extended.
+- **Flight events**: `MemoryRead`, `MemoryWrite`, `MemoryError`, `MemoryStoreOpened`.
+  `ToolRegistry::invoke` emits memory events after successful kv tool calls.
+- **`docs/INTERFACE.md`** — agent-facing interface doc (tools, capabilities, events).
+- **`docs/SPIKES/p5.1-storage-primitive.md`** — implementation notes.
+
+### Fixed
+- Adversarial review (p5.1): `kv_set` now enforces `MAX_KV_VALUE_BYTES = 256 KiB`
+  to prevent unbounded redb entry growth.
+
 ## [p4.7] - 2026-06-13 (v0.17.0)
 
 Pre-Phase-5 cleanup sprint. Addresses all P0/P1 findings from

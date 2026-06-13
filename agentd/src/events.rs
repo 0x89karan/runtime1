@@ -38,6 +38,18 @@ pub enum EventKind {
     SandboxApplied,
     /// MCP server configured without `capabilities`; running unsandboxed.
     SandboxSkipped,
+    /// A `kv_get` call completed successfully (data shape documented in events.rs).
+    /// data: { agent, namespace, key, found: bool }
+    MemoryRead,
+    /// A `kv_set` call committed successfully.
+    /// data: { agent, namespace, key, bytes: usize }
+    MemoryWrite,
+    /// Memory store open or transaction failed; store unavailable.
+    /// data: { stage: "open"|"version_check"|"schema_init", hint, error }
+    MemoryUnavailable,
+    /// Corrupt store renamed to `.corrupt`; new empty store opened.
+    /// data: { path }
+    MemoryQuarantined,
     Error,
 }
 
@@ -84,6 +96,10 @@ mod tests {
         assert_eq!(kind_str(EventKind::FuseSkipped), "fuse_skipped");
         assert_eq!(kind_str(EventKind::SandboxApplied), "sandbox_applied");
         assert_eq!(kind_str(EventKind::SandboxSkipped), "sandbox_skipped");
+        assert_eq!(kind_str(EventKind::MemoryRead), "memory_read");
+        assert_eq!(kind_str(EventKind::MemoryWrite), "memory_write");
+        assert_eq!(kind_str(EventKind::MemoryUnavailable), "memory_unavailable");
+        assert_eq!(kind_str(EventKind::MemoryQuarantined), "memory_quarantined");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

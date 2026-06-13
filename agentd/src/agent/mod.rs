@@ -693,7 +693,7 @@ mod tests {
         ]);
 
         let mut reg = crate::tools::ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()], None).unwrap();
+        register_native(&mut reg, &["read_file".to_string()], None, None).unwrap();
         let (rec, _tmp) = recorder();
 
         let answer = run(
@@ -1180,7 +1180,7 @@ mod tests {
         }
 
         let mut reg = crate::tools::ToolRegistry::new();
-        register_native(&mut reg, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut reg, &["spawn_agent".to_string()], None, None).unwrap();
         let (rec, _tmp) = recorder();
 
         let err = run(

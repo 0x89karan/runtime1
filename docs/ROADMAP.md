@@ -511,7 +511,7 @@ byte-for-byte identical. **Acceptance:** build/clippy/test/clippy-linux clean; +
 tests; binary size unchanged. (F-002/F-003 sandbox-net hardening are recommended as a
 non-blocking **p4.8**, not gating Phase 5.)
 
-### ▢ p5.1 — Storage primitive (redb behind `MemoryStore`)
+### ✅ p5.1 — Storage primitive (redb behind `MemoryStore`)
 **Depends on:** p4.7. The substrate behind a thin trait — `agentd/src/memory/{mod,store}.rs`,
 `RedbStore` over `memory.redb` (mode 0600, quarantine-on-corrupt, never deleted on
 success). New `Capability::KbRead { segment }` / `KbWrite { segment }` (prefix match
@@ -519,6 +519,11 @@ like `FsRead`, deny-by-default). Single agent uses it via `kv_get`/`kv_set` nati
 tools over a `scratch:` namespace; demoable in isolation. Events: `memory_read`,
 `memory_write`, `memory_unavailable`, `memory_quarantined`. **Acceptance:** +6 tests;
 **binary size delta documented, must stay ≤ 4 MB** (≈ +0.6 MB expected).
+**Shipped:** 304 tests pass. Binary 2.1 MB (macOS) / 3.8 MB (x86_64-linux-musl);
+redb 4.1.0 added ≈ +0.2 MB (macOS) / +0.7 MB (musl); well under ≤ 4 MB guard.
+Post-adversarial-review: `MAX_KV_VALUE_BYTES = 256 KiB` enforced in `kv_set`; 5 minor
+findings deferred to TODOS.md (kv-ar-01 through kv-ar-05).
+`docs/INTERFACE.md` (Phase 6 design) added in the same branch — docs-only, no code impact.
 
 ### ▢ p5.2 — Per-agent short-term + paging
 **Depends on:** p5.1. Tier 1 / Tier 2 separated cleanly. A context manager
@@ -586,6 +591,97 @@ detail and per-increment acceptance: `docs/PHASE-5-PLAN.md`.
 
 ---
 
+## Phase 6 — Interface and agent catalogue
+
+Goal: give the operator a real, legible interface over the multi-agent runtime, and a
+template catalogue that surfaces *what can run and how to run it* — without breaking the
+"CLI is the contract" rule or the super-light budget. Full design in `docs/INTERFACE.md`.
+
+Architectural calls (from `docs/INTERFACE.md`): a **`ratatui` TUI shipped as a separate
+`agentctl` binary** (not baked into `agentd`, so the 4 MB guard is untouched; a GUI's
+browser/WebView weight can't live in the QEMU image). The interface is a **read-only
+view** over the existing `/agents/<id>/*` FUSE files + `flight.jsonl` — new data gets a
+`surfaces/` amendment, never a parallel data plane. The one write need (spawn) is a
+narrow `/agents/control` endpoint; everything else stays daemon-free. **Templates**
+(`*.template.toml`, a superset of `agent.toml`) make agents discoverable before they
+run; `agentctl spawn <template>` generates an `agent.toml` and execs `agentd`.
+
+### ▢ p6.1 — Template schema + on-disk catalogue
+**Depends on:** Phase 4.6. `*.template.toml` schema (superset of `agent.toml`:
+`[template]`, suggested `[capabilities]` deny-by-default, `[[tools.mcp_servers]]`,
+`[memory]` segments, `[card]`, `sample_tasks`). On-disk: `templates/` (repo) +
+`~/.agentos/templates/` (user), user-overrides-repo precedence. CLI-consumable, no UI.
+**Acceptance:** a template parses, resolves by name with correct precedence, and
+generates a valid `agent.toml`; tests cover precedence + the strip-template-keys path.
+
+### ▢ p6.2 — `agentctl list-templates` / `agentctl spawn <template>`
+**Depends on:** p6.1. New `agentctl/` workspace member (the operator CLI). `spawn`
+generates an `agent.toml` from a template + `--task`/`--cap-add` overrides
+(deny-by-default base) and execs `agentd`. No daemon, works in QEMU. **Acceptance:**
+`agentctl spawn scout --task "…"` runs the scout end-to-end; `list-templates` shows
+name·source·showcases; capability overrides never exceed the template's suggestions
+without an explicit flag.
+
+### ▢ p6.3 — Read-only TUI: dashboard + agent detail + system
+**Depends on:** p6.2, p3.1 (FUSE). `ratatui`+`crossterm` in `agentctl`; reads
+`/agents/<id>/{status,context_size,budget,flight}` + the proposed `/agents/system`
+surface. Requires `surfaces/` amendments: status enrichment (awaiting-inference vs
+awaiting-tool), `/agents/<id>/tools`, `/agents/system/{budget,queue,sandbox,provider}`
+(expose the deferred-queue count, today omitted from the snapshot). **Acceptance:** the
+three views render live against a running multi-agent demo over both a local mount and a
+QEMU serial console; `make clippy-linux` clean for the FUSE amendments.
+
+### ▢ p6.4 — Topology view (multi-agent graph)
+**Depends on:** p6.3, p1.5/p1.6 (bus + cards). The spawn tree + message graph, derived
+from `flight.jsonl` (`agent_spawned.parent_id`, `agent_child_result_delivered`,
+`message_sent/received`) + snapshot `AwaitingChild`. The hard view — a time-evolving
+derived graph. v1: spawn tree + completed edges; message edges layered after. Optional
+`/agents/<id>/edges` surface to avoid log-scraping. **Acceptance:** a coordinator demo's
+spawn tree and at least one live message edge render correctly.
+
+### ▢ p6.5 — Memory view
+**Depends on:** **p5.7** (`/agents/<id>/memory/`, `/agents/kb/<segment>/`) and the
+`PHASE-5-PLAN.md §E` contracts (provenance schema, versioned store, `memory_*`/`kb_*`
+events). Read-only browse of per-agent short/long-term stores and shared KB segments,
+with provenance shown; lexical search box (Layer 1). Labels semantic search as
+available only via an attached Layer-2 MCP KB. **Acceptance:** the journaler's long-term
+entries and a shared `project:` segment are browsable with provenance; the tab degrades
+gracefully ("memory subsystem not present") when Phase 5 is absent.
+
+### ▢ p6.6 — Spawn view
+**Depends on:** p6.2, p6.3. Template picker → task field → capability toggles
+(pre-checked from the template, deny-by-default) → preview generated `agent.toml` →
+spawn. Mode (a) generate-and-exec ships here; mode (b) inject-into-running-scheduler
+depends on the writable **`/agents/control`** surface (its own sub-task). **Acceptance:**
+spawning from the form produces the same `agent.toml` the CLI would and starts the agent;
+no capability is granted beyond the template without an explicit toggle.
+
+### ▢ p6.7 — Starter catalogue (the committed templates)
+**Depends on:** p6.1 (+ p5.x for memory-dependent templates). Ship the 7 templates:
+scout, librarian, journaler, code-aware, watcher, coordinator, memory-custodian — each
+with its showcase rationale. journaler/memory-custodian are Phase-5-gated; watcher is
+marked trigger-gated (no event-trigger mechanism exists yet). **Acceptance:** every
+non-gated template spawns and runs its sample task; the demo set exercises sandbox +
+capabilities + bus + (when present) memory.
+
+### ▢ p6.8 — Sandbox-enforcement surface + edge-case polish
+**Depends on:** p6.3, p4.1–p4.6. `EnforcementStatus` surfaced in System + Agent-detail
+from `/agents/system/sandbox` + `/agents/<id>/sandbox`; **prominent degradation warnings**
+(Landlock ABI < V4 → net not enforced — the F-002 silent-degradation case made visible;
+aarch64 DenySpawn no-op; gVisor in effect; net-ns absent because a `Net` cap is present).
+Logs/inspector filters finalized. **Acceptance:** a kernel without Landlock V4 shows the
+degraded-net warning; a gVisor server shows `isolation=gvisor`; the inspector filters by
+kind/agent/capability_denied/sandbox_skipped/error.
+
+**Exit criteria for Phase 6:** an operator can, from `agentctl` over the QEMU serial
+console or SSH, see every running agent and its spend/status, drill into one agent's
+flight + tools + sandbox enforcement, see the spawn/message topology, browse memory
+(when Phase 5 is present), spawn a new agent from a template, and answer "what did agent
+X do" without hand-written `jq` — all as views over the unchanged CLI/FUSE contract,
+with `agentd` still ≤ 4 MB.
+
+---
+
 ## Beyond
 
 Re-homed into Phase 5 (above): the memory substrate (Layer 1 — embedded, lexical).
@@ -600,6 +696,8 @@ Remaining:
   (two storage layers) + §9 Q1 (decided).
 - Additional inference backends (incl. a local `impl InferenceGateway`, and a remote
   `embed()` method on the gateway if embeddings are ever pulled in-process rather than
-  into the KB sidecar), richer A2A/ACP interop, a human interface layer (Phase 6 —
-  surfaces memory views; see `docs/PHASE-5-PLAN.md` §E for the contracts Phase 5
-  exposes), and multi-device agent migration.
+  into the KB sidecar), richer A2A/ACP interop, and multi-device agent migration.
+
+Re-homed into Phase 6 (above): the human interface layer (operator TUI + agent
+catalogue). Beyond Phase 6: an event-trigger surface (unlocks the Watcher template —
+the daemon-shaped agent), and write-capable memory/control surfaces.

@@ -36,9 +36,50 @@ pub struct Config {
     pub tools: ToolsConfig,
     #[serde(default)]
     pub scheduler: SchedulerConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Path for the flight log (JSONL). Defaults to "flight.jsonl" in the CWD.
     /// The --log-path CLI flag takes precedence over this field.
     pub log_path: Option<String>,
+}
+
+/// Configuration for the durable key/value memory store (p5.1+).
+///
+/// ```toml
+/// # Durable key/value memory store (p5.1+):
+/// # [memory]
+/// # store_path = "memory.redb"   # relative to CWD or absolute; defaults to "memory.redb"
+/// # enabled    = true            # set false to run without any persistent memory
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Path to the redb database file.
+    /// Relative paths are resolved relative to the CWD at startup.
+    /// Absolute paths are used as-is.
+    #[serde(default = "default_memory_store_path")]
+    pub store_path: String,
+    /// Set to false to disable the memory store entirely.
+    /// When false, `kv_get` and `kv_set` tools are not registered.
+    #[serde(default = "default_memory_enabled")]
+    pub enabled: bool,
+}
+
+fn default_memory_store_path() -> String {
+    "memory.redb".to_string()
+}
+
+fn default_memory_enabled() -> bool {
+    true
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            store_path: default_memory_store_path(),
+            enabled: default_memory_enabled(),
+        }
+    }
 }
 
 impl Config {
@@ -733,6 +774,68 @@ command = "/usr/bin/echo"
         let cfg: Config = toml::from_str(raw).unwrap();
         assert!(cfg.tools.mcp_servers[0].env.is_empty(),
             "absent env field must default to empty map");
+    }
+
+    // ── p5.1: MemoryConfig tests ──────────────────────────────────────────────
+
+    #[test]
+    fn memory_config_defaults_when_section_absent() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.memory.store_path, "memory.redb");
+        assert!(cfg.memory.enabled);
+    }
+
+    #[test]
+    fn memory_config_explicit_values_parse() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[memory]
+store_path = "/var/lib/agentd/mem.redb"
+enabled = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.memory.store_path, "/var/lib/agentd/mem.redb");
+        assert!(!cfg.memory.enabled);
+    }
+
+    #[test]
+    fn capabilities_kb_write_round_trip() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+capabilities = [{ KbWrite = { segment = "agent:scratch" } }]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let caps = cfg.agent_configs().unwrap();
+        assert_eq!(
+            caps[0].capabilities,
+            Some(vec![Capability::KbWrite { segment: "agent:scratch".to_string() }])
+        );
+    }
+
+    #[test]
+    fn capabilities_kb_read_round_trip() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+capabilities = [{ KbRead = { segment = "agent:scratch" } }]
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let caps = cfg.agent_configs().unwrap();
+        assert_eq!(
+            caps[0].capabilities,
+            Some(vec![Capability::KbRead { segment: "agent:scratch".to_string() }])
+        );
     }
 
     // ── p1.6: AgentCard tests ─────────────────────────────────────────────────

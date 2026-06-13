@@ -54,7 +54,11 @@ Phase 3 (Surfaces + Sandbox):
   `SandboxApplied`/`SandboxSkipped` flight events; `CONFIG_SECCOMP=y` in
   kernel-extras.config; 180 tests pass.
 
-**Phases 0–4 complete (p4.7 landed). Phase 4 (Isolation & hardening) + pre-Phase-5 cleanup complete. Next: Phase 5 — see `docs/ROADMAP.md`.**
+**Phases 0–4 complete (p4.7 landed). Phase 4 (Isolation & hardening) + pre-Phase-5 cleanup complete.**
+
+**p5.1 complete (v0.18.0).** Storage primitive: redb 4.1.0-backed `MemoryStore`, `KbRead`/`KbWrite`
+capabilities, `kv_get`/`kv_set` native tools, 4 new flight events, 304 tests.
+**Next: p5.2 (per-agent short-term + paging) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

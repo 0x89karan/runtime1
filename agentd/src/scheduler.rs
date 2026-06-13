@@ -1474,7 +1474,7 @@ mod tests {
         };
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["write_file".to_string()], None).unwrap();
+        register_native(&mut registry, &["write_file".to_string()], None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             InferenceResponse {
@@ -1527,7 +1527,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
 
         let responses = vec![
             // Parent turn 0: spawns child
@@ -1596,7 +1596,7 @@ mod tests {
         }
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
 
         let parent = AgentConfig {
             capabilities: Some(vec![Capability::Spawn]),
@@ -1627,7 +1627,7 @@ mod tests {
         use crate::tools::native::register_native;
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent turn 0: tries to spawn (will be denied)
@@ -1664,7 +1664,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent turn 0: spawn (will be denied — already at max depth 0, limit 0)
@@ -1713,7 +1713,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Parent turn 0 (10+5=15 tokens): spawn
@@ -1765,7 +1765,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
 
         // Build a spawn response that carries an explicit child_id.
         let spawn_response = InferenceResponse {
@@ -1815,7 +1815,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
 
         let spawn_response = InferenceResponse {
             blocks: vec![Block::ToolUse {
@@ -1866,11 +1866,11 @@ mod tests {
         use crate::tools::native::register_native;
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["send_message".to_string()], None).unwrap();
+        register_native(&mut registry, &["send_message".to_string()], None, None).unwrap();
 
         // Run both agents via a single MockGateway (interleaved responses).
         let mut registry2 = ToolRegistry::new();
-        register_native(&mut registry2, &["send_message".to_string()], None).unwrap();
+        register_native(&mut registry2, &["send_message".to_string()], None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent alpha: send_message to beta
@@ -1915,7 +1915,7 @@ mod tests {
         use crate::tools::native::register_native;
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["send_message".to_string()], None).unwrap();
+        register_native(&mut registry, &["send_message".to_string()], None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent sends to unknown recipient

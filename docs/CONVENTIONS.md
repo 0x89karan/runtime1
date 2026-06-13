@@ -29,6 +29,7 @@ subsystem, tool, or provider. (For *what* to build, see `ROADMAP.md`; for *why*,
 | `events` | `EventKind` enum + stable string serialization | business logic |
 | `flight_recorder` | the event log (append-only JSONL writer) | business logic |
 | `config` | the TOML spec | runtime state |
+| `memory` | `MemoryStore` trait + `RedbStore` backend; `validate_segment` | scheduling, agent logic |
 
 When a new subsystem appears in the roadmap, add a module; don't bolt it onto an
 existing one.
@@ -84,6 +85,10 @@ Phase 0 kinds (canonical — do not rename):
 | `agent_checkpointed` | agent state checkpointed to disk (agent_id, turn) (p3.2+) |
 | `agent_restored` | agent state restored from checkpoint (agent_id, turn) (p3.2+) |
 | `system_shutdown_requested` | SIGTERM or SIGINT received; graceful shutdown initiated (p2.3+) |
+| `memory_read` | `kv_get` completed (agent, found: bool) (p5.1+) |
+| `memory_write` | `kv_set` committed (agent, bytes: usize) (p5.1+) |
+| `memory_unavailable` | store open or transaction failed; kv tools not registered (stage, hint, error) (p5.1+) |
+| `memory_quarantined` | corrupt store renamed to `.corrupt`; fresh store opened (path) (p5.1+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it
@@ -120,6 +125,30 @@ lists tools, and registers each as a `Tool`. No code change needed to add a serv
 To sandbox the server subprocess (p3.3+), add a `capabilities` array to the server entry.
 The `sandbox/` crate compiles Landlock FS rules + seccomp-bpf into a `CompiledSandbox`
 applied via `pre_exec`. Omitting `capabilities` runs the server unsandboxed (warn emitted).
+
+### Add a memory namespace
+
+Memory namespaces use the `agent:<scope>` convention (e.g. `agent:scratch`, `agent:notes`).
+To give an agent read/write access to a namespace:
+
+1. Add `KbRead`/`KbWrite` capabilities in the agent's `capabilities` array in `agent.toml` /
+   `agents.toml`:
+   ```toml
+   capabilities = [
+     { KbWrite = { segment = "agent:scratch" } },
+     { KbRead  = { segment = "agent:scratch" } },
+   ]
+   ```
+2. Add `kv_get` and/or `kv_set` to `native` in `[tools]`:
+   ```toml
+   [tools]
+   native = ["read_file", "kv_get", "kv_set"]
+   ```
+   **Note:** `kv_get`/`kv_set` are NOT included in `"all"` — they must be listed explicitly.
+3. `KbRead { segment: "agent" }` is a prefix grant: it permits reading any namespace
+   starting with `agent:` or `agent/`. Use the tightest scope your agent actually needs.
+4. `KbWrite { segment: "" }` (empty) always denies — the empty segment is a sentinel for
+   "capability type check only", never a wildcard write grant.
 
 ## Config
 

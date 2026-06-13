@@ -43,6 +43,13 @@ pub enum Capability {
     Mcp { server: String, tools: Vec<String> },
     /// Reserved — no tool declares Spawn yet; always denied.
     Spawn,
+    /// Read access to a memory namespace segment (prefix-match on namespace).
+    /// `KbRead { segment: "agent:scratch" }` grants read access to all keys
+    /// whose namespace equals or starts with `"agent:scratch"` followed by a
+    /// segment delimiter (`:` or `/`) or end-of-string.
+    KbRead { segment: String },
+    /// Write access to a memory namespace segment (same prefix semantics as KbRead).
+    KbWrite { segment: String },
 }
 
 /// Normalize a path by resolving `.` and `..` components without filesystem
@@ -74,6 +81,7 @@ pub fn normalize_path(p: &Path) -> PathBuf {
 /// rather than "can this specific invocation proceed?". For path-based capabilities,
 /// an empty `prefix` in `required` is treated as a wildcard meaning "any path of this
 /// type" — so `FsRead { prefix: "" }` matches any granted `FsRead` capability.
+/// Same semantics for `KbRead`/`KbWrite { segment: "" }`.
 /// For `Mcp`, the full server+tools check still applies (the tool name is static).
 pub fn satisfies_type(granted: &[Capability], required: &Capability) -> bool {
     match required {
@@ -82,6 +90,12 @@ pub fn satisfies_type(granted: &[Capability], required: &Capability) -> bool {
         }
         Capability::FsWrite { prefix } if prefix.is_empty() => {
             granted.iter().any(|g| matches!(g, Capability::FsWrite { .. }))
+        }
+        Capability::KbRead { segment } if segment.is_empty() => {
+            granted.iter().any(|g| matches!(g, Capability::KbRead { .. }))
+        }
+        Capability::KbWrite { segment } if segment.is_empty() => {
+            granted.iter().any(|g| matches!(g, Capability::KbWrite { .. }))
         }
         other => satisfies(granted, other),
     }
@@ -143,6 +157,51 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
             }
         }),
         Capability::Spawn => granted.iter().any(|g| matches!(g, Capability::Spawn)),
+        Capability::KbRead { segment: req_seg } => {
+            if req_seg.is_empty() {
+                return false; // empty segment is never a valid requirement
+            }
+            granted.iter().any(|g| {
+                if let Capability::KbRead { segment: g_seg } = g {
+                    kb_segment_satisfies(g_seg, req_seg)
+                } else {
+                    false
+                }
+            })
+        }
+        Capability::KbWrite { segment: req_seg } => {
+            if req_seg.is_empty() {
+                return false; // empty segment is never a valid requirement
+            }
+            granted.iter().any(|g| {
+                if let Capability::KbWrite { segment: g_seg } = g {
+                    kb_segment_satisfies(g_seg, req_seg)
+                } else {
+                    false
+                }
+            })
+        }
+    }
+}
+
+/// Return true if `granted_prefix` covers `required_segment`.
+///
+/// An empty granted segment is NEVER a valid grant (fail-safe to deny, mirrors
+/// the FsRead empty-prefix guard). Otherwise, `required` must equal `granted`
+/// or start with `granted` followed by a segment delimiter (`:` or `/`).
+/// This prevents `"agent:scratch"` from matching `"agent:scratchpad"`.
+fn kb_segment_satisfies(granted: &str, required: &str) -> bool {
+    if granted.is_empty() {
+        return false; // empty grant is not valid
+    }
+    if required == granted {
+        return true;
+    }
+    // required must start with granted + a delimiter (':' or '/')
+    if let Some(rest) = required.strip_prefix(granted) {
+        rest.starts_with(':') || rest.starts_with('/')
+    } else {
+        false
     }
 }
 
@@ -387,6 +446,73 @@ mod tests {
         assert!(!satisfies_type(&caps, &Capability::FsRead { prefix: "".to_string() }));
     }
 
+    // ── KbRead / KbWrite prefix-match tests ─────────────────────────────────
+
+    #[test]
+    fn kb_read_prefix_match_exact_ok() {
+        let caps = vec![Capability::KbRead { segment: "agent:scratch".to_string() }];
+        assert!(satisfies(&caps, &Capability::KbRead { segment: "agent:scratch".to_string() }));
+    }
+
+    #[test]
+    fn kb_read_prefix_match_sub_segment_ok() {
+        let caps = vec![Capability::KbRead { segment: "agent".to_string() }];
+        // "agent:scratch" starts with "agent:" — colon delimiter, allowed.
+        assert!(satisfies(&caps, &Capability::KbRead { segment: "agent:scratch".to_string() }));
+    }
+
+    #[test]
+    fn kb_write_empty_segment_denies() {
+        let caps = vec![Capability::KbWrite { segment: "".to_string() }];
+        assert!(
+            !satisfies(&caps, &Capability::KbWrite { segment: "agent:scratch".to_string() }),
+            "empty-segment grant must deny all"
+        );
+    }
+
+    #[test]
+    fn kb_read_boundary_check_prevents_prefix_squatting() {
+        // "agent:scratch" must NOT match a grant of "agent:scratch" to access
+        // "agent:scratchpad" — the boundary check must catch this.
+        let caps = vec![Capability::KbRead { segment: "agent:scratch".to_string() }];
+        assert!(
+            !satisfies(&caps, &Capability::KbRead { segment: "agent:scratchpad".to_string() }),
+            "granted 'agent:scratch' must not match 'agent:scratchpad'"
+        );
+    }
+
+    #[test]
+    fn kb_write_boundary_slash_delimiter_ok() {
+        let caps = vec![Capability::KbWrite { segment: "agent".to_string() }];
+        // "agent/sub" starts with "agent/" — slash delimiter, allowed.
+        assert!(satisfies(&caps, &Capability::KbWrite { segment: "agent/sub".to_string() }));
+    }
+
+    #[test]
+    fn kb_required_empty_segment_always_denied() {
+        let caps = vec![Capability::KbRead { segment: "agent:scratch".to_string() }];
+        // An empty required segment is a programming error — always denied.
+        assert!(!satisfies(&caps, &Capability::KbRead { segment: "".to_string() }));
+    }
+
+    #[test]
+    fn satisfies_type_kb_read_empty_segment_matches_any_kb_read_grant() {
+        let caps = [Capability::KbRead { segment: "agent:scratch".to_string() }];
+        assert!(satisfies_type(&caps, &Capability::KbRead { segment: "".to_string() }));
+    }
+
+    #[test]
+    fn satisfies_type_kb_write_empty_segment_matches_any_kb_write_grant() {
+        let caps = [Capability::KbWrite { segment: "agent:scratch".to_string() }];
+        assert!(satisfies_type(&caps, &Capability::KbWrite { segment: "".to_string() }));
+    }
+
+    #[test]
+    fn satisfies_type_kb_read_empty_no_grant_returns_false() {
+        let caps = [Capability::KbWrite { segment: "agent:scratch".to_string() }];
+        assert!(!satisfies_type(&caps, &Capability::KbRead { segment: "".to_string() }));
+    }
+
     #[test]
     fn satisfies_type_non_fs_delegates_to_satisfies() {
         // For non-empty prefixes, satisfies_type delegates to satisfies.
@@ -395,5 +521,32 @@ mod tests {
         assert!(satisfies_type(&caps, &Capability::FsRead { prefix: "/workspace/file.rs".to_string() }));
         // Non-matching non-empty prefix → false
         assert!(!satisfies_type(&caps, &Capability::FsRead { prefix: "/etc/passwd".to_string() }));
+    }
+
+    // ── Gap ②: empty cap-set denies KbRead explicitly ────────────────────────
+
+    #[test]
+    fn satisfies_empty_cap_set_denies_kb_read() {
+        assert!(!satisfies(&[], &Capability::KbRead { segment: "agent:scratch".to_string() }));
+    }
+
+    // ── Gap ③: cross-type KbRead/KbWrite isolation ───────────────────────────
+
+    #[test]
+    fn kb_write_grant_does_not_satisfy_kb_read_requirement() {
+        let caps = vec![Capability::KbWrite { segment: "agent:scratch".to_string() }];
+        assert!(
+            !satisfies(&caps, &Capability::KbRead { segment: "agent:scratch".to_string() }),
+            "KbWrite grant must not satisfy KbRead requirement"
+        );
+    }
+
+    #[test]
+    fn kb_read_grant_does_not_satisfy_kb_write_requirement() {
+        let caps = vec![Capability::KbRead { segment: "agent:scratch".to_string() }];
+        assert!(
+            !satisfies(&caps, &Capability::KbWrite { segment: "agent:scratch".to_string() }),
+            "KbRead grant must not satisfy KbWrite requirement"
+        );
     }
 }

@@ -6,5 +6,6 @@ pub mod config;
 pub mod events;
 pub mod flight_recorder;
 pub mod inference;
+pub mod memory;
 pub mod scheduler;
 pub mod tools;

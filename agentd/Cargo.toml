@@ -1,6 +1,6 @@
 [package]
 name = "agentd"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2021"
 
 [[bin]]
@@ -17,6 +17,7 @@ path = "tests/fixtures/sandbox_probe.rs"
 
 [dependencies]
 anyhow = "1"
+redb = "4.1.0"
 surfaces = { path = "../surfaces" }
 sandbox = { path = "../sandbox" }
 libc = "0.2"

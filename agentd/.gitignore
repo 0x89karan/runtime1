@@ -2,3 +2,5 @@
 flight.jsonl
 checkpoint.json
 checkpoint.json.corrupt
+memory.redb
+*.redb.corrupt

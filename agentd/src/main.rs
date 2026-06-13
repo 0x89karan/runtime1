@@ -5,6 +5,7 @@ use agentd::{agent::{truncate, PREVIEW_CHARS}, checkpoint::CheckpointStore, conf
 use agentd::capability::Capability;
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
+use agentd::memory::store::RedbStore;
 use agentd::tools::{
     mcp::{McpClient, McpTool},
     native::register_native,
@@ -119,7 +120,44 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     }
 
     let mut registry = ToolRegistry::new();
-    register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)))?;
+
+    // Open memory store (if enabled). Quarantine corrupt files and emit flight events.
+    let memory_store: Option<Arc<dyn agentd::memory::MemoryStore>> = if cfg.memory.enabled {
+        let store_path = PathBuf::from(&cfg.memory.store_path);
+        match RedbStore::open(&store_path) {
+            Ok((store, quarantined)) => {
+                if let Some(ref corrupt_path) = quarantined {
+                    recorder.record(
+                        "agentd",
+                        None,
+                        EventKind::MemoryQuarantined,
+                        serde_json::json!({ "path": corrupt_path.display().to_string() }),
+                    );
+                    tracing::warn!(path = %corrupt_path.display(), "corrupt memory store quarantined; starting fresh");
+                }
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::MemoryUnavailable,
+                    serde_json::json!({
+                        "stage": "open",
+                        "hint": "kv_get/kv_set will not be registered",
+                        "error": format!("{e:#}"),
+                    }),
+                );
+                tracing::warn!(error = %e, "memory store unavailable; kv tools will not be registered");
+                None
+            }
+        }
+    } else {
+        tracing::info!("memory store disabled (memory.enabled = false)");
+        None
+    };
+
+    register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store)?;
 
     // Pass 1: validate capabilities and isolation settings before spawning any process.
 
@@ -591,8 +629,8 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
                     rules.push(SandboxRule::AllowNetConnect { port });
                 }
             }
-            // Mcp is advisory; Spawn is handled above.
-            Capability::Mcp { .. } | Capability::Spawn => {}
+            // Mcp/KbRead/KbWrite are agent-level only; no sandbox rule maps to them.
+            Capability::Mcp { .. } | Capability::Spawn | Capability::KbRead { .. } | Capability::KbWrite { .. } => {}
         }
     }
     rules

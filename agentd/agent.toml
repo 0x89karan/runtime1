@@ -22,3 +22,8 @@ native = ["all"]                      # built-in tools: "all" or a list like ["r
 # name    = "filesystem"
 # command = "npx"
 # args    = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+
+# Durable key/value store (p5.1+). Defaults shown; uncomment to override.
+# [memory]
+# store_path = "memory.redb"   # path to the redb file (relative to CWD or absolute)
+# enabled    = true            # set to false to skip store open and kv tool registration

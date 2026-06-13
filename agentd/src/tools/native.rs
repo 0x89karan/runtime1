@@ -6,13 +6,27 @@ use serde_json::{json, Value};
 
 use crate::capability::Capability;
 use crate::config::AgentCard;
+use crate::memory::{validate_segment, MemoryStore};
 use super::{Tool, ToolRegistry};
 
 const READ_FILE_MAX: usize = 100_000;
+const MAX_KV_VALUE_BYTES: usize = 256 * 1024; // 256 KiB per stored value
 
 pub struct ReadFile;
 pub struct WriteFile;
 pub struct ListDir;
+/// Read a value from the durable key/value store.
+/// NOT registered under `native = ["all"]` — requires explicit listing.
+pub struct KvGet {
+    pub store: Arc<dyn MemoryStore>,
+}
+
+/// Write a value to the durable key/value store.
+/// NOT registered under `native = ["all"]` — requires explicit listing.
+pub struct KvSet {
+    pub store: Arc<dyn MemoryStore>,
+}
+
 pub struct SpawnAgentTool;
 pub struct ListAgentsTool {
     pub cards: Arc<Vec<AgentCard>>,
@@ -146,6 +160,147 @@ impl Tool for ListDir {
     }
 }
 
+/// Extract and validate namespace + key from tool input.
+/// Returns a human-readable error when the format is wrong.
+/// Note: this runs inside `invoke`, after the capability check — format errors
+/// are only visible to agents that already passed the capability gate.
+fn extract_ns_key(input: &Value) -> Result<(String, String)> {
+    let namespace = input["namespace"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("namespace must be a string (e.g. \"agent:scratch\")"))?;
+    let key = input["key"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("key must be a string (e.g. \"my-note\")"))?;
+    validate_segment(namespace, "namespace")
+        .map_err(|e| anyhow::anyhow!("{e}; use namespace like \"agent:scratch\""))?;
+    validate_segment(key, "key").map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((namespace.to_string(), key.to_string()))
+}
+
+#[async_trait]
+impl Tool for KvGet {
+    fn name(&self) -> &str {
+        "kv_get"
+    }
+
+    fn description(&self) -> &str {
+        "Read a value from the durable key/value store. \
+         Use namespace \"agent:scratch\" for ephemeral scratch notes. \
+         Pass namespace and key as separate fields — e.g. namespace=\"agent:scratch\", key=\"my-note\"."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Memory namespace granted to this agent (e.g. \"agent:scratch\")"
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Key within the namespace (e.g. \"my-note\")"
+                }
+            },
+            "required": ["namespace", "key"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        // For type-level check (input=Null), return empty segment = "any KbRead".
+        if input.is_null() {
+            return Some(Capability::KbRead { segment: "".to_string() });
+        }
+        let namespace = input["namespace"].as_str().unwrap_or("").to_string();
+        Some(Capability::KbRead { segment: namespace })
+    }
+
+    async fn invoke(&self, input: Value) -> Result<String> {
+        let (namespace, key) = extract_ns_key(&input)?;
+        let store = Arc::clone(&self.store);
+        let ns = namespace.clone();
+        let k = key.clone();
+        let result = tokio::task::spawn_blocking(move || store.get(&ns, &k))
+            .await
+            .context("kv_get spawn_blocking join")??;
+        // Known limitation: both a missing key and a key storing "" return the empty string.
+        // The MemoryRead flight event's `found` field uses the non-empty heuristic. Fixing this
+        // properly requires a sentinel return value or a separate exists() call (p5.x).
+        match result {
+            Some(v) => Ok(v),
+            None => Ok(String::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for KvSet {
+    fn name(&self) -> &str {
+        "kv_set"
+    }
+
+    fn description(&self) -> &str {
+        "Write a value to the durable key/value store. \
+         Use namespace \"agent:scratch\" for ephemeral scratch notes that persist across turns. \
+         Pass namespace and key as separate fields — e.g. namespace=\"agent:scratch\", key=\"my-note\". \
+         Requires KbWrite capability for the namespace."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "namespace": {
+                    "type": "string",
+                    "description": "Memory namespace granted to this agent (e.g. \"agent:scratch\")"
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Key within the namespace (e.g. \"my-note\")"
+                },
+                "value": {
+                    "type": "string",
+                    "description": "Value to store"
+                }
+            },
+            "required": ["namespace", "key", "value"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        if input.is_null() {
+            return Some(Capability::KbWrite { segment: "".to_string() });
+        }
+        let namespace = input["namespace"].as_str().unwrap_or("").to_string();
+        Some(Capability::KbWrite { segment: namespace })
+    }
+
+    async fn invoke(&self, input: Value) -> Result<String> {
+        let (namespace, key) = extract_ns_key(&input)?;
+        let value = input["value"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("value must be a string"))?
+            .to_string();
+        if value.len() > MAX_KV_VALUE_BYTES {
+            anyhow::bail!(
+                "value too large: {} bytes exceeds limit of {} bytes",
+                value.len(),
+                MAX_KV_VALUE_BYTES
+            );
+        }
+        let store = Arc::clone(&self.store);
+        let ns = namespace.clone();
+        let k = key.clone();
+        let v = value.clone();
+        tokio::task::spawn_blocking(move || store.put(&ns, &k, &v))
+            .await
+            .context("kv_set spawn_blocking join")??;
+        Ok(format!("stored {} bytes at {namespace}:{key}", value.len()))
+    }
+}
+
 #[async_trait]
 impl Tool for SpawnAgentTool {
     fn name(&self) -> &str {
@@ -250,15 +405,22 @@ impl Tool for SendMessageTool {
     }
 }
 
-/// Register native tools by name. Pass `["all"]` to register all of them,
-/// or a subset by name (e.g. `["read_file", "list_dir"]`).
+/// Register native tools by name. Pass `["all"]` to register all general-purpose
+/// tools, or a subset by name (e.g. `["read_file", "list_dir"]`).
 /// Returns an error if any name collides with an already-registered tool.
 ///
 /// `cards` is required when registering `list_agents`; ignored otherwise.
+///
+/// **Note:** `kv_get` and `kv_set` are NOT included in `"all"`. They must be
+/// requested explicitly (e.g. `native = ["kv_get", "kv_set"]`) because they
+/// require `KbRead`/`KbWrite` capability grants — auto-registering them for
+/// every agent would produce noisy capability-denied events for agents that
+/// have no memory capability.
 pub fn register_native(
     reg: &mut ToolRegistry,
     names: &[String],
     cards: Option<Arc<Vec<AgentCard>>>,
+    store: Option<Arc<dyn MemoryStore>>,
 ) -> anyhow::Result<()> {
     let all = names.iter().any(|n| n == "all");
     let want = |name: &str| all || names.iter().any(|n| n == name);
@@ -280,6 +442,17 @@ pub fn register_native(
     }
     if want("send_message") {
         reg.register(Box::new(SendMessageTool))?;
+    }
+    // kv_get / kv_set — NOT included in "all"; require explicit opt-in.
+    if names.iter().any(|n| n == "kv_get") {
+        if let Some(s) = store.clone() {
+            reg.register(Box::new(KvGet { store: s }))?;
+        }
+    }
+    if names.iter().any(|n| n == "kv_set") {
+        if let Some(s) = store.clone() {
+            reg.register(Box::new(KvSet { store: s }))?;
+        }
     }
     Ok(())
 }
@@ -424,9 +597,9 @@ mod tests {
     }
 
     #[test]
-    fn register_native_all_registers_all_six() {
+    fn register_native_all_registers_six_base_tools_not_kv() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
@@ -434,6 +607,9 @@ mod tests {
         assert!(names.contains(&"spawn_agent".to_string()));
         assert!(names.contains(&"list_agents".to_string()));
         assert!(names.contains(&"send_message".to_string()));
+        // kv tools must NOT be in "all"
+        assert!(!names.contains(&"kv_get".to_string()), "kv_get must not be in 'all'");
+        assert!(!names.contains(&"kv_set".to_string()), "kv_set must not be in 'all'");
     }
 
     #[test]
@@ -456,7 +632,7 @@ mod tests {
     #[test]
     fn register_native_subset() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()], None).unwrap();
+        register_native(&mut reg, &["read_file".to_string()], None, None).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
@@ -466,7 +642,166 @@ mod tests {
     #[test]
     fn register_native_empty_registers_nothing() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &[], None).unwrap();
+        register_native(&mut reg, &[], None, None).unwrap();
         assert!(reg.tool_names().is_empty());
+    }
+
+    // ── In-memory store for unit tests ──────────────────────────────────────
+
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use crate::memory::MemoryStore;
+
+    struct SimpleStore(Mutex<HashMap<String, String>>);
+    impl SimpleStore {
+        fn new_arc() -> Arc<Self> {
+            Arc::new(SimpleStore(Mutex::new(HashMap::new())))
+        }
+    }
+    impl MemoryStore for SimpleStore {
+        fn get(&self, ns: &str, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(&format!("{}\x00{}", ns, key)).cloned())
+        }
+        fn put(&self, ns: &str, key: &str, value: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().insert(format!("{}\x00{}", ns, key), value.to_string());
+            Ok(())
+        }
+        fn append(&self, ns: &str, key: &str, value: &str) -> anyhow::Result<()> {
+            let k = format!("{}\x00{}", ns, key);
+            let mut m = self.0.lock().unwrap();
+            let e = m.entry(k).or_default();
+            if !e.is_empty() { e.push('\n'); }
+            e.push_str(value);
+            Ok(())
+        }
+        fn delete(&self, ns: &str, key: &str) -> anyhow::Result<bool> {
+            Ok(self.0.lock().unwrap().remove(&format!("{}\x00{}", ns, key)).is_some())
+        }
+        fn iter(&self, ns: &str) -> anyhow::Result<Vec<(String, String)>> {
+            let prefix = format!("{}\x00", ns);
+            let m = self.0.lock().unwrap();
+            Ok(m.iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
+                .collect())
+        }
+        fn meta_version(&self) -> anyhow::Result<u64> { Ok(1) }
+    }
+
+    // ── Gap ④: extract_ns_key error paths ───────────────────────────────────
+
+    #[tokio::test]
+    async fn kv_get_missing_namespace_errors() {
+        let tool = KvGet { store: SimpleStore::new_arc() };
+        let err = tool.invoke(json!({"key": "my-note"})).await.unwrap_err();
+        assert!(err.to_string().contains("namespace"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kv_get_missing_key_errors() {
+        let tool = KvGet { store: SimpleStore::new_arc() };
+        let err = tool.invoke(json!({"namespace": "agent:scratch"})).await.unwrap_err();
+        assert!(err.to_string().contains("key"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kv_get_invalid_namespace_chars_errors() {
+        let tool = KvGet { store: SimpleStore::new_arc() };
+        let err = tool
+            .invoke(json!({"namespace": "bad namespace!", "key": "my-note"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("namespace"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kv_set_missing_value_field_errors() {
+        let tool = KvSet { store: SimpleStore::new_arc() };
+        let err = tool
+            .invoke(json!({"namespace": "agent:scratch", "key": "my-note"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("value"), "got: {err}");
+    }
+
+    // ── Gap ⑥: KvGet miss path returns "" ───────────────────────────────────
+
+    #[tokio::test]
+    async fn kv_get_miss_returns_empty_string() {
+        let tool = KvGet { store: SimpleStore::new_arc() };
+        let result = tool
+            .invoke(json!({"namespace": "agent:scratch", "key": "nonexistent"}))
+            .await
+            .unwrap();
+        assert_eq!(result, "", "absent key must return empty string");
+    }
+
+    // ── Gap ⑤: required_capability_for both branches ────────────────────────
+
+    #[test]
+    fn kv_get_required_cap_null_returns_empty_segment() {
+        let tool = KvGet { store: SimpleStore::new_arc() };
+        let cap = tool.required_capability_for(&Value::Null);
+        assert!(matches!(&cap, Some(Capability::KbRead { segment }) if segment.is_empty()));
+    }
+
+    #[test]
+    fn kv_get_required_cap_with_input_returns_namespace() {
+        let tool = KvGet { store: SimpleStore::new_arc() };
+        let cap = tool.required_capability_for(&json!({"namespace": "agent:scratch", "key": "k"}));
+        assert!(matches!(&cap, Some(Capability::KbRead { segment }) if segment == "agent:scratch"));
+    }
+
+    #[test]
+    fn kv_set_required_cap_null_returns_empty_segment() {
+        let tool = KvSet { store: SimpleStore::new_arc() };
+        let cap = tool.required_capability_for(&Value::Null);
+        assert!(matches!(&cap, Some(Capability::KbWrite { segment }) if segment.is_empty()));
+    }
+
+    // ── Finding #6: MAX_KV_VALUE_BYTES enforced in kv_set ───────────────────────
+
+    #[tokio::test]
+    async fn kv_set_oversized_value_errors() {
+        let tool = KvSet { store: SimpleStore::new_arc() };
+        let big = "x".repeat(MAX_KV_VALUE_BYTES + 1);
+        let err = tool
+            .invoke(json!({"namespace": "agent:scratch", "key": "big", "value": big}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kv_set_max_size_value_succeeds() {
+        let tool = KvSet { store: SimpleStore::new_arc() };
+        let exact = "x".repeat(MAX_KV_VALUE_BYTES);
+        let result = tool
+            .invoke(json!({"namespace": "agent:scratch", "key": "big", "value": exact}))
+            .await
+            .unwrap();
+        assert!(result.contains("bytes"), "got: {result}");
+    }
+
+    // ── Gap ⑦: register_native with store=None + kv tools → silent skip ──────
+
+    #[test]
+    fn register_native_kv_tools_without_store_silently_skips() {
+        let mut reg = ToolRegistry::new();
+        register_native(
+            &mut reg,
+            &["kv_get".to_string(), "kv_set".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !reg.tool_names().contains(&"kv_get".to_string()),
+            "kv_get must not be registered without store"
+        );
+        assert!(
+            !reg.tool_names().contains(&"kv_set".to_string()),
+            "kv_set must not be registered without store"
+        );
     }
 }
