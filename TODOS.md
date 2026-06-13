@@ -29,6 +29,26 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
   On real power loss the rename or tmp data blocks may not be durable.
 - Fix: `f.sync_all().await?` after `write_all`; `File::open(parent).sync_all()` after rename.
 
+**F-015 (P2) — `extra_env` can re-inject secrets via operator config**
+- `tools/mcp.rs:100-102`: the `extra_env` loop from `McpServerConfig.env` runs after `env_clear()` with
+  no denylist. An operator (or compromised `agents.toml`) can write `ANTHROPIC_API_KEY = "sk-…"` to pass
+  the key explicitly to an MCP subprocess — defeating the F-001 env isolation.
+- Fix: apply a short hardcoded denylist (e.g. `ANTHROPIC_API_KEY`, any `*_API_KEY`/`*_SECRET` pattern)
+  before inserting `extra_env` keys. Log a warning and drop the offending key.
+
+**F-016 (P2) — `drain_mailbox` can inject messages into a just-terminated agent**
+- `scheduler.rs:325`: `drain_mailbox` runs after `sm.step()` regardless of terminal state. When `step()`
+  returns `AgentEffect::Completed`/`Failed`, the agent is terminal but the mailbox is still drained and
+  messages injected, only to be immediately discarded (or serialized into the terminal checkpoint).
+- Fix: check `state.agents[&agent_id].is_terminal()` after `step()` and skip drain when terminal.
+
+**F-017 (P3) — `Net{}` with empty ports grants unrestricted network (worse than no `Net`)**
+- `main.rs:568-570`: `Net { ports: [] }` sets `has_net = true` (suppressing `IsolateNetwork`) then skips
+  the rule loop (`ports.is_empty()` → `continue`). The result: full unrestricted network with no isolation.
+  Declaring no `Net` capability gives `IsolateNetwork`; declaring `Net` with empty ports gives nothing.
+- Fix (or document): either treat empty-ports `Net` as "unrestricted but acknowledged" (add a warn event),
+  or change the semantics to treat empty ports as equivalent to `IsolateNetwork`. Decide in Phase 5.
+
 ## Phase 0 — Technical Debt
 
 **~~P2 — Sync I/O in native tool impls (p0.5)~~** ✓ Done in p2.5.

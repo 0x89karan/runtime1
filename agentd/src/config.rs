@@ -696,6 +696,45 @@ task = "t"
         assert_eq!(cfg.log_path.as_deref(), Some("/var/log/agentd/flight.jsonl"));
     }
 
+    // ── p4.7: McpServerConfig.env field tests ────────────────────────────────
+
+    #[test]
+    fn mcp_server_env_field_parses() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+
+[tools.mcp_servers.env]
+MY_KEY = "my_value"
+OTHER = "42"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let env = &cfg.tools.mcp_servers[0].env;
+        assert_eq!(env.get("MY_KEY").map(|s| s.as_str()), Some("my_value"));
+        assert_eq!(env.get("OTHER").map(|s| s.as_str()), Some("42"));
+    }
+
+    #[test]
+    fn mcp_server_env_defaults_to_empty() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.tools.mcp_servers[0].env.is_empty(),
+            "absent env field must default to empty map");
+    }
+
     // ── p1.6: AgentCard tests ─────────────────────────────────────────────────
 
     #[test]

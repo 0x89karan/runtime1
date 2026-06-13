@@ -50,6 +50,17 @@ Pre-Phase-5 cleanup sprint. Addresses all P0/P1 findings from
   (`checkpoint.json.<pid>.<nanos>.tmp`) to prevent races between concurrent agentd
   processes sharing a working directory.
 - **F-014 (P1): README `##Status` updated to reflect Phases 0–4 complete (v0.16.0).**
+- **Ship-review: `apply_compiled_inner` no longer heap-allocates in fork child.**
+  `format!("0 {uid} 1\n")` inside `apply_compiled_inner` violated the function's
+  async-signal-safe contract — `format!` calls `malloc`, which can deadlock in a
+  multi-threaded process (Tokio runtime) if the allocator mutex is held by another
+  thread at the moment of `fork`. Replaced with a stack-allocated `id_map_entry`
+  helper that writes "0 {id} 1\n" into a `[u8; 16]` without any allocation.
+- **Ship-review: checkpoint tmp-name uniqueness window fixed.**
+  `tmp_path()` used `subsec_nanos()` (wraps 0–999,999,999 every second) instead of
+  `as_nanos()` (monotonically increasing since UNIX epoch). Two saves within the same
+  process in the same wall-clock second could produce the same tmp filename. Changed to
+  `d.as_nanos() as u64` for true monotonic uniqueness.
 
 ### Documentation
 - **F-013 (P1): CONVENTIONS.md event taxonomy completed.**

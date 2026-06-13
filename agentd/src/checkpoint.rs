@@ -113,7 +113,7 @@ impl CheckpointStore {
     fn tmp_path(&self) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
         let pid = std::process::id();
         self.path.with_file_name(format!("checkpoint.json.{pid}.{nanos}.tmp"))
@@ -367,6 +367,17 @@ mod tests {
             msg.contains("write checkpoint tmp"),
             "error context must mention the tmp write: {msg}"
         );
+    }
+
+    #[test]
+    fn tmp_path_has_tmp_extension_and_contains_pid() {
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let p = store.tmp_path();
+        let name = p.file_name().unwrap().to_string_lossy();
+        assert!(name.ends_with(".tmp"), "tmp_path must end in .tmp: {name}");
+        let pid = std::process::id().to_string();
+        assert!(name.contains(&pid), "tmp_path must embed the process id: {name}");
     }
 
     /// write failure (via read-only directory) propagates as Err.
