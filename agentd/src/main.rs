@@ -1,7 +1,7 @@
 use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
-use agentd::{checkpoint::CheckpointStore, config, scheduler::Scheduler};
+use agentd::{agent::{truncate, PREVIEW_CHARS}, checkpoint::CheckpointStore, config, scheduler::Scheduler};
 use agentd::capability::Capability;
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
@@ -299,7 +299,7 @@ async fn run_agent(path: PathBuf) -> anyhow::Result<()> {
                 "max_tokens":   cfg.model.max_tokens,
                 "max_turns":    ac.max_turns,
                 "token_budget": ac.token_budget,
-                "task":         ac.task,
+                "task_preview": truncate(&ac.task, PREVIEW_CHARS),
                 "native_tools": cfg.tools.native,
                 "mcp_servers":  cfg.tools.mcp_servers.len(),
             }),
