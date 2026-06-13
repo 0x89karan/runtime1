@@ -50,7 +50,7 @@ it fails.
 
 The audit recommends it and Phase 5 depends on it. Written in full increment format.
 
-> #### ▢ p4.7 — Pre-Phase-5 cleanup (audit blockers)
+> #### ✓ p4.7 — Pre-Phase-5 cleanup (audit blockers)
 >
 > **Depends on:** Phase 4.6 (current `main`).
 >

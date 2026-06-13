@@ -500,7 +500,7 @@ hard ceiling). Retrieval is an **explicit tool, never automatic injection**
 cognition-is-remote). `checkpoint.json` **coexists** as crash recovery; it does not
 become the memory store.
 
-### ▢ p4.7 — Pre-Phase-5 cleanup (audit blockers) — **prerequisite**
+### ✓ p4.7 — Pre-Phase-5 cleanup (audit blockers) — **prerequisite**
 **Depends on:** p4.6. Closes the `docs/AUDIT-phase-4-6.md` findings that block Phase 5
 or compound once a second writer touches working memory: F-001 (MCP subprocess env
 leak — `env_clear` + allowlist), F-009 (`Arc<[Msg]>` request — no per-turn deep
