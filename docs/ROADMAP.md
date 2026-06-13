@@ -482,9 +482,115 @@ Two items:
 
 ---
 
+## Phase 5 — Memory substrate
+
+Goal: the missing subsystem — a four-tier memory substrate (in-context working,
+per-agent short-term, per-agent long-term, shared knowledge base) on one
+capability-segmented store. See DESIGN.md Part 4.3 / 5.3 and the full design in
+`docs/DESIGN-memory.md`. Per-increment build detail (files, types, tests, events,
+acceptance) lives in `docs/PHASE-5-PLAN.md` — the entries here mirror the Phase 1/4
+depth; the plan doc is what each increment `/autoplan`s against.
+
+Architectural calls (from `docs/DESIGN-memory.md`): **redb** (pure-Rust, ~0.6 MB) is
+the store — bundled SQLite would breach the 4 MB CI guard and dynamic SQLite breaks
+the static-musl binary. Memory is **memory-as-tool** (no new `AgentEffect`/`Block`).
+Eviction is **runtime-floor + agent-policy** (defer while budget allows, force at a
+hard ceiling). Retrieval is an **explicit tool, never automatic injection**
+(metered-cognition lock). No vectors/embeddings in Phase 5 (preserves
+cognition-is-remote). `checkpoint.json` **coexists** as crash recovery; it does not
+become the memory store.
+
+### ▢ p4.7 — Pre-Phase-5 cleanup (audit blockers) — **prerequisite**
+**Depends on:** p4.6. Closes the `docs/AUDIT-phase-4-6.md` findings that block Phase 5
+or compound once a second writer touches working memory: F-001 (MCP subprocess env
+leak — `env_clear` + allowlist), F-009 (`Arc<[Msg]>` request — no per-turn deep
+clone), F-005/F-006 (mailbox-injection ordering), F-011 (checkpoint version probe
+before deserialize + unique tmp name), F-004 (FUSE read overflow), F-013/F-014 (six
+event kinds into CONVENTIONS; README phase status). Demo flight logs stay
+byte-for-byte identical. **Acceptance:** build/clippy/test/clippy-linux clean; +≥6
+tests; binary size unchanged. (F-002/F-003 sandbox-net hardening are recommended as a
+non-blocking **p4.8**, not gating Phase 5.)
+
+### ▢ p5.1 — Storage primitive (redb behind `MemoryStore`)
+**Depends on:** p4.7. The substrate behind a thin trait — `agentd/src/memory/{mod,store}.rs`,
+`RedbStore` over `memory.redb` (mode 0600, quarantine-on-corrupt, never deleted on
+success). New `Capability::KbRead { segment }` / `KbWrite { segment }` (prefix match
+like `FsRead`, deny-by-default). Single agent uses it via `kv_get`/`kv_set` native
+tools over a `scratch:` namespace; demoable in isolation. Events: `memory_read`,
+`memory_write`, `memory_unavailable`, `memory_quarantined`. **Acceptance:** +6 tests;
+**binary size delta documented, must stay ≤ 4 MB** (≈ +0.6 MB expected).
+
+### ▢ p5.2 — Per-agent short-term + paging
+**Depends on:** p5.1. Tier 1 / Tier 2 separated cleanly. A context manager
+(`memory/context.rs`) pages evictable blocks from working memory to short-term under
+token-budget pressure — soft threshold advertises `mem_page` (agent self-pages),
+hard ceiling force-pages so an agent never exceeds budget nor silently loses state.
+Tier 2 (`short_term: Vec<MemItem>` on `AgentTask`) survives restart via the
+checkpoint (`FORMAT_VERSION` 1 → 2, `#[serde(default)]` back-compat). Event:
+`memory_paged`. **Acceptance:** +7 tests; v1 checkpoint loads; a budget that would
+have hit `budget_exceeded` instead completes via paging.
+
+### ▢ p5.3 — Per-agent long-term + checkpoint coexistence
+**Depends on:** p5.1, p5.2. `mem_remember`/`mem_recall` over the agent's own
+`agent/<id>` namespace (implicit self-grant; cross-agent Tier-3 read needs `KbRead`).
+Durable across runs — `memory.redb` persists where `checkpoint.json` is deleted on
+success. Runtime-stamped, unforgeable provenance. Event: `memory_distilled` (manual
+remember). **Acceptance:** +4 tests; after clean completion `memory.redb` exists and
+`checkpoint.json` does not; provenance unforgeable.
+
+### ▢ p5.4 — Shared KB MVP (namespace + mutability classes + provenance)
+**Depends on:** p5.3. Multi-agent segmented KB: one namespace axis, three classes
+(`canon` read-only / `log` append-only / `scratch` mutable LWW+version). `kb_put`/
+`kb_get`; `KbRead`/`KbWrite` enforced across agents; `[[memory.segments]]` config
+seeds canon. The DESIGN-memory §4 worked example (agent A logs, later agent B
+retrieves with provenance, no Net) ships as an integration test. Extends
+`memory_write`/`memory_read` with `tier:4` + `class`. **Acceptance:** +6 tests;
+worked-example test passes; THREAT_MODEL §7.1/§7.2 stubbed.
+
+### ▢ p5.5 — Retrieval as tool (lexical search)
+**Depends on:** p5.4. `kb_search { segment?, query, author?, limit? }` over a
+tokenized inverted index (`memory/index.rs`, BM25-lite in Rust) maintained
+transactionally with entry writes. No embeddings, no network. Event: `kb_search`.
+**Acceptance:** +6 tests; ranked, segment-scoped, author-filterable; `KbRead`-gated.
+
+### ▢ p5.6 — Eviction & summarization
+**Depends on:** p5.5. Per-segment capacity/age eviction floor (drops oldest + index
+postings in one txn); optional end-of-run distillation (`distill_on_complete`,
+default off — one budget-bounded inference promoting short-term to Tier 3). Event:
+`memory_evicted`. **Acceptance:** +5 tests; eviction observable; distillation respects
+the budget guard and is off by default (demos unchanged).
+
+### ▢ p5.7 — `/agents/<id>/memory/` + `/agents/kb/` FUSE (read-only)
+**Depends on:** p5.4, p4.7 (F-004). Memory observable from the control plane,
+following the existing inode scheme: per-agent `memory/{short_term,long_term/}` and an
+operator `kb/<segment>/` browse (not an agent capability — does not bypass `KbRead`).
+Read-only; bounded snapshot projection. **Acceptance:** +4 tests; `make clippy-linux`
+clean; `cat /agents/<id>/memory/long_term/<key>` works on the QEMU image; F-004
+regression test passes.
+
+### ▢ p5.8 — Phase 5 hardening pass
+**Depends on:** p5.1–p5.7. THREAT_MODEL §7 written in full; the **p4.6-shaped startup
+invariant** asserted (`memory.redb` path must not fall inside any MCP server's FS
+sandbox prefix); a demo `agents.toml` that actually exercises memory (KbWrite+Net
+agent, KbRead agent, seeded canon, spawning, non-zero global budget); CONVENTIONS
+table completeness check (+14 rows total across Phase 5); TODOS swept. **Acceptance:**
++3 tests; sandbox-path assertion test passes; memory-demo flight log shows
+`memory_write`/`kb_search`/`memory_read`/`memory_paged`; binary ≤ 4 MB.
+
+**Exit criteria for Phase 5:** a finding written by one agent is retrievable with
+provenance by a later, differently-capability-scoped agent over a capability-gated
+shared KB; working memory pages under budget pressure; long-term memory survives
+restart; memory is browsable under `/agents`; the binary is still ≤ 4 MB; and the
+single-agent demo's flight-event sequence is unchanged when memory is unused. Full
+detail and per-increment acceptance: `docs/PHASE-5-PLAN.md`.
+
+---
+
 ## Beyond
 
-Memory substrate (two-tier in-context / external memory from DESIGN.md), additional
-inference backends (incl. a local `impl InferenceGateway`), richer A2A/ACP
-interop, and multi-device agent migration. Re-plan these into a stack when Phase 1–2
-land.
+Re-homed into Phase 5 (above): the memory substrate. Remaining: additional inference
+backends (incl. a local `impl InferenceGateway`, and a remote `embed()` method that
+would unlock semantic/vector KB retrieval while preserving the remote-cognition lock —
+see `docs/DESIGN-memory.md` §9 Q1), richer A2A/ACP interop, a human interface layer
+(Phase 6 — surfaces memory views; see `docs/PHASE-5-PLAN.md` §E for the contracts
+Phase 5 exposes), and multi-device agent migration.
