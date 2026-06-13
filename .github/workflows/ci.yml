@@ -64,4 +64,3 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
-        working-directory: agentd
