@@ -37,11 +37,13 @@ is called out explicitly (see §4, storage substrate).
   existing `CallTools` effect. No new `AgentEffect`, no new `Block` types.
 
 ### Non-goals (Phase 5)
-- **No semantic/vector retrieval.** No embeddings, no vector index. Lexical
-  (token/substring) search only. Vectors require an embedding model — that is
-  either local inference (violates the remote-cognition lock) or a remote
-  `embed()` round-trip per write+query (cost the lock makes us account for). Both
-  are deferred to a later phase with the lock argument made explicit (§9, Q1).
+- **No semantic/vector retrieval *in the embedded store*.** The built-in
+  `redb`-backed store (Layer 1, §4) is lexical only — token/substring search, no
+  embeddings, no vector index. Semantic + keyword (hybrid) retrieval is delivered by
+  an **optional external KB attached over MCP** (Layer 2, §4), whose embeddings come
+  from a **remote embedding API** — preserving the remote-cognition lock (no weights
+  on the `agentd` host). Layer 2's full integration (an HTTP/SSE MCP transport) is a
+  later increment; Phase 5 ships Layer 1 plus the stdio-sidecar path. Decided in §9 Q1.
 - **No automatic retrieval injection.** Retrieval is an explicit tool call, never
   silent context stuffing (§3.4 read semantics, justified).
 - **No at-rest encryption.** Inherits the checkpoint §3.3 gap; tracked, not closed.
@@ -302,10 +304,49 @@ computed in Rust. Good enough for a KB MVP; ranked FTS and vectors are deferred
 *content format* of `canon`/`log` entries (markdown bodies), not as a separate
 mechanism.
 
-> If a future phase needs semantic search, the path is: add an `embed()` method to
-> `InferenceGateway` (remote embeddings — preserves the cognition-is-remote lock),
-> store vectors in a redb table, brute-force cosine for small N or add `sqlite-vec`
-> only if N grows enough to justify the size hit. That decision is out of scope here.
+### Two storage layers — embedded (Layer 1) + external hybrid KB over MCP (Layer 2)
+
+The single `redb` decision above covers **Layer 1**: the always-present, zero-dependency,
+in-binary store for per-agent short/long-term memory and a lexical shared KB. It works
+offline, ships in the 4 MB binary, and is what Phase 5 builds.
+
+Semantic search at scale is delivered by **Layer 2: an optional external hybrid KB
+attached as an MCP server** — *not* by adding a vector engine to `agentd`. This is the
+cleaner split and it falls out of the existing architecture: MCP is already the tool
+ABI, and the runtime already spawns, sandboxes, and capability-scopes MCP servers. So
+"connect an external semantic+keyword KB to the AgentOS container" is just "attach a
+tool server." Benefits: the heavy index/embedding machinery lives **outside** the
+binary (holds the super-light line) and **outside** the `agentd` host (holds the
+remote-cognition lock — see embeddings below).
+
+- **Agent-facing surface is identical across layers.** The same `kb_search` / `kb_get`
+  / `kb_put` tools (§4 read/write semantics), capability-gated by `KbRead`/`KbWrite`
+  (+ `Mcp { server, tools }` for the external server). An agent cannot tell whether
+  retrieval was lexical-local or hybrid-remote — only the backing changes.
+- **Hybrid engine choice (Layer 2):** an engine that fuses BM25/keyword with vector
+  search (reciprocal-rank fusion). Default recommendation **Postgres + `pgvector` +
+  native FTS** (one container does both halves, simplest to operate); **Qdrant**
+  (Rust, single binary) or **Meilisearch** (Rust, light) are good purpose-built
+  alternatives. The engine, not `agentd`, owns the index.
+- **Connection mechanism:** today's MCP client is **stdio-only** (p0.5), so the first
+  version is a **co-located stdio sidecar** — `agentd` spawns the KB server like the
+  filesystem server, zero new runtime code. A **networked KB container** needs an
+  **HTTP/SSE MCP transport** added to `agentd` (a later increment); when it lands, the
+  p4.6 Landlock V4 TCP-port rules are the enforcement layer — grant the KB server
+  `Net { ports: [<kb-port>] }`. (Heed AUDIT **F-002**: on kernels < 6.7 that port
+  restriction silently degrades to full network — close it in p4.8 first.)
+
+**Embeddings — remote API, lock preserved (decided, §9 Q1).** Semantic retrieval needs
+an embedding model, and embeddings are inference-shaped, so the **Layer 2 KB sidecar
+computes them by calling a remote embedding API** — never `agentd`, and no local
+embedding weights anywhere in AgentOS. **Anthropic offers no first-party embeddings
+API**, so the canonical pairing with Claude is **Voyage AI** (the `voyage-3` family;
+Voyage is part of MongoDB); Cohere and OpenAI embedding APIs are equally viable. The
+exact Voyage model id should be read from Voyage's own docs at integration time (it is
+outside the Claude API surface). The KB server is the only component that holds an
+embedding-API key — and per AUDIT **F-001**, that key (and `ANTHROPIC_API_KEY`) must be
+kept out of the sidecar's environment unless explicitly granted (the p4.7 env-allowlist
+fix is the control).
 
 ### Worked example — A logs a finding, B retrieves it
 Agents: `scout` (caps: `KbWrite { "project:acme" }`, `Net { ports:[443] }`) and a
@@ -481,16 +522,18 @@ A new **§7 — Memory substrate** for THREAT_MODEL.md, sketched:
 
 ## 9. Open questions (real, with trade-offs)
 
-**Q1 — When do semantic (vector) retrieval and embeddings enter, and how is the
-remote-cognition lock honored?** Lexical search covers the MVP, but a KB of any size
-wants semantic recall. The lock forbids a local embedding model. Options: (a) remote
-`embed()` on the `InferenceGateway` — preserves the lock, costs a round-trip and
-tokens per write+query, and makes *every KB write* a network+budget event; (b)
-argue that a *local embedding* model is "retrieval, not cognition" and therefore
-outside the lock — defensible (no generation, no autonomy) but a real reinterpretation
-of a constitutional decision. **My lean:** (a), deferred to Phase 6, because it keeps
-the lock literal; but (b) is a legitimate call the user should make explicitly. This
-is the one genuinely unresolved design fork.
+**Q1 — How do semantic (vector) retrieval and embeddings enter? — RESOLVED.**
+**Decision: option (a) — external hybrid KB over MCP, with embeddings from a remote
+API; the remote-cognition lock stays literal.** Lexical search (Layer 1) covers the
+MVP; semantic recall arrives as the optional Layer 2 external KB (§4), whose sidecar
+calls a remote embedding API (Voyage AI canonical; Cohere/OpenAI viable) — no local
+embedding weights on the `agentd` host. The rejected alternative (b) — running a
+*local* embedding model and arguing "retrieval, not cognition" is outside the lock —
+was a real reinterpretation of a constitutional decision and is explicitly **not**
+taken. Trade-off accepted: every semantic write/query is a network + (metered) cost
+event, owned and bounded by the KB sidecar. Residual sub-question (timing): Layer 2's
+HTTP/SSE MCP transport is a later increment; the stdio-sidecar path is available within
+Phase 5's reach.
 
 **Q2 — Should any retrieval ever be automatic?** Phase 5 says no (explicit tools
 only). But a "working-set" of the agent's own most-recent Tier-3 entries, auto-

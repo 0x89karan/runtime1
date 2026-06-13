@@ -588,9 +588,18 @@ detail and per-increment acceptance: `docs/PHASE-5-PLAN.md`.
 
 ## Beyond
 
-Re-homed into Phase 5 (above): the memory substrate. Remaining: additional inference
-backends (incl. a local `impl InferenceGateway`, and a remote `embed()` method that
-would unlock semantic/vector KB retrieval while preserving the remote-cognition lock —
-see `docs/DESIGN-memory.md` §9 Q1), richer A2A/ACP interop, a human interface layer
-(Phase 6 — surfaces memory views; see `docs/PHASE-5-PLAN.md` §E for the contracts
-Phase 5 exposes), and multi-device agent migration.
+Re-homed into Phase 5 (above): the memory substrate (Layer 1 — embedded, lexical).
+Remaining:
+- **Layer 2 — external hybrid (semantic + keyword) KB over MCP.** Attach a real search
+  engine (Postgres+pgvector+FTS, or Qdrant/Meilisearch) as a sandboxed MCP server;
+  embeddings come from a **remote embedding API** (Voyage AI canonical; Cohere/OpenAI
+  viable), preserving the remote-cognition lock — no embedding weights on the `agentd`
+  host. Stdio-sidecar is reachable within Phase 5; a **networked KB needs an HTTP/SSE
+  MCP transport** added to the MCP client (its own increment), with the p4.6 Landlock
+  V4 TCP-port rules as the enforcement layer. Design: `docs/DESIGN-memory.md` §4
+  (two storage layers) + §9 Q1 (decided).
+- Additional inference backends (incl. a local `impl InferenceGateway`, and a remote
+  `embed()` method on the gateway if embeddings are ever pulled in-process rather than
+  into the KB sidecar), richer A2A/ACP interop, a human interface layer (Phase 6 —
+  surfaces memory views; see `docs/PHASE-5-PLAN.md` §E for the contracts Phase 5
+  exposes), and multi-device agent migration.
