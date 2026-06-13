@@ -302,7 +302,7 @@ impl fuser::Filesystem for AgentsFs {
         };
         let offset = if offset < 0 { 0usize } else { offset as usize };
         let start = offset.min(content.len());
-        let end   = (offset + size as usize).min(content.len());
+        let end   = offset.saturating_add(size as usize).min(content.len());
         reply.data(&content[start..end]);
     }
 

@@ -1,5 +1,34 @@
 # TODOS
 
+## Phase 4 — Open (deferred from p4.7 audit)
+
+Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phase 5:
+
+**F-006 (P2) — `inject_messages` appends `Block::Text` onto a ToolResult-only user turn**
+- `agent/mod.rs:240-241`: after a tool cycle, the last user message is all `Block::ToolResult`;
+  injection pushes a `Block::Text` into it yielding mixed content. Anthropic tolerates this today
+  but a stricter provider (or future validation) would reject it.
+- Fix: when the target user message contains any `ToolResult`, push a *new* user message instead.
+
+**F-007 (P2) — `StopReason::MaxTokens` mislabelled as `BudgetExceeded`**
+- `agent/mod.rs:333-344`: a per-response generation cap (`model.max_tokens`) is conflated with the
+  cumulative per-agent `token_budget`. The agent emits `budget_exceeded` even when nowhere near budget.
+- Fix: distinct event kind (e.g. `max_tokens_truncated`); don't attach the unrelated `token_budget`.
+
+**F-008 (P2) — `StopReason::Other(_)` and empty `EndTurn` complete silently with `""`**
+- `agent/mod.rs:346-371`: unknown/future stop reason or end_turn with only a filtered thinking block
+  yields `Completed("")` — a silent empty answer reported as success.
+- Fix: treat empty extracted text as `Failed`; handle `Other(_)` distinctly with a warning event.
+
+**F-009 (P2) — Global token budget is a soft, post-hoc ceiling**
+- `scheduler.rs:608-609`: a single inference can overshoot the ceiling by up to one inference.
+- Fix: document "soft ceiling, overshoot ≤ one in-flight inference per agent" in ROADMAP/NOTES.
+
+**F-012 (P2) — No `fsync` before/after checkpoint rename**
+- `checkpoint.rs:47,117`: `write_all` not followed by `sync_all()`; parent dir not fsynced after rename.
+  On real power loss the rename or tmp data blocks may not be durable.
+- Fix: `f.sync_all().await?` after `write_all`; `File::open(parent).sync_all()` after rename.
+
 ## Phase 0 — Technical Debt
 
 **~~P2 — Sync I/O in native tool impls (p0.5)~~** ✓ Done in p2.5.

@@ -91,16 +91,32 @@ pub struct SchedulerCheckpoint {
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
 pub struct CheckpointStore {
-    path:     PathBuf,
-    tmp_path: PathBuf,
+    path: PathBuf,
+}
+
+/// Minimal probe struct — deserialized first to check compatibility before
+/// attempting full deserialization of the checkpoint.
+#[derive(Deserialize)]
+struct VersionProbe {
+    format_version: u32,
 }
 
 impl CheckpointStore {
     pub fn new(dir: &Path) -> Self {
         Self {
-            path:     dir.join("checkpoint.json"),
-            tmp_path: dir.join("checkpoint.json.tmp"),
+            path: dir.join("checkpoint.json"),
         }
+    }
+
+    /// Generate a unique tmp path per save call to prevent races when two agentd
+    /// processes share a working directory (e.g. during OS boot overlap).
+    fn tmp_path(&self) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        self.path.with_file_name(format!("checkpoint.json.{pid}.{nanos}.tmp"))
     }
 
     /// Write `cp` atomically. Calls `tokio::fs::write` so the scheduler's async
@@ -111,12 +127,13 @@ impl CheckpointStore {
     /// `rename(2)` preserves those permissions on the final `checkpoint.json`.
     pub async fn save(&self, cp: &SchedulerCheckpoint) -> Result<()> {
         let json = serde_json::to_string(cp).context("serialize checkpoint")?;
-        write_mode_600(&self.tmp_path, json.as_bytes())
+        let tmp = self.tmp_path();
+        write_mode_600(&tmp, json.as_bytes())
             .await
-            .context("write checkpoint.json.tmp")?;
-        tokio::fs::rename(&self.tmp_path, &self.path)
+            .context("write checkpoint tmp")?;
+        tokio::fs::rename(&tmp, &self.path)
             .await
-            .context("rename checkpoint.json.tmp -> checkpoint.json")?;
+            .context("rename checkpoint tmp -> checkpoint.json")?;
         Ok(())
     }
 
@@ -129,15 +146,22 @@ impl CheckpointStore {
             return Ok(None);
         }
         let bytes = std::fs::read(&self.path).context("read checkpoint.json")?;
-        let cp: SchedulerCheckpoint =
-            serde_json::from_slice(&bytes).context("parse checkpoint.json")?;
-        if cp.format_version > FORMAT_VERSION {
+
+        // Probe the version field before attempting full deserialization so we can
+        // distinguish "too new" (intentional refusal) from "corrupt" (parse error).
+        let probe: VersionProbe = serde_json::from_slice(&bytes)
+            .context("checkpoint.json: cannot read format_version")?;
+        if probe.format_version > FORMAT_VERSION {
             anyhow::bail!(
-                "checkpoint format_version {} > supported {}; refusing to load stale format",
-                cp.format_version,
+                "checkpoint format_version {} > supported {}; \
+                 this checkpoint was written by a newer agentd — refusing to load",
+                probe.format_version,
                 FORMAT_VERSION
             );
         }
+
+        let cp: SchedulerCheckpoint =
+            serde_json::from_slice(&bytes).context("parse checkpoint.json")?;
         Ok(Some(cp))
     }
 }
@@ -271,7 +295,11 @@ mod tests {
             "spawn_depths": {}
         });
         std::fs::write(&store.path, serde_json::to_string(&json).unwrap()).unwrap();
+        let err = store.load().unwrap_err();
+        let msg = format!("{err}");
         assert!(store.load().is_err(), "newer format_version must return Err");
+        // Must be identified as "too new" (explicit refusal), not "corrupt".
+        assert!(msg.contains("refusing to load"), "error must say 'refusing to load': {msg}");
     }
 
     #[test]
@@ -288,7 +316,12 @@ mod tests {
         let cp = minimal_scheduler_checkpoint();
         store.save(&cp).await.unwrap();
         assert!(store.path.exists(), "checkpoint.json must exist after save");
-        assert!(!store.tmp_path.exists(), "checkpoint.json.tmp must not persist after rename");
+        // No .tmp files should remain after a successful save.
+        let tmp_files: Vec<_> = std::fs::read_dir(dir.path()).unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(tmp_files.is_empty(), "no .tmp files must remain after rename");
     }
 
     #[tokio::test]
@@ -331,8 +364,8 @@ mod tests {
         assert!(result.is_err(), "save must return Err when write fails");
         let msg = format!("{:#}", result.unwrap_err());
         assert!(
-            msg.contains("write checkpoint.json.tmp"),
-            "error context must mention the tmp path: {msg}"
+            msg.contains("write checkpoint tmp"),
+            "error context must mention the tmp write: {msg}"
         );
     }
 
@@ -351,7 +384,7 @@ mod tests {
         // Write a valid tmp file directly so write_mode_600 succeeds.
         let cp = minimal_scheduler_checkpoint();
         let json = serde_json::to_string(&cp).unwrap();
-        std::fs::write(&store.tmp_path, &json).unwrap();
+        std::fs::write(&store.tmp_path(), &json).unwrap();
         // Now lock the directory — rename requires write permission on the parent dir.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         // save() will try write_mode_600 (fails on read-only dir), so the error

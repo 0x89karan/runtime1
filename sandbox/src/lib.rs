@@ -162,6 +162,21 @@ impl CompiledSandbox {
     }
 }
 
+/// Returns true if the running kernel supports Landlock ABI version 4 (Linux ≥ 6.7),
+/// which is required for TCP port enforcement via `AllowNetConnect`.
+///
+/// On non-Linux or if Landlock is unavailable, always returns false.
+pub fn landlock_v4_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::query_landlock_abi_version() >= 4
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Compile sandbox rules into a `CompiledSandbox` ready for `apply_compiled`.
 ///
 /// May allocate (opens file descriptors, builds Vec); must NOT be called inside
@@ -420,7 +435,7 @@ mod linux {
 
     /// Query the kernel's supported Landlock ABI version.
     /// Returns the version (1..N) on success, or 0 if Landlock is unavailable.
-    fn query_landlock_abi_version() -> i64 {
+    pub(super) fn query_landlock_abi_version() -> i64 {
         let ret = unsafe {
             libc::syscall(
                 SYS_LANDLOCK_CREATE_RULESET,
@@ -647,7 +662,25 @@ mod linux {
             let mut flags: libc::c_int = libc::CLONE_NEWUSER;
             if inner.isolate_net   { flags |= libc::CLONE_NEWNET; }
             if inner.isolate_mount { flags |= libc::CLONE_NEWNS;  }
-            if unsafe { libc::unshare(flags) } != 0 {
+            let unshare_ok = unsafe { libc::unshare(flags) } == 0;
+            if unshare_ok {
+                // Write uid_map and gid_map to preserve DAC identity inside the
+                // user namespace. Without these mappings, the process runs as the
+                // overflow uid (nobody/65534), breaking Landlock FS grants via DAC
+                // for user-owned files with modes < 0644.
+                //
+                // "deny" must be written to setgroups before gid_map on kernels ≥ 3.19
+                // to prevent privilege escalation via supplementary group removal.
+                let uid = unsafe { libc::getuid() };
+                let gid = unsafe { libc::getgid() };
+                let _ = std::fs::write("/proc/self/setgroups", "deny");
+                let uid_map = format!("0 {uid} 1\n");
+                let gid_map = format!("0 {gid} 1\n");
+                // BestEffort: write errors here mean uid_map is already set or the
+                // namespace was not actually created; don't fail the whole sandbox.
+                let _ = std::fs::write("/proc/self/uid_map", uid_map.as_bytes());
+                let _ = std::fs::write("/proc/self/gid_map", gid_map.as_bytes());
+            } else {
                 let errno = unsafe { *libc::__errno_location() };
                 // BestEffort: EPERM = user namespaces disabled by kernel policy
                 // (kernel.unprivileged_userns_clone = 0); ENOSYS = too old.

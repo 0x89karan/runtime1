@@ -225,6 +225,11 @@ pub struct McpServerConfig {
     /// `"gvisor"`: wrap command with `runsc do`; requires `runsc` on PATH.
     #[serde(default)]
     pub isolation: IsolationMode,
+    /// Extra environment variables to pass to this MCP server subprocess.
+    /// Applied on top of the standard allowlist (PATH, HOME, USER, LANG, LC_ALL, TMPDIR).
+    /// The parent process's full environment, including secrets, is NOT inherited.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 #[cfg(test)]

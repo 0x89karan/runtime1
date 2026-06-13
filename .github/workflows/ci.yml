@@ -51,3 +51,17 @@ jobs:
           echo "agentd musl binary: ${SIZE} bytes"
           MAX_BYTES=4194304  # 4 MB = 4 * 1024 * 1024
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 4 MB limit"; exit 1; }
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit dependencies
+        run: cargo audit
+        working-directory: agentd

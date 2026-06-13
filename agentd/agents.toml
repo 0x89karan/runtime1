@@ -3,9 +3,19 @@
 # Watch log:  tail -f flight.jsonl
 # Verbosity:  RUST_LOG=debug cargo run -- agents.toml
 #
-# All agents share the [model] config and [tools] config.
-# Each [[agents]] entry runs concurrently subject to [scheduler] limits.
-# Answers print in completion order.
+# This demo exercises:
+#   - Two concurrent agents with capability grants (p1.4+)
+#   - Admission control (global budget + concurrency cap)
+#   - Per-agent capability grants (FsRead scoped to the project)
+#
+# To also exercise MCP-with-sandbox, add an [[tools.mcp_servers]] block:
+#   [[tools.mcp_servers]]
+#   name = "notes"
+#   command = "cat"
+#   args = ["/tmp/notes.txt"]
+#   capabilities = [{ FsRead = { prefix = "/tmp" } }]
+#
+# All agents share [model] and [tools].
 
 [model]
 provider = "anthropic"
@@ -15,14 +25,12 @@ max_tokens = 4096
 [tools]
 native = ["read_file", "list_dir"]
 
-# Optional: admission control (p1.3+).
-# global_token_budget = 0        # 0 = unlimited; >0 = stop-admission threshold (no new
-#                                 #   inferences once this many tokens have been spent;
-#                                 #   a single inference may spend past it if it runs over)
-# max_concurrent_inferences = 0  # 0 = unlimited; >0 = max in-flight inference calls
+# Admission control (p1.3+):
+#   global_token_budget: stop admitting new inferences after this many total tokens.
+#   max_concurrent_inferences: max in-flight inference calls (0 = unlimited).
 [scheduler]
-global_token_budget        = 0
-max_concurrent_inferences  = 0
+global_token_budget        = 200_000   # ~$0.05 ceiling for this demo run
+max_concurrent_inferences  = 4
 
 [[agents]]
 id          = "surveyor"
@@ -31,13 +39,10 @@ description = "Lists and summarises source files in the agentd/src directory."
 skills      = ["fs-read", "summarize"]
 task        = "List the agentd/src directory and describe every source file in one sentence each."
 max_turns   = 10
-token_budget = 50_000
+token_budget = 80_000
 priority    = 0
-# Optional: least-privilege tool grants (p1.4+). Absent = unrestricted.
-# capabilities = [{ FsRead = { prefix = "/workspace" } }]           # read-only under prefix
-# capabilities = [{ FsRead = { prefix = "/" } }, { FsWrite = { prefix = "/tmp" } }]
-# capabilities = [{ Mcp = { server = "mcp-server", tools = [] } }]  # all tools on server
-# capabilities = []                                                   # deny all tools
+# Least-privilege: this agent may only read the project source tree (p1.4+).
+capabilities = [{ FsRead = { prefix = "." } }]
 
 [[agents]]
 id          = "analyst"
@@ -46,5 +51,7 @@ description = "Explains crate dependencies from Cargo.toml."
 skills      = ["fs-read", "explain"]
 task        = "Read agentd/Cargo.toml and explain what each dependency is used for."
 max_turns   = 10
-token_budget = 50_000
+token_budget = 80_000
 priority    = 0
+# Least-privilege: read-only access to the project tree.
+capabilities = [{ FsRead = { prefix = "." } }]

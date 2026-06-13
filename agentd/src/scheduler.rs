@@ -305,21 +305,24 @@ impl Scheduler {
                             let new_tokens =
                                 u64::from(resp.input_tokens) + u64::from(resp.output_tokens);
                             let priority = state.agents[&agent_id].priority();
-                            // Provide response, then drain mailbox before next step.
+                            // Provide response, step, then drain mailbox.
+                            // Draining mailbox AFTER step ensures injected messages are
+                            // appended after the assistant turn that was just pushed,
+                            // preserving correct message ordering (F-005).
                             state
                                 .agents
                                 .get_mut(&agent_id)
                                 .expect("agent_id in EffectResult must be present in agents map")
                                 .provide_inference(resp, &recorder);
-                            drain_mailbox(&agent_id, &mut state, &recorder);
                             let (effect, turn) = {
                                 let sm = state
                                     .agents
                                     .get_mut(&agent_id)
-                                    .expect("agent_id must still be present after drain_mailbox");
+                                    .expect("agent_id must still be present after provide_inference");
                                 let t = sm.turn();
                                 (sm.step(&recorder), t)
                             };
+                            drain_mailbox(&agent_id, &mut state, &recorder);
                             state.tokens_spent = state.tokens_spent.saturating_add(new_tokens);
                             let cap_set = state.agents[&agent_id].cap_set_cloned();
                             // Drain deferred agents first (they were waiting for a slot to open),
