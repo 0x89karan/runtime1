@@ -98,7 +98,15 @@ no circular dep); `MemoryStore::list_namespaces()` default-impl with `RedbStore`
 `memory/`/`memory/short_term`/`memory/long_term/`; fixed inode 9 for `kb/`; dynamic pool
 ≥1_000_000 for `memory/long_term/<key>`, `kb/<seg>/`, `kb/<seg>/<key>`; bounded key lists
 (MAX_DIR_KEYS=100); `mount()` accepts `Option<Arc<dyn MemoryAccess>>`; 446 tests.
-**Next: p5.8 (Phase 5 hardening) — see `docs/ROADMAP.md`.**
+**p5.8 complete (v0.25.0).** Phase 5 hardening: OV-1 startup invariant (`memory.store_path`
+must not fall inside any MCP server's FS sandbox prefix, checked via `normalize_path` +
+`anyhow::ensure!`); `NAMESPACES` redb table for O(k) `list_namespaces()` with one-time backfill
+on pre-p5.8 stores; `prune_dead_agent()` in `AgentsFs` (lazy inode-map cleanup in `readdir(Root)`
+for terminated agents, all 6 maps); `getattr` ENOENT guard for `memory/` and `long_term/` dirs
+when store is absent; `memory_distilled` row added to CONVENTIONS.md event table;
+THREAT_MODEL.md §7 expanded to §7.1–7.6 (memory substrate threats); memory-demo `agents.toml`;
+`event_taxonomy_completeness` test; 476 tests.
+**Next: Phase 6 (Interface and agent catalogue) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 
