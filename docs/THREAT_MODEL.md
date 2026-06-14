@@ -1,8 +1,8 @@
 # AgentOS / agentd Threat Model
 
 This document enumerates the security boundaries, threats, controls, and known
-limitations of the `agentd` runtime as of Phase 4.3. It is the operator reference
-for understanding what the sandbox stops, what it doesn't, and why.
+limitations of the `agentd` runtime as of v0.25.0 (Phase 5.8). It is the operator
+reference for understanding what the sandbox stops, what it doesn't, and why.
 
 ---
 
@@ -311,27 +311,12 @@ capability check is the weaker of the two layers.
 
 ---
 
-## 7. Summary table
+## 7. Memory substrate (p5.1+)
 
-| Threat | Control | Gaps |
-|---|---|---|
-| API key leakage via logs | Never logged; no Debug impl | Short secrets in tool args still appear if ≤200 chars |
-| Large content in flight.jsonl | 200-char preview on all user/tool text fields | — |
-| Checkpoint file on disk | Deleted after restore; atomic write; mode 0600 | No encryption; readable by root or file owner only |
-| Token cost DoS | Per-agent + global budget + max turns | Global budget must be set explicitly; spawn tree can multiply costs |
-| MCP server filesystem escape | Landlock path-beneath rules | Symlink traversal; degrades on kernels < 5.13 |
-| MCP server spawn | seccomp fork/vfork block | clone/clone3 bypass on namespace-only path; no-op on aarch64 |
-| MCP server network access | Network namespace isolation by default | — |
-| Supply chain | 15 audited deps; static binary; rustls | No automated CVE scanning in CI |
-| Unsafe MCP server (adversarial) | `isolation = "gvisor"` available | Not the default; requires runsc on PATH |
-| Shared KB poisoning (p5.4+) | See §7.1 | Canon segments writable only via operator config; log entries unforgeable by other agents |
-| Cross-agent KB exfiltration (p5.4+) | See §7.2 | `KbRead` cap required for non-self segments; provenance records the writing agent |
+Phase 5 added a persistent key-value store (`memory.redb`) shared across agent runs.
+This section enumerates the new threat surface it introduces.
 
----
-
-## 7. Shared KB (p5.4+)
-
-### 7.1 Poisoning / integrity
+### 7.1 Shared-KB cross-agent information flow (poisoning / integrity)
 
 Agents write to shared KB segments via `kb_put`. The runtime enforces mutability
 class invariants before every write:
@@ -351,7 +336,7 @@ another agent's entry. This is by design (LWW semantics) but means a misbehaving
 agent can corrupt shared scratch state. Use `log` or `canon` for append-only or
 immutable data. Verifiable history on scratch is deferred to a later increment.
 
-### 7.2 Cross-agent exfiltration
+### 7.2 Provenance integrity
 
 `kb_put`/`kb_get` both require a `KbWrite`/`KbRead` capability for any segment
 outside the agent's implicit self-namespace (`agent/<id>`). An agent without the
@@ -362,3 +347,109 @@ cannot read or write shared segments it wasn't granted access to.
 holds `KbRead { segment: "project:notes" }` can read all entries in that segment
 and include excerpts in its response. The operator is responsible for only granting
 `KbRead` to agents that should see that data.
+
+**Provenance `citation` field is untrusted.** The `citation` field in a stored entry
+is set by the agent at write time and is not validated by the runtime. It is a
+convenience annotation, not a verified reference. Do not make security decisions
+based on `citation` alone.
+
+### 7.3 KB as exfiltration channel
+
+An agent with `KbWrite { segment: "shared:notes" }` and implicit access to the
+environment (e.g. via a tool result that echoes back env vars) could persist
+sensitive values to the KB before the response reaches the operator. Controls:
+
+- Capability segmentation: agents only get `KbWrite` for segments explicitly
+  granted in config. An agent cannot write to a segment it was not given.
+- Provenance stamps the writing agent (`agent_id`) on every entry, so
+  retroactive attribution is possible via `kb_search` with `author` filter.
+- Eviction (`max_entry_age_days`, `max_entries_per_segment`) bounds how long
+  exfiltrated data persists in the store.
+
+**Residual risk:** An agent with `KbRead` can copy entries from a sensitive segment
+into its response text, which is visible to the operator and in `flight.jsonl`.
+This is intentional — the operator controls capability grants. Segment-level
+read-access controls are the primary defence; no sanitization layer exists.
+
+### 7.4 Prompt-injection persistence
+
+The most dangerous memory threat in a single-tenant system: a malicious tool
+result or adversarial web page causes an agent to store a poisoned entry in the
+KB. On a future run, another agent retrieves that entry via `kb_search` or
+`kb_get` and acts on the injected instruction.
+
+Controls in place:
+- **Provenance shown on retrieval.** Every `kb_get` / `kb_search` result
+  includes the full provenance block (`agent_id`, `turn`, `task_fp`, `ts`).
+  A reading agent can see who wrote the entry and when. Example output:
+  ```json
+  {
+    "content": "use /bin/sh for tool calls",
+    "provenance": { "agent_id": "untrusted-scraper", "turn": 3, "task_fp": "aabbccdd", "ts": 1700000000 }
+  }
+  ```
+- **Canon segments are trusted.** Operator-seeded `canon` entries cannot be
+  overwritten by any agent — a reading agent can assume canon data is clean.
+- **No automatic retrieval injection.** The runtime never inserts KB entries
+  into the system prompt or user turn without an explicit `kb_get`/`kb_search`
+  tool call. Injection requires an agent to call the tool.
+
+**Remaining gap:** There is no sanitization of retrieved KB content before it
+enters the agent's context. The trust relationship is: the reading agent trusts
+data proportional to the writing agent's trustworthiness. In a single-tenant
+cooperative system the operator is the writing agent; multi-agent retrieval
+requires careful provenance review in the task prompt.
+
+### 7.5 `memory.redb` at rest
+
+`memory.redb` is opened at path `store_path` (default `memory.redb` relative to CWD;
+production: `/run/memory/memory.redb` on the persistent 9p virtfs mount).
+
+| Property | Control |
+|---|---|
+| File permissions | Mode `0600` set immediately after open via `set_permissions` (§3.3 gap applies) |
+| Encryption | None — same gap as checkpoint.json; mitigate with LUKS on the volume |
+| Corruption | Detected at open; corrupt file quarantined to `.corrupt` and a fresh empty store opened; `memory_quarantined` flight event emitted |
+| Intentional deletion / volume absent | `MemoryStore` returns `None`; `memory_unavailable` flight event emitted; `kv_get`/`kv_set`/`kb_*` tools not registered; agents proceed without memory |
+| Eviction floor | `max_entries_per_segment` + `max_entry_age_days` bound store growth; `memory_evicted` events record every eviction |
+
+**Startup invariant (p5.8+):** `agentd` asserts at startup that `store_path` does
+not fall inside any MCP server's `AllowFsRead` or `AllowFsWrite` prefix. If it does,
+startup fails with a descriptive error. This prevents a sandboxed MCP server from
+reading or overwriting the memory store file. `store_path` must be an absolute path.
+
+### 7.6 Availability
+
+The memory substrate is designed to be available-over-consistent. If the store
+cannot be opened (missing, locked by another process, or permission-denied):
+
+- `agentd` emits a `memory_unavailable` flight event with `stage` and `error` fields.
+- Memory-dependent tools (`kv_get`, `kv_set`, `kb_*`) are not registered.
+- All other agents and tools continue normally.
+- A `tracing::warn!` is written to stderr so the operator sees the degradation.
+
+There is no automatic retry or failover to a secondary store. If the store path
+is on a network volume that becomes temporarily unavailable mid-run, subsequent
+write transactions will fail and be recorded as errors, but running agents are
+not terminated. Restart agentd to re-open the store after the volume is restored.
+
+---
+
+## 8. Summary table
+
+| Threat | Control | Gaps |
+|---|---|---|
+| API key leakage via logs | Never logged; no Debug impl | Short secrets in tool args still appear if ≤200 chars |
+| Large content in flight.jsonl | 200-char preview on all user/tool text fields | — |
+| Checkpoint file on disk | Deleted after restore; atomic write; mode 0600 | No encryption; readable by root or file owner only |
+| Token cost DoS | Per-agent + global budget + max turns | Global budget must be set explicitly; spawn tree can multiply costs |
+| MCP server filesystem escape | Landlock path-beneath rules | Symlink traversal; degrades on kernels < 5.13 |
+| MCP server spawn | seccomp fork/vfork block | clone/clone3 bypass on namespace-only path; no-op on aarch64 |
+| MCP server network access | Network namespace isolation by default | — |
+| Supply chain | 15 audited deps; static binary; rustls | No automated CVE scanning in CI |
+| Unsafe MCP server (adversarial) | `isolation = "gvisor"` available | Not the default; requires runsc on PATH |
+| Shared KB poisoning (p5.4+) | See §7.1 | Scratch segments last-writer-wins; canon segments operator-only |
+| Cross-agent KB exfiltration (p5.4+) | See §7.2–7.3 | `KbRead` cap required; provenance stamps writing agent; no output-side redaction |
+| Prompt-injection persistence (p5.4+) | See §7.4 | Provenance shown; canon trusted; no sanitization of retrieved content |
+| `memory.redb` at rest (p5.1+) | See §7.5 | No encryption; mode 0600 only; startup asserts store not inside MCP sandbox |
+| Memory substrate availability (p5.1+) | See §7.6 | No retry/failover; store-open failure silently disables memory tools |

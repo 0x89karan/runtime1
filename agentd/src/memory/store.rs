@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 
 use crate::memory::{index, EvictedEntry, MemoryStore, MutabilityClass, SearchHit, SCHEMA_VERSION};
 
@@ -14,6 +14,10 @@ const INDEX: TableDefinition<&str, &str> = TableDefinition::new("index");
 /// Write timestamp per entry: key = composite entry key, value = Unix seconds.
 const AGE: TableDefinition<&str, u64> = TableDefinition::new("age");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// Namespace → entry count. Maintained atomically with every put/append/delete.
+/// Enables O(k) list_namespaces() (k = segment count) instead of O(n) ENTRIES scan.
+/// Backfilled from ENTRIES on first open of existing stores (single write transaction).
+const NAMESPACES: TableDefinition<&str, u64> = TableDefinition::new("namespaces");
 
 const SEG_CLASS_PREFIX: &str = "seg_class:";
 const LOG_SEQ_PREFIX: &str = "log_seq:";
@@ -129,8 +133,53 @@ impl RedbStore {
                 meta.insert("format_version", SCHEMA_VERSION)
                     .context("writing format_version")?;
             }
+            let _ns = txn.open_table(NAMESPACES).context("opening namespaces table")?;
         }
         txn.commit().context("committing schema init")?;
+
+        // One-time backfill: if NAMESPACES is empty but ENTRIES is not, this is an
+        // existing store from before p5.8.  Rebuild NAMESPACES in a single atomic
+        // transaction (all-or-nothing — a partial backfill followed by a crash would
+        // leave NAMESPACES non-empty on next open, skipping this guard permanently).
+        let needs_backfill = {
+            let rtxn = self.db.begin_read().context("beginning read for backfill check")?;
+            let ns_tbl = rtxn.open_table(NAMESPACES).context("checking namespaces table")?;
+            let entries_tbl = rtxn.open_table(ENTRIES).context("checking entries table")?;
+            let ns_empty = ns_tbl.is_empty().context("checking namespaces empty")?;
+            let entries_nonempty = !entries_tbl.is_empty().context("checking entries empty")?;
+            ns_empty && entries_nonempty
+        };
+
+        if needs_backfill {
+            let rtxn = self.db.begin_read().context("beginning read for backfill scan")?;
+            let entries_tbl = rtxn.open_table(ENTRIES).context("opening entries for backfill")?;
+            let mut counts: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            let mut entry_count: u64 = 0;
+            for item in entries_tbl.iter().context("iterating entries for backfill")? {
+                let (k_guard, _) = item.context("reading entry for backfill")?;
+                let k = k_guard.value();
+                if let Some(sep) = k.find('\x00') {
+                    *counts.entry(k[..sep].to_string()).or_insert(0) += 1;
+                }
+                entry_count += 1;
+            }
+            drop(rtxn);
+            tracing::info!(
+                entries = entry_count,
+                namespaces = counts.len(),
+                "namespaces: backfilling from existing store entries"
+            );
+            let wtxn = self.db.begin_write().context("beginning write for backfill")?;
+            {
+                let mut ns_tbl = wtxn.open_table(NAMESPACES).context("opening namespaces for backfill")?;
+                for (ns, count) in &counts {
+                    ns_tbl.insert(ns.as_str(), *count).context("writing backfill namespace")?;
+                }
+            }
+            wtxn.commit().context("committing backfill")?;
+        }
+
         Ok(())
     }
 
@@ -226,12 +275,15 @@ impl RedbStore {
             let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
             let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
             let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
+            let mut ns_tbl = txn.open_table(NAMESPACES).context("opening namespaces table")?;
 
             let old_value = entries_tbl
                 .get(ek.as_str())
                 .context("reading old entry for put")?
                 .map(|g| g.value().to_string());
 
+            // is_new drives both doc_count and NAMESPACES counter — only increment
+            // on actual new key insertion, not on overwrites (OV-1 guard).
             let is_new = old_value.is_none();
             if let Some(ref old_v) = old_value {
                 let old_tokens = index::tokenize(old_v);
@@ -254,6 +306,15 @@ impl RedbStore {
                 meta_tbl
                     .insert(doc_count_key.as_str(), cur + 1)
                     .context("incrementing doc count")?;
+
+                let ns_cur = ns_tbl
+                    .get(namespace)
+                    .context("reading namespace count")?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                ns_tbl
+                    .insert(namespace, ns_cur + 1)
+                    .context("incrementing namespace count")?;
             }
         }
         txn.commit().context("committing put")?;
@@ -269,6 +330,7 @@ impl RedbStore {
             let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
             let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
             let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
+            let mut ns_tbl = txn.open_table(NAMESPACES).context("opening namespaces table")?;
 
             let old_value_opt = entries_tbl
                 .get(ek.as_str())
@@ -302,6 +364,15 @@ impl RedbStore {
                 meta_tbl
                     .insert(doc_count_key.as_str(), cur + 1)
                     .context("incrementing doc count")?;
+
+                let ns_cur = ns_tbl
+                    .get(namespace)
+                    .context("reading namespace count")?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                ns_tbl
+                    .insert(namespace, ns_cur + 1)
+                    .context("incrementing namespace count")?;
             }
         }
         txn.commit().context("committing append")?;
@@ -337,6 +408,7 @@ impl MemoryStore for RedbStore {
             let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
             let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
             let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
+            let mut ns_tbl = txn.open_table(NAMESPACES).context("opening namespaces table")?;
 
             let old_value = entries_tbl
                 .get(ek.as_str())
@@ -359,6 +431,20 @@ impl MemoryStore for RedbStore {
                     meta_tbl
                         .insert(doc_count_key.as_str(), cur - 1)
                         .context("decrementing doc count")?;
+                }
+                // NAMESPACES counter: decrement and remove the key when count reaches 0
+                // (no ghost namespace entries in FUSE kb/ after the last entry is deleted).
+                let ns_cur = ns_tbl
+                    .get(namespace)
+                    .context("reading namespace count for delete")?
+                    .map(|g| g.value())
+                    .unwrap_or(1);
+                if ns_cur <= 1 {
+                    ns_tbl.remove(namespace).context("removing namespace at zero count")?;
+                } else {
+                    ns_tbl
+                        .insert(namespace, ns_cur - 1)
+                        .context("decrementing namespace count")?;
                 }
                 true
             } else {
@@ -392,16 +478,13 @@ impl MemoryStore for RedbStore {
 
     fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
         let txn = self.db.begin_read().context("beginning read")?;
-        let table = txn.open_table(ENTRIES).context("opening entries table")?;
-        let mut seen = std::collections::BTreeSet::new();
-        for item in table.iter().context("iterating entries for namespaces")? {
-            let (k_guard, _) = item.context("reading entry")?;
-            let k = k_guard.value();
-            if let Some(sep) = k.find('\x00') {
-                seen.insert(k[..sep].to_string());
-            }
+        let table = txn.open_table(NAMESPACES).context("opening namespaces table")?;
+        let mut result = Vec::new();
+        for item in table.iter().context("iterating namespaces")? {
+            let (k_guard, _) = item.context("reading namespace entry")?;
+            result.push(k_guard.value().to_string());
         }
-        Ok(seen.into_iter().collect())
+        Ok(result)
     }
 
     fn list_keys(&self, namespace: &str) -> anyhow::Result<Vec<String>> {
@@ -701,7 +784,9 @@ impl MemoryStore for RedbStore {
             let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
             let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
             let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
+            let mut ns_tbl = txn.open_table(NAMESPACES).context("opening namespaces table")?;
             let doc_count_key = format!("{DOC_COUNT_PREFIX}{namespace}");
+            let mut actually_evicted: u64 = 0;
 
             for (composite_key, reason) in &to_evict {
                 let old_value = entries_tbl
@@ -735,12 +820,29 @@ impl MemoryStore for RedbStore {
                         .insert(doc_count_key.as_str(), cur - 1)
                         .context("decrementing doc count after eviction")?;
                 }
+                actually_evicted += 1;
 
                 let user_key = composite_key
                     .strip_prefix(&prefix_start)
                     .map(str::to_string)
                     .unwrap_or_else(|| composite_key[ns_prefix_len..].to_string());
                 evicted.push(EvictedEntry { key: user_key, reason: reason.clone() });
+            }
+
+            // Update NAMESPACES counter for the evicted entries.
+            if actually_evicted > 0 {
+                let ns_cur = ns_tbl
+                    .get(namespace)
+                    .context("reading namespace count for eviction")?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                if ns_cur <= actually_evicted {
+                    ns_tbl.remove(namespace).context("removing namespace after eviction")?;
+                } else {
+                    ns_tbl
+                        .insert(namespace, ns_cur - actually_evicted)
+                        .context("decrementing namespace count after eviction")?;
+                }
             }
         }
         txn.commit().context("committing eviction")?;
@@ -1159,6 +1261,92 @@ mod tests {
 
     // ── list_namespaces ───────────────────────────────────────────────────────
 
+    // ── p5.8: NAMESPACES table ───────────────────────────────────────────────
+
+    #[test]
+    fn namespaces_backfill_from_entries() {
+        // Simulate a pre-p5.8 store: ENTRIES + META populated, no NAMESPACES table.
+        // On open, init_schema creates NAMESPACES (empty) and backfill should run.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("backfill.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut e = txn.open_table(ENTRIES).unwrap();
+                e.insert("kb:alpha\x00key1", "val1").unwrap();
+                e.insert("kb:alpha\x00key2", "val2").unwrap();
+                e.insert("kb:beta\x00key1", "val3").unwrap();
+                let mut m = txn.open_table(META).unwrap();
+                m.insert("format_version", SCHEMA_VERSION).unwrap();
+                // Deliberately omit NAMESPACES table — pre-p5.8 schema.
+            }
+            txn.commit().unwrap();
+        }
+        let (store, q) = RedbStore::open(&path).unwrap();
+        assert!(q.is_none());
+        let mut ns = store.list_namespaces().unwrap();
+        ns.sort();
+        assert_eq!(ns, vec!["kb:alpha", "kb:beta"],
+            "backfill must populate NAMESPACES from ENTRIES on first open of pre-p5.8 store");
+    }
+
+    #[test]
+    fn namespaces_counter_put_and_delete() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put("kb:counter", "a", "alpha").unwrap();
+        store.put("kb:counter", "b", "beta").unwrap();
+        store.put("kb:counter", "c", "gamma").unwrap();
+        // Update existing key — should NOT increment counter.
+        store.put("kb:counter", "a", "updated-alpha").unwrap();
+        let ns = store.list_namespaces().unwrap();
+        assert_eq!(ns, vec!["kb:counter"], "one namespace should be present");
+        // Delete 2 of 3 entries.
+        store.delete("kb:counter", "a").unwrap();
+        store.delete("kb:counter", "b").unwrap();
+        // Namespace still present with 1 remaining entry.
+        let ns2 = store.list_namespaces().unwrap();
+        assert_eq!(ns2, vec!["kb:counter"], "namespace must still appear after partial delete");
+        // Delete the last entry.
+        store.delete("kb:counter", "c").unwrap();
+        let ns3 = store.list_namespaces().unwrap();
+        assert!(ns3.is_empty(), "namespace must disappear after last entry is deleted");
+    }
+
+    #[test]
+    fn list_namespaces_uses_namespaces_table() {
+        // Verify: list_namespaces reflects the NAMESPACES table — deletions
+        // should remove a namespace once all its keys are gone.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put("seg:a", "k1", "v1").unwrap();
+        store.put("seg:b", "k1", "v1").unwrap();
+        let mut ns = store.list_namespaces().unwrap();
+        ns.sort();
+        assert_eq!(ns, vec!["seg:a", "seg:b"]);
+        store.delete("seg:a", "k1").unwrap();
+        let ns2 = store.list_namespaces().unwrap();
+        assert_eq!(ns2, vec!["seg:b"], "seg:a must vanish after its only key is deleted");
+    }
+
+    #[test]
+    fn delete_removes_namespace_key_at_zero() {
+        // NAMESPACES must use remove() not insert(0) when count reaches zero —
+        // no ghost entries should remain after the last key is deleted.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ghost.redb");
+        let (store, _) = RedbStore::open(&path).unwrap();
+        store.put("ephemeral", "only-key", "only-value").unwrap();
+        store.delete("ephemeral", "only-key").unwrap();
+        drop(store);
+        // Reopen and verify NAMESPACES has no entry for "ephemeral".
+        let (store2, _) = RedbStore::open(&path).unwrap();
+        let ns = store2.list_namespaces().unwrap();
+        assert!(!ns.contains(&"ephemeral".to_string()),
+            "NAMESPACES must not contain ghost entry after last key deleted");
+    }
+
     #[test]
     fn list_namespaces_empty_store_returns_empty() {
         let dir = TempDir::new().unwrap();
@@ -1175,8 +1363,8 @@ mod tests {
         store.put("agent/alice", "k2", "v2").unwrap();  // same namespace, second key
         store.put("agent/bob", "k1", "v1").unwrap();
         store.put("canon", "doc-1", "v1").unwrap();
-        let ns = store.list_namespaces().unwrap();
-        // Should be exactly 3 unique namespaces, sorted
+        let mut ns = store.list_namespaces().unwrap();
+        ns.sort(); // redb iterates in btree order (lexicographic), but sort explicitly for clarity
         assert_eq!(ns, vec!["agent/alice", "agent/bob", "canon"],
             "namespaces must be deduplicated and alphabetically sorted");
     }
@@ -1191,5 +1379,63 @@ mod tests {
         let ns = store.list_namespaces().unwrap();
         assert_eq!(ns, vec!["scratch"],
             "multiple keys in one namespace must yield exactly one namespace entry");
+    }
+
+    // ── p5.8: NAMESPACES counter via append ───────────────────────────────────
+
+    #[test]
+    fn namespaces_counter_append() {
+        // Verify that append() increments the NAMESPACES counter for new keys.
+        // Log segments always create new keys (unique seq-based keys), so each
+        // append should increment the counter.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.append("kb:log", "ts:1", "first entry").unwrap();
+        store.append("kb:log", "ts:2", "second entry").unwrap();
+        // NAMESPACES must contain "kb:log" with count 2
+        let ns = store.list_namespaces().unwrap();
+        assert_eq!(ns, vec!["kb:log"], "append must create namespace entry");
+        let keys = store.list_keys("kb:log").unwrap();
+        assert_eq!(keys.len(), 2, "two appended entries must exist");
+        // Overwrite an existing key via append — same key means is_new=false,
+        // NAMESPACES counter must NOT double-count.
+        store.append("kb:log", "ts:1", "updated first entry").unwrap();
+        let ns2 = store.list_namespaces().unwrap();
+        assert_eq!(ns2, vec!["kb:log"], "namespace must still appear after overwrite append");
+        let keys2 = store.list_keys("kb:log").unwrap();
+        assert_eq!(keys2.len(), 2, "overwrite append must not add a new key");
+    }
+
+    // ── p5.8: NAMESPACES counter after eviction ───────────────────────────────
+
+    #[test]
+    fn namespaces_counter_evict_to_zero() {
+        // Evicting all entries from a namespace must remove it from NAMESPACES.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put("kb:evict-ns", "a", "val1").unwrap();
+        store.put("kb:evict-ns", "b", "val2").unwrap();
+        assert!(store.list_namespaces().unwrap().contains(&"kb:evict-ns".to_string()),
+            "precondition: namespace must appear before eviction");
+        // Evict all entries: max_entries = 0 removes everything.
+        let evicted = store.evict("kb:evict-ns", Some(0), None, 0).unwrap();
+        assert_eq!(evicted.len(), 2, "both entries must be evicted");
+        assert!(!store.list_namespaces().unwrap().contains(&"kb:evict-ns".to_string()),
+            "namespace must disappear after all entries are evicted");
+    }
+
+    #[test]
+    fn namespaces_counter_partial_evict_retains_namespace() {
+        // Evicting a subset of entries must keep the namespace in NAMESPACES.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put("kb:partial", "a", "val1").unwrap();
+        store.put("kb:partial", "b", "val2").unwrap();
+        store.put("kb:partial", "c", "val3").unwrap();
+        // Evict 1 of 3 (max_entries = 2 keeps 2, removes 1).
+        let evicted = store.evict("kb:partial", Some(2), None, 0).unwrap();
+        assert_eq!(evicted.len(), 1, "one entry must be evicted");
+        assert!(store.list_namespaces().unwrap().contains(&"kb:partial".to_string()),
+            "namespace must remain after partial eviction");
     }
 }

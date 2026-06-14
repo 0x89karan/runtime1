@@ -3,6 +3,47 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.8] - 2026-06-15 (v0.25.0)
+
+Phase 5 hardening: security invariants, FUSE inode pruning, memory store index, docs completeness.
+
+### Added
+- **Startup invariant (OV-1):** `memory.store_path` must be absolute and must not fall inside any
+  MCP server's `FsRead`/`FsWrite` sandbox prefix. Checked on every startup via `anyhow::ensure!`;
+  `..` traversal is resolved by `normalize_path` before comparison. Test:
+  `store_path_inside_sandbox_prefix_fails_startup`.
+- **`NAMESPACES` redb table:** `TableDefinition<&str, u64>` maintained atomically on every
+  `put`, `append`, `delete`, and `evict`. `list_namespaces()` is now O(k) (k = number of distinct
+  namespaces) instead of O(n) full ENTRIES scan. One-time backfill on first open of pre-p5.8 stores.
+- **`prune_dead_agent()` in `AgentsFs`** (ar-01): lazy pruning in `readdir(Root)` for terminated
+  agents. Cleans all 6 inode maps: `dir_inodes`, `inode_to_id`, `dyn_ino_kind`, `lt_key_ino`,
+  `kb_seg_ino`, `kb_key_ino`. Shared segments (no `agent/{id}/` prefix) are not pruned.
+- **`dyn_file_content()` match dispatch clarified** (ar-02): removed tautological
+  `debug_assert!(matches!(...))` inside `LtFile` and `KbFile` arms; the enclosing `match`
+  already guarantees the variant — added explanatory comments instead.
+- **`getattr` ENOENT guard for memory dirs** (ar-03): `OFF_MEMORY_DIR` (+5) and `OFF_LONG_TERM_DIR`
+  (+7) return `ENOENT` when `self.memory.is_none()`. `OFF_SHORT_TERM` (+6) exempted — still served
+  from `AgentSnapshot.short_term_previews`.
+- **Memory demo `agents.toml`**: two-agent KB write→search→read demo exercising `canon`/`scratch`
+  segments, `KbRead`/`KbWrite` capabilities, `spawn_agent`, and `global_token_budget`.
+- **CONVENTIONS.md completeness**: `memory_distilled` row added to the Phase-5 event table
+  (was missing from p5.3). `event_taxonomy_completeness` test asserts all 9 `memory_*`/`kb_*`
+  EventKind strings appear in CONVENTIONS.md.
+- **THREAT_MODEL.md §7 expanded** to §7.1–7.6 (memory substrate threats): §7.3 KB exfiltration
+  channel, §7.4 prompt-injection persistence, §7.5 `memory.redb` at rest, §7.6 availability.
+  Old §7 Summary renumbered to §8.
+- **9 new tests** (476 total up from 467): 4 NAMESPACES tests in `store.rs`, 3 surfaces tests
+  (`inode_map_pruned_on_snapshot_update`, `getattr_memory_dir_enoent_when_no_store`,
+  `getattr_short_term_ok_when_no_store`), 2 main.rs tests
+  (`store_path_inside_sandbox_prefix_fails_startup`, `event_taxonomy_completeness`).
+
+### Changed
+- `agents.toml` rewritten as a memory demo (writer + spawned reader, `project:meta` canon seed,
+  `project:research` scratch segment, `claude-haiku-4-5-20251001`, 100k global budget).
+- TODOS.md: p5.7-ar-01/02/03/04 closed; p5.7-ar-05 (`MAX_DIR_KEYS` silent truncation) deferred to p6+.
+
+---
+
 ## [p5.7] - 2026-06-14 (v0.24.0)
 
 FUSE memory surface: `/agents/<id>/memory/` and `/agents/kb/` read-only directories

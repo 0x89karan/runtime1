@@ -1,71 +1,71 @@
-# AgentOS multi-agent specification (p1.2+)
+# AgentOS memory demo (p5.8+)
 # Run:        cargo run -- agents.toml
 # Watch log:  tail -f flight.jsonl
-# Verbosity:  RUST_LOG=debug cargo run -- agents.toml
 #
-# This demo exercises:
-#   - Two concurrent agents with capability grants (p1.4+)
-#   - Admission control (global budget + concurrency cap)
-#   - Per-agent capability grants (FsRead scoped to the project)
+# This demo exercises the full shared-KB write → search → read flow:
+#   grep '"kind":"memory_write"' flight.jsonl    # writer stores a finding
+#   grep '"kind":"kb_search"'    flight.jsonl    # reader searches for it
+#   grep '"kind":"memory_read"'  flight.jsonl    # reader retrieves the full entry
 #
-# To also exercise MCP-with-sandbox, add an [[tools.mcp_servers]] block:
-#   [[tools.mcp_servers]]
-#   name = "notes"
-#   command = "cat"
-#   args = ["/tmp/notes.txt"]
-#   capabilities = [{ FsRead = { prefix = "/tmp" } }]
+# Segment classes:
+#   canon   — operator-seeded at startup; agents cannot write (read-only trust anchor)
+#   log     — append-only; each kb_put gets a new monotonic key
+#   scratch — last-writer-wins; any KbWrite agent can overwrite
 #
-# All agents share [model] and [tools].
+# The writer agent stores a finding in "project:research", then spawns a reader
+# agent as a child (via spawn_agent).  Spawn requires the Spawn capability.
+# The reader retrieves the finding and reports it.
 
 [model]
-provider = "anthropic"
-model    = "claude-sonnet-4-6"
-max_tokens = 4096
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 2048
 
 [tools]
-native = ["read_file", "list_dir"]
+# kv_get, kv_set, kb_put, kb_get, kb_search are NOT included in "all"; list them
+# explicitly.  spawn_agent is always available when the Spawn capability is granted.
+native = ["kb_put", "kb_get", "kb_search", "mem_remember", "mem_recall"]
 
-# Admission control (p1.3+):
-#   global_token_budget: stop admitting new inferences after this many total tokens.
-#   max_concurrent_inferences: max in-flight inference calls (0 = unlimited).
 [scheduler]
-global_token_budget        = 200_000   # ~$0.05 ceiling for this demo run
-max_concurrent_inferences  = 4
+global_token_budget       = 100_000   # ~$0.02 ceiling for this demo
+max_concurrent_inferences = 2
 
-# Durable key/value store (p5.1+). Defaults shown; uncomment to override.
-# [memory]
-# store_path = "memory.redb"   # path to the redb file (relative to CWD or absolute)
-# enabled    = true            # set to false to skip store open and kv tool registration
+[memory]
+store_path = "/run/memory/memory.redb"   # persistent 9p virtfs mount in QEMU distro
+enabled    = true
 
-# To use kv / KB tools, add capabilities and explicit native tool names
-# (kv_get, kv_set, kb_put, kb_get, kb_search are NOT included in "all"):
-#   capabilities = [
-#     { KbWrite = { segment = "agent:scratch" } },
-#     { KbRead  = { segment = "agent:scratch" } },
-#   ]
-#   [tools]
-#   native = ["read_file", "list_dir", "kv_get", "kv_set", "kb_put", "kb_get", "kb_search"]
+# Operator-seeded canon segment: read-only trust anchor for agents.
+[[memory.segments]]
+name  = "project:meta"
+class = "canon"
+seed  = [
+  { key = "guidelines", value = "Always cite evidence. Prefer primary sources." },
+]
 
-[[agents]]
-id          = "surveyor"
-name        = "Source Surveyor"
-description = "Lists and summarises source files in the agentd/src directory."
-skills      = ["fs-read", "summarize"]
-task        = "List the agentd/src directory and describe every source file in one sentence each."
-max_turns   = 10
-token_budget = 80_000
-priority    = 0
-# Least-privilege: this agent may only read the project source tree (p1.4+).
-capabilities = [{ FsRead = { prefix = "." } }]
+# Scratch segment for ephemeral research findings: any KbWrite agent can update.
+[[memory.segments]]
+name  = "project:research"
+class = "scratch"
 
 [[agents]]
-id          = "analyst"
-name        = "Dependency Analyst"
-description = "Explains crate dependencies from Cargo.toml."
-skills      = ["fs-read", "explain"]
-task        = "Read agentd/Cargo.toml and explain what each dependency is used for."
-max_turns   = 10
-token_budget = 80_000
-priority    = 0
-# Least-privilege: read-only access to the project tree.
-capabilities = [{ FsRead = { prefix = "." } }]
+id          = "writer"
+name        = "Research Writer"
+description = "Stores a research finding in the shared KB, then spawns a reader to verify it."
+skills      = ["kb-write", "spawn"]
+task        = """
+1. Read the operator guidelines from the canon KB segment:
+     kb_get(segment="project:meta", key="guidelines")
+2. Store a research finding about Rust memory safety to the scratch segment:
+     kb_put(segment="project:research", key="rust-ownership", content="Rust's ownership model eliminates use-after-free and double-free bugs at compile time, with zero runtime overhead.")
+3. Spawn a child agent named 'reader' with task: "Search the project:research KB segment for findings about Rust memory safety and summarise what you find."
+   Grant the child: KbRead capability for segment "project:research".
+"""
+max_turns    = 8
+token_budget = 40_000
+# Spawn requires an explicit Spawn capability — omitting it silently denies spawn_agent.
+capabilities = [
+  { Spawn    = {} },
+  { KbWrite  = { segment = "project:research" } },
+  { KbRead   = { segment = "project:meta" } },
+  { KbRead   = { segment = "project:research" } },
+]
