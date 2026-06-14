@@ -4,7 +4,11 @@ use tempfile::TempDir;
 use agentd::capability::Capability;
 use agentd::flight_recorder::FlightRecorder;
 use agentd::memory::store::RedbStore;
-use agentd::tools::{native::register_native, ToolRegistry};
+use agentd::tools::{native::register_native, ToolContext, ToolRegistry};
+
+fn ctx(agent_id: &str) -> ToolContext {
+    ToolContext { agent_id: agent_id.to_string(), turn: 0, task_fp: String::new() }
+}
 
 fn registry_with_store(store: Arc<dyn agentd::memory::MemoryStore>) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
@@ -40,7 +44,7 @@ async fn kv_roundtrip_with_capabilities() {
         .invoke(
             "kv_set",
             serde_json::json!({ "namespace": "agent:scratch", "key": "greeting", "value": "hello" }),
-            "test-agent",
+            &ctx("test-agent"),
             Some(&caps),
             &rec,
         )
@@ -52,7 +56,7 @@ async fn kv_roundtrip_with_capabilities() {
         .invoke(
             "kv_get",
             serde_json::json!({ "namespace": "agent:scratch", "key": "greeting" }),
-            "test-agent",
+            &ctx("test-agent"),
             Some(&caps),
             &rec,
         )
@@ -76,7 +80,7 @@ async fn kv_set_denied_without_capability() {
         .invoke(
             "kv_set",
             serde_json::json!({ "namespace": "agent:scratch", "key": "k", "value": "v" }),
-            "test-agent",
+            &ctx("test-agent"),
             Some(&caps),
             &rec,
         )

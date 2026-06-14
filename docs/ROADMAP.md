@@ -525,17 +525,16 @@ Post-adversarial-review: `MAX_KV_VALUE_BYTES = 256 KiB` enforced in `kv_set`; 5 
 findings deferred to TODOS.md (kv-ar-01 through kv-ar-05).
 `docs/INTERFACE.md` (Phase 6 design) added in the same branch — docs-only, no code impact.
 
-### ▢ p5.2 — Per-agent short-term + paging
-**Depends on:** p5.1. Tier 1 / Tier 2 separated cleanly. A context manager
-(`memory/context.rs`) pages evictable blocks from working memory to short-term under
-token-budget pressure — soft threshold advertises `mem_page` (agent self-pages),
-hard ceiling force-pages so an agent never exceeds budget nor silently loses state.
-Tier 2 (`short_term: Vec<MemItem>` on `AgentTask`) survives restart via the
-checkpoint (`FORMAT_VERSION` 1 → 2, `#[serde(default)]` back-compat). Event:
-`memory_paged`. **Acceptance:** +7 tests; v1 checkpoint loads; a budget that would
-have hit `budget_exceeded` instead completes via paging.
+### ✅ p5.2 — Per-agent short-term + paging (v0.19.0)
+**Depends on:** p5.1. `memory/context.rs` with `MemoryPressure`, `assess()`,
+`page_count()`, `page_turns()`. `MemItem { turn, role: Role, content_preview, blocks_json }`.
+Soft threshold (75%) → `memory_pressure_advisory` event only. Hard threshold (90%) →
+force-evict oldest turn PAIRS (preserves alternating-role invariant). `short_term: Vec<MemItem>`
+on `AgentTask` and `AgentCheckpoint` (`#[serde(default)]`); `FORMAT_VERSION` 1 → 2.
+`to_checkpoint`/`from_checkpoint` explicitly updated. `docs/CONVENTIONS.md` updated with
+FORMAT_VERSION migration policy and both new events. 14 acceptance tests; 322 tests pass.
 
-### ▢ p5.3 — Per-agent long-term + checkpoint coexistence
+### ✅ p5.3 — Per-agent long-term + checkpoint coexistence
 **Depends on:** p5.1, p5.2. `mem_remember`/`mem_recall` over the agent's own
 `agent/<id>` namespace (implicit self-grant; cross-agent Tier-3 read needs `KbRead`).
 Durable across runs — `memory.redb` persists where `checkpoint.json` is deleted on

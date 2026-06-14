@@ -29,7 +29,7 @@ subsystem, tool, or provider. (For *what* to build, see `ROADMAP.md`; for *why*,
 | `events` | `EventKind` enum + stable string serialization | business logic |
 | `flight_recorder` | the event log (append-only JSONL writer) | business logic |
 | `config` | the TOML spec | runtime state |
-| `memory` | `MemoryStore` trait + `RedbStore` backend; `validate_segment` | scheduling, agent logic |
+| `memory` | `MemoryStore` trait + `RedbStore` backend; `context` pressure manager + Tier-2 `MemItem`; `validate_segment` | scheduling, agent loop logic |
 
 When a new subsystem appears in the roadmap, add a module; don't bolt it onto an
 existing one.
@@ -89,6 +89,8 @@ Phase 0 kinds (canonical — do not rename):
 | `memory_write` | `kv_set` committed (agent, bytes: usize) (p5.1+) |
 | `memory_unavailable` | store open or transaction failed; kv tools not registered (stage, hint, error) (p5.1+) |
 | `memory_quarantined` | corrupt store renamed to `.corrupt`; fresh store opened (path) (p5.1+) |
+| `memory_pressure_advisory` | token spend reached SOFT_THRESHOLD (75%); advisory only, no eviction (agent, turn, tokens_spent_pct, soft_threshold) (p5.2+) |
+| `memory_paged` | oldest turn pairs evicted from active context to short_term Tier 2 (agent, turn, pages_moved, short_term_depth, tokens_spent_pct) (p5.2+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it
@@ -149,6 +151,20 @@ To give an agent read/write access to a namespace:
    starting with `agent:` or `agent/`. Use the tightest scope your agent actually needs.
 4. `KbWrite { segment: "" }` (empty) always denies — the empty segment is a sentinel for
    "capability type check only", never a wildcard write grant.
+
+## Checkpoint FORMAT_VERSION migration policy
+
+`checkpoint.rs` exports `FORMAT_VERSION: u32`. On load, the probe guard rejects checkpoints
+where `format_version > FORMAT_VERSION`. Rules:
+
+- **Additive fields** (new optional data): use `#[serde(default)]` on the new field and bump
+  `FORMAT_VERSION`. Old checkpoints load with the default value.
+- **Breaking changes** (field removal or rename): bump `FORMAT_VERSION` AND refuse to load
+  the old version (or add a migration path, which is preferred).
+- `FORMAT_VERSION` is a **compatibility floor**, not a field inventory. The number
+  represents the minimum version a reader can safely parse with this code.
+- Test each migration: the v(N-1) compat test must use `CheckpointStore::load()` on a raw
+  JSON fixture (not just bare serde), to exercise the version-probe path.
 
 ## Config
 

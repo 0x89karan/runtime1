@@ -58,7 +58,16 @@ Phase 3 (Surfaces + Sandbox):
 
 **p5.1 complete (v0.18.0).** Storage primitive: redb 4.1.0-backed `MemoryStore`, `KbRead`/`KbWrite`
 capabilities, `kv_get`/`kv_set` native tools, 4 new flight events, 304 tests.
-**Next: p5.2 (per-agent short-term + paging) — see `docs/ROADMAP.md`.**
+**p5.2 complete (v0.19.0).** Per-agent short-term memory + paging: `memory/context.rs` with
+`MemoryPressure`, `assess()`, `page_count()`, `page_turns()`; `MemItem` struct; soft/hard
+thresholds (75%/90%); `short_term: Vec<MemItem>` on `AgentTask` + checkpoint;
+`FORMAT_VERSION` 1→2; `MemoryPressureAdvisory` + `MemoryPaged` events; 322 tests.
+**p5.3 complete (v0.20.0).** Per-agent long-term memory + checkpoint coexistence:
+`ToolContext { agent_id, turn, task_fp }` injected into every `Tool::invoke`; `MemRemember`
+(`mem_remember`) + `MemRecall` (`mem_recall`) tools under implicit self-grant; nanosecond
+key, 8 KiB limit, provenance JSON; `task_fp` = FNV-1a 64-bit hash of initial task text;
+`EventKind::MemoryDistilled`; cross-agent namespace isolation via `agent/{id}`; 336 tests.
+**Next: p5.4 (shared KB MVP) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

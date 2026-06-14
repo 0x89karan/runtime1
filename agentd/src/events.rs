@@ -50,6 +50,15 @@ pub enum EventKind {
     /// Corrupt store renamed to `.corrupt`; new empty store opened.
     /// data: { path }
     MemoryQuarantined,
+    /// Token spend reached SOFT_THRESHOLD (75%); advisory only, no eviction.
+    /// data: { agent, turn, tokens_spent_pct: f64, soft_threshold: f64 }
+    MemoryPressureAdvisory,
+    /// Oldest turn pairs evicted from active context into short_term (Tier 2).
+    /// data: { agent, turn, pages_moved: usize, short_term_depth: usize, tokens_spent_pct: f64 }
+    MemoryPaged,
+    /// Agent called `mem_remember`; content committed to Tier-3 long-term storage.
+    /// data: { agent, turn, items: 1 }
+    MemoryDistilled,
     Error,
 }
 
@@ -100,6 +109,9 @@ mod tests {
         assert_eq!(kind_str(EventKind::MemoryWrite), "memory_write");
         assert_eq!(kind_str(EventKind::MemoryUnavailable), "memory_unavailable");
         assert_eq!(kind_str(EventKind::MemoryQuarantined), "memory_quarantined");
+        assert_eq!(kind_str(EventKind::MemoryPressureAdvisory), "memory_pressure_advisory");
+        assert_eq!(kind_str(EventKind::MemoryPaged), "memory_paged");
+        assert_eq!(kind_str(EventKind::MemoryDistilled), "memory_distilled");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

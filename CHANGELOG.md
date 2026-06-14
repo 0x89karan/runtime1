@@ -3,6 +3,98 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.3] - 2026-06-14 (v0.20.0)
+
+Per-Agent Long-Term Memory + Checkpoint Coexistence: agents can now explicitly
+distil knowledge to a durable Tier-3 store (`mem_remember`) and retrieve it
+across restarts (`mem_recall`). Memory survives clean exit; checkpoints do not.
+
+### Added
+- **`ToolContext`** struct (`tools/mod.rs`): `{ agent_id, turn, task_fp }` —
+  runtime-stamped, unforgeable provenance injected into every `Tool::invoke`.
+  `task_fp` is an FNV-1a 64-bit hash of the agent's initial task text (16 hex
+  chars), recomputed from the checkpoint on restore.
+- **`MemRemember`** tool (`tools/native.rs`): `mem_remember { content, tags }` —
+  stores a JSON entry `{ content, tags, provenance: { agent_id, turn, ts, task_fp } }`
+  under `agent/{id}` namespace with a nanosecond-timestamp key. Max 8 KiB per entry.
+  No capability required (implicit self-grant). Emits `memory_distilled` flight event.
+- **`MemRecall`** tool (`tools/native.rs`): `mem_recall { query, limit }` — iterates
+  `agent/{id}` namespace, filters by substring match (content + tags, case-insensitive),
+  returns JSON array newest-first. Default limit 10, max 50.
+- **`EventKind::MemoryDistilled`** (`events.rs`) — emitted by `ToolRegistry::invoke`
+  post-call for `mem_remember`.
+- **`register_native`** updated: `"mem_remember"` and `"mem_recall"` are explicit
+  opt-in names (like `kv_get`/`kv_set`); silently skipped if `store = None`.
+
+### Changed
+- `Tool::invoke` signature: `async fn invoke(&self, input, ctx: &ToolContext)` —
+  all existing `impl Tool` updated to accept `_ctx: &ToolContext`.
+- `ToolRegistry::invoke` takes `ctx: &ToolContext` instead of `agent_id: &str`.
+- `AgentTask` gains `task_fp: String` field (runtime-only; recomputed on restore).
+- `agentd` version: 0.19.0 → 0.20.0.
+
+### Fixed (ship review)
+- `MemRemember`/`MemRecall`: namespace now validated via `validate_segment` (consistent
+  with `kv_get`/`kv_set`; rejects agent IDs with spaces or null bytes).
+- `MemRemember` size guard now checks the serialized entry (`content + tags + provenance`)
+  instead of `content` alone; tags could previously cause the stored value to exceed 8 KiB.
+- `MemRecall` now rejects empty `query` with an explicit error instead of silently returning
+  all entries (empty string matched every record).
+- `MemRemember` key generation propagates system clock errors instead of falling back to
+  key `0x0000000000000000` (which could silently overwrite other entries).
+- `MemoryDistilled` event docstring corrected (removed `key`/`segment` fields that were
+  never emitted; actual payload is `{ agent, turn, items: 1 }`).
+
+### Tests
+- 336 tests (up from 322 in p5.2). New: 15 unit tests for `MemRemember`/`MemRecall`
+  (remember→recall, tag match, cross-agent isolation, oversized content, no-cap,
+  store-absent skip, not-in-all, registry post-call hook; coverage gap tests: missing
+  field errors, limit clamping, default limit, newest-first ordering, MemoryDistilled
+  event emission).
+
+## [p5.2] - 2026-06-14 (v0.19.0)
+
+Per-Agent Short-Term Memory + Paging: Tier-2 eviction buffer; agents under
+budget pressure page old turns out of active context instead of hitting
+`budget_exceeded`.
+
+### Added
+- **`memory/context.rs`**: `MemoryPressure` enum, `assess()` (budget % → pressure
+  level), `page_count()` (pairs eligible for eviction), `page_turns()` (two-pass
+  serialize-then-drain, preserving alternating-role invariant). Constants:
+  `SOFT_THRESHOLD = 0.75`, `HARD_THRESHOLD = 0.90`.
+- **`MemItem`** struct (`memory/context.rs`): `{ turn: u32, role: Role,
+  content_preview: String, blocks_json: String }` — serializable paged turn pair.
+  `role: Role` (typed, not `String`).
+- **`short_term: Vec<MemItem>`** field on `AgentTask` and `AgentCheckpoint`
+  (`#[serde(default)]` for v1 back-compat).
+- **Paging in `step_need_infer`**: Soft pressure → `MemoryPressureAdvisory` event
+  (advisory only, no text injection, edge-triggered on None→Soft transition only).
+  Hard pressure → `page_turns()` evicts oldest pairs; on success emits `MemoryPaged`;
+  on serde error emits `Error` and skips. Hard pressure with context too short to page
+  emits one advisory on first entry instead of silently doing nothing.
+- **`to_checkpoint` / `from_checkpoint`** explicitly updated to include `short_term`.
+- **Flight events**: `EventKind::MemoryPressureAdvisory`, `EventKind::MemoryPaged`.
+- **FORMAT_VERSION 1 → 2**: additive bump; v1 checkpoints load with `short_term = []`.
+- **`short_term_depth()`** public accessor on `AgentTask`.
+- **FORMAT_VERSION migration policy** documented in `docs/CONVENTIONS.md`.
+- Both new events added to CONVENTIONS.md event table; `memory` module boundary updated.
+
+### Changed
+- `FORMAT_VERSION` in `checkpoint.rs`: 1 → 2.
+- `agentd` version: 0.18.0 → 0.19.0.
+
+### Fixed
+- `MemoryPressureAdvisory` no longer spams the flight log — edge-triggered (fires
+  once on transition, not every turn at soft/hard pressure).
+- `content_preview` in `MemItem` was always empty for `ToolUse` blocks; now uses
+  the tool name as preview (e.g. `"read_file"`).
+- `debug_assert!` in `page_turns` validates alternating-role invariant before drain.
+
+### Tests
+- 322 tests (up from 304 in p5.1). New: 14 unit tests covering all acceptance
+  criteria (AC1–AC14 from plan).
+
 ## [p5.1] - 2026-06-14 (v0.18.0)
 
 Storage Primitive: durable key/value store backed by redb 4.1.0.

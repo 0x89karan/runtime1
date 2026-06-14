@@ -10,12 +10,23 @@ use crate::capability::{satisfies, satisfies_type, Capability};
 use crate::flight_recorder::{EventKind, FlightRecorder};
 use crate::inference::ToolSpec;
 
+/// Runtime context injected by the scheduler for every tool invocation.
+///
+/// Fields are runtime-stamped and unforgeable — the agent cannot set them
+/// via tool input. `MemRemember` uses `turn` and `task_fp` for provenance.
+pub struct ToolContext {
+    pub agent_id: String,
+    pub turn: u32,
+    /// Stable 16-hex fingerprint of the agent's initial task (FNV-1a 64-bit).
+    pub task_fp: String,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn input_schema(&self) -> Value;
-    async fn invoke(&self, input: Value) -> Result<String>;
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<String>;
 
     /// The specific capability required to invoke this tool with the given
     /// `input`. Called at invocation time so path-based tools can return the
@@ -121,7 +132,7 @@ impl ToolRegistry {
         &self,
         name: &str,
         input: Value,
-        agent_id: &str,
+        ctx: &ToolContext,
         cap_set: Option<&[Capability]>,
         recorder: &FlightRecorder,
     ) -> Result<String> {
@@ -134,7 +145,7 @@ impl ToolRegistry {
             if let Some(required) = tool.required_capability_for(&input) {
                 if !satisfies(caps, &required) {
                     recorder.record(
-                        agent_id,
+                        &ctx.agent_id,
                         None,
                         EventKind::CapabilityDenied,
                         serde_json::json!({
@@ -150,30 +161,42 @@ impl ToolRegistry {
             }
         }
 
-        let result = tool.invoke(input).await?;
+        let result = tool.invoke(input, ctx).await?;
 
-        // Post-call hook: emit memory events for kv tools.
-        // Tool::invoke has no agent_id or recorder; we emit here where both are available.
+        // Post-call hook: emit memory events for kv and long-term memory tools.
+        // Tool::invoke has no recorder; we emit here where both are available.
         match name {
             "kv_get" => {
                 recorder.record(
-                    agent_id,
+                    &ctx.agent_id,
                     None,
                     EventKind::MemoryRead,
                     serde_json::json!({
-                        "agent": agent_id,
+                        "agent": &ctx.agent_id,
                         "found": !result.is_empty(),
                     }),
                 );
             }
             "kv_set" => {
                 recorder.record(
-                    agent_id,
+                    &ctx.agent_id,
                     None,
                     EventKind::MemoryWrite,
                     serde_json::json!({
-                        "agent": agent_id,
+                        "agent": &ctx.agent_id,
                         "bytes": result.len(),
+                    }),
+                );
+            }
+            "mem_remember" => {
+                recorder.record(
+                    &ctx.agent_id,
+                    Some(ctx.turn),
+                    EventKind::MemoryDistilled,
+                    serde_json::json!({
+                        "agent": &ctx.agent_id,
+                        "turn": ctx.turn,
+                        "items": 1,
                     }),
                 );
             }
@@ -202,12 +225,16 @@ mod tests {
         (rec, tmp)
     }
 
+    fn ctx(agent_id: &str) -> ToolContext {
+        ToolContext { agent_id: agent_id.to_string(), turn: 0, task_fp: String::new() }
+    }
+
     #[tokio::test]
     async fn unknown_tool_returns_error() {
         let reg = ToolRegistry::new();
         let (rec, _tmp) = recorder();
         let err = reg
-            .invoke("nonexistent", serde_json::json!({}), "a", None, &rec)
+            .invoke("nonexistent", serde_json::json!({}), &ctx("a"), None, &rec)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("nonexistent"));
@@ -284,7 +311,7 @@ mod tests {
             .invoke(
                 "write_file",
                 serde_json::json!({"path": "/tmp/x", "content": "hi"}),
-                "test-agent",
+                &ctx("test-agent"),
                 Some(&caps),
                 &rec,
             )
@@ -318,7 +345,7 @@ mod tests {
             .invoke(
                 "write_file",
                 serde_json::json!({"path": path, "content": "hello"}),
-                "test-agent",
+                &ctx("test-agent"),
                 Some(&caps),
                 &rec,
             )
@@ -413,7 +440,7 @@ mod tests {
         reg.invoke(
             "kv_get",
             serde_json::json!({"namespace": "agent:scratch", "key": "absent"}),
-            "agent1",
+            &ctx("agent1"),
             Some(&caps),
             &rec,
         )
@@ -441,7 +468,7 @@ mod tests {
         reg.invoke(
             "kv_set",
             serde_json::json!({"namespace": "agent:scratch", "key": "k", "value": "hello"}),
-            "agent1",
+            &ctx("agent1"),
             Some(&caps),
             &rec,
         )
@@ -452,5 +479,40 @@ mod tests {
         assert_eq!(event["kind"], "memory_write");
         assert_eq!(event["data"]["agent"], "agent1");
         assert!(event["data"]["bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn mem_remember_invoke_emits_memory_distilled_event() {
+        let mut reg = ToolRegistry::new();
+        register_native(
+            &mut reg,
+            &["mem_remember".to_string()],
+            None,
+            Some(SimpleStore::new_arc()),
+        )
+        .unwrap();
+        let (rec, tmp) = recorder();
+        let ctx_with_turn = ToolContext {
+            agent_id: "agent42".to_string(),
+            turn: 3,
+            task_fp: "deadbeef".to_string(),
+        };
+        reg.invoke(
+            "mem_remember",
+            serde_json::json!({"content": "test memory entry", "tags": ["test"]}),
+            &ctx_with_turn,
+            None,
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["kind"], "memory_distilled");
+        assert_eq!(event["agent"], "agent42");
+        assert_eq!(event["turn"], 3u64);
+        assert_eq!(event["data"]["agent"], "agent42");
+        assert_eq!(event["data"]["turn"], 3u64);
+        assert_eq!(event["data"]["items"], 1u64);
     }
 }

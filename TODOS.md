@@ -1,13 +1,13 @@
 # TODOS
 
-## Phase 5 — Open (deferred from p5.1 adversarial review)
+## Phase 5 — Open (deferred from p5.1 + p5.2 adversarial reviews)
 
 **kv-ar-01 (P2) — `kv_get` returns `""` for both missing key and empty stored value**
 - `tools/native.rs:KvGet::invoke`: `None` and `Some("")` both return `Ok(String::new())`.
   The `MemoryRead` flight event's `found` field uses a non-empty heuristic (`!result.is_empty()`),
   misclassifying an empty stored value as a cache miss.
 - Fix: return a sentinel (or a separate `exists()` call) to distinguish miss from empty-value hit.
-  Requires ABI change; defer to p5.2 or next tool-ABI revision.
+  Requires ABI change; defer to p5.4 or next tool-ABI revision.
 
 **kv-ar-02 (P2) — `try_open` TOCTOU: `path.exists()` check before `open`/`create`**
 - `memory/store.rs:try_open`: the exists check and the subsequent `open`/`create` are not atomic.
@@ -26,10 +26,66 @@
   will see `unknown tool` errors at runtime with no log to explain why.
 - Fix: emit a `MemoryStoreOpened`-equivalent warning event (or `MemoryError`) in the skip branch.
 
+**p5.2-ar-01 (P2) — `short_term` Vec grows unbounded; no size/depth cap**
+- `agent/mod.rs`: `short_term.extend(items)` is never trimmed. A long-running agent that reads large
+  files under sustained hard pressure accumulates unbounded `MemItem` records (each `blocks_json`
+  can be MB-sized). The vec is checkpointed every N turns.
+- Fix: add a `max_short_term_depth: usize` config (or size-in-bytes watermark); evict oldest items
+  from `short_term` itself when the cap is hit. Defer to p5.6 (principled eviction policy).
+
+**p5.2-ar-02 (P2) — `MemItem.turn` records eviction time, not original message turn**
+- `agent/mod.rs:page_turns(…, at_turn=self.turn)`: all items in a single batch get the same
+  `turn` value (the turn when eviction happened), not the turn when the message was generated.
+  Items from turns 1, 2, 3 all appear as e.g. `turn=7` in `short_term`.
+- Impact on p5.3: temporal ordering within a batch is lost; items appear artificially newer.
+- Fix: pass `original_index: usize` derived from message position when building `MemItem`, or
+  add an `evicted_at_turn: u32` alongside a separate `original_turn` field. Coordinate with p5.3.
+
+**p5.2-ar-03 (P2) — Conservative `page_count` formula may provide no practical budget relief**
+- `context.rs:page_count`: `(len-1)/4` evicts only 1 pair for 5–8 messages. Under sustained hard
+  pressure an agent with 7 messages at 91% removes 2 messages; cumulative spend is unchanged; next
+  turn is still Hard. Agent may burn many turns evicting tiny amounts of context.
+- Fix in p5.6: replace formula with an aggressive mode (evict all available pairs when entering
+  Hard for the first time) and/or a token-weighted eviction (evict until Tier-1 size drops below target).
+
 **kv-ar-05 (P2) — Corrupt-quarantine overwrites previous `.corrupt` file**
 - `memory/store.rs:try_open`: rename to `<path>.corrupt` silently discards a previous quarantine
   if a second corruption event occurs before the user investigates.
 - Fix: include a timestamp or counter in the quarantine name (e.g. `memory.redb.corrupt.1234567890`).
+
+**p5.3-ar-04 (P2) — `mem_recall` loads full namespace into memory before filtering**
+- `tools/native.rs:MemRecall::invoke`: `store.iter(&ns)` returns the entire namespace as a
+  `Vec<(String, String)>` before sorting and filtering. An agent that calls `mem_remember` thousands
+  of times causes `mem_recall` to allocate all stored data on every search call.
+- Fix: enforce a max entry count per namespace at write time in `MemRemember`, or implement a
+  cursor/range API in `MemoryStore` that applies the limit at the scan level.
+
+**p5.3-ar-05 (P2) — `task_fp` on checkpoint restore uses `messages[0].blocks[0]`; wrong when first block is not Text**
+- `agent/mod.rs:from_checkpoint`: `task_fp` is recomputed from the first block of the first message.
+  If the first block is a `ToolUse` or `ToolResult` (programmatically injected task), `task_text`
+  becomes `""` and all such agents share the same FNV-1a fingerprint (`cbf29ce484222325`), breaking
+  provenance isolation in Tier-3 memory.
+- Fix: persist `task_fp` directly in `AgentCheckpoint` (serialize/restore the already-computed value
+  rather than recomputing from messages). Alternatively, compute from `cp.cfg.task` if present.
+
+**p5.3-ar-01 (P3) — `PREVIEW_CHARS` constant duplicated across two modules**
+- `memory/context.rs` and `agent/mod.rs` each define their own `PREVIEW_CHARS = 200`. If they
+  diverge (e.g. someone changes one and not the other), content previews in Tier-2 short_term items
+  will be truncated inconsistently compared to the inline `content_preview` field built in the agent loop.
+- Fix: define once in `memory/context.rs` as `pub(crate)` and import in `agent/mod.rs`.
+
+**p5.3-ar-02 (P3) — No test for `MemoryDistilled` suppression on `mem_remember` failure**
+- `tools/mod.rs:ToolRegistry::invoke`: the `MemoryDistilled` post-call hook fires only after
+  `tool.invoke(...).await?` succeeds. There is no test that verifies the event is NOT emitted
+  when `mem_remember` fails (e.g. oversized content routed through the registry).
+- Fix: add a unit test invoking `mem_remember` via `ToolRegistry` with >8 KiB content; assert
+  `Err` returned and no `memory_distilled` event recorded.
+
+**p5.3-ar-03 (P3) — No test for `task_fingerprint()` determinism on known inputs**
+- `agent/mod.rs:task_fingerprint`: private FNV-1a hash; no test pins the output for a known
+  input string, so a refactor could silently shift all stored `task_fp` values.
+- Fix: add a unit test with a known ASCII string (and empty string) asserting the exact 16-char
+  hex output; verifies stability across refactors.
 
 ## Phase 4 — Open (deferred from p4.7 audit)
 
@@ -390,3 +446,34 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - New flight events: `agent_card_registered`, `message_sent`, `message_received`.
 - 142 tests pass (unit + integration).
 - **Completed:** v0.6.0 (2026-06-09)
+
+**p5.1 — Storage primitive (redb-backed MemoryStore)**
+- `memory/` module: `MemoryStore` trait + `RedbStore` backend (`redb` 4.1.0).
+- `kv_get` / `kv_set` native tools; `KbRead` / `KbWrite` capability gating.
+- `MemoryStoreOpened`, `MemoryRead`, `MemoryWrite`, `MemoryError` flight events.
+- `[memory]` TOML section with `enabled`, `path`, `table` fields; `memory.enabled` default false.
+- `FORMAT_VERSION` stored as metadata; `try_open` with TOCTOU-noted lock; 0600 mode on db file.
+- 304 tests pass.
+- **Completed:** v0.18.0 (PR #26)
+
+**p5.2 — Per-agent short-term memory + paging**
+- `memory/context.rs`: `MemoryPressure` enum (`None`/`Soft`/`Hard`), `assess()`, `page_count()`, `page_turns()`.
+- `MemItem { turn, role: Role, content_preview, blocks_json }` stored in `short_term: Vec<MemItem>` on `AgentTask`.
+- Soft threshold 75% → edge-triggered `MemoryPressureAdvisory` (fires once on `None→Soft` transition, not every turn).
+- Hard threshold 90% → `page_turns()` evicts oldest turn PAIRS (preserves alternating-role invariant); Hard+n=0 path emits advisory once on first entry.
+- `last_pressure: MemoryPressure` runtime field on `AgentTask` for edge-triggering; not checkpointed (resets to None on restore, correct behavior).
+- `FORMAT_VERSION` 1→2; `#[serde(default)] short_term` for backward compat; `to_checkpoint`/`from_checkpoint` updated.
+- `MemoryPressureAdvisory` + `MemoryPaged` flight events; both documented in `docs/CONVENTIONS.md`.
+- `content_preview` covers all three `Block` variants (`Text`, `ToolResult`, `ToolUse`); `debug_assert!` for alternating-role invariant.
+- 322 tests pass (14 new unit tests covering all acceptance criteria).
+- Deferred: p5.2-ar-01 (unbounded Vec → p5.6), p5.2-ar-02 (at_turn stamps → p5.3), p5.2-ar-03 (conservative eviction → p5.6).
+- **Completed:** v0.19.0
+
+**p5.3 — Per-agent long-term memory + checkpoint coexistence**
+- `ToolContext` struct (`tools/mod.rs`): `{ agent_id, turn, task_fp }` injected into every `Tool::invoke`. `task_fp` = FNV-1a 64-bit hash of initial task text, 16 hex chars; recomputed on restore.
+- `MemRemember` tool: `mem_remember { content, tags }` — stores JSON entry with provenance under `agent/{id}` namespace; nanosecond-timestamp key; 8 KiB limit. Returns `None` from `required_capability_for` (implicit self-grant).
+- `MemRecall` tool: `mem_recall { query, limit }` — iterates `agent/{id}` namespace, substring match, newest-first. Default 10, max 50 results.
+- `EventKind::MemoryDistilled` — emitted post-call by `ToolRegistry::invoke` for `mem_remember`.
+- All existing `Tool::invoke` signatures updated to accept `ctx: &ToolContext`; test helpers updated in `native.rs`, `mod.rs`, `mcp_client.rs`, and `memory_integration.rs`.
+- 331 tests pass (9 new; up from 322 in p5.2).
+- **Completed:** v0.20.0

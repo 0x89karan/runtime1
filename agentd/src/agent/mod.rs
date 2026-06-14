@@ -9,8 +9,26 @@ use crate::{
     config::{AgentConfig, ModelConfig, SpawnConfig},
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceRequest, InferenceResponse, Msg, Role, StopReason, ToolSpec},
-    tools::ToolRegistry,
+    memory::{
+        context::{assess, page_count, page_turns, MemoryPressure, SOFT_THRESHOLD},
+        MemItem,
+    },
+    tools::{ToolContext, ToolRegistry},
 };
+
+/// FNV-1a 64-bit hash of `task`, formatted as 16 lowercase hex chars.
+/// Deterministic across Rust versions (no random seed). Used as the `task_fp`
+/// provenance field embedded in Tier-3 memory entries.
+fn task_fingerprint(task: &str) -> String {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut hash = FNV_OFFSET;
+    for b in task.bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
 
 #[must_use = "AgentEffect names the IO the scheduler must perform; ignoring it stalls the agent"]
 pub enum AgentEffect {
@@ -40,6 +58,14 @@ pub struct AgentTask {
     stored_response: Option<InferenceResponse>,
     /// Set to true after Completed or Failed to guard provide_* calls.
     terminal:        bool,
+    /// Tier-2 eviction buffer: turns paged out of active context.
+    pub(crate) short_term: Vec<MemItem>,
+    /// Last observed pressure level; used to edge-trigger advisory events.
+    /// Runtime-only — not checkpointed (resets to None on restore, which is correct).
+    last_pressure: MemoryPressure,
+    /// Stable 16-hex fingerprint of the initial task (FNV-1a 64-bit, deterministic).
+    /// Embedded in Tier-3 provenance via ToolContext; not checkpointed (recomputed on restore).
+    task_fp: String,
 }
 
 impl AgentTask {
@@ -66,6 +92,9 @@ impl AgentTask {
             turn: 0,
             stored_response: None,
             terminal: false,
+            short_term: vec![],
+            last_pressure: MemoryPressure::None,
+            task_fp: task_fingerprint(task),
         }
     }
 
@@ -73,6 +102,11 @@ impl AgentTask {
     /// after a gateway failure, to preserve the correct turn number in the log.
     pub fn turn(&self) -> u32 {
         self.turn
+    }
+
+    /// Stable fingerprint of the initial task, for Tier-3 provenance stamps.
+    pub fn task_fp(&self) -> &str {
+        &self.task_fp
     }
 
     /// Scheduling priority from config. Higher value = runs before lower.
@@ -114,6 +148,7 @@ impl AgentTask {
             turn:            self.turn,
             stored_response: self.stored_response.clone(),
             terminal:        self.terminal,
+            short_term:      self.short_term.clone(),
         }
     }
 
@@ -123,6 +158,12 @@ impl AgentTask {
         cp: crate::checkpoint::AgentCheckpoint,
         specs: Vec<ToolSpec>,
     ) -> Self {
+        // Recompute task_fp from the initial task message (messages[0]) on restore.
+        // Clone to owned String before moving cp.messages into the struct below.
+        let task_text = cp.messages.first()
+            .and_then(|m| m.blocks.first())
+            .and_then(|b| if let Block::Text { text } = b { Some(text.clone()) } else { None })
+            .unwrap_or_default();
         Self {
             agent_id:        cp.agent_id,
             cfg:             cp.cfg,
@@ -134,12 +175,26 @@ impl AgentTask {
             turn:            cp.turn,
             stored_response: cp.stored_response,
             terminal:        false,
+            short_term:      cp.short_term,
+            last_pressure:   MemoryPressure::None,
+            task_fp:         task_fingerprint(&task_text),
         }
     }
 
     /// Total tokens consumed so far (input + output). Used by the snapshot.
     pub fn context_tokens(&self) -> u64 {
         self.total_input + self.total_output
+    }
+
+    /// Number of turn pairs currently in the Tier-2 eviction buffer.
+    pub fn short_term_depth(&self) -> usize {
+        self.short_term.len()
+    }
+
+    /// Number of messages in the active context window.
+    #[cfg(test)]
+    pub(crate) fn message_count(&self) -> usize {
+        self.messages.len()
     }
 
     /// First `max_chars` Unicode scalar values of the agent's task string.
@@ -264,6 +319,82 @@ impl AgentTask {
                 self.cfg.max_turns
             ));
         }
+
+        // Memory pressure check: assess current token spend against budget.
+        // Paging gives N+1 relief (the next inference request will be smaller);
+        // it cannot reduce already-spent tokens for the current turn.
+        // Advisory events are edge-triggered (fire once on transition, not every turn).
+        let total_spent = self.total_input + self.total_output;
+        let tokens_spent_pct = if self.cfg.token_budget > 0 {
+            total_spent as f64 / self.cfg.token_budget as f64
+        } else {
+            0.0
+        };
+        let current_pressure = assess(total_spent, self.cfg.token_budget);
+        match &current_pressure {
+            MemoryPressure::None => {}
+            MemoryPressure::Soft => {
+                if self.last_pressure == MemoryPressure::None {
+                    recorder.record(
+                        &self.agent_id,
+                        Some(self.turn),
+                        EventKind::MemoryPressureAdvisory,
+                        json!({
+                            "agent":             &self.agent_id,
+                            "turn":              self.turn,
+                            "tokens_spent_pct":  tokens_spent_pct,
+                            "soft_threshold":    SOFT_THRESHOLD,
+                        }),
+                    );
+                }
+            }
+            MemoryPressure::Hard => {
+                let n = page_count(&self.messages);
+                if n > 0 {
+                    match page_turns(&mut self.messages, n, self.turn) {
+                        Ok(items) => {
+                            let pages_moved = items.len();
+                            self.short_term.extend(items);
+                            recorder.record(
+                                &self.agent_id,
+                                Some(self.turn),
+                                EventKind::MemoryPaged,
+                                json!({
+                                    "agent":             &self.agent_id,
+                                    "turn":              self.turn,
+                                    "pages_moved":       pages_moved,
+                                    "short_term_depth":  self.short_term.len(),
+                                    "tokens_spent_pct":  tokens_spent_pct,
+                                }),
+                            );
+                        }
+                        Err(e) => {
+                            recorder.record(
+                                &self.agent_id,
+                                Some(self.turn),
+                                EventKind::Error,
+                                json!({ "stage": "page_turns", "error": e.to_string() }),
+                            );
+                        }
+                    }
+                } else if self.last_pressure != MemoryPressure::Hard {
+                    // Hard pressure but context too short to page — log once on entry.
+                    recorder.record(
+                        &self.agent_id,
+                        Some(self.turn),
+                        EventKind::MemoryPressureAdvisory,
+                        json!({
+                            "agent":             &self.agent_id,
+                            "turn":              self.turn,
+                            "tokens_spent_pct":  tokens_spent_pct,
+                            "soft_threshold":    SOFT_THRESHOLD,
+                            "note":              "hard pressure, context too short to page",
+                        }),
+                    );
+                }
+            }
+        }
+        self.last_pressure = current_pressure;
 
         if self.turn == 0 {
             let preview = self
@@ -501,11 +632,17 @@ impl AgentTask {
 pub(crate) async fn run_tools_sequential(
     agent_id: &str,
     turn: u32,
+    task_fp: &str,
     blocks: &[Block],
     registry: &ToolRegistry,
     cap_set: Option<&[crate::capability::Capability]>,
     recorder: &FlightRecorder,
 ) -> Vec<Block> {
+    let ctx = ToolContext {
+        agent_id: agent_id.to_string(),
+        turn,
+        task_fp: task_fp.to_string(),
+    };
     let mut results: Vec<Block> = Vec::new();
     for block in blocks {
         let Block::ToolUse { id, name, input } = block else {
@@ -520,7 +657,7 @@ pub(crate) async fn run_tools_sequential(
         );
 
         let (content, is_error) = match registry
-            .invoke(name, input.clone(), agent_id, cap_set, recorder)
+            .invoke(name, input.clone(), &ctx, cap_set, recorder)
             .await
         {
             Ok(s) => {
@@ -797,7 +934,7 @@ mod tests {
             name:  "unknown_tool".to_string(),
             input: serde_json::json!({ "key": "value" }),
         }];
-        run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
+        run_tools_sequential("agent", 0, "", &blocks, &registry, None, &rec).await;
 
         let content = std::fs::read_to_string(tmp.path()).unwrap();
         let event: serde_json::Value = content
@@ -822,7 +959,7 @@ mod tests {
             name:  "unknown_tool".to_string(),
             input: serde_json::json!({ "content": long_val }),
         }];
-        run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
+        run_tools_sequential("agent", 0, "", &blocks, &registry, None, &rec).await;
 
         let content = std::fs::read_to_string(tmp.path()).unwrap();
         let event: serde_json::Value = content
@@ -845,7 +982,7 @@ mod tests {
             fn name(&self) -> &str { "long_error_tool" }
             fn description(&self) -> &str { "always fails with a long error" }
             fn input_schema(&self) -> serde_json::Value { serde_json::json!({}) }
-            async fn invoke(&self, _: serde_json::Value) -> anyhow::Result<String> {
+            async fn invoke(&self, _: serde_json::Value, _ctx: &crate::tools::ToolContext) -> anyhow::Result<String> {
                 anyhow::bail!("{}", "e".repeat(PREVIEW_CHARS + 100))
             }
         }
@@ -860,7 +997,7 @@ mod tests {
             name:  "long_error_tool".to_string(),
             input: serde_json::json!({}),
         }];
-        run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
+        run_tools_sequential("agent", 0, "", &blocks, &registry, None, &rec).await;
 
         let content = std::fs::read_to_string(tmp.path()).unwrap();
         let event: serde_json::Value = content
@@ -1216,7 +1353,7 @@ mod tests {
             },
         ];
 
-        let results = run_tools_sequential("agent", 0, &blocks, &registry, None, &rec).await;
+        let results = run_tools_sequential("agent", 0, "", &blocks, &registry, None, &rec).await;
 
         // Text block skipped; unknown tool returns an error result (not a panic)
         assert_eq!(results.len(), 1, "only the ToolUse block should produce a result");
@@ -1439,6 +1576,7 @@ mod tests {
             turn:            3,
             stored_response: None,
             terminal:        true, // saved as true — must be reset to false
+            short_term:      vec![],
         };
         let task = AgentTask::from_checkpoint(cp, vec![fresh_spec]);
         assert_eq!(task.agent_id, "agent-42");
@@ -1469,6 +1607,180 @@ mod tests {
         assert_eq!(restored.turn, 1);
         assert_eq!(restored.messages.len(), task.messages.len());
         assert!(!restored.is_terminal());
+    }
+
+    // ── p5.2: memory paging tests ─────────────────────────────────────────────
+
+    // AC10: AgentTask with hard pressure calls page_turns, emits MemoryPaged
+    #[test]
+    fn step_hard_pressure_emits_memory_paged() {
+        let (rec, tmp) = recorder();
+        let budget = 100u64;
+        let cfg = agent_cfg(20, budget);
+        let mut sm = AgentTask::new("pg", "task", &cfg, &model_cfg(), vec![]);
+
+        // 2 full tool cycles at 20+20=40 tokens each → total=80 → 80% < HARD_THRESHOLD
+        // After each cycle: messages gains 2 entries (Assistant + User)
+        for i in 0..2usize {
+            let _ = sm.step(&rec);
+            sm.provide_inference(
+                InferenceResponse {
+                    blocks:        vec![Block::ToolUse {
+                        id:    format!("c{i}"),
+                        name:  "no_tool".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason:   StopReason::ToolUse,
+                    input_tokens:  20,
+                    output_tokens: 20,
+                },
+                &rec,
+            );
+            let _ = sm.step(&rec); // → CallTools (pushes Assistant msg)
+            sm.provide_tool_results(
+                vec![Block::ToolResult {
+                    tool_use_id: format!("c{i}"),
+                    content:     "r".to_string(),
+                    is_error:    false,
+                }],
+                &rec,
+            ); // pushes User(tool_results)
+        }
+        // total=80, messages.len()=5
+
+        // One more inference (5+6=11 tokens) → total=91 → 91% > HARD_THRESHOLD
+        let _ = sm.step(&rec);
+        sm.provide_inference(
+            InferenceResponse {
+                blocks:        vec![Block::ToolUse {
+                    id:    "c2".to_string(),
+                    name:  "no_tool".to_string(),
+                    input: serde_json::json!({}),
+                }],
+                stop_reason:   StopReason::ToolUse,
+                input_tokens:  5,
+                output_tokens: 6,
+            },
+            &rec,
+        );
+        let _ = sm.step(&rec); // → CallTools (pushes Assistant)
+        sm.provide_tool_results(
+            vec![Block::ToolResult {
+                tool_use_id: "c2".to_string(),
+                content:     "r2".to_string(),
+                is_error:    false,
+            }],
+            &rec,
+        );
+        // total=91, messages.len()=7
+
+        // Next step_need_infer: Hard pressure, page_count(7)=1 pair → page!
+        let _ = sm.step(&rec);
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(log.contains("memory_paged"), "MemoryPaged event must be emitted under hard pressure");
+
+        let paged: Vec<serde_json::Value> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|e: &serde_json::Value| e["kind"] == "memory_paged")
+            .collect();
+        assert_eq!(paged.len(), 1, "exactly one memory_paged event");
+        assert!(
+            paged[0]["data"]["pages_moved"].as_u64().unwrap_or(0) > 0,
+            "pages_moved must be > 0"
+        );
+        assert!(
+            sm.short_term_depth() > 0,
+            "short_term must be non-empty after hard paging"
+        );
+    }
+
+    // AC11: Soft pressure emits MemoryPressureAdvisory event; no text injected into messages
+    #[test]
+    fn step_soft_pressure_emits_advisory_no_injection() {
+        let (rec, tmp) = recorder();
+        let budget = 100u64;
+        let cfg = agent_cfg(20, budget);
+        let mut sm = AgentTask::new("soft", "task", &cfg, &model_cfg(), vec![]);
+
+        // 1 tool cycle at 37+38=75 tokens → 75% = exactly SOFT_THRESHOLD
+        let _ = sm.step(&rec);
+        sm.provide_inference(
+            InferenceResponse {
+                blocks:        vec![Block::ToolUse {
+                    id:    "c0".to_string(),
+                    name:  "no_tool".to_string(),
+                    input: serde_json::json!({}),
+                }],
+                stop_reason:   StopReason::ToolUse,
+                input_tokens:  37,
+                output_tokens: 38,
+            },
+            &rec,
+        );
+        let _ = sm.step(&rec); // → CallTools
+        sm.provide_tool_results(
+            vec![Block::ToolResult {
+                tool_use_id: "c0".to_string(),
+                content:     "r".to_string(),
+                is_error:    false,
+            }],
+            &rec,
+        );
+        // total=75, messages.len()=3
+
+        let msg_count_before = sm.message_count();
+        let _ = sm.step(&rec); // step_need_infer: Soft pressure
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(
+            log.contains("memory_pressure_advisory"),
+            "MemoryPressureAdvisory event must be emitted at soft threshold"
+        );
+        assert!(
+            !log.contains("memory_paged"),
+            "MemoryPaged must NOT be emitted at soft threshold"
+        );
+        assert_eq!(
+            sm.message_count(),
+            msg_count_before,
+            "messages must not change under soft pressure"
+        );
+    }
+
+    // AC14: to_checkpoint/from_checkpoint preserve short_term (items not zeroed on restore)
+    #[test]
+    fn checkpoint_roundtrip_preserves_short_term() {
+        use crate::memory::MemItem;
+        use crate::inference::Role;
+
+        let (rec, _tmp) = recorder();
+        let cfg = agent_cfg(20, 1_000_000);
+        let mut sm = AgentTask::new("cp-st", "task", &cfg, &model_cfg(), vec![]);
+
+        // Manually push a MemItem into short_term to simulate prior paging
+        sm.short_term.push(MemItem {
+            turn:            1,
+            role:            Role::Assistant,
+            content_preview: "evicted content".to_string(),
+            blocks_json:     r#"[{"type":"text","text":"evicted"}]"#.to_string(),
+        });
+
+        let cp = sm.to_checkpoint();
+        assert_eq!(cp.short_term.len(), 1, "to_checkpoint must include short_term");
+        assert_eq!(cp.short_term[0].turn, 1);
+
+        let restored = AgentTask::from_checkpoint(cp, vec![]);
+        assert_eq!(
+            restored.short_term.len(),
+            1,
+            "from_checkpoint must restore short_term (not zero it)"
+        );
+        assert_eq!(restored.short_term[0].turn, 1);
+        assert_eq!(restored.short_term[0].content_preview, "evicted content");
+
+        let _ = rec; // suppress unused warning
     }
 
     #[test]

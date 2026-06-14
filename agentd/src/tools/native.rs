@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use crate::capability::Capability;
 use crate::config::AgentCard;
 use crate::memory::{validate_segment, MemoryStore};
-use super::{Tool, ToolRegistry};
+use super::{Tool, ToolContext, ToolRegistry};
 
 const READ_FILE_MAX: usize = 100_000;
 const MAX_KV_VALUE_BYTES: usize = 256 * 1024; // 256 KiB per stored value
@@ -24,6 +24,18 @@ pub struct KvGet {
 /// Write a value to the durable key/value store.
 /// NOT registered under `native = ["all"]` — requires explicit listing.
 pub struct KvSet {
+    pub store: Arc<dyn MemoryStore>,
+}
+
+/// Commit a piece of knowledge to Tier-3 long-term memory under the agent's own namespace.
+/// NOT registered under `native = ["all"]` — requires explicit listing.
+pub struct MemRemember {
+    pub store: Arc<dyn MemoryStore>,
+}
+
+/// Search Tier-3 long-term memory for entries matching a query string.
+/// NOT registered under `native = ["all"]` — requires explicit listing.
+pub struct MemRecall {
     pub store: Arc<dyn MemoryStore>,
 }
 
@@ -59,7 +71,7 @@ impl Tool for ReadFile {
         Some(Capability::FsRead { prefix: path })
     }
 
-    async fn invoke(&self, input: Value) -> Result<String> {
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let path = input["path"].as_str().context("path must be a string")?;
         let content =
             tokio::fs::read_to_string(path).await.with_context(|| format!("reading {path}"))?;
@@ -99,7 +111,7 @@ impl Tool for WriteFile {
         Some(Capability::FsWrite { prefix: path })
     }
 
-    async fn invoke(&self, input: Value) -> Result<String> {
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let path = input["path"].as_str().context("path must be a string")?;
         let content = input["content"].as_str().context("content must be a string")?;
         if let Some(parent) = std::path::Path::new(path).parent() {
@@ -140,7 +152,7 @@ impl Tool for ListDir {
         Some(Capability::FsRead { prefix: path })
     }
 
-    async fn invoke(&self, input: Value) -> Result<String> {
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let path = input["path"].as_str().context("path must be a string")?;
         let mut dir = tokio::fs::read_dir(path)
             .await
@@ -216,7 +228,7 @@ impl Tool for KvGet {
         Some(Capability::KbRead { segment: namespace })
     }
 
-    async fn invoke(&self, input: Value) -> Result<String> {
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let (namespace, key) = extract_ns_key(&input)?;
         let store = Arc::clone(&self.store);
         let ns = namespace.clone();
@@ -277,7 +289,7 @@ impl Tool for KvSet {
         Some(Capability::KbWrite { segment: namespace })
     }
 
-    async fn invoke(&self, input: Value) -> Result<String> {
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let (namespace, key) = extract_ns_key(&input)?;
         let value = input["value"]
             .as_str()
@@ -298,6 +310,181 @@ impl Tool for KvSet {
             .await
             .context("kv_set spawn_blocking join")??;
         Ok(format!("stored {} bytes at {namespace}:{key}", value.len()))
+    }
+}
+
+const MAX_MEM_CONTENT_BYTES: usize = 8 * 1024; // 8 KiB per long-term memory entry
+
+#[async_trait]
+impl Tool for MemRemember {
+    fn name(&self) -> &str {
+        "mem_remember"
+    }
+
+    fn description(&self) -> &str {
+        "Commit a piece of knowledge to long-term memory. Persists across restarts. \
+         Use this to record findings, decisions, or facts you want to recall later. \
+         Stored under your own agent namespace — other agents cannot read it."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "The text to remember (max 8 KiB)"
+                },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional labels to help recall later"
+                }
+            },
+            "required": ["content"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        // Implicit self-grant: always writes to agent/{ctx.agent_id}; no cap needed.
+        None
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<String> {
+        let content = input["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("content must be a string"))?;
+        let tags: Vec<String> = input["tags"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        let ts_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .map_err(|e| anyhow::anyhow!("system clock error: {e}"))?;
+        let key = format!("{ts_ns:016x}");
+        let namespace = format!("agent/{}", ctx.agent_id);
+        validate_segment(&namespace, "agent namespace")?;
+
+        let entry = serde_json::to_string(&serde_json::json!({
+            "content": content,
+            "tags": tags,
+            "provenance": {
+                "agent_id": ctx.agent_id,
+                "turn": ctx.turn,
+                "ts": ts_ns,
+                "task_fp": ctx.task_fp,
+            }
+        }))?;
+        if entry.len() > MAX_MEM_CONTENT_BYTES {
+            anyhow::bail!(
+                "entry too large: {} bytes (content + tags + provenance) exceeds limit of {} bytes",
+                entry.len(),
+                MAX_MEM_CONTENT_BYTES
+            );
+        }
+
+        let store = Arc::clone(&self.store);
+        let ns = namespace.clone();
+        let k = key.clone();
+        let entry_clone = entry.clone();
+        tokio::task::spawn_blocking(move || store.put(&ns, &k, &entry_clone))
+            .await
+            .context("mem_remember spawn_blocking join")??;
+
+        Ok(format!(
+            "remembered: key={key} namespace={namespace} bytes={}",
+            entry.len()
+        ))
+    }
+}
+
+#[async_trait]
+impl Tool for MemRecall {
+    fn name(&self) -> &str {
+        "mem_recall"
+    }
+
+    fn description(&self) -> &str {
+        "Search your long-term memory for entries matching a query string. \
+         Returns matching entries as JSON, newest first. \
+         Fields: query (required), limit (optional integer, default 10, max 50)."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Substring to search for in remembered content and tags"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results to return (default 10, max 50)"
+                }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        // Implicit self-grant: always reads from agent/{ctx.agent_id}; no cap needed.
+        None
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<String> {
+        let query = input["query"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("query must be a string"))?
+            .to_lowercase();
+        anyhow::ensure!(!query.is_empty(), "query must not be empty");
+        let limit = input["limit"].as_u64().unwrap_or(10).min(50) as usize;
+
+        let ns = format!("agent/{}", ctx.agent_id);
+        validate_segment(&ns, "agent namespace")?;
+        let store = Arc::clone(&self.store);
+        let mut entries: Vec<(String, String)> =
+            tokio::task::spawn_blocking(move || store.iter(&ns))
+                .await
+                .context("mem_recall spawn_blocking join")??;
+
+        // Newest first — keys are hex-encoded nanosecond timestamps.
+        entries.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let matches: Vec<serde_json::Value> = entries
+            .into_iter()
+            .filter_map(|(key, val)| {
+                let parsed: serde_json::Value = serde_json::from_str(&val).ok()?;
+                let content_hit = parsed["content"]
+                    .as_str()
+                    .map(|c| c.to_lowercase().contains(&query))
+                    .unwrap_or(false);
+                let tags_hit = parsed["tags"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter().any(|t| {
+                            t.as_str()
+                                .map(|s| s.to_lowercase().contains(&query))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
+                if content_hit || tags_hit {
+                    let mut entry = parsed;
+                    entry["key"] = serde_json::Value::String(key);
+                    Some(entry)
+                } else {
+                    None
+                }
+            })
+            .take(limit)
+            .collect();
+
+        Ok(serde_json::to_string(&matches)?)
     }
 }
 
@@ -331,7 +518,7 @@ impl Tool for SpawnAgentTool {
         Some(Capability::Spawn)
     }
 
-    async fn invoke(&self, _input: Value) -> Result<String> {
+    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<String> {
         // spawn_agent is intercepted by step_with_response() before reaching invoke().
         // If this is called, something bypassed the normal effect dispatch path.
         Err(anyhow::anyhow!(
@@ -363,7 +550,7 @@ impl Tool for ListAgentsTool {
         None
     }
 
-    async fn invoke(&self, _input: Value) -> Result<String> {
+    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<String> {
         let mut cards = self.cards.as_ref().clone();
         cards.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(serde_json::to_string(&cards)?)
@@ -397,7 +584,7 @@ impl Tool for SendMessageTool {
         None
     }
 
-    async fn invoke(&self, _input: Value) -> Result<String> {
+    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<String> {
         // send_message is intercepted by the scheduler before reaching invoke().
         Err(anyhow::anyhow!(
             "send_message must be intercepted by the scheduler; invoke() should never be called"
@@ -454,6 +641,17 @@ pub fn register_native(
             reg.register(Box::new(KvSet { store: s }))?;
         }
     }
+    // mem_remember / mem_recall — NOT included in "all"; require explicit opt-in.
+    if names.iter().any(|n| n == "mem_remember") {
+        if let Some(s) = store.clone() {
+            reg.register(Box::new(MemRemember { store: s }))?;
+        }
+    }
+    if names.iter().any(|n| n == "mem_recall") {
+        if let Some(s) = store.clone() {
+            reg.register(Box::new(MemRecall { store: s }))?;
+        }
+    }
     Ok(())
 }
 
@@ -462,11 +660,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn ctx() -> ToolContext {
+        ToolContext { agent_id: "test".to_string(), turn: 0, task_fp: String::new() }
+    }
+
     #[tokio::test]
     async fn read_file_returns_cargo_toml() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         let result = ReadFile
-            .invoke(json!({"path": path.to_str().unwrap()}))
+            .invoke(json!({"path": path.to_str().unwrap()}), &ctx())
             .await
             .unwrap();
         assert!(!result.is_empty());
@@ -476,7 +678,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_missing_path_errors() {
         let err = ReadFile
-            .invoke(json!({"path": "/nonexistent/p0.3-test-file.txt"}))
+            .invoke(json!({"path": "/nonexistent/p0.3-test-file.txt"}), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("reading"));
@@ -484,7 +686,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_missing_input_key_errors() {
-        let err = ReadFile.invoke(json!({})).await.unwrap_err();
+        let err = ReadFile.invoke(json!({}), &ctx()).await.unwrap_err();
         assert!(err.to_string().contains("path"));
     }
 
@@ -496,7 +698,7 @@ mod tests {
         let content = "x".repeat(READ_FILE_MAX + 50);
         std::fs::write(&path, &content).unwrap();
         let result = ReadFile
-            .invoke(json!({"path": path.to_str().unwrap()}))
+            .invoke(json!({"path": path.to_str().unwrap()}), &ctx())
             .await
             .unwrap();
         assert!(result.contains("[truncated at"));
@@ -508,7 +710,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("out.txt");
         WriteFile
-            .invoke(json!({"path": path.to_str().unwrap(), "content": "hello p0.3"}))
+            .invoke(json!({"path": path.to_str().unwrap(), "content": "hello p0.3"}), &ctx())
             .await
             .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -520,7 +722,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("a/b/c/out.txt");
         WriteFile
-            .invoke(json!({"path": path.to_str().unwrap(), "content": "nested"}))
+            .invoke(json!({"path": path.to_str().unwrap(), "content": "nested"}), &ctx())
             .await
             .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nested");
@@ -528,7 +730,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_file_missing_path_errors() {
-        let err = WriteFile.invoke(json!({"content": "hi"})).await.unwrap_err();
+        let err = WriteFile.invoke(json!({"content": "hi"}), &ctx()).await.unwrap_err();
         assert!(err.to_string().contains("path"));
     }
 
@@ -537,7 +739,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("out.txt");
         let err = WriteFile
-            .invoke(json!({"path": path.to_str().unwrap()}))
+            .invoke(json!({"path": path.to_str().unwrap()}), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("content"));
@@ -549,7 +751,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
         std::fs::write(dir.path().join("file.txt"), "").unwrap();
         let result = ListDir
-            .invoke(json!({"path": dir.path().to_str().unwrap()}))
+            .invoke(json!({"path": dir.path().to_str().unwrap()}), &ctx())
             .await
             .unwrap();
         assert!(result.contains("subdir/"), "dirs must end with /");
@@ -559,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_dir_missing_path_key_errors() {
-        let err = ListDir.invoke(json!({})).await.unwrap_err();
+        let err = ListDir.invoke(json!({}), &ctx()).await.unwrap_err();
         assert!(err.to_string().contains("path"));
     }
 
@@ -567,7 +769,7 @@ mod tests {
     async fn list_dir_empty_dir_returns_empty_string() {
         let dir = TempDir::new().unwrap();
         let result = ListDir
-            .invoke(json!({"path": dir.path().to_str().unwrap()}))
+            .invoke(json!({"path": dir.path().to_str().unwrap()}), &ctx())
             .await
             .unwrap();
         assert_eq!(result, "");
@@ -576,7 +778,7 @@ mod tests {
     #[tokio::test]
     async fn list_dir_missing_path_errors() {
         let err = ListDir
-            .invoke(json!({"path": "/nonexistent/p0.3-dir"}))
+            .invoke(json!({"path": "/nonexistent/p0.3-dir"}), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("reading directory"));
@@ -589,7 +791,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "").unwrap();
         std::fs::write(dir.path().join("m.txt"), "").unwrap();
         let result = ListDir
-            .invoke(json!({"path": dir.path().to_str().unwrap()}))
+            .invoke(json!({"path": dir.path().to_str().unwrap()}), &ctx())
             .await
             .unwrap();
         let lines: Vec<&str> = result.lines().collect();
@@ -623,7 +825,7 @@ mod tests {
     async fn spawn_agent_invoke_returns_error() {
         let tool = SpawnAgentTool;
         let err = tool
-            .invoke(serde_json::json!({ "task": "test" }))
+            .invoke(serde_json::json!({ "task": "test" }), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("intercepted"));
@@ -693,14 +895,14 @@ mod tests {
     #[tokio::test]
     async fn kv_get_missing_namespace_errors() {
         let tool = KvGet { store: SimpleStore::new_arc() };
-        let err = tool.invoke(json!({"key": "my-note"})).await.unwrap_err();
+        let err = tool.invoke(json!({"key": "my-note"}), &ctx()).await.unwrap_err();
         assert!(err.to_string().contains("namespace"), "got: {err}");
     }
 
     #[tokio::test]
     async fn kv_get_missing_key_errors() {
         let tool = KvGet { store: SimpleStore::new_arc() };
-        let err = tool.invoke(json!({"namespace": "agent:scratch"})).await.unwrap_err();
+        let err = tool.invoke(json!({"namespace": "agent:scratch"}), &ctx()).await.unwrap_err();
         assert!(err.to_string().contains("key"), "got: {err}");
     }
 
@@ -708,7 +910,7 @@ mod tests {
     async fn kv_get_invalid_namespace_chars_errors() {
         let tool = KvGet { store: SimpleStore::new_arc() };
         let err = tool
-            .invoke(json!({"namespace": "bad namespace!", "key": "my-note"}))
+            .invoke(json!({"namespace": "bad namespace!", "key": "my-note"}), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("namespace"), "got: {err}");
@@ -718,7 +920,7 @@ mod tests {
     async fn kv_set_missing_value_field_errors() {
         let tool = KvSet { store: SimpleStore::new_arc() };
         let err = tool
-            .invoke(json!({"namespace": "agent:scratch", "key": "my-note"}))
+            .invoke(json!({"namespace": "agent:scratch", "key": "my-note"}), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("value"), "got: {err}");
@@ -730,7 +932,7 @@ mod tests {
     async fn kv_get_miss_returns_empty_string() {
         let tool = KvGet { store: SimpleStore::new_arc() };
         let result = tool
-            .invoke(json!({"namespace": "agent:scratch", "key": "nonexistent"}))
+            .invoke(json!({"namespace": "agent:scratch", "key": "nonexistent"}), &ctx())
             .await
             .unwrap();
         assert_eq!(result, "", "absent key must return empty string");
@@ -766,7 +968,7 @@ mod tests {
         let tool = KvSet { store: SimpleStore::new_arc() };
         let big = "x".repeat(MAX_KV_VALUE_BYTES + 1);
         let err = tool
-            .invoke(json!({"namespace": "agent:scratch", "key": "big", "value": big}))
+            .invoke(json!({"namespace": "agent:scratch", "key": "big", "value": big}), &ctx())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("too large"), "got: {err}");
@@ -777,7 +979,7 @@ mod tests {
         let tool = KvSet { store: SimpleStore::new_arc() };
         let exact = "x".repeat(MAX_KV_VALUE_BYTES);
         let result = tool
-            .invoke(json!({"namespace": "agent:scratch", "key": "big", "value": exact}))
+            .invoke(json!({"namespace": "agent:scratch", "key": "big", "value": exact}), &ctx())
             .await
             .unwrap();
         assert!(result.contains("bytes"), "got: {result}");
@@ -802,6 +1004,267 @@ mod tests {
         assert!(
             !reg.tool_names().contains(&"kv_set".to_string()),
             "kv_set must not be registered without store"
+        );
+    }
+
+    // ── p5.3: mem_remember + mem_recall tests ───────────────────────────────
+
+    fn mem_ctx(agent_id: &str) -> ToolContext {
+        ToolContext {
+            agent_id: agent_id.to_string(),
+            turn: 1,
+            task_fp: "abc123".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn remember_then_recall_finds_content() {
+        let store = SimpleStore::new_arc();
+        let remember = MemRemember { store: store.clone() };
+        let recall = MemRecall { store: store.clone() };
+
+        let result = remember
+            .invoke(
+                json!({"content": "the sky is blue", "tags": ["weather", "sky"]}),
+                &mem_ctx("agent-a"),
+            )
+            .await
+            .unwrap();
+        assert!(result.contains("remembered:"), "got: {result}");
+
+        // Recall by content substring.
+        let hits = recall
+            .invoke(json!({"query": "sky", "limit": 10}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hits).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["content"], "the sky is blue");
+        assert!(parsed[0]["key"].as_str().is_some(), "entry must have a key");
+    }
+
+    #[tokio::test]
+    async fn recall_no_match_returns_empty_array() {
+        let store = SimpleStore::new_arc();
+        let remember = MemRemember { store: store.clone() };
+        let recall = MemRecall { store: store.clone() };
+
+        remember
+            .invoke(json!({"content": "hello world"}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+
+        let hits = recall
+            .invoke(json!({"query": "zzznomatch"}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hits).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn recall_tag_match_works() {
+        let store = SimpleStore::new_arc();
+        let remember = MemRemember { store: store.clone() };
+        let recall = MemRecall { store: store.clone() };
+
+        remember
+            .invoke(
+                json!({"content": "unrelated text", "tags": ["important", "priority"]}),
+                &mem_ctx("agent-a"),
+            )
+            .await
+            .unwrap();
+
+        let hits = recall
+            .invoke(json!({"query": "priority"}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hits).unwrap();
+        assert_eq!(parsed.as_array().unwrap().len(), 1, "tag match must find entry");
+    }
+
+    #[tokio::test]
+    async fn self_namespace_access_without_explicit_cap_grant() {
+        // mem_remember / mem_recall require no capability — they use an implicit
+        // self-namespace (agent/{id}) and return None from required_capability_for.
+        let remember = MemRemember { store: SimpleStore::new_arc() };
+        let recall = MemRecall { store: SimpleStore::new_arc() };
+        assert!(
+            remember.required_capability_for(&serde_json::Value::Null).is_none(),
+            "mem_remember must require no capability"
+        );
+        assert!(
+            recall.required_capability_for(&serde_json::Value::Null).is_none(),
+            "mem_recall must require no capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_agent_namespaces_are_isolated() {
+        // Agent-A and agent-B each have separate namespaces; recalls are scoped
+        // to the calling agent's context, so B's memories are invisible to A.
+        let store = SimpleStore::new_arc();
+        let remember = MemRemember { store: store.clone() };
+        let recall = MemRecall { store: store.clone() };
+
+        remember
+            .invoke(json!({"content": "secret from agent-b"}), &mem_ctx("agent-b"))
+            .await
+            .unwrap();
+
+        // Agent-A's recall must not see agent-B's memories.
+        let hits = recall
+            .invoke(json!({"query": "secret"}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hits).unwrap();
+        assert_eq!(
+            parsed.as_array().unwrap().len(),
+            0,
+            "agent-a must not see agent-b's memories"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_oversized_content_errors() {
+        let store = SimpleStore::new_arc();
+        let remember = MemRemember { store };
+        let big = "x".repeat(MAX_MEM_CONTENT_BYTES + 1);
+        let err = remember
+            .invoke(json!({"content": big}), &mem_ctx("agent-a"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn register_native_mem_tools_without_store_silently_skips() {
+        let mut reg = ToolRegistry::new();
+        register_native(
+            &mut reg,
+            &["mem_remember".to_string(), "mem_recall".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !reg.tool_names().contains(&"mem_remember".to_string()),
+            "mem_remember must not be registered without store"
+        );
+        assert!(
+            !reg.tool_names().contains(&"mem_recall".to_string()),
+            "mem_recall must not be registered without store"
+        );
+    }
+
+    #[test]
+    fn register_native_all_does_not_include_mem_tools() {
+        let mut reg = ToolRegistry::new();
+        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        let names = reg.tool_names();
+        assert!(!names.contains(&"mem_remember".to_string()), "mem_remember must not be in 'all'");
+        assert!(!names.contains(&"mem_recall".to_string()), "mem_recall must not be in 'all'");
+    }
+
+    #[tokio::test]
+    async fn remember_missing_content_field_errors() {
+        let tool = MemRemember { store: SimpleStore::new_arc() };
+        let err = tool.invoke(json!({}), &mem_ctx("agent-a")).await.unwrap_err();
+        assert!(err.to_string().contains("content"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn recall_missing_query_field_errors() {
+        let tool = MemRecall { store: SimpleStore::new_arc() };
+        let err = tool.invoke(json!({}), &mem_ctx("agent-a")).await.unwrap_err();
+        assert!(err.to_string().contains("query"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn recall_limit_clamped_at_50() {
+        // Insert 60 matching entries directly; recall with limit: 100 must return ≤50.
+        let store = SimpleStore::new_arc();
+        let ns = "agent/agent-a";
+        for i in 0u64..60 {
+            let key = format!("{i:016x}");
+            let entry = serde_json::to_string(&serde_json::json!({
+                "content": "hello world",
+                "tags": [],
+                "provenance": { "agent_id": "agent-a", "turn": 0, "ts": i, "task_fp": "" },
+            }))
+            .unwrap();
+            store.put(ns, &key, &entry).unwrap();
+        }
+        let recall = MemRecall { store };
+        let hits = recall
+            .invoke(json!({"query": "hello", "limit": 100}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&hits).unwrap();
+        assert_eq!(parsed.len(), 50, "limit must be clamped to 50; got {}", parsed.len());
+    }
+
+    #[tokio::test]
+    async fn recall_default_limit_is_10() {
+        // Insert 15 matching entries; recall without explicit limit must return exactly 10.
+        let store = SimpleStore::new_arc();
+        let ns = "agent/agent-a";
+        for i in 0u64..15 {
+            let key = format!("{i:016x}");
+            let entry = serde_json::to_string(&serde_json::json!({
+                "content": "hello world",
+                "tags": [],
+                "provenance": { "agent_id": "agent-a", "turn": 0, "ts": i, "task_fp": "" },
+            }))
+            .unwrap();
+            store.put(ns, &key, &entry).unwrap();
+        }
+        let recall = MemRecall { store };
+        // No `limit` field → must default to 10.
+        let hits = recall
+            .invoke(json!({"query": "hello"}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&hits).unwrap();
+        assert_eq!(parsed.len(), 10, "default limit must be 10; got {}", parsed.len());
+    }
+
+    #[tokio::test]
+    async fn recall_newest_first_ordering() {
+        // Insert 3 entries with known hex keys (simulated timestamps 100, 200, 300).
+        // MemRecall sorts keys descending → expect 300, 200, 100 order.
+        let store = SimpleStore::new_arc();
+        let ns = "agent/agent-a";
+        for ts in [100u64, 200u64, 300u64] {
+            let key = format!("{ts:016x}");
+            let entry = serde_json::to_string(&serde_json::json!({
+                "content": format!("entry at ts={ts}"),
+                "tags": [],
+                "provenance": { "agent_id": "agent-a", "turn": 0, "ts": ts, "task_fp": "" },
+            }))
+            .unwrap();
+            store.put(ns, &key, &entry).unwrap();
+        }
+        let recall = MemRecall { store };
+        let hits = recall
+            .invoke(json!({"query": "entry at ts=", "limit": 10}), &mem_ctx("agent-a"))
+            .await
+            .unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&hits).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert!(
+            parsed[0]["content"].as_str().unwrap().contains("300"),
+            "expected ts=300 first, got: {}",
+            parsed[0]["content"]
+        );
+        assert!(
+            parsed[1]["content"].as_str().unwrap().contains("200"),
+            "expected ts=200 second"
+        );
+        assert!(
+            parsed[2]["content"].as_str().unwrap().contains("100"),
+            "expected ts=100 third"
         );
     }
 }

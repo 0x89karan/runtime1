@@ -656,12 +656,15 @@ fn enqueue_or_defer(
             }
         }
         AgentEffect::CallTools(blocks) => {
+            let task_fp = state.agents.get(&agent_id)
+                .map(|a| a.task_fp().to_string())
+                .unwrap_or_default();
             let reg = Arc::clone(registry);
             let rec = Arc::clone(recorder);
             let id = agent_id;
             state.pending.push(Box::pin(async move {
                 let results = run_tools_sequential(
-                    &id, turn, &blocks, &reg, cap_set.as_deref(), &rec,
+                    &id, turn, &task_fp, &blocks, &reg, cap_set.as_deref(), &rec,
                 )
                 .await;
                 EffectResult::Tools { agent_id: id, results }
@@ -2097,6 +2100,7 @@ mod tests {
             turn:        1,
             stored_response: None,
             terminal:    false,
+            short_term:  vec![],
         }
     }
 

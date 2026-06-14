@@ -46,7 +46,7 @@ pub(crate) async fn run(
 
             AgentEffect::CallTools(blocks) => {
                 let results =
-                    run_tools_sequential(agent_id, sm.turn(), &blocks, registry, None, recorder)
+                    run_tools_sequential(agent_id, sm.turn(), sm.task_fp(), &blocks, registry, None, recorder)
                         .await;
                 sm.provide_tool_results(results, recorder);
             }

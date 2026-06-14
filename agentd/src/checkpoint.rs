@@ -10,9 +10,10 @@ use crate::{
     bus::MailMessage,
     config::{AgentConfig, ModelConfig},
     inference::{InferenceResponse, Msg, ToolSpec},
+    memory::MemItem,
 };
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Create `path` with mode 0600 on Unix, then write `data`.
 ///
@@ -67,6 +68,10 @@ pub struct AgentCheckpoint {
     pub stored_response: Option<InferenceResponse>,
     /// Always false when saved — guards against the terminal-race described in OV-2.
     pub terminal:        bool,
+    /// Tier-2 eviction buffer: turns paged out of active context.
+    /// `#[serde(default)]` makes v1 checkpoints (no field) load as empty vec.
+    #[serde(default)]
+    pub short_term:      Vec<MemItem>,
 }
 
 /// A serializable entry in the awaiting map (child → parent relationship).
@@ -204,6 +209,7 @@ mod tests {
             turn:            1,
             stored_response: None,
             terminal:        false,
+            short_term:      vec![],
         }
     }
 
@@ -367,6 +373,89 @@ mod tests {
             msg.contains("write checkpoint tmp"),
             "error context must mention the tmp write: {msg}"
         );
+    }
+
+    // AC12: v1 checkpoint (no `short_term` field) loads via CheckpointStore::load()
+    // with short_term defaulting to empty vec. format_version=1 passes the guard.
+    #[tokio::test]
+    async fn v1_checkpoint_loads_with_empty_short_term() {
+        use crate::memory::MemItem;
+
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+
+        // Build a v1-style checkpoint JSON with no `short_term` field.
+        let v1_json = serde_json::json!({
+            "format_version": 1,
+            "agents": [{
+                "agent_id": "v1-agent",
+                "cfg": {
+                    "id": "v1-agent",
+                    "task": "test",
+                    "max_turns": 5,
+                    "token_budget": 100_000,
+                    "priority": 0,
+                    "capabilities": null,
+                    "name": null,
+                    "description": "",
+                    "skills": []
+                },
+                "model_cfg": { "provider": "mock", "model": "mock", "max_tokens": 1024 },
+                "messages": [],
+                "specs": [],
+                "total_input": 0,
+                "total_output": 0,
+                "turn": 0,
+                "stored_response": null,
+                "terminal": false
+                // no "short_term" field — v1 format
+            }],
+            "awaiting": [],
+            "mailboxes": {},
+            "tokens_spent": 0,
+            "child_seq": 0,
+            "spawn_depths": {}
+        });
+        std::fs::write(&store.path, serde_json::to_string(&v1_json).unwrap()).unwrap();
+
+        let cp = store.load().unwrap().expect("v1 checkpoint must load");
+        assert_eq!(cp.format_version, 1);
+        assert_eq!(cp.agents.len(), 1);
+        assert!(
+            cp.agents[0].short_term.is_empty(),
+            "v1 checkpoint must deserialize to empty short_term"
+        );
+        let _: Vec<MemItem> = cp.agents[0].short_term.clone(); // type check
+    }
+
+    // AC13: v2 checkpoint with non-empty short_term round-trips through save()/load()
+    #[tokio::test]
+    async fn v2_checkpoint_with_short_term_roundtrips() {
+        use crate::inference::Role;
+        use crate::memory::MemItem;
+
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+
+        let item = MemItem {
+            turn:            3,
+            role:            Role::Assistant,
+            content_preview: "partial answer".to_string(),
+            blocks_json:     r#"[{"type":"text","text":"partial answer"}]"#.to_string(),
+        };
+
+        let mut cp = minimal_scheduler_checkpoint();
+        cp.agents[0].short_term = vec![item.clone()];
+
+        store.save(&cp).await.unwrap();
+        let loaded = store.load().unwrap().unwrap();
+
+        assert_eq!(loaded.agents[0].short_term.len(), 1);
+        let loaded_item = &loaded.agents[0].short_term[0];
+        assert_eq!(loaded_item.turn, 3);
+        assert_eq!(loaded_item.role, Role::Assistant);
+        assert_eq!(loaded_item.content_preview, "partial answer");
+        assert_eq!(loaded_item.blocks_json, item.blocks_json);
     }
 
     #[test]

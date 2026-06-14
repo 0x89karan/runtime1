@@ -1,4 +1,7 @@
+pub mod context;
 pub mod store;
+
+pub use context::MemItem;
 
 /// Schema version written to the `meta` table on first create.
 /// Distinct from redb's own file-format version (redb owns that; we own this).

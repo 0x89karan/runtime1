@@ -34,7 +34,7 @@ const MAX_NAME_LEN: usize = 64;
 /// with buggy or malicious servers that always return nextCursor.
 const MCP_MAX_TOOL_PAGES: usize = 100;
 
-use super::Tool;
+use super::{Tool, ToolContext};
 use crate::capability::Capability;
 use crate::inference::ToolSpec;
 
@@ -530,7 +530,7 @@ impl Tool for McpTool {
         })
     }
 
-    async fn invoke(&self, input: Value) -> Result<String> {
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let result = self
             .client
             .request(
