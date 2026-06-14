@@ -340,6 +340,80 @@ The audit recommends it and Phase 5 depends on it. Written in full increment for
 
 ---
 
+> #### ▢ p5.3.5 — Detachable memory volume (distro/infra)
+>
+> **Depends on:** p5.1 (`store_path`). Independent of p5.4+ — infra-only, parallelizable.
+> **Sequence:** run next / in parallel with p5.4; land before relying on container-respawn
+> memory continuity. Not a blocker for the crate work.
+>
+> **Goal:** Make the durable store (`memory.redb`, Tiers 3/4) a separate, persistent,
+> re-attachable volume — distinct from the ephemeral container, the secrets-in mount, and
+> the disposable output mount. Kill + respawn the AgentOS container → re-attach the same
+> volume → knowledge continuity. **No crate logic, no schema, no migration; default
+> `store_path` unchanged.**
+>
+> **Design reference:** `docs/DESIGN-memory.md` §2.2 (checkpoint vs memory) + §6
+> (Persistence — the detachable memory volume).
+>
+> **Scope — files modified (exact diff):**
+> - `distro/overlay/init` — add a third 9p mount, mirroring `secrets0`/`output0`:
+>   ```sh
+>   mkdir -p /run/secrets /run/output /run/memory
+>   # …after the secrets0 + output0 mounts:
+>   mount -t 9p -o trans=virtio,version=9p2000.L memory0 /run/memory || {
+>       echo "ERROR: failed to mount memory0 via 9p." >&2
+>       echo "       Is -virtfs ...,mount_tag=memory0 in the QEMU command?" >&2
+>       exec sh
+>   }
+>   ```
+> - `distro/Makefile` — add to the `run` AND `test` targets (test → throwaway dir so real
+>   runs aren't polluted; `run` → create `~/.agentos-memory` like `~/.agentos-secrets`):
+>   ```make
+>   # run target:
+>   -virtfs local,path=$(HOME)/.agentos-memory,mount_tag=memory0,security_model=none,id=memory0
+>   # test target:
+>   -virtfs local,path=$(CURDIR)/$(OUTPUT_DIR)/test-memory,mount_tag=memory0,security_model=none,id=memory0
+>   ```
+> - `distro/overlay/etc/agentd/agent.toml` — `[memory]` with
+>   `store_path = "/run/memory/memory.redb"` (and add `kv_get`/`kv_set` to `native` if the
+>   demo exercises memory).
+> - `agentd/src/config.rs` — **no default change** (keep `"memory.redb"`); add a doc-comment:
+>   "container/production deployments set `store_path` to an absolute path on a persistent
+>   mount, e.g. `/run/memory/memory.redb`."
+> - `docs/RUNBOOK.md` — §2b (three-mount model + `~/.agentos-memory`), §3 (filesystem
+>   layout), §6 (backups: the volume is the durable artifact). While here, fix the stale
+>   `4 MB` guard references → `6 MB` (p5.2 bumped the CI guard).
+> - `docs/THREAT_MODEL.md` — note: the memory volume is durable + outside the container, so
+>   the at-rest-encryption gap (§3.3) applies with a larger window; mode 0600 + host perms.
+>
+> **Capability additions:** none. **Event additions:** none.
+>
+> **Tests added:**
+> - `config::tests::absolute_store_path_honored` (if not already covered by p5.1).
+> - **2-boot QA** (document in the PR; full automation needs a two-boot harness): `make run`
+>   → agent `kv_set`s a key → halt → `make run` → `kv_get` returns it. A scripted version
+>   drives two QEMU boots against the same `~/.agentos-memory` and asserts via the flight log.
+>
+> **Test invariants that must hold:** `cargo test` is unchanged (default `store_path`
+> untouched); the single-agent demo flight sequence is unchanged when memory is unused.
+>
+> **Acceptance criteria:**
+> - `make build/run/test` pass; `ls /run/memory` works on the console; the demo's
+>   `memory.redb` lands in `~/.agentos-memory/` on the host.
+> - A `kv_set` value survives a fresh boot (2-boot QA documented in the PR).
+> - Wiping `/run/output` or `make clean` does **not** lose memory.
+> - `make clippy-linux` clean (no crate logic changed). Default `store_path` unchanged.
+> - `docs/RUNBOOK.md` + `docs/THREAT_MODEL.md` updated.
+>
+> **Out of scope:** checkpoint-on-volume (cross-respawn *run*-continuity) — a separate
+> optional toggle; concurrent multi-container access (needs the Layer-2 KB service, §4);
+> at-rest encryption (THREAT_MODEL gap, separate increment).
+>
+> **Known risks:** redb is **single-writer** — the volume supports *sequential* container
+> generations, not two at once (that's the external KB service, §4). The p5.8
+> store-path-vs-sandbox invariant is satisfied for free: `/run/memory` is outside any MCP
+> server's FS sandbox prefix.
+
 > #### ▢ p5.4 — Shared KB MVP (namespace + mutability classes + provenance)
 >
 > **Depends on:** p5.3
@@ -449,7 +523,9 @@ The audit recommends it and Phase 5 depends on it. Written in full increment for
 >
 > **Goal:** The store cannot grow unbounded: per-segment capacity and age floors evict
 > oldest entries (and their index postings). Optionally, an end-of-run distillation
-> pass promotes the run's salient short-term items into Tier 3.
+> pass **compiles** the run's salient short-term items into markdown-wiki Tier-3 entries
+> (the "llm-wiki" content format, DESIGN-memory §4) — distilled, human-readable, and
+> lexically searchable — rather than copying raw turns.
 >
 > **Design reference:** `docs/DESIGN-memory.md` §3 (eviction), §4 (failure modes), §9 Q3.
 >
