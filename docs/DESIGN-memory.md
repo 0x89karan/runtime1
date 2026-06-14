@@ -468,6 +468,38 @@ checkpoint *into* the store.** What changes:
 
 ---
 
+### Persistence — the detachable memory volume
+
+The container is **cattle**; the memory is the **durable identity you re-attach**. Memory
+must not live in container-internal/ephemeral storage. In the QEMU image the rootfs is a
+RAM-backed initramfs — anything outside a host-backed mount is lost on respawn — so the
+durable store (`memory.redb`, Tiers 3/4) lives on a **dedicated persistent volume**, on
+equal footing with secrets:
+
+| mount | direction | lifetime |
+|---|---|---|
+| `secrets0` → `/run/secrets` | in | durable, sensitive |
+| `output0` → `/run/output` | out | **disposable** (logs, files) |
+| **`memory0` → `/run/memory`** | durable state | **persists, re-attachable** |
+
+Kill the container, spawn fresh, re-attach the same `~/.agentos-memory/` → continuity.
+
+**Two continuities, two homes — keep them distinct:**
+- **Knowledge continuity** (long-term + shared KB survive across many container
+  generations) → the memory volume (`memory.redb`, Tiers 3/4). The durable substrate.
+- **Run continuity** (resume an interrupted task after the box died mid-run) →
+  `checkpoint.json` (Tiers 1/2 + scheduler state). Ephemeral by default (deleted on
+  success); put it on the volume only if you want cross-respawn run-resume — and note it's
+  the *sensitive* artifact (full history; the §3.3 / §8 encryption gap bites harder once durable).
+
+Tiers 1/2 staying ephemeral is correct — they *are* the run; the checkpoint is their
+snapshot. Only Tiers 3/4 are durable.
+
+**Single-writer caveat.** redb is single-writer, so the volume supports **sequential**
+container generations (kill → respawn). Two containers sharing one volume *simultaneously*
+needs the external Layer-2 KB service (§4), which handles concurrent clients — the volume
+is for the embedded path. Build spec: increment **p5.3.5** in `docs/PHASE-5-PLAN.md`.
+
 ## 7. Sandbox interactions
 
 The p4.6 Net-shaped invariant trap is worth a deliberate check here, and it yields

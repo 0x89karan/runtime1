@@ -542,6 +542,21 @@ success. Runtime-stamped, unforgeable provenance. Event: `memory_distilled` (man
 remember). **Acceptance:** +4 tests; after clean completion `memory.redb` exists and
 `checkpoint.json` does not; provenance unforgeable.
 
+### ▢ p5.3.5 — Detachable memory volume (distro/infra)
+**Depends on:** p5.1 (`store_path`). Independent of p5.4+ (infra-only — no crate logic, no
+schema, default unchanged), so it builds in parallel. **Run it next / alongside p5.4**,
+before relying on container-respawn for memory continuity, so the shared KB lands on a
+proper durable home rather than being retrofitted. Makes the durable store (`memory.redb`,
+Tiers 3/4) a **separate, persistent, re-attachable volume** — a dedicated `memory0` 9p
+mount (`~/.agentos-memory/` → `/run/memory`), distinct from `secrets0` (in) and the
+disposable `output0` (out). Kill + respawn the container → re-attach the same volume →
+knowledge continuity (run-continuity stays with `checkpoint.json`, a separate concern).
+Design: `docs/DESIGN-memory.md` §6 (detachable volume); full spec + exact distro diff:
+`docs/PHASE-5-PLAN.md` p5.3.5. **Acceptance:** a `kv_set` value written in one boot is
+readable after a fresh boot (2-boot QA); wiping `/run/output` / `make clean` does not lose
+memory; default `store_path` unchanged. (redb is single-writer → sequential container
+generations; concurrent multi-container needs the Layer-2 KB service.)
+
 ### ▢ p5.4 — Shared KB MVP (namespace + mutability classes + provenance)
 **Depends on:** p5.3. Multi-agent segmented KB: one namespace axis, three classes
 (`canon` read-only / `log` append-only / `scratch` mutable LWW+version). `kb_put`/
