@@ -705,6 +705,9 @@ fn missing_mcp_server_with_sandbox_error_stage_unknown() {
 id = "sandbox-stage-test"
 task = "test"
 
+[memory]
+enabled = false
+
 [[tools.mcp_servers]]
 name = "sandboxed-ghost"
 command = "/nonexistent/sandboxed-binary"
