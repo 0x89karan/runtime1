@@ -579,7 +579,7 @@ default off — one budget-bounded inference promoting short-term to Tier 3). Ev
 `memory_evicted`. **Acceptance:** +5 tests; eviction observable; distillation respects
 the budget guard and is off by default (demos unchanged).
 
-### ▢ p5.7 — `/agents/<id>/memory/` + `/agents/kb/` FUSE (read-only)
+### ✅ p5.7 — `/agents/<id>/memory/` + `/agents/kb/` FUSE (read-only)
 **Depends on:** p5.4, p4.7 (F-004). Memory observable from the control plane,
 following the existing inode scheme: per-agent `memory/{short_term,long_term/}` and an
 operator `kb/<segment>/` browse (not an agent capability — does not bypass `KbRead`).

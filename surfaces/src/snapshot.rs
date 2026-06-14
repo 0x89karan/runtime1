@@ -20,6 +20,10 @@ pub struct AgentSnapshot {
     pub context_tokens: u64,
     pub token_budget:  u64,
     pub task_preview:  String,
+    /// Bounded preview of Tier-2 short-term memory (max 20 items).
+    /// Each entry is formatted as `"t{turn} {role}: {content_preview}"`.
+    /// Empty when the agent has no paged turns or memory is disabled.
+    pub short_term_previews: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

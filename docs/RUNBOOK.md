@@ -294,14 +294,59 @@ verify FS-write servers behave before trusting them in production.
 
 ### The FUSE surface (`/agents/<id>/`)
 Read-only. Mounted in dev mode unless `--no-fuse`/`AGENTOS_NO_FUSE`.
+
+**Requires** `fusermount3` on PATH and `agentd` started without `--no-fuse`.
+The `memory/` and `kb/` subtrees only appear when `[memory] enabled = true` is set.
 ```bash
 ls /agents/                        # one dir per running agent (by id)
 cat /agents/scout/status           # running | deferred | awaiting_child | done | failed
 cat /agents/scout/context_size     # working-context token count
 cat /agents/scout/budget           # spend vs token_budget
-cat /agents/scout/flight           # this agent's flight tail
+cat /agents/scout/flight           # this agent's flight events (JSONL — pipe through jq .)
 fusermount3 -u /agents             # manual unmount if a crash left it mounted
 ```
+
+**Memory surface (p5.7+)** — visible once `[memory] enabled = true`:
+```bash
+# Confirm the FUSE memory surface is active
+grep '"kind":"fuse_mounted"' flight.jsonl | tail -1
+
+# Inspect short-term context (up to 20 previews, one per line)
+cat /agents/scout/memory/short_term
+# Example output:
+#   t0 user: Research the competitor landscape for AI agent runtimes
+#   t1 assistant: I'll start by searching for existing frameworks...
+
+# List long-term memory keys (nanosecond timestamp filenames; up to 100 shown)
+ls /agents/scout/memory/long_term/
+# 1749123456789012345  1749234567890123456
+
+# Read a long-term memory entry (raw JSON with value + provenance)
+cat /agents/scout/memory/long_term/1749123456789012345 | jq -r '.value'
+
+# Scan all long-term entries for a keyword
+grep -r "keyword" /agents/scout/memory/long_term/ 2>/dev/null | head
+
+# Browse shared KB segments
+ls /agents/kb/                     # one dir per segment (canon, scratch, etc.)
+cat /agents/kb/canon/my-key        # raw JSON entry
+ls /agents/kb/scratch/ | head -10  # up to 100 keys per segment
+
+# jq one-liner to list all long-term entries with content previews
+for f in /agents/scout/memory/long_term/*; do
+  printf "=== %s ===\n" "$(basename "$f")"
+  cat "$f" | jq -r '.value' 2>/dev/null | head -c 120
+  echo
+done
+```
+
+> **Notes:**
+> - `long_term/` shows at most 100 keys; if the agent has stored more, the rest are
+>   in the store but not listed (no truncation marker — check `mem_recall` or the redb file).
+> - `kb/` only shows segments without the `agent/` namespace prefix (shared KB only;
+>   per-agent long-term memory is under each agent's `long_term/` directory, not here).
+> - `watch -n 1 cat /agents/scout/memory/short_term` works but avoid polling `ls /agents/kb/`
+>   in a tight loop — every `ls kb/` triggers an O(n) namespace scan (p5.8 will add an index).
 
 ### The memory store *(p5.1 landed; tiers land in p5.2+)*
 p5.1 ships a durable key/value store and two tools. **Point at it / enable it:**
@@ -314,9 +359,9 @@ native = ["read_file", "kv_get", "kv_set"]   # kv_* are NOT in "all" — list ex
 ```
 Grant access with `KbRead`/`KbWrite` capabilities (deny-by-default). **Back it up** by
 copying the single `memory.redb` file when `agentd` is stopped (it's a redb file, mode
-0600). **Inspect:** via `kv_get` from an agent, or `/agents/<id>/memory/` *(lands in
-p5.7)*. Per-agent tiers, the shared KB, lexical search, and eviction land across
-p5.2–p5.8 (`PHASE-5-PLAN.md`).
+0600). **Inspect:** via `kv_get` from an agent, or `/agents/<id>/memory/` (p5.7, landed).
+Per-agent tiers, the shared KB, lexical search, and eviction land across p5.2–p5.8
+(`PHASE-5-PLAN.md`).
 
 ### The interface *(lands in p6.x)*
 A `ratatui` TUI shipped as a **separate `agentctl` binary** (read-only over `/agents`
@@ -529,8 +574,8 @@ What's landed vs coming, with operational implications. Design: `DESIGN-memory.m
   capabilities become a real authorization boundary.
 - *(lands in p5.5–p5.6):* `kb_search` (lexical) + eviction/age floors (a growth knob to
   tune).
-- *(lands in p5.7):* `/agents/<id>/memory/` + `/agents/kb/<segment>/` FUSE — read-only
-  memory inspection without `jq`.
+- *p5.7 (landed, v0.24.0):* `/agents/<id>/memory/` + `/agents/kb/<segment>/` FUSE — read-only
+  memory inspection (see §4 "Memory surface" walkthrough).
 - **Semantic search** is *not* in the embedded store: it arrives only by attaching an
   **external hybrid KB as an MCP server** (Layer 2), embeddings from a remote API
   (Voyage/Cohere/OpenAI) — operationally just another `Net`-capable, sandboxed MCP

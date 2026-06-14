@@ -1,5 +1,46 @@
 # TODOS
 
+## Phase 5 — Open (deferred from p5.7)
+
+**p5.7-ar-01 (P2) — Inode map entries are never pruned for terminated agents**
+- `agents_fs.rs`: `DynInoMap` is an append-only `HashMap` keyed by `DynInoKind`. When an agent
+  terminates and its `AgentSnapshot` is removed from `SchedulerSnapshot`, its dynamic inode entries
+  (long-term keys, KB segment keys) remain in the map indefinitely. A long-running daemon with many
+  short-lived agents accumulates unbounded map entries.
+- Fix: on `update_snapshot`, collect the set of live agent IDs and KB segment names; purge `DynInoMap`
+  entries whose agent/segment no longer appears in the snapshot. Deferred to p5.8.
+
+**p5.7-ar-02 (P2) — HashMap lookup in `getattr`/`read` does not assert inode kind**
+- `agents_fs.rs`: dynamic inode handlers call `self.dyn_inos.get(&ino)` and destructure the `DynInoKind`
+  variant via `if let`. If the ino somehow resolves to a different variant than expected (e.g. due to a
+  future inode collision or bug), the else branch returns `ENOENT` silently. A `debug_assert_eq!` on the
+  expected variant would catch regressions early.
+- Fix: add `debug_assert!(matches!(kind, DynInoKind::LtFile { .. }))` etc. in each dynamic handler.
+  Deferred to p5.8.
+
+**p5.7-ar-03 (P2) — `getattr` returns `Directory` for `memory/` and `memory/long_term/` even when memory store is not configured**
+- `agents_fs.rs`: the offsets for `memory/` (`OFF_MEMORY_DIR`) and `memory/long_term/` (`OFF_LT_DIR`) are
+  hardcoded as `FileAttr { kind: Directory }`. When `fuse_mem_access` is `None` (no memory store), lookup
+  for these paths returns `ENOENT`, but `getattr` by inode still returns `Directory`. A client that
+  caches getattr results (like a VFS layer) may see an inconsistent state.
+- Fix: in `getattr`, check `self.mem.is_none()` for the `OFF_MEMORY_DIR`/`OFF_LT_DIR` inodes and return
+  `ENOENT`. Or gate the directory entries at `readdir` time (they are already absent from readdir when
+  `mem.is_none()`). Deferred to p5.8.
+
+**p5.7-ar-04 (P3) — `list_namespaces` is O(n) full ENTRIES scan (no NAMESPACES index)**
+- `memory/store.rs:RedbStore::list_namespaces`: iterates the full ENTRIES table to collect distinct
+  namespace prefixes. For large stores (>10k entries), this is a full table scan on every KB readdir.
+- Fix: maintain a separate `NAMESPACES` redb table (key = namespace string, value = entry count)
+  updated atomically with every put/delete. Deferred to p5.8 (NAMESPACES index pass).
+
+**p5.7-ar-05 (P3) — `MAX_DIR_KEYS=100` truncation is silent (no overflow marker in readdir)**
+- `agents_fs.rs:capped_keys`: the cap is applied with `.take(MAX_DIR_KEYS)`. When a namespace has more
+  than 100 entries, the directory listing is silently truncated. An `ls` that returns 100 entries is
+  indistinguishable from one that exhausted the full set.
+- Fix (or document): emit a sentinel file entry (e.g. `…truncated`) in readdir when the cap fires,
+  or increase `MAX_DIR_KEYS` and add a per-call budget. Document the limit prominently in RUNBOOK.md.
+  (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p5.8.
+
 ## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
 
 **p5.5-ar-01 (P3) — Posting list loading is O(n) RAM at query time**
@@ -511,3 +552,15 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - All existing `Tool::invoke` signatures updated to accept `ctx: &ToolContext`; test helpers updated in `native.rs`, `mod.rs`, `mcp_client.rs`, and `memory_integration.rs`.
 - 331 tests pass (9 new; up from 322 in p5.2).
 - **Completed:** v0.20.0
+
+**p5.7 — FUSE `/agents/<id>/memory/` + `/agents/kb/`**
+- `MemoryAccess` trait in `surfaces/src/lib.rs`: `list_namespaces`, `list_keys`, `get_entry`.
+- `MemoryAccessBridge` newtype in `main.rs` (Linux-only) bridges `Arc<dyn MemoryStore>` → `Arc<dyn MemoryAccess>`.
+- `AgentsFs` extended: `INO_KB=9`, `AGENT_NS_PREFIX`, `MAX_DIR_KEYS=100`, `MAX_SHORT_TERM_PREVIEWS=20`; dynamic inode pool (`DYNAMIC_INO_START=1_000_000`) for `LtFile`/`KbSeg`/`KbFile` inodes.
+- FUSE lookup/readdir for `memory/`, `memory/short_term`, `memory/long_term/`, `memory/long_term/<key>`, `kb/`, `kb/<seg>/`, `kb/<seg>/<key>`.
+- `AgentSnapshot::short_term_previews: Vec<String>` populated in `update_snapshot`.
+- `MemoryStore::list_keys` added (key-only range scan, skips value deserialization).
+- Correctness fixes: existence check before `alloc_dir`/`alloc_kb_seg` in lookup; single `get_entry` per LongTermDir/KbSegDir lookup; removed double RwLock in `OFF_SHORT_TERM`.
+- Deferred: `list_namespaces` full-scan → p5.8 (NAMESPACES table).
+- 445 tests pass (33 surfaces + 412 agentd).
+- **Completed:** v0.24.0

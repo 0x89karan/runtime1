@@ -30,6 +30,8 @@ subsystem, tool, or provider. (For *what* to build, see `ROADMAP.md`; for *why*,
 | `flight_recorder` | the event log (append-only JSONL writer) | business logic |
 | `config` | the TOML spec | runtime state |
 | `memory` | `MemoryStore` trait + `RedbStore` backend; `context` pressure manager + Tier-2 `MemItem`; `validate_segment` | scheduling, agent loop logic |
+| `surfaces` | FUSE virtual filesystem (`AgentsFs`), `SchedulerSnapshot`, `MemoryAccess` bridge trait | business logic, scheduling internals |
+| `sandbox` | `SandboxRule` enum, `compile()`/`apply_compiled()` for Landlock + seccomp-bpf | agent loop logic, scheduling |
 
 When a new subsystem appears in the roadmap, add a module; don't bolt it onto an
 existing one.
@@ -153,6 +155,25 @@ To give an agent read/write access to a namespace:
    starting with `agent:` or `agent/`. Use the tightest scope your agent actually needs.
 4. `KbWrite { segment: "" }` (empty) always denies — the empty segment is a sentinel for
    "capability type check only", never a wildcard write grant.
+
+### FUSE surface paths (p3.1+)
+
+`/agents` is a read-only virtual filesystem mounted via FUSE at boot (Linux only).
+Each agent appears as a directory; memory and KB surfaces appeared in p5.7.
+
+| Path | Content | Format | Notes |
+|---|---|---|---|
+| `/agents/<id>/status` | agent lifecycle state | `running` \| `deferred` \| `awaiting_child:<id>` \| `done` \| `failed` | |
+| `/agents/<id>/context_size` | token count | integer | |
+| `/agents/<id>/budget` | token budget | integer or `unlimited` | |
+| `/agents/<id>/flight` | recent flight events for this agent | JSONL tail (last 20 lines) | |
+| `/agents/<id>/memory/short_term` | in-context conversation previews | one `t{n} {role}: {preview}` per line, ≤20 entries | absent if no memory store configured |
+| `/agents/<id>/memory/long_term/<key>` | per-agent Tier-3 KB entry | raw JSON value + provenance | key is nanosecond timestamp; ≤100 keys shown |
+| `/agents/kb/<segment>/<key>` | shared KB segment entry | raw JSON value + provenance | agent-namespaced entries (`agent/…`) excluded; ≤100 keys per segment |
+
+Silent truncation: directories with more than 100 entries show the first 100 (no overflow marker). An ENTRIES index per segment (NAMESPACES table) is deferred to p5.8.
+
+When adding a new virtual file to an agent directory, assign it the next inode offset in `agents_fs.rs` (`+8`, `+9`, …) and add a row to this table in the same PR.
 
 ## Checkpoint FORMAT_VERSION migration policy
 

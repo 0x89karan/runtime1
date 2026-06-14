@@ -3,6 +3,72 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.7] - 2026-06-14 (v0.24.0)
+
+FUSE memory surface: `/agents/<id>/memory/` and `/agents/kb/` read-only directories
+expose agent short-term/long-term memory and shared KB segments to control-plane tools.
+
+### Added
+- **`surfaces::MemoryAccess` trait**: minimal read-only interface (`list_namespaces`,
+  `list_keys`, `get_entry`) defined in the `surfaces` leaf crate so `AgentsFs` can
+  browse memory without a circular dependency.
+- **`MemoryStore::list_namespaces()`**: default-impl trait method on `MemoryStore`
+  (returns empty); overridden by `RedbStore` to scan ENTRIES for distinct namespace
+  prefixes.
+- **`MemoryAccessBridge`** in `main.rs` (Linux-only): wraps `Arc<dyn MemoryStore>` and
+  implements `MemoryAccess` via `iter()` / `get()` / `list_namespaces()`.
+- **`AgentSnapshot::short_term_previews: Vec<String>`**: bounded projection (≤20 items)
+  of the agent's Tier-2 short-term buffer, formatted `"t{turn} {role}: {preview}"`.
+  Populated by `update_snapshot` in the scheduler.
+- **FUSE inode scheme extended** (new offsets within per-agent 10-slot window):
+  `+5 memory/` (dir), `+6 memory/short_term` (file), `+7 memory/long_term/` (dir).
+  Fixed inode `9` for top-level `kb/` dir. Dynamic pool at `≥1_000_000` for
+  `memory/long_term/<key>`, `kb/<seg>/`, and `kb/<seg>/<key>`.
+- **`/agents/<id>/memory/short_term`**: renders `short_term_previews` from snapshot.
+- **`/agents/<id>/memory/long_term/<key>`**: reads live from `MemoryAccess`; up to
+  100 keys listed per directory to bound snapshot size.
+- **`/agents/kb/<seg>/<key>`**: operator-visible KB browse; only namespaces without
+  `agent/` prefix appear; up to 100 keys per segment.
+- **`mount()` signature updated** to accept `Option<Arc<dyn MemoryAccess>>`; memory
+  subtrees only appear when the store is configured.
+- **467 tests** (up from 406): 9 new surfaces tests in initial commit (`memory_subtree_lists_short_and_long_term`,
+  `short_term_file_reflects_snapshot_previews`, `kb_segment_browse_returns_entry_content`,
+  `large_memory_entry_read_does_not_panic`, `memory_view_stale_snapshot_does_not_tear_ongoing_read`,
+  plus updated `all_eight_inodes_registered_after_alloc` and `file_name_for_offset_covers_all_files`);
+  13 regression tests added during review/QA hardening passes.
+
+### Changed
+- **`MemoryAccessBridge`** errors now emit `tracing::warn!` instead of silently returning
+  empty/`None` — `list_namespaces`, `list_keys`, and `get_entry` all log the error and
+  the namespace/key on failure, making FUSE surface issues visible in the diagnostic log.
+- **`MemoryStore::list_keys(namespace)`** added as a new trait method (default-impl on
+  `MemoryStore`, overridden by `RedbStore`): scans ENTRIES keys for a given namespace
+  prefix without deserializing values, cutting per-readdir allocation in half for
+  `long_term/<key>` and `kb/<seg>/<key>` listings.
+
+### Fixed
+- **`getattr(INO_KB)` returns `ENOENT` when no memory store is configured**: previously
+  the `kb/` directory appeared in `getattr` responses even when `self.memory.is_none()`,
+  making it visible but empty and inconsistent with `readdir`. Now `ENOENT` is returned
+  at the `getattr` level to match the `readdir` behavior.
+- **`alloc_dir()` inode pool exhaustion guard**: added `debug_assert!` to detect if the
+  fixed-inode counter reaches `DYNAMIC_INO_START` (1 000 000), which would corrupt inode
+  lookups silently. Fires in debug/test builds; the fixed pool is large enough for
+  any realistic agent count.
+- **Slash/NUL key filter in `LongTermDir` and `KbSegDir` readdir**: keys containing
+  `/` or `\0` are now silently skipped before being emitted as FUSE directory entries.
+  Such keys would have caused FUSE to corrupt the virtual path tree or cause kernel
+  EINVAL errors on directory listing.
+- **Slash/NUL segment filter in `Kb` readdir**: `list_namespaces()` results are now
+  additionally filtered for `/` and `\0` characters beyond the existing `agent/` prefix
+  filter, preventing malformed segment names from corrupting the `kb/` directory tree.
+- **`KbSegDir` readdir no longer panics on map divergence**: the `self.kb_seg_ino[&segment]`
+  index access (which could panic if `kb_seg_ino` and `dyn_ino_map` diverge) is replaced
+  with `.get()` + `EIO` reply, consistent with the "loop never panics on bad input" invariant.
+- **`wrapping_sub` consistency in `file_content_for_ino`**: plain `ino - dir_ino`
+  subtraction replaced with `ino.wrapping_sub(*dir_ino)` to match the wrapping arithmetic
+  used in every other offset calculation in `agents_fs.rs`.
+
 ## [p5.6] - 2026-06-14 (v0.23.0)
 
 Eviction & summarization: per-segment capacity/age eviction floor and optional

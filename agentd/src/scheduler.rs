@@ -21,6 +21,8 @@ use crate::{
 };
 use surfaces::{AgentSnapshot, AgentStatus, SchedulerSnapshot};
 
+const MAX_SHORT_TERM_PREVIEWS: usize = 20;
+
 type PendingFut = Pin<Box<dyn std::future::Future<Output = EffectResult> + Send>>;
 
 enum EffectResult {
@@ -1145,6 +1147,21 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 context_tokens: task.context_tokens(),
                 token_budget:   task.token_budget(),
                 task_preview:   task.task_preview(80),
+                short_term_previews: task
+                    .short_term
+                    .iter()
+                    .take(MAX_SHORT_TERM_PREVIEWS)
+                    .map(|item| {
+                        let role = match &item.role {
+                            Role::User      => "user",
+                            Role::Assistant => "assistant",
+                        };
+                        // Strip embedded newlines so each preview is always one line
+                        // in the FUSE short_term virtual file (format is line-per-item).
+                        let preview = item.content_preview.replace(['\n', '\r'], " ");
+                        format!("t{} {}: {}", item.turn, role, preview)
+                    })
+                    .collect(),
             }
         })
         .collect();
@@ -2223,6 +2240,102 @@ mod tests {
         let s = snap.read().unwrap();
         let a = s.agents.iter().find(|x| x.id == "a").unwrap();
         assert_eq!(a.status, AgentStatus::Deferred);
+    }
+
+    // ── update_snapshot: short_term_previews ──────────────────────────────────
+
+    #[test]
+    fn update_snapshot_short_term_user_role_formatted() {
+        use crate::memory::MemItem;
+        use crate::inference::Role;
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot::default()));
+        let mut state = minimal_state("a");
+        let agent = state.agents.get_mut("a").unwrap();
+        agent.short_term.push(MemItem {
+            turn:            3,
+            role:            Role::User,
+            content_preview: "hello from user".to_string(),
+            blocks_json:     "[]".to_string(),
+        });
+        update_snapshot(&snap, &state);
+        let s = snap.read().unwrap();
+        let a = s.agents.iter().find(|x| x.id == "a").unwrap();
+        assert_eq!(a.short_term_previews, vec!["t3 user: hello from user"]);
+    }
+
+    #[test]
+    fn update_snapshot_short_term_assistant_role_formatted() {
+        use crate::memory::MemItem;
+        use crate::inference::Role;
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot::default()));
+        let mut state = minimal_state("a");
+        let agent = state.agents.get_mut("a").unwrap();
+        agent.short_term.push(MemItem {
+            turn:            7,
+            role:            Role::Assistant,
+            content_preview: "assistant reply".to_string(),
+            blocks_json:     "[]".to_string(),
+        });
+        update_snapshot(&snap, &state);
+        let s = snap.read().unwrap();
+        let a = s.agents.iter().find(|x| x.id == "a").unwrap();
+        assert_eq!(a.short_term_previews, vec!["t7 assistant: assistant reply"]);
+    }
+
+    #[test]
+    fn update_snapshot_short_term_capped_at_twenty() {
+        use crate::memory::MemItem;
+        use crate::inference::Role;
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot::default()));
+        let mut state = minimal_state("a");
+        let agent = state.agents.get_mut("a").unwrap();
+        // Push 30 items — only 20 should appear in the snapshot
+        for i in 0..30u32 {
+            agent.short_term.push(MemItem {
+                turn:            i,
+                role:            Role::User,
+                content_preview: format!("item-{}", i),
+                blocks_json:     "[]".to_string(),
+            });
+        }
+        update_snapshot(&snap, &state);
+        let s = snap.read().unwrap();
+        let a = s.agents.iter().find(|x| x.id == "a").unwrap();
+        assert_eq!(a.short_term_previews.len(), 20,
+            "short_term_previews must be capped at 20 items");
+        // Verify the first item is item-0
+        assert!(a.short_term_previews[0].contains("item-0"));
+        // Verify the last item is item-19 (not item-29)
+        assert!(a.short_term_previews[19].contains("item-19"));
+    }
+
+    #[test]
+    fn update_snapshot_short_term_newlines_in_preview_are_sanitized() {
+        use crate::memory::MemItem;
+        use crate::inference::Role;
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot::default()));
+        let mut state = minimal_state("a");
+        let agent = state.agents.get_mut("a").unwrap();
+        // content_preview contains embedded newlines (common in multi-line LLM output)
+        agent.short_term.push(MemItem {
+            turn:            1,
+            role:            Role::User,
+            content_preview: "first line\nsecond line\r\nthird line".to_string(),
+            blocks_json:     "[]".to_string(),
+        });
+        update_snapshot(&snap, &state);
+        let s = snap.read().unwrap();
+        let a = s.agents.iter().find(|x| x.id == "a").unwrap();
+        assert_eq!(a.short_term_previews.len(), 1);
+        // The preview must not contain raw newlines — the FUSE short_term file is
+        // line-per-item; embedded newlines would corrupt the format.
+        assert!(!a.short_term_previews[0].contains('\n'),
+            "short_term_previews must not contain embedded newlines");
+        assert!(!a.short_term_previews[0].contains('\r'),
+            "short_term_previews must not contain embedded carriage returns");
+        // Content should still be present (spaces substituted for newlines)
+        assert!(a.short_term_previews[0].contains("first line"));
+        assert!(a.short_term_previews[0].contains("second line"));
     }
 
     // ── p3.2: checkpoint / restore tests ─────────────────────────────────────

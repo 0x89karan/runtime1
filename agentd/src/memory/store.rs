@@ -390,6 +390,38 @@ impl MemoryStore for RedbStore {
         Ok(results)
     }
 
+    fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+        let txn = self.db.begin_read().context("beginning read")?;
+        let table = txn.open_table(ENTRIES).context("opening entries table")?;
+        let mut seen = std::collections::BTreeSet::new();
+        for item in table.iter().context("iterating entries for namespaces")? {
+            let (k_guard, _) = item.context("reading entry")?;
+            let k = k_guard.value();
+            if let Some(sep) = k.find('\x00') {
+                seen.insert(k[..sep].to_string());
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
+
+    fn list_keys(&self, namespace: &str) -> anyhow::Result<Vec<String>> {
+        let prefix_start = format!("{}\x00", namespace);
+        let prefix_end   = format!("{}\x01", namespace);
+        let txn = self.db.begin_read().context("beginning read transaction")?;
+        let table = txn.open_table(ENTRIES).context("opening entries table")?;
+        let range = table
+            .range(prefix_start.as_str()..prefix_end.as_str())
+            .context("iterating namespace keys")?;
+        let ns_prefix_len = namespace.len() + 1; // +1 for \x00
+        let mut keys = Vec::new();
+        for item in range {
+            let (k_guard, _) = item.context("reading range item")?;
+            let k_str = k_guard.value();
+            keys.push(k_str[ns_prefix_len..].to_string());
+        }
+        Ok(keys)
+    }
+
     fn meta_version(&self) -> anyhow::Result<u64> {
         let txn = self.db.begin_read().context("beginning read transaction")?;
         let table = txn.open_table(META).context("opening meta table")?;
@@ -1123,5 +1155,41 @@ mod tests {
         // max_entries = 5; only 2 present → nothing evicted.
         let evicted = store.evict("kb:test", Some(5), None, 3000).unwrap();
         assert!(evicted.is_empty(), "nothing should be evicted when under capacity");
+    }
+
+    // ── list_namespaces ───────────────────────────────────────────────────────
+
+    #[test]
+    fn list_namespaces_empty_store_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let ns = store.list_namespaces().unwrap();
+        assert!(ns.is_empty(), "empty store must return no namespaces");
+    }
+
+    #[test]
+    fn list_namespaces_deduplicates_and_sorts() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put("agent/alice", "k1", "v1").unwrap();
+        store.put("agent/alice", "k2", "v2").unwrap();  // same namespace, second key
+        store.put("agent/bob", "k1", "v1").unwrap();
+        store.put("canon", "doc-1", "v1").unwrap();
+        let ns = store.list_namespaces().unwrap();
+        // Should be exactly 3 unique namespaces, sorted
+        assert_eq!(ns, vec!["agent/alice", "agent/bob", "canon"],
+            "namespaces must be deduplicated and alphabetically sorted");
+    }
+
+    #[test]
+    fn list_namespaces_single_namespace_multiple_keys() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        for i in 0..10 {
+            store.put("scratch", &format!("key-{}", i), "val").unwrap();
+        }
+        let ns = store.list_namespaces().unwrap();
+        assert_eq!(ns, vec!["scratch"],
+            "multiple keys in one namespace must yield exactly one namespace entry");
     }
 }

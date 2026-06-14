@@ -12,7 +12,37 @@ use agentd::tools::{
     ToolRegistry,
 };
 use sandbox::{CompiledSandbox, SandboxRule};
+#[cfg(target_os = "linux")]
+use surfaces::MemoryAccess;
 use surfaces::SchedulerSnapshot;
+
+/// Bridge from `Arc<dyn MemoryStore>` to `Arc<dyn MemoryAccess>` for the FUSE handler.
+#[cfg(target_os = "linux")]
+struct MemoryAccessBridge(Arc<dyn agentd::memory::MemoryStore>);
+#[cfg(target_os = "linux")]
+impl MemoryAccess for MemoryAccessBridge {
+    fn list_namespaces(&self) -> Vec<String> {
+        self.0.list_namespaces().unwrap_or_else(|e| {
+            tracing::warn!("memory FUSE: list_namespaces error: {e:#}");
+            vec![]
+        })
+    }
+    fn list_keys(&self, namespace: &str) -> Vec<String> {
+        self.0.list_keys(namespace).unwrap_or_else(|e| {
+            tracing::warn!("memory FUSE: list_keys({namespace}) error: {e:#}");
+            vec![]
+        })
+    }
+    fn get_entry(&self, namespace: &str, key: &str) -> Option<String> {
+        match self.0.get(namespace, key) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("memory FUSE: get({namespace}, {key}) error: {e:#}");
+                None
+            }
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -420,7 +450,10 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         );
         None
     } else {
-        match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot)) {
+        let fuse_mem_access: Option<Arc<dyn MemoryAccess>> = memory_store_for_distillation
+            .as_ref()
+            .map(|s| Arc::new(MemoryAccessBridge(Arc::clone(s))) as Arc<dyn MemoryAccess>);
+        match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot), fuse_mem_access) {
             Ok(session) => {
                 recorder.record(
                     "agentd",

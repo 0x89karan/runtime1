@@ -102,6 +102,24 @@ pub trait MemoryStore: Send + Sync {
     ) -> anyhow::Result<(Vec<SearchHit>, usize)>;
     // returns (hits, terms_matched)
 
+    // ── FUSE surface listing (p5.7) ─────────────────────────────────────────
+
+    /// Return all distinct namespace strings that contain at least one entry.
+    ///
+    /// Used by the FUSE `/agents/kb/` directory to enumerate KB segments.
+    /// Default returns empty; override in concrete stores.
+    fn list_namespaces(&self) -> anyhow::Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Return all keys in `namespace` without fetching values.
+    ///
+    /// Prefer this over `iter()` when values are not needed (e.g. FUSE directory
+    /// listings). Default falls back to `iter()`; override for efficiency.
+    fn list_keys(&self, namespace: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self.iter(namespace)?.into_iter().map(|(k, _)| k).collect())
+    }
+
     // ── Eviction (p5.6) ─────────────────────────────────────────────────────
 
     /// Evict entries from `namespace` that exceed capacity or age limits.

@@ -91,7 +91,14 @@ drops oldest entries beyond `max_entries`/`max_age` removing ENTRIES+INDEX+AGE+M
 `max_entries_per_segment`, `max_entry_age_days`, `distill_on_complete`; `Scheduler::with_distillation()`
 builder enables post-run short-term→Tier-3 inference summarization (budget-bounded, off by default);
 `docs/CONVENTIONS.md` row for `memory_evicted`; 406 tests.
-**Next: p5.7 (FUSE `/agents/<id>/memory/` + `/agents/kb/`) — see `docs/ROADMAP.md`.**
+**p5.7 complete (v0.24.0).** FUSE memory surface: `surfaces::MemoryAccess` trait (leaf-crate,
+no circular dep); `MemoryStore::list_namespaces()` default-impl with `RedbStore` override;
+`MemoryAccessBridge` in `main.rs` wraps `Arc<dyn MemoryStore>` → `Arc<dyn MemoryAccess>`;
+`AgentSnapshot::short_term_previews` (≤20 items); new inode offsets +5/+6/+7 for
+`memory/`/`memory/short_term`/`memory/long_term/`; fixed inode 9 for `kb/`; dynamic pool
+≥1_000_000 for `memory/long_term/<key>`, `kb/<seg>/`, `kb/<seg>/<key>`; bounded key lists
+(MAX_DIR_KEYS=100); `mount()` accepts `Option<Arc<dyn MemoryAccess>>`; 446 tests.
+**Next: p5.8 (Phase 5 hardening) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 
