@@ -15,7 +15,8 @@ use crate::{
     checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, SchedulerCheckpoint},
     config::{AgentConfig, ModelConfig, SchedulerConfig, SpawnConfig},
     flight_recorder::{EventKind, FlightRecorder},
-    inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse},
+    inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse, Msg, Role},
+    memory::MemoryStore,
     tools::ToolRegistry,
 };
 use surfaces::{AgentSnapshot, AgentStatus, SchedulerSnapshot};
@@ -103,14 +104,16 @@ struct SchedulerRestored {
 }
 
 pub struct Scheduler {
-    agents:   HashMap<String, AgentTask>,
-    sched:    SchedulerConfig,
-    gateway:  Arc<dyn InferenceGateway + Send + Sync>,
-    registry: Arc<ToolRegistry>,
-    recorder: Arc<FlightRecorder>,
-    snapshot: Arc<RwLock<SchedulerSnapshot>>,
-    store:    CheckpointStore,
-    restored: Option<SchedulerRestored>,
+    agents:              HashMap<String, AgentTask>,
+    sched:               SchedulerConfig,
+    gateway:             Arc<dyn InferenceGateway + Send + Sync>,
+    registry:            Arc<ToolRegistry>,
+    recorder:            Arc<FlightRecorder>,
+    snapshot:            Arc<RwLock<SchedulerSnapshot>>,
+    store:               CheckpointStore,
+    restored:            Option<SchedulerRestored>,
+    memory_store:        Option<Arc<dyn MemoryStore>>,
+    distill_on_complete: bool,
 }
 
 impl Scheduler {
@@ -195,13 +198,45 @@ impl Scheduler {
             }
         }
 
-        Ok(Self { agents, sched, gateway, registry, recorder, snapshot, store, restored })
+        Ok(Self {
+            agents,
+            sched,
+            gateway,
+            registry,
+            recorder,
+            snapshot,
+            store,
+            restored,
+            memory_store:        None,
+            distill_on_complete: false,
+        })
+    }
+
+    /// Attach a memory store and enable end-of-run short-term distillation.
+    /// When set, each completed agent whose `short_term` buffer is non-empty gets one
+    /// budget-bounded inference call; the result is written to `agent/{id}/distilled/…`
+    /// and a `memory_distilled` event is emitted. Off by default — existing demos unchanged.
+    pub fn with_distillation(mut self, store: Arc<dyn MemoryStore>) -> Self {
+        self.memory_store = Some(store);
+        self.distill_on_complete = true;
+        self
     }
 
     /// Run all agents concurrently until every one reaches a terminal state.
     /// Returns a map from agent_id to Ok(answer) or Err.
     pub async fn run(self) -> HashMap<String, anyhow::Result<String>> {
-        let Self { agents, sched, gateway, registry, recorder, snapshot, store, restored } = self;
+        let Self {
+            agents,
+            sched,
+            gateway,
+            registry,
+            recorder,
+            snapshot,
+            store,
+            restored,
+            memory_store,
+            distill_on_complete,
+        } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
 
@@ -432,6 +467,115 @@ impl Scheduler {
                 &registry,
                 &recorder,
             );
+        }
+
+        // Post-run distillation (p5.6): promote each completed agent's short-term
+        // buffer to Tier 3 via one bounded inference call. Off by default.
+        if distill_on_complete {
+            if let Some(ref mem_store) = memory_store {
+                // Collect agents that have short_term items.
+                let candidates: Vec<(String, Vec<crate::memory::MemItem>)> = state
+                    .agents
+                    .iter()
+                    .filter(|(_, t)| !t.short_term.is_empty())
+                    .map(|(id, t)| (id.clone(), t.short_term.clone()))
+                    .collect();
+
+                for (agent_id, items) in candidates {
+                    // Budget guard: require headroom for at least a small inference.
+                    const MIN_DISTILL_TOKENS: u64 = 512;
+                    let budget_ok = sched.global_token_budget == 0
+                        || state.tokens_spent + MIN_DISTILL_TOKENS <= sched.global_token_budget;
+                    if !budget_ok {
+                        break;
+                    }
+
+                    let summary_text = items
+                        .iter()
+                        .map(|m| {
+                            let role_str = match m.role {
+                                Role::User => "user",
+                                Role::Assistant => "assistant",
+                            };
+                            format!("[turn {}] {}: {}", m.turn, role_str, m.content_preview)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let req = InferenceRequest {
+                        system: Some(
+                            "Distill the following conversation excerpts into a brief, \
+                             factual summary of key findings and decisions."
+                                .to_string(),
+                        ),
+                        messages: vec![Msg {
+                            role: Role::User,
+                            blocks: vec![Block::Text {
+                                text: format!(
+                                    "Summarize these memory excerpts:\n{summary_text}"
+                                ),
+                            }],
+                        }],
+                        tools:      vec![],
+                        max_tokens: 1024,
+                    };
+
+                    let max_out_tokens = match sched.global_token_budget {
+                        0 => req.max_tokens,
+                        cap => {
+                            let remaining = cap.saturating_sub(state.tokens_spent) as u32;
+                            req.max_tokens.min(remaining)
+                        }
+                    };
+                    let req = InferenceRequest { max_tokens: max_out_tokens, ..req };
+
+                    match gateway.infer(req).await {
+                        Ok(resp) => {
+                            let distilled: String = resp
+                                .blocks
+                                .iter()
+                                .filter_map(|b| {
+                                    if let Block::Text { text } = b {
+                                        Some(text.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(" ");
+
+                            state.tokens_spent +=
+                                resp.input_tokens as u64 + resp.output_tokens as u64;
+
+                            let ns = format!("agent/{agent_id}");
+                            let key = format!(
+                                "distilled/{:016x}",
+                                items.iter().map(|m| m.turn as u64).max().unwrap_or(0)
+                            );
+                            let store_clone = Arc::clone(mem_store);
+                            let _ = tokio::task::spawn_blocking(move || {
+                                store_clone.put(&ns, &key, &distilled)
+                            })
+                            .await;
+
+                            recorder.record(
+                                &agent_id,
+                                None,
+                                EventKind::MemoryDistilled,
+                                json!({ "agent": agent_id, "items": items.len() }),
+                            );
+                        }
+                        Err(e) => {
+                            recorder.record(
+                                &agent_id,
+                                None,
+                                EventKind::Error,
+                                json!({ "stage": "distillation", "error": e.to_string() }),
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         state.outcomes
@@ -2270,6 +2414,134 @@ mod tests {
         ).unwrap();
         let outcomes = sched.run().await;
         assert!(outcomes["nochk"].is_ok(), "agent must complete successfully with interval=0");
+    }
+
+    // ── p5.6: distill_on_complete ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn distill_on_complete_promotes_to_tier3() {
+        use crate::memory::{MemItem, MemoryStore};
+        use crate::memory::store::RedbStore;
+        use crate::inference::Role as InfRole;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mem_path = dir.path().join("mem.redb");
+        let (mem_store, _) = RedbStore::open(&mem_path).unwrap();
+        let mem_arc: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(mem_store);
+
+        // Agent gets one response then ends; two extra responses for distillation
+        // (MockGateway is queried once per agent turn + once for distillation).
+        let gw = MockGateway::new(vec![
+            end_turn("agent answer", 10, 5),
+            end_turn("distilled summary of key findings", 20, 10),
+        ]);
+
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("distil", "some task")],
+            &model_cfg(),
+            unlimited(),
+            std::sync::Arc::new(gw),
+            std::sync::Arc::new(ToolRegistry::new()),
+            std::sync::Arc::clone(&rec),
+            std::sync::Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        )
+        .unwrap();
+
+        // Inject a short_term item so distillation triggers.
+        // We do this by running, then manually checking via a fresh build where
+        // short_term would be populated by real paging.
+        // For this test we verify the machinery fires when short_term is non-empty —
+        // inject it via a helper that creates a second Scheduler with pre-seeded state.
+        // Simpler: since paging is driven by token pressure and our mock uses tiny
+        // token counts, just trust the distillation path works when the condition is
+        // met. Here we directly set short_term via the pub(crate) accessor in tests
+        // by replacing the agent before running.
+        let mut sched_with_items = sched;
+        // Seed short_term items into the agent before run (access pub(crate) field).
+        let agent = sched_with_items.agents.get_mut("distil").unwrap();
+        agent.short_term.push(MemItem {
+            turn: 1,
+            role: InfRole::User,
+            content_preview: "first paged turn preview".to_string(),
+            blocks_json: "[]".to_string(),
+        });
+
+        let sched_distil = sched_with_items.with_distillation(std::sync::Arc::clone(&mem_arc));
+        sched_distil.run().await;
+
+        // Verify: a memory_distilled event must be in the flight log.
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            log.contains("\"memory_distilled\""),
+            "memory_distilled event must be emitted after distillation run"
+        );
+
+        // Verify: the distilled content is in the memory store.
+        let entries = mem_arc.iter("agent/distil").unwrap();
+        assert!(
+            !entries.is_empty(),
+            "distilled content must be written to memory store under agent/distil"
+        );
+    }
+
+    #[tokio::test]
+    async fn distill_disabled_no_extra_inference() {
+        use crate::memory::{MemItem, MemoryStore};
+        use crate::memory::store::RedbStore;
+        use crate::inference::Role as InfRole;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let mem_path = dir.path().join("mem.redb");
+        let (mem_store, _) = RedbStore::open(&mem_path).unwrap();
+        let mem_arc: std::sync::Arc<dyn MemoryStore> = std::sync::Arc::new(mem_store);
+
+        // Only one response queued — if distillation fires it would drain the queue
+        // and MockGateway would error.
+        let gw = MockGateway::new(vec![end_turn("agent answer", 10, 5)]);
+
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("nodeistil", "some task")],
+            &model_cfg(),
+            unlimited(),
+            std::sync::Arc::new(gw),
+            std::sync::Arc::new(ToolRegistry::new()),
+            std::sync::Arc::clone(&rec),
+            std::sync::Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        )
+        .unwrap();
+
+        // Seed a short_term item — distillation would consume an inference if enabled.
+        let mut sched_items = sched;
+        let agent = sched_items.agents.get_mut("nodeistil").unwrap();
+        agent.short_term.push(MemItem {
+            turn: 1,
+            role: InfRole::User,
+            content_preview: "paged turn".to_string(),
+            blocks_json: "[]".to_string(),
+        });
+
+        // Do NOT call with_distillation — distill_on_complete stays false.
+        sched_items.run().await;
+
+        // memory_distilled must NOT appear in the log.
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            !log.contains("\"memory_distilled\""),
+            "memory_distilled must not appear when distill_on_complete is false"
+        );
+
+        // Memory store must stay empty.
+        let entries = mem_arc.iter("agent/nodeistil").unwrap();
+        assert!(
+            entries.is_empty(),
+            "no distilled content must be written when distillation is disabled"
+        );
     }
 
     #[tokio::test]

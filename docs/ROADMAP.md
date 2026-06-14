@@ -572,7 +572,7 @@ tokenized inverted index (`memory/index.rs`, BM25-lite in Rust) maintained
 transactionally with entry writes. No embeddings, no network. Event: `kb_search`.
 **Acceptance:** +6 tests; ranked, segment-scoped, author-filterable; `KbRead`-gated.
 
-### ▢ p5.6 — Eviction & summarization
+### ✅ p5.6 — Eviction & summarization
 **Depends on:** p5.5. Per-segment capacity/age eviction floor (drops oldest + index
 postings in one txn); optional end-of-run distillation (`distill_on_complete`,
 default off — one budget-bounded inference promoting short-term to Tier 3). Event:

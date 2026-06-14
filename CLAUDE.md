@@ -84,7 +84,14 @@ with `memory::MutabilityClass`; `kv_set` canon/log bypass fixed; provenance stam
 writes; `doc_count:{namespace}` META key for IDF; 21-word stoplist tokenizer in `memory/index.rs`;
 `MemoryStore::search()` + `SearchHit`; flat output with content/provenance expanded; `KbRead`-gated;
 `kb_search` flight event; 390 tests.
-**Next: p5.6 (eviction & summarization) — see `docs/ROADMAP.md`.**
+**p5.6 complete (v0.23.0).** Eviction & summarization: `AGE` redb table (composite key → Unix
+timestamp) written atomically with every put/append, removed on delete; `MemoryStore::evict()`
+drops oldest entries beyond `max_entries`/`max_age` removing ENTRIES+INDEX+AGE+META in one txn;
+`EvictedEntry` struct; `EventKind::MemoryEvicted`; `[memory]` config fields
+`max_entries_per_segment`, `max_entry_age_days`, `distill_on_complete`; `Scheduler::with_distillation()`
+builder enables post-run short-term→Tier-3 inference summarization (budget-bounded, off by default);
+`docs/CONVENTIONS.md` row for `memory_evicted`; 406 tests.
+**Next: p5.7 (FUSE `/agents/<id>/memory/` + `/agents/kb/`) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

@@ -65,8 +65,11 @@ pub struct SegmentConfig {
 ///
 /// ```toml
 /// [memory]
-/// store_path = "memory.redb"   # relative to CWD or absolute
-/// enabled    = true
+/// store_path             = "memory.redb"   # relative to CWD or absolute
+/// enabled                = true
+/// max_entries_per_segment = 500            # p5.6: evict oldest beyond this
+/// max_entry_age_days      = 90             # p5.6: evict entries older than N days
+/// distill_on_complete     = false          # p5.6: summarise short-term → Tier 3
 ///
 /// [[memory.segments]]          # p5.4: declare shared KB segments
 /// name  = "project:notes"
@@ -90,6 +93,19 @@ pub struct MemoryConfig {
     /// mutability class in the store at startup.
     #[serde(default)]
     pub segments: Vec<SegmentConfig>,
+    /// Per-segment capacity limit (p5.6). Oldest entries are evicted first once the
+    /// count exceeds this value. `None` (the default) means no capacity-based eviction.
+    #[serde(default)]
+    pub max_entries_per_segment: Option<usize>,
+    /// Per-segment age limit in days (p5.6). Entries older than this are evicted.
+    /// `None` (the default) means no age-based eviction.
+    #[serde(default)]
+    pub max_entry_age_days: Option<u64>,
+    /// When true, each completed agent's short-term memory buffer is distilled into
+    /// a single Tier-3 inference summary at the end of the run (p5.6).
+    /// Default false — existing demos unchanged.
+    #[serde(default)]
+    pub distill_on_complete: bool,
 }
 
 fn default_memory_store_path() -> String {
@@ -103,9 +119,12 @@ fn default_memory_enabled() -> bool {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            store_path: default_memory_store_path(),
-            enabled: default_memory_enabled(),
-            segments: Vec::new(),
+            store_path:               default_memory_store_path(),
+            enabled:                  default_memory_enabled(),
+            segments:                 Vec::new(),
+            max_entries_per_segment:  None,
+            max_entry_age_days:       None,
+            distill_on_complete:      false,
         }
     }
 }
@@ -832,6 +851,39 @@ enabled = false
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.memory.store_path, "/var/lib/agentd/mem.redb");
         assert!(!cfg.memory.enabled);
+    }
+
+    // ── p5.6: eviction config tests ──────────────────────────────────────────
+
+    #[test]
+    fn memory_config_eviction_fields_default_to_none_and_false() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.memory.max_entries_per_segment.is_none(), "max_entries_per_segment defaults None");
+        assert!(cfg.memory.max_entry_age_days.is_none(), "max_entry_age_days defaults None");
+        assert!(!cfg.memory.distill_on_complete, "distill_on_complete defaults false");
+    }
+
+    #[test]
+    fn memory_config_eviction_fields_parse() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[memory]
+max_entries_per_segment = 500
+max_entry_age_days = 90
+distill_on_complete = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.memory.max_entries_per_segment, Some(500));
+        assert_eq!(cfg.memory.max_entry_age_days, Some(90));
+        assert!(cfg.memory.distill_on_complete);
     }
 
     #[test]

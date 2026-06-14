@@ -3,6 +3,35 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.6] - 2026-06-14 (v0.23.0)
+
+Eviction & summarization: per-segment capacity/age eviction floor and optional
+end-of-run short-term distillation.
+
+### Added
+- **`MemoryStore::evict()`** trait method and `RedbStore` implementation: drops oldest
+  entries beyond `max_entries` and/or older than `max_age_secs`, removing ENTRIES +
+  INDEX postings + AGE + META doc_count in a single atomic transaction. Returns
+  `Vec<EvictedEntry>` with key + reason (`"capacity"` or `"age"`).
+- **`AGE` redb table**: composite key → Unix timestamp (seconds). Written atomically
+  with every `put()` and `append()` write; removed on `delete()` and eviction.
+- **`EvictedEntry`** struct in `memory/mod.rs`: `key: String`, `reason: String`.
+- **`EventKind::MemoryEvicted`** in `events.rs`: serializes as `"memory_evicted"`;
+  data shape: `{ segment, key, reason }`.
+- **Config fields** on `[memory]`: `max_entries_per_segment: Option<usize>`,
+  `max_entry_age_days: Option<u64>`, `distill_on_complete: bool` (default false).
+- **`Scheduler::with_distillation(store)`** builder: attaches a memory store and
+  enables end-of-run short-term distillation. For each completed agent whose
+  `short_term` buffer is non-empty, makes one budget-bounded inference call to
+  summarize the paged turns and writes the result to `agent/{id}/distilled/…` under
+  Tier 3. Respects the global token budget guard; off by default (demos unchanged).
+- **`docs/CONVENTIONS.md`**: `memory_evicted` row added to event taxonomy table.
+- 406 tests (up from 397): 5 new eviction store tests (`evicts_oldest_beyond_capacity`,
+  `evicts_entries_past_max_age`, `eviction_removes_index_postings`,
+  `evict_empty_namespace_returns_empty`, `evict_below_capacity_does_nothing`),
+  2 scheduler tests (`distill_on_complete_promotes_to_tier3`,
+  `distill_disabled_no_extra_inference`), 2 config tests.
+
 ## [p5.5] - 2026-06-14 (v0.22.0)
 
 Retrieval as tool: `kb_search` with BM25-lite inverted index over the shared KB.

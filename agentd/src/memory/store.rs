@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::memory::{index, MemoryStore, MutabilityClass, SearchHit, SCHEMA_VERSION};
+use crate::memory::{index, EvictedEntry, MemoryStore, MutabilityClass, SearchHit, SCHEMA_VERSION};
 
 /// Composite entry key: `"{namespace}\x00{key}"`.
 /// The `\x00` separator is safe because our namespace/key grammar disallows
@@ -11,6 +11,8 @@ use crate::memory::{index, MemoryStore, MutabilityClass, SearchHit, SCHEMA_VERSI
 const ENTRIES: TableDefinition<&str, &str> = TableDefinition::new("entries");
 /// Inverted index: key = `"{namespace}\x00{word}"`, value = JSON array of entry keys.
 const INDEX: TableDefinition<&str, &str> = TableDefinition::new("index");
+/// Write timestamp per entry: key = composite entry key, value = Unix seconds.
+const AGE: TableDefinition<&str, u64> = TableDefinition::new("age");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 
 const SEG_CLASS_PREFIX: &str = "seg_class:";
@@ -24,6 +26,13 @@ fn entry_key(namespace: &str, key: &str) -> String {
 
 fn index_key(namespace: &str, word: &str) -> String {
     format!("{}\x00{}", namespace, word)
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub struct RedbStore {
@@ -110,6 +119,7 @@ impl RedbStore {
             // Open all tables to ensure they exist before any read.
             let _entries = txn.open_table(ENTRIES).context("opening entries table")?;
             let _index = txn.open_table(INDEX).context("opening index table")?;
+            let _age = txn.open_table(AGE).context("opening age table")?;
             let mut meta = txn.open_table(META).context("opening meta table")?;
             if meta
                 .get("format_version")
@@ -206,27 +216,15 @@ impl RedbStore {
         }
         Ok(())
     }
-}
 
-impl MemoryStore for RedbStore {
-    fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<String>> {
-        let k = entry_key(namespace, key);
-        let txn = self.db.begin_read().context("beginning read transaction")?;
-        let table = txn.open_table(ENTRIES).context("opening entries table")?;
-        let result = table
-            .get(k.as_str())
-            .context("reading entry")?
-            .map(|guard| guard.value().to_string());
-        Ok(result)
-    }
-
-    fn put(&self, namespace: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    fn put_at(&self, namespace: &str, key: &str, value: &str, now_secs: u64) -> anyhow::Result<()> {
         let ek = entry_key(namespace, key);
         let new_tokens = index::tokenize(value);
         let txn = self.db.begin_write().context("beginning write transaction")?;
         {
             let mut entries_tbl = txn.open_table(ENTRIES).context("opening entries table")?;
             let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
+            let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
             let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
 
             let old_value = entries_tbl
@@ -242,6 +240,7 @@ impl MemoryStore for RedbStore {
             }
 
             entries_tbl.insert(ek.as_str(), value).context("inserting entry")?;
+            age_tbl.insert(ek.as_str(), now_secs).context("writing age")?;
             Self::index_tokens(&mut index_tbl, namespace, ek.as_str(), &new_tokens)
                 .context("indexing new tokens on put")?;
 
@@ -261,13 +260,14 @@ impl MemoryStore for RedbStore {
         Ok(())
     }
 
-    fn append(&self, namespace: &str, key: &str, value: &str) -> anyhow::Result<()> {
+    fn append_at(&self, namespace: &str, key: &str, value: &str, now_secs: u64) -> anyhow::Result<()> {
         let ek = entry_key(namespace, key);
         let new_tokens = index::tokenize(value);
         let txn = self.db.begin_write().context("beginning write transaction")?;
         {
             let mut entries_tbl = txn.open_table(ENTRIES).context("opening entries table")?;
             let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
+            let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
             let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
 
             let old_value_opt = entries_tbl
@@ -286,6 +286,7 @@ impl MemoryStore for RedbStore {
             entries_tbl
                 .insert(ek.as_str(), combined.as_str())
                 .context("inserting appended entry")?;
+            age_tbl.insert(ek.as_str(), now_secs).context("writing age for append")?;
 
             // Only index the newly-appended portion; old tokens already indexed.
             Self::index_tokens(&mut index_tbl, namespace, ek.as_str(), &new_tokens)
@@ -306,6 +307,27 @@ impl MemoryStore for RedbStore {
         txn.commit().context("committing append")?;
         Ok(())
     }
+}
+
+impl MemoryStore for RedbStore {
+    fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<String>> {
+        let k = entry_key(namespace, key);
+        let txn = self.db.begin_read().context("beginning read transaction")?;
+        let table = txn.open_table(ENTRIES).context("opening entries table")?;
+        let result = table
+            .get(k.as_str())
+            .context("reading entry")?
+            .map(|guard| guard.value().to_string());
+        Ok(result)
+    }
+
+    fn put(&self, namespace: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        self.put_at(namespace, key, value, unix_now_secs())
+    }
+
+    fn append(&self, namespace: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        self.append_at(namespace, key, value, unix_now_secs())
+    }
 
     fn delete(&self, namespace: &str, key: &str) -> anyhow::Result<bool> {
         let ek = entry_key(namespace, key);
@@ -313,6 +335,7 @@ impl MemoryStore for RedbStore {
         let existed = {
             let mut entries_tbl = txn.open_table(ENTRIES).context("opening entries table")?;
             let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
+            let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
             let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
 
             let old_value = entries_tbl
@@ -325,6 +348,7 @@ impl MemoryStore for RedbStore {
                 Self::deindex_tokens(&mut index_tbl, namespace, ek.as_str(), &old_tokens)
                     .context("deindexing deleted entry")?;
                 entries_tbl.remove(ek.as_str()).context("deleting entry")?;
+                age_tbl.remove(ek.as_str()).context("removing age entry")?;
                 let doc_count_key = format!("{DOC_COUNT_PREFIX}{namespace}");
                 let cur = meta_tbl
                     .get(doc_count_key.as_str())
@@ -570,6 +594,126 @@ impl MemoryStore for RedbStore {
         hits.truncate(limit);
 
         Ok((hits, terms_matched))
+    }
+
+    fn evict(
+        &self,
+        namespace: &str,
+        max_entries: Option<usize>,
+        max_age_secs: Option<u64>,
+        now_secs: u64,
+    ) -> anyhow::Result<Vec<EvictedEntry>> {
+        let prefix_start = format!("{}\x00", namespace);
+        let prefix_end = format!("{}\x01", namespace);
+        let ns_prefix_len = namespace.len() + 1;
+
+        // Phase 1: read AGE table to get all entries for this namespace.
+        let all_entries: Vec<(String, u64)> = {
+            let txn = self.db.begin_read().context("beginning read for eviction scan")?;
+            let age_tbl = txn.open_table(AGE).context("opening age table for eviction")?;
+            let range = age_tbl
+                .range(prefix_start.as_str()..prefix_end.as_str())
+                .context("scanning age table")?;
+            let mut entries = Vec::new();
+            for item in range {
+                let (k_guard, v_guard) = item.context("reading age item")?;
+                entries.push((k_guard.value().to_string(), v_guard.value()));
+            }
+            entries
+        };
+
+        if all_entries.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Identify entries to evict; track (composite_key, reason).
+        let mut to_evict: Vec<(String, String)> = Vec::new();
+
+        // Age-based eviction.
+        if let Some(max_age) = max_age_secs {
+            let oldest_allowed = now_secs.saturating_sub(max_age);
+            for (composite_key, ts) in &all_entries {
+                if *ts < oldest_allowed {
+                    to_evict.push((composite_key.clone(), "age".to_string()));
+                }
+            }
+        }
+
+        // Capacity-based eviction (oldest-first after age evictions are removed).
+        if let Some(max_cap) = max_entries {
+            let age_evicted: std::collections::HashSet<&str> =
+                to_evict.iter().map(|(k, _)| k.as_str()).collect();
+            let mut remaining: Vec<(&String, u64)> = all_entries
+                .iter()
+                .filter(|(k, _)| !age_evicted.contains(k.as_str()))
+                .map(|(k, ts)| (k, *ts))
+                .collect();
+            if remaining.len() > max_cap {
+                remaining.sort_unstable_by_key(|(_, ts)| *ts);
+                let evict_count = remaining.len() - max_cap;
+                for (k, _) in remaining.iter().take(evict_count) {
+                    to_evict.push(((*k).clone(), "capacity".to_string()));
+                }
+            }
+        }
+
+        if to_evict.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Phase 2: atomically delete the evicted entries from all tables.
+        let txn = self.db.begin_write().context("beginning write for eviction")?;
+        let mut evicted = Vec::new();
+        {
+            let mut entries_tbl = txn.open_table(ENTRIES).context("opening entries table")?;
+            let mut index_tbl = txn.open_table(INDEX).context("opening index table")?;
+            let mut age_tbl = txn.open_table(AGE).context("opening age table")?;
+            let mut meta_tbl = txn.open_table(META).context("opening meta table")?;
+            let doc_count_key = format!("{DOC_COUNT_PREFIX}{namespace}");
+
+            for (composite_key, reason) in &to_evict {
+                let old_value = entries_tbl
+                    .get(composite_key.as_str())
+                    .context("reading entry for eviction")?
+                    .map(|g| g.value().to_string());
+
+                let Some(ref old_v) = old_value else { continue };
+                let old_tokens = index::tokenize(old_v);
+                Self::deindex_tokens(
+                    &mut index_tbl,
+                    namespace,
+                    composite_key.as_str(),
+                    &old_tokens,
+                )
+                .context("deindexing evicted entry")?;
+                entries_tbl
+                    .remove(composite_key.as_str())
+                    .context("removing evicted entry")?;
+                age_tbl
+                    .remove(composite_key.as_str())
+                    .context("removing age for evicted entry")?;
+
+                let cur = meta_tbl
+                    .get(doc_count_key.as_str())
+                    .context("reading doc count")?
+                    .map(|g| g.value())
+                    .unwrap_or(0);
+                if cur > 0 {
+                    meta_tbl
+                        .insert(doc_count_key.as_str(), cur - 1)
+                        .context("decrementing doc count after eviction")?;
+                }
+
+                let user_key = composite_key
+                    .strip_prefix(&prefix_start)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| composite_key[ns_prefix_len..].to_string());
+                evicted.push(EvictedEntry { key: user_key, reason: reason.clone() });
+            }
+        }
+        txn.commit().context("committing eviction")?;
+
+        Ok(evicted)
     }
 }
 
@@ -904,5 +1048,80 @@ mod tests {
         let (hits, _) = store.search(Some("kb:docs"), "quokka", Some("any-agent"), 10).unwrap();
         assert_eq!(hits.len(), 1, "entry without provenance must be included under author filter");
         assert_eq!(hits[0].key, "plain");
+    }
+
+    // ── p5.6: eviction ──────────────────────────────────────────────────────
+
+    #[test]
+    fn evict_empty_namespace_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let evicted = store.evict("kb:empty", Some(10), Some(3600), 1_000_000).unwrap();
+        assert!(evicted.is_empty(), "nothing to evict in empty namespace");
+    }
+
+    #[test]
+    fn evicts_oldest_beyond_capacity() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        // Write 3 entries with distinct timestamps using put_at.
+        store.put_at("kb:test", "old", "oldest entry content", 1000).unwrap();
+        store.put_at("kb:test", "mid", "middle entry content", 2000).unwrap();
+        store.put_at("kb:test", "new", "newest entry content", 3000).unwrap();
+        // Capacity = 2 → oldest must be evicted.
+        let evicted = store.evict("kb:test", Some(2), None, 4000).unwrap();
+        assert_eq!(evicted.len(), 1, "one entry must be evicted");
+        assert_eq!(evicted[0].key, "old");
+        assert_eq!(evicted[0].reason, "capacity");
+        // Remaining: mid, new.
+        assert!(store.get("kb:test", "old").unwrap().is_none(), "old must be gone");
+        assert!(store.get("kb:test", "mid").unwrap().is_some(), "mid must remain");
+        assert!(store.get("kb:test", "new").unwrap().is_some(), "new must remain");
+    }
+
+    #[test]
+    fn evicts_entries_past_max_age() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put_at("kb:test", "stale", "stale content here", 100).unwrap();
+        store.put_at("kb:test", "fresh", "fresh content here", 5000).unwrap();
+        // max_age = 3600s; now = 6000 → cutoff = 2400 → stale (ts=100) must be evicted.
+        let evicted = store.evict("kb:test", None, Some(3600), 6000).unwrap();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].key, "stale");
+        assert_eq!(evicted[0].reason, "age");
+        assert!(store.get("kb:test", "stale").unwrap().is_none());
+        assert!(store.get("kb:test", "fresh").unwrap().is_some());
+    }
+
+    #[test]
+    fn eviction_removes_index_postings() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put_at("kb:test", "evict-me", "catamaran sailing unique", 100).unwrap();
+        store.put_at("kb:test", "keep-me", "kayak paddling unique", 5000).unwrap();
+        // Verify both are searchable before eviction.
+        let (before, _) = store.search(Some("kb:test"), "unique", None, 10).unwrap();
+        assert_eq!(before.len(), 2);
+        // Evict by age: cutoff = 4000 → evict-me (ts=100) gone, keep-me (ts=5000) stays.
+        store.evict("kb:test", None, Some(3600), 6000).unwrap();
+        // "catamaran" must no longer appear.
+        let (cat, _) = store.search(Some("kb:test"), "catamaran", None, 10).unwrap();
+        assert_eq!(cat.len(), 0, "catamaran posting must be removed after eviction");
+        // "unique" from keep-me must still appear.
+        let (uniq, _) = store.search(Some("kb:test"), "unique", None, 10).unwrap();
+        assert_eq!(uniq.len(), 1);
+        assert_eq!(uniq[0].key, "keep-me");
+    }
+
+    #[test]
+    fn evict_below_capacity_does_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put_at("kb:test", "a", "alpha content", 1000).unwrap();
+        store.put_at("kb:test", "b", "beta content", 2000).unwrap();
+        // max_entries = 5; only 2 present → nothing evicted.
+        let evicted = store.evict("kb:test", Some(5), None, 3000).unwrap();
+        assert!(evicted.is_empty(), "nothing should be evicted when under capacity");
     }
 }

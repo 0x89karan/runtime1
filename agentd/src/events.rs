@@ -62,6 +62,9 @@ pub enum EventKind {
     /// Agent called `kb_search`; inverted index queried.
     /// data: { agent_id, segment?, query_preview, hits: usize, terms_matched: usize }
     KbSearch,
+    /// Entry evicted from a KB segment (capacity or age floor).
+    /// data: { segment, key, reason: "capacity"|"age" }
+    MemoryEvicted,
     Error,
 }
 
@@ -116,6 +119,7 @@ mod tests {
         assert_eq!(kind_str(EventKind::MemoryPaged), "memory_paged");
         assert_eq!(kind_str(EventKind::MemoryDistilled), "memory_distilled");
         assert_eq!(kind_str(EventKind::KbSearch), "kb_search");
+        assert_eq!(kind_str(EventKind::MemoryEvicted), "memory_evicted");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

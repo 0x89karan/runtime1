@@ -18,6 +18,14 @@ pub enum MutabilityClass {
     Scratch,
 }
 
+/// An entry evicted from a KB segment by the capacity/age floor.
+#[derive(Debug, Clone)]
+pub struct EvictedEntry {
+    pub key: String,
+    /// `"capacity"` or `"age"`.
+    pub reason: String,
+}
+
 /// A single result from a `kb_search` query.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -93,6 +101,24 @@ pub trait MemoryStore: Send + Sync {
         limit: usize,
     ) -> anyhow::Result<(Vec<SearchHit>, usize)>;
     // returns (hits, terms_matched)
+
+    // ── Eviction (p5.6) ─────────────────────────────────────────────────────
+
+    /// Evict entries from `namespace` that exceed capacity or age limits.
+    ///
+    /// - `max_entries`: if `Some(n)`, evict oldest entries until `count ≤ n`.
+    /// - `max_age_secs`: if `Some(s)`, evict entries written before `now_secs - s`.
+    /// - `now_secs`: caller-supplied Unix timestamp in seconds (avoids `SystemTime` in store).
+    ///
+    /// Returns the list of evicted entries (key + reason). Eviction happens in
+    /// one atomic transaction: ENTRIES + INDEX + AGE + META all consistent.
+    fn evict(
+        &self,
+        namespace: &str,
+        max_entries: Option<usize>,
+        max_age_secs: Option<u64>,
+        now_secs: u64,
+    ) -> anyhow::Result<Vec<EvictedEntry>>;
 }
 
 /// Validate that a namespace or key string conforms to the allowed grammar.

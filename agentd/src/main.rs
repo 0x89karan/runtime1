@@ -169,6 +169,8 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         }
     }
 
+    // Keep a clone for distillation wiring (p5.6) before moving into the registry.
+    let memory_store_for_distillation = memory_store.clone();
     register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store)?;
 
     // Pass 1: validate capabilities and isolation settings before spawning any process.
@@ -496,6 +498,17 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             }
             return Err(e);
         }
+    };
+
+    // Wire p5.6 distillation if enabled.
+    let scheduler = if cfg.memory.distill_on_complete {
+        if let Some(store) = memory_store_for_distillation {
+            scheduler.with_distillation(store)
+        } else {
+            scheduler
+        }
+    } else {
+        scheduler
     };
 
     let outcomes = scheduler.run().await;

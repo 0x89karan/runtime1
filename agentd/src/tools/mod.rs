@@ -564,6 +564,15 @@ mod tests {
             hits.truncate(limit);
             Ok((hits, terms_matched))
         }
+        fn evict(
+            &self,
+            _namespace: &str,
+            _max_entries: Option<usize>,
+            _max_age_secs: Option<u64>,
+            _now_secs: u64,
+        ) -> anyhow::Result<Vec<crate::memory::EvictedEntry>> {
+            Ok(vec![])
+        }
     }
 
     #[test]
