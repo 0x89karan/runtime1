@@ -2,7 +2,7 @@ use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
 use agentd::{agent::{truncate, PREVIEW_CHARS}, checkpoint::CheckpointStore, config, scheduler::Scheduler};
-use agentd::capability::Capability;
+use agentd::capability::{normalize_path, Capability};
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
 use agentd::memory::store::RedbStore;
@@ -154,6 +154,53 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // Open memory store (if enabled). Quarantine corrupt files and emit flight events.
     let memory_store: Option<Arc<dyn agentd::memory::MemoryStore>> = if cfg.memory.enabled {
         let store_path = PathBuf::from(&cfg.memory.store_path);
+
+        // Startup invariant (p5.8): the memory store must not fall inside any MCP
+        // server's AllowFsRead or AllowFsWrite sandbox prefix.  A sandboxed server
+        // that can read/write the store path could corrupt or exfiltrate all memory.
+        // We only enforce the absolute-path requirement when MCP FS prefixes are
+        // present — without them, starts_with is not applicable and relative paths
+        // are harmless (they resolve relative to CWD as before p5.8).
+        let norm_store = normalize_path(&store_path);
+        let has_mcp_fs_prefix = cfg.tools.mcp_servers.iter().any(|srv| {
+            srv.capabilities.iter().flatten().any(|cap| {
+                matches!(cap, Capability::FsRead { .. } | Capability::FsWrite { .. })
+            })
+        });
+        if has_mcp_fs_prefix {
+            anyhow::ensure!(
+                norm_store.is_absolute(),
+                "memory.store_path must be an absolute path when MCP FS prefixes are \
+                 configured, got: {}  \
+                 (set store_path = \"/run/memory/memory.redb\" in [memory])",
+                store_path.display()
+            );
+        }
+        for srv in &cfg.tools.mcp_servers {
+            for cap in srv.capabilities.iter().flatten() {
+                let prefix = match cap {
+                    Capability::FsRead { prefix } | Capability::FsWrite { prefix } => prefix,
+                    _ => continue,
+                };
+                let norm_prefix = normalize_path(std::path::Path::new(prefix));
+                // Empty prefix after normalization is not a valid grant — skip it.
+                // (mirrors the guard in capability.rs satisfies())
+                if norm_prefix.as_os_str().is_empty() {
+                    continue;
+                }
+                anyhow::ensure!(
+                    !norm_store.starts_with(&norm_prefix),
+                    "memory store {} falls inside MCP server {:?}'s {} sandbox prefix {}; \
+                     move the store outside all server FS prefixes \
+                     (e.g. set store_path = \"/run/memory/memory.redb\" in [memory])",
+                    norm_store.display(),
+                    srv.name,
+                    if matches!(cap, Capability::FsRead { .. }) { "FsRead" } else { "FsWrite" },
+                    norm_prefix.display()
+                );
+            }
+        }
+
         match RedbStore::open(&store_path) {
             Ok((store, quarantined)) => {
                 if let Some(ref corrupt_path) = quarantined {
@@ -1011,6 +1058,86 @@ mod tests {
         let args: Vec<String> = ["agent.toml", "--log-path"]
             .iter().map(|s| s.to_string()).collect();
         assert_eq!(parse_log_path(&args), None);
+    }
+
+    // ── p5.8 startup invariant: store_path must not fall inside MCP FS prefix ─
+
+    #[test]
+    fn store_path_inside_sandbox_prefix_fails_startup() {
+        use agentd::capability::normalize_path;
+        use std::path::{Path, PathBuf};
+
+        // Replicates the startup assertion logic from run() in isolation.
+        fn check(store_path_str: &str, prefix_str: &str) -> anyhow::Result<()> {
+            let store_path = PathBuf::from(store_path_str);
+            let norm_store = normalize_path(&store_path);
+            anyhow::ensure!(
+                norm_store.is_absolute(),
+                "memory.store_path must be an absolute path: {}",
+                store_path.display()
+            );
+            let norm_prefix = normalize_path(Path::new(prefix_str));
+            if norm_prefix.as_os_str().is_empty() {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                !norm_store.starts_with(&norm_prefix),
+                "store {} inside prefix {}",
+                norm_store.display(),
+                norm_prefix.display()
+            );
+            Ok(())
+        }
+
+        // Case 1: absolute store inside FS prefix → error
+        assert!(
+            check("/var/run/memory.redb", "/var/run").is_err(),
+            "absolute store inside FS prefix must be rejected"
+        );
+
+        // Case 2: absolute store outside all FS prefixes → ok
+        assert!(
+            check("/run/memory/memory.redb", "/tmp/workspace").is_ok(),
+            "absolute store outside FS prefixes must be accepted"
+        );
+
+        // Case 3: store path with '..' that normalizes into prefix → error
+        assert!(
+            check("/var/run/../run/memory.redb", "/var/run").is_err(),
+            "store path with '..' resolving inside prefix must be rejected"
+        );
+
+        // Case 4: empty prefix is skipped; absolute store → ok
+        assert!(
+            check("/run/memory/memory.redb", "").is_ok(),
+            "empty MCP FS prefix must be skipped (not a wildcard match)"
+        );
+    }
+
+    // ── p5.8 CONVENTIONS.md event taxonomy completeness check ─────────────────
+
+    #[test]
+    fn event_taxonomy_completeness() {
+        // All 9 Phase-5 memory/KB event kind strings must appear in CONVENTIONS.md.
+        // This fails if a new event is added to events.rs but the docs table is not updated.
+        let conventions = include_str!("../../docs/CONVENTIONS.md");
+        let required_kinds = [
+            "memory_read",
+            "memory_write",
+            "memory_unavailable",
+            "memory_quarantined",
+            "memory_pressure_advisory",
+            "memory_paged",
+            "memory_distilled",
+            "kb_search",
+            "memory_evicted",
+        ];
+        for kind in &required_kinds {
+            assert!(
+                conventions.contains(kind),
+                "CONVENTIONS.md missing event kind: `{kind}` — add a row to the taxonomy table"
+            );
+        }
     }
 }
 

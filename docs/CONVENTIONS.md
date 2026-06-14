@@ -26,7 +26,7 @@ subsystem, tool, or provider. (For *what* to build, see `ROADMAP.md`; for *why*,
 | `tools` | the `Tool` ABI, native tools, MCP client | agent/loop logic |
 | `capability` | what an agent is allowed to do | enforcement of unrelated concerns |
 | `bus` | agent addressing, messaging, spawn | scheduling internals |
-| `events` | `EventKind` enum + stable string serialization | business logic |
+| `events` | `EventKind` enum + stable string serialization; canonical taxonomy source of truth for all `EventKind` variants | business logic |
 | `flight_recorder` | the event log (append-only JSONL writer) | business logic |
 | `config` | the TOML spec | runtime state |
 | `memory` | `MemoryStore` trait + `RedbStore` backend; `context` pressure manager + Tier-2 `MemItem`; `validate_segment` | scheduling, agent loop logic |
@@ -93,6 +93,7 @@ Phase 0 kinds (canonical — do not rename):
 | `memory_quarantined` | corrupt store renamed to `.corrupt`; fresh store opened (path) (p5.1+) |
 | `memory_pressure_advisory` | token spend reached SOFT_THRESHOLD (75%); advisory only, no eviction (agent, turn, tokens_spent_pct, soft_threshold) (p5.2+) |
 | `memory_paged` | oldest turn pairs evicted from active context to short_term Tier 2 (agent, turn, pages_moved, short_term_depth, tokens_spent_pct) (p5.2+) |
+| `memory_distilled` | `mem_remember` committed a long-term memory entry to Tier 3 (agent, key, bytes) (p5.3+) |
 | `kb_search` | `kb_search` tool invoked; inverted index queried (agent_id, segment, query_preview, hits: usize, terms_matched: usize) (p5.5+) |
 | `memory_evicted` | entry evicted from a KB segment by capacity or age floor (segment, key, reason: "capacity"\|"age") (p5.6+) |
 

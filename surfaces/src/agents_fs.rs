@@ -212,9 +212,14 @@ impl AgentsFs {
             let base = self.dir_inodes[agent_id];
             let offset = parent.wrapping_sub(base);
             return match offset {
-                0                => Some(ParentKind::AgentDir(agent_id.clone())),
-                o if o == OFF_MEMORY_DIR    => Some(ParentKind::MemoryDir(agent_id.clone())),
-                o if o == OFF_LONG_TERM_DIR => Some(ParentKind::LongTermDir(agent_id.clone())),
+                0 => Some(ParentKind::AgentDir(agent_id.clone())),
+                // ar-03: memory/ and long_term/ do not exist when no memory store is configured.
+                o if o == OFF_MEMORY_DIR && self.memory.is_some() => {
+                    Some(ParentKind::MemoryDir(agent_id.clone()))
+                }
+                o if o == OFF_LONG_TERM_DIR && self.memory.is_some() => {
+                    Some(ParentKind::LongTermDir(agent_id.clone()))
+                }
                 _ => None,
             };
         }
@@ -270,15 +275,75 @@ impl AgentsFs {
         let mem = self.memory.as_ref()?;
         match self.dyn_ino_kind.get(&ino)? {
             DynInoKind::LtFile { agent_id, key } => {
+                // ar-02: this arm is reached only when dyn_ino_kind maps ino → LtFile.
                 let ns = format!("{}{}", AGENT_NS_PREFIX, agent_id);
                 let val = mem.get_entry(&ns, key)?;
                 Some(value_bytes(&val))
             }
             DynInoKind::KbFile { segment, key } => {
+                // ar-02: this arm is reached only when dyn_ino_kind maps ino → KbFile.
                 let val = mem.get_entry(segment, key)?;
                 Some(value_bytes(&val))
             }
             DynInoKind::KbSeg { .. } => None,  // directory, not a file
+        }
+    }
+
+    /// Prune all inode-map entries for a dead agent (ar-01).
+    ///
+    /// Must be called with the agent_id *collected into a String* before this
+    /// call — callers iterate `dir_inodes.keys()` and must collect the dead IDs
+    /// into a `Vec<String>` before calling this (Rust borrow checker requires it).
+    fn prune_dead_agent(&mut self, agent_id: &str) {
+        if let Some(base) = self.dir_inodes.remove(agent_id) {
+            // Remove all 8 fixed per-agent inodes (dir + offsets 1–7).
+            for offset in [
+                0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
+                OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR,
+            ] {
+                self.inode_to_id.remove(&(base + offset));
+            }
+        }
+        // Remove dynamic inodes for this agent's long-term keys.
+        let lt_keys_to_remove: Vec<(String, String)> = self
+            .lt_key_ino
+            .keys()
+            .filter(|(id, _)| id == agent_id)
+            .cloned()
+            .collect();
+        for k in &lt_keys_to_remove {
+            if let Some(ino) = self.lt_key_ino.remove(k) {
+                self.dyn_ino_kind.remove(&ino);
+            }
+        }
+        // Remove kb_seg_ino entries scoped to this agent's namespace prefix.
+        // Shared segments ("canon", "scratch") use flat names — not "agent/{id}/" —
+        // so they are correctly left untouched by this filter.
+        let agent_seg_prefix = format!("agent/{}/", agent_id);
+        let kb_segs_to_remove: Vec<String> = self
+            .kb_seg_ino
+            .keys()
+            .filter(|seg| seg.starts_with(&agent_seg_prefix))
+            .cloned()
+            .collect();
+        for seg in &kb_segs_to_remove {
+            if let Some(ino) = self.kb_seg_ino.remove(seg) {
+                self.dyn_ino_kind.remove(&ino);
+            }
+        }
+        // Remove kb_key_ino entries (individual file inodes) for this agent's segments.
+        // Mirrors the kb_seg_ino cleanup above — must also clear the file-level inodes
+        // or dyn_ino_kind will accumulate stale KbFile entries for dead agents.
+        let kb_files_to_remove: Vec<(String, String)> = self
+            .kb_key_ino
+            .keys()
+            .filter(|(seg, _)| seg.starts_with(&agent_seg_prefix))
+            .cloned()
+            .collect();
+        for k in &kb_files_to_remove {
+            if let Some(ino) = self.kb_key_ino.remove(k) {
+                self.dyn_ino_kind.remove(&ino);
+            }
         }
     }
 
@@ -289,6 +354,13 @@ impl AgentsFs {
         if let Some(agent_id) = self.inode_to_id.get(&ino) {
             let base = self.dir_inodes[agent_id];
             let offset = ino.wrapping_sub(base);
+            // ar-03: mirror the getattr() guard — memory/ and long_term/ do not
+            // exist as directories when no memory store is configured.
+            if (offset == OFF_MEMORY_DIR || offset == OFF_LONG_TERM_DIR)
+                && self.memory.is_none()
+            {
+                return false;
+            }
             return matches!(offset, 0) || offset == OFF_MEMORY_DIR || offset == OFF_LONG_TERM_DIR;
         }
         if let Some(DynInoKind::KbSeg { .. }) = self.dyn_ino_kind.get(&ino) {
@@ -536,8 +608,19 @@ impl fuser::Filesystem for AgentsFs {
         if let Some(agent_id) = self.inode_to_id.get(&ino).cloned() {
             let base   = self.dir_inodes[&agent_id];
             let offset = ino.wrapping_sub(base);
-            if matches!(offset, 0) || offset == OFF_MEMORY_DIR || offset == OFF_LONG_TERM_DIR {
+            if matches!(offset, 0) {
                 reply.attr(&TTL, &make_file_attr(ino, 0, fuser::FileType::Directory));
+            } else if offset == OFF_MEMORY_DIR || offset == OFF_LONG_TERM_DIR {
+                // ar-03: return ENOENT for memory/ and long_term/ when the memory store
+                // is not configured — prevents VFS-layer inconsistency where getattr
+                // returns Directory for an inode that readdir never lists.
+                // OFF_SHORT_TERM (+6) intentionally exempted: it serves from
+                // AgentSnapshot::short_term_previews regardless of store state.
+                if self.memory.is_none() {
+                    reply.error(libc::ENOENT);
+                } else {
+                    reply.attr(&TTL, &make_file_attr(ino, 0, fuser::FileType::Directory));
+                }
             } else {
                 let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
                 reply.attr(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile));
@@ -603,6 +686,23 @@ impl fuser::Filesystem for AgentsFs {
                 };
                 let agent_ids: Vec<String> = snap.agents.iter().map(|a| a.id.clone()).collect();
                 drop(snap);
+
+                // ar-01: prune inode maps for agents no longer in the snapshot.
+                // Collect dead IDs first — cannot iterate dir_inodes.keys() and
+                // mutate self simultaneously (Rust borrow checker).
+                {
+                    use std::collections::HashSet;
+                    let live: HashSet<&str> = agent_ids.iter().map(String::as_str).collect();
+                    let dead: Vec<String> = self
+                        .dir_inodes
+                        .keys()
+                        .filter(|id| !live.contains(id.as_str()))
+                        .cloned()
+                        .collect();
+                    for id in &dead {
+                        self.prune_dead_agent(id);
+                    }
+                }
 
                 let mut v = vec![
                     (ROOT_INO, fuser::FileType::Directory, ".".to_string()),
@@ -1374,5 +1474,131 @@ mod tests {
             .unwrap_or_default();
         assert!(namespaces.is_empty(),
             "kb/ readdir must return no segments when memory=None");
+    }
+
+    // ── prune_dead_agent (ar-01) ──────────────────────────────────────────────
+
+    #[test]
+    fn inode_map_pruned_on_snapshot_update() {
+        // ar-01: prune_dead_agent must remove all 5 maps' entries for the given agent.
+        let snap = make_snap(vec![agent_snap("agent-a", AgentStatus::Running)]);
+        let mock = MockMemory::new();
+        mock.insert("agent/agent-a", "lt-key", "val");
+        let mut fs = AgentsFs::new(snap, Some(mock));
+        let base = fs.alloc_dir("agent-a");
+        let lt_ino = fs.alloc_lt_file("agent-a", "lt-key");
+        let _kb_seg_ino = fs.alloc_kb_seg("canon"); // shared seg — must NOT be pruned
+
+        // Sanity: agent-a dir and lt entry registered
+        assert!(fs.dir_inodes.contains_key("agent-a"), "precondition: dir_inodes");
+        assert!(fs.inode_to_id.contains_key(&base), "precondition: base inode");
+        assert!(fs.inode_to_id.contains_key(&(base + OFF_STATUS)), "precondition: status inode");
+        assert!(fs.lt_key_ino.contains_key(&("agent-a".to_string(), "lt-key".to_string())),
+            "precondition: lt_key_ino");
+        assert!(fs.dyn_ino_kind.contains_key(&lt_ino), "precondition: dyn_ino_kind");
+
+        // Prune agent-a
+        fs.prune_dead_agent("agent-a");
+
+        // All agent-a entries must be gone from every map
+        assert!(!fs.dir_inodes.contains_key("agent-a"), "dir_inodes must be cleared");
+        for offset in [0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
+                       OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR] {
+            assert!(!fs.inode_to_id.contains_key(&(base + offset)),
+                "inode_to_id must not contain base+{offset} after prune");
+        }
+        assert!(!fs.lt_key_ino.contains_key(&("agent-a".to_string(), "lt-key".to_string())),
+            "lt_key_ino must be cleared");
+        assert!(!fs.dyn_ino_kind.contains_key(&lt_ino), "dyn_ino_kind lt entry must be cleared");
+
+        // Shared "canon" segment must NOT be pruned — it has no "agent/agent-a/" prefix
+        assert!(fs.kb_seg_ino.contains_key("canon"), "shared KB segment must survive prune");
+    }
+
+    // ── ar-03: getattr ENOENT for memory dirs when no store ──────────────────
+
+    #[test]
+    fn getattr_memory_dir_enoent_when_no_store() {
+        // ar-03: with no memory store, getattr for OFF_MEMORY_DIR and
+        // OFF_LONG_TERM_DIR must return ENOENT.  We can't call getattr() directly
+        // in unit tests (it takes a FUSE ReplyAttr), so we verify the preconditions
+        // that drive the ENOENT branch: the inodes ARE registered by alloc_dir (so
+        // the lookup reaches the ar-03 guard), and file_content_for_ino returns
+        // None for those directory offsets, consistent with ENOENT semantics.
+        let snap = make_snap(vec![agent_snap("x", AgentStatus::Running)]);
+        let mut fs = AgentsFs::new(snap, None); // no memory store
+        let base = fs.alloc_dir("x");
+
+        // Precondition: memory=None (ar-03 guard fires)
+        assert!(fs.memory.is_none(), "precondition: no memory store configured");
+
+        // Inodes ARE registered — getattr reaches the guard before returning ENOENT
+        assert!(fs.inode_to_id.contains_key(&(base + OFF_MEMORY_DIR)),
+            "memory/ inode registered even without store");
+        assert!(fs.inode_to_id.contains_key(&(base + OFF_LONG_TERM_DIR)),
+            "long_term/ inode registered even without store");
+
+        // Directory offsets have no file content — no torn read possible
+        assert!(fs.file_content_for_ino(base + OFF_MEMORY_DIR).is_none(),
+            "memory/ is a directory: no file content");
+        assert!(fs.file_content_for_ino(base + OFF_LONG_TERM_DIR).is_none(),
+            "long_term/ is a directory: no file content");
+    }
+
+    #[test]
+    fn getattr_short_term_ok_when_no_store() {
+        // ar-03 exemption regression guard: OFF_SHORT_TERM is intentionally
+        // served from AgentSnapshot (not the memory store), so getattr must NOT
+        // return ENOENT even when memory=None.
+        let snap = make_snap(vec![AgentSnapshot {
+            short_term_previews: vec!["t0 user: hello".to_string()],
+            ..agent_snap("x", AgentStatus::Running)
+        }]);
+        let mut fs = AgentsFs::new(snap, None); // no memory store
+        let base = fs.alloc_dir("x");
+
+        assert!(fs.memory.is_none(), "precondition: no memory store");
+
+        // short_term must be readable from the snapshot even without memory store
+        let content = fs.file_content_for_ino(base + OFF_SHORT_TERM);
+        assert!(content.is_some(), "short_term must be readable without memory store");
+        let s = String::from_utf8(content.unwrap()).unwrap();
+        assert!(s.contains("t0 user: hello"), "short_term content must reflect snapshot previews");
+    }
+
+    // ── prune_dead_agent kb_key_ino cleanup ───────────────────────────────────
+
+    #[test]
+    fn prune_dead_agent_cleans_kb_key_ino() {
+        // Regression guard: prune_dead_agent must clean kb_key_ino and the
+        // associated dyn_ino_kind::KbFile entries for agent-scoped segments.
+        let snap = make_snap(vec![agent_snap("agent-kb", AgentStatus::Running)]);
+        let mut fs = AgentsFs::new(snap, None);
+        fs.alloc_dir("agent-kb");
+        // Allocate a KB file inode in this agent's scoped segment.
+        let kb_ino = fs.alloc_kb_file("agent/agent-kb/scratch", "key1");
+
+        assert!(fs.kb_key_ino.contains_key(&("agent/agent-kb/scratch".to_string(), "key1".to_string())),
+            "precondition: kb_key_ino entry exists");
+        assert!(fs.dyn_ino_kind.contains_key(&kb_ino),
+            "precondition: dyn_ino_kind::KbFile entry exists");
+
+        fs.prune_dead_agent("agent-kb");
+
+        assert!(!fs.kb_key_ino.contains_key(&("agent/agent-kb/scratch".to_string(), "key1".to_string())),
+            "kb_key_ino must be cleared after prune");
+        assert!(!fs.dyn_ino_kind.contains_key(&kb_ino),
+            "dyn_ino_kind::KbFile entry must be cleared after prune");
+    }
+
+    #[test]
+    fn prune_dead_agent_idempotent_for_unknown_agent() {
+        // prune_dead_agent on a never-allocated agent_id must be a no-op (no panic).
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None);
+        // Must not panic even though "ghost" was never registered.
+        fs.prune_dead_agent("ghost");
+        assert!(fs.dir_inodes.is_empty());
+        assert!(fs.inode_to_id.is_empty());
     }
 }

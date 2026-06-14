@@ -587,7 +587,7 @@ Read-only; bounded snapshot projection. **Acceptance:** +4 tests; `make clippy-l
 clean; `cat /agents/<id>/memory/long_term/<key>` works on the QEMU image; F-004
 regression test passes.
 
-### ▢ p5.8 — Phase 5 hardening pass
+### ✅ p5.8 — Phase 5 hardening pass
 **Depends on:** p5.1–p5.7. THREAT_MODEL §7 written in full; the **p4.6-shaped startup
 invariant** asserted (`memory.redb` path must not fall inside any MCP server's FS
 sandbox prefix); a demo `agents.toml` that actually exercises memory (KbWrite+Net

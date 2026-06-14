@@ -1,37 +1,23 @@
 # TODOS
 
-## Phase 5 — Open (deferred from p5.7)
+## Phase 5 — Open (deferred from p5.8)
 
-**p5.7-ar-01 (P2) — Inode map entries are never pruned for terminated agents**
-- `agents_fs.rs`: `DynInoMap` is an append-only `HashMap` keyed by `DynInoKind`. When an agent
-  terminates and its `AgentSnapshot` is removed from `SchedulerSnapshot`, its dynamic inode entries
-  (long-term keys, KB segment keys) remain in the map indefinitely. A long-running daemon with many
-  short-lived agents accumulates unbounded map entries.
-- Fix: on `update_snapshot`, collect the set of live agent IDs and KB segment names; purge `DynInoMap`
-  entries whose agent/segment no longer appears in the snapshot. Deferred to p5.8.
+**~~p5.7-ar-01 (P2) — Inode map entries are never pruned for terminated agents~~** ✓ Fixed in p5.8.
+- `prune_dead_agent()` method added to `AgentsFs`; called in `readdir(Root)` for every agent ID
+  in the current snapshot that is absent from the live agent set. Cleans all 6 maps: `dir_inodes`,
+  `inode_to_id`, `dyn_ino_kind`, `lt_key_ino`, `kb_seg_ino`, `kb_key_ino`.
 
-**p5.7-ar-02 (P2) — HashMap lookup in `getattr`/`read` does not assert inode kind**
-- `agents_fs.rs`: dynamic inode handlers call `self.dyn_inos.get(&ino)` and destructure the `DynInoKind`
-  variant via `if let`. If the ino somehow resolves to a different variant than expected (e.g. due to a
-  future inode collision or bug), the else branch returns `ENOENT` silently. A `debug_assert_eq!` on the
-  expected variant would catch regressions early.
-- Fix: add `debug_assert!(matches!(kind, DynInoKind::LtFile { .. }))` etc. in each dynamic handler.
-  Deferred to p5.8.
+**~~p5.7-ar-02 (P2) — HashMap lookup in `getattr`/`read` does not assert inode kind~~** ✓ Fixed in p5.8.
+- Tautological `debug_assert!(matches!(...))` removed from `dyn_file_content()` LtFile and KbFile arms;
+  the enclosing `match` already guarantees the variant — explanatory `// ar-02:` comments added instead.
 
-**p5.7-ar-03 (P2) — `getattr` returns `Directory` for `memory/` and `memory/long_term/` even when memory store is not configured**
-- `agents_fs.rs`: the offsets for `memory/` (`OFF_MEMORY_DIR`) and `memory/long_term/` (`OFF_LT_DIR`) are
-  hardcoded as `FileAttr { kind: Directory }`. When `fuse_mem_access` is `None` (no memory store), lookup
-  for these paths returns `ENOENT`, but `getattr` by inode still returns `Directory`. A client that
-  caches getattr results (like a VFS layer) may see an inconsistent state.
-- Fix: in `getattr`, check `self.mem.is_none()` for the `OFF_MEMORY_DIR`/`OFF_LT_DIR` inodes and return
-  `ENOENT`. Or gate the directory entries at `readdir` time (they are already absent from readdir when
-  `mem.is_none()`). Deferred to p5.8.
+**~~p5.7-ar-03 (P2) — `getattr` returns `Directory` for `memory/` and `memory/long_term/` even when memory store is not configured~~** ✓ Fixed in p5.8.
+- `getattr()` now returns `ENOENT` for `OFF_MEMORY_DIR` (+5) and `OFF_LONG_TERM_DIR` (+7) inodes when
+  `self.memory.is_none()`. `OFF_SHORT_TERM` (+6) intentionally exempted (served from `AgentSnapshot`).
 
-**p5.7-ar-04 (P3) — `list_namespaces` is O(n) full ENTRIES scan (no NAMESPACES index)**
-- `memory/store.rs:RedbStore::list_namespaces`: iterates the full ENTRIES table to collect distinct
-  namespace prefixes. For large stores (>10k entries), this is a full table scan on every KB readdir.
-- Fix: maintain a separate `NAMESPACES` redb table (key = namespace string, value = entry count)
-  updated atomically with every put/delete. Deferred to p5.8 (NAMESPACES index pass).
+**~~p5.7-ar-04 (P3) — `list_namespaces` is O(n) full ENTRIES scan (no NAMESPACES index)~~** ✓ Fixed in p5.8.
+- `NAMESPACES: TableDefinition<&str, u64>` redb table maintained atomically on every put/append/delete/evict.
+  One-time backfill on first open of pre-p5.8 stores. `list_namespaces()` is now O(k) (k = distinct namespaces).
 
 **p5.7-ar-05 (P3) — `MAX_DIR_KEYS=100` truncation is silent (no overflow marker in readdir)**
 - `agents_fs.rs:capped_keys`: the cap is applied with `.take(MAX_DIR_KEYS)`. When a namespace has more
@@ -39,7 +25,7 @@
   indistinguishable from one that exhausted the full set.
 - Fix (or document): emit a sentinel file entry (e.g. `…truncated`) in readdir when the cap fires,
   or increase `MAX_DIR_KEYS` and add a per-call budget. Document the limit prominently in RUNBOOK.md.
-  (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p5.8.
+  (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p6+.
 
 ## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
 

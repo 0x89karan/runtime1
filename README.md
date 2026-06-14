@@ -14,7 +14,7 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phases 0–4 complete (v0.16.0).** `agentd` is a working Rust binary.
+**Phases 0–5 complete (v0.25.0).** `agentd` is a working Rust binary.
 Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
 inference gateway, tools, MCP stdio client, cooperative scheduler, capability
 system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
@@ -23,8 +23,11 @@ added the `/agents` FUSE virtual filesystem (`surfaces/`) and the
 Landlock LSM + seccomp-bpf sandbox crate (`sandbox/`) for MCP server
 subprocesses. Phase 4 hardened the sandbox: pre-exec error pipe, binary size
 CI guard, THREAT_MODEL, flight-event redaction, seccomp clone3 filter, and
-Landlock V4 TCP port enforcement. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for
-the full increment list.
+Landlock V4 TCP port enforcement. Phase 5 added the persistent memory substrate
+(redb-backed `MemoryStore`, short-term paging, long-term per-agent memory,
+shared KB with mutability classes, BM25 search, eviction + summarization, FUSE
+memory surface, and a hardening pass covering the OV-1 startup invariant and
+inode pruning). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
 
