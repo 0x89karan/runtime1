@@ -212,9 +212,14 @@ impl AgentsFs {
             let base = self.dir_inodes[agent_id];
             let offset = parent.wrapping_sub(base);
             return match offset {
-                0                => Some(ParentKind::AgentDir(agent_id.clone())),
-                o if o == OFF_MEMORY_DIR    => Some(ParentKind::MemoryDir(agent_id.clone())),
-                o if o == OFF_LONG_TERM_DIR => Some(ParentKind::LongTermDir(agent_id.clone())),
+                0 => Some(ParentKind::AgentDir(agent_id.clone())),
+                // ar-03: memory/ and long_term/ do not exist when no memory store is configured.
+                o if o == OFF_MEMORY_DIR && self.memory.is_some() => {
+                    Some(ParentKind::MemoryDir(agent_id.clone()))
+                }
+                o if o == OFF_LONG_TERM_DIR && self.memory.is_some() => {
+                    Some(ParentKind::LongTermDir(agent_id.clone()))
+                }
                 _ => None,
             };
         }
