@@ -3,6 +3,57 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.4] - 2026-06-14 (v0.21.0)
+
+Shared KB MVP: multi-agent segmented knowledge base with three mutability classes
+(`canon` / `log` / `scratch`), runtime-stamped provenance, and capability-gated
+`kb_put` / `kb_get` tools.
+
+### Added
+- **`KbPut` / `KbGet` tools** (`tools/native.rs`): Tier-4 KB tools gated behind
+  `KbWrite`/`KbRead` capabilities. `kb_put` enforces mutability class: canon → deny,
+  log → auto-generated monotonic hex key, scratch → caller key + incrementing version.
+  Provenance (`agent_id`, `turn`, `task_fp`, `ts`, `citation`) stamped from `ToolContext`.
+- **`MemoryStore` trait extensions**: `segment_class`, `set_segment_class`,
+  `next_log_seq` — implemented in `RedbStore` via the META table.
+- **`[[memory.segments]]` TOML config**: `SegmentConfig { name, class }` in
+  `MemoryConfig`; `main.rs` seeds classes into the store at startup.
+- **`memory_write` / `memory_read` events extended** with `tier: 4` and `class`
+  fields for KB operations.
+- **THREAT_MODEL.md §7.1/§7.2**: KB poisoning and cross-agent exfiltration analysis.
+- 376 tests (up from 336). 6 new feature tests + 30 new tests from pre-landing review:
+  RedbStore segment_class/next_log_seq/next_scratch_version persistence, kb tool
+  exclusion from "all", store=None silent-skip, kv_set canon/log denial, event field
+  assertions.
+
+### Fixed (pre-landing review)
+- **`kv_set` bypassed canon/log enforcement**: `KvSet::invoke` now checks `segment_class`
+  before writing, matching the invariant enforced by `KbPut`.
+- **Scratch version TOCTOU**: `next_scratch_version()` added to `MemoryStore` trait and
+  `RedbStore`; `KbPut` scratch branch atomically bumps the counter before constructing
+  the entry, preventing two concurrent writers from producing identical version numbers.
+- **Enum duplication**: `config::SegmentClass` replaced by re-export of
+  `memory::MutabilityClass` (with `serde::Deserialize`); manual 3-arm translation in
+  `main.rs` eliminated.
+- **`seg_class:` / `log_seq:` prefixes**: extracted to named constants in `store.rs`.
+
+## [p5.3.5] - 2026-06-14 (infra-only, no version bump)
+
+Detachable memory volume: `memory.redb` (Tiers 3/4) now lives on a persistent,
+re-attachable host volume rather than the ephemeral output mount. Kill + respawn the
+AgentOS container and re-attach the same volume for knowledge continuity.
+
+### Changed
+- **`distro/overlay/init`**: added `memory0` 9p virtfs mount to `/run/memory`.
+- **`distro/Makefile`**: added `-virtfs local,path=$(HOME)/.agentos-memory,...` to
+  `QEMU_FLAGS`; `prereqs` creates `~/.agentos-memory/` on first run; `test` target
+  uses a per-run temp directory for the memory volume.
+- **`distro/overlay/etc/agentd/agent.toml`**: `store_path = "/run/memory/memory.redb"`.
+- **`agentd/src/config.rs`**: doc comment updated with container deployment guidance.
+- **CI guard confirmed at 6 MB** (`MAX_BYTES=6291456`); stale "≤ 4 MB" references in
+  ROADMAP.md and RUNBOOK.md corrected.
+- No crate logic changed; no schema migration; default `store_path` unchanged.
+
 ## [p5.3] - 2026-06-14 (v0.20.0)
 
 Per-Agent Long-Term Memory + Checkpoint Coexistence: agents can now explicitly

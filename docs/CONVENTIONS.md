@@ -85,8 +85,8 @@ Phase 0 kinds (canonical — do not rename):
 | `agent_checkpointed` | agent state checkpointed to disk (agent_id, turn) (p3.2+) |
 | `agent_restored` | agent state restored from checkpoint (agent_id, turn) (p3.2+) |
 | `system_shutdown_requested` | SIGTERM or SIGINT received; graceful shutdown initiated (p2.3+) |
-| `memory_read` | `kv_get` completed (agent, found: bool) (p5.1+) |
-| `memory_write` | `kv_set` committed (agent, bytes: usize) (p5.1+) |
+| `memory_read` | `kv_get` / `kb_get` completed (agent, found: bool; p5.4+: tier:4, class) (p5.1+) |
+| `memory_write` | `kv_set` / `kb_put` committed (agent, bytes: usize; p5.4+: tier:4, class) (p5.1+) |
 | `memory_unavailable` | store open or transaction failed; kv tools not registered (stage, hint, error) (p5.1+) |
 | `memory_quarantined` | corrupt store renamed to `.corrupt`; fresh store opened (path) (p5.1+) |
 | `memory_pressure_advisory` | token spend reached SOFT_THRESHOLD (75%); advisory only, no eviction (agent, turn, tokens_spent_pct, soft_threshold) (p5.2+) |

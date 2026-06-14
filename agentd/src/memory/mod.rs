@@ -7,9 +7,10 @@ pub use context::MemItem;
 /// Distinct from redb's own file-format version (redb owns that; we own this).
 pub const SCHEMA_VERSION: u64 = 1;
 
-/// Mutability class of a memory entry (for future tier enforcement).
-/// Unused in p5.1 but stored with entries so p5.2+ can enforce invariants.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Mutability class for shared KB segments (p5.4).
+/// Enforced by the `kb_put` / `kb_get` Tier-4 tools.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MutabilityClass {
     Canon,
     Log,
@@ -18,12 +19,9 @@ pub enum MutabilityClass {
 
 /// Thin abstraction over the durable key/value backend.
 ///
-/// `Arc<dyn MemoryStore>` is the currency passed to `KvGet`/`KvSet` tools.
-/// The only implementation in p5.1 is `RedbStore`; p5.2+ may add additional
-/// tiers that implement the same interface.
-///
-/// All methods are synchronous. Callers in async contexts must use
-/// `tokio::task::spawn_blocking` for write operations.
+/// `Arc<dyn MemoryStore>` is the currency passed to storage-backed tools.
+/// The sole implementation is `RedbStore` (backed by redb). All methods are
+/// synchronous; callers in async contexts must use `spawn_blocking` for writes.
 pub trait MemoryStore: Send + Sync {
     /// Read a value. Returns `None` when the key is absent.
     fn get(&self, namespace: &str, key: &str) -> anyhow::Result<Option<String>>;
@@ -42,6 +40,25 @@ pub trait MemoryStore: Send + Sync {
 
     /// Return the schema version written on first create.
     fn meta_version(&self) -> anyhow::Result<u64>;
+
+    // ── Shared KB (p5.4) ────────────────────────────────────────────────────
+
+    /// Return the mutability class of `namespace`, or `None` if not configured.
+    fn segment_class(&self, namespace: &str) -> anyhow::Result<Option<MutabilityClass>>;
+
+    /// Persist the mutability class for `namespace`.
+    /// Called at startup for each `[[memory.segments]]` entry.
+    fn set_segment_class(&self, namespace: &str, class: MutabilityClass) -> anyhow::Result<()>;
+
+    /// Atomically increment and return the next monotonic sequence number for
+    /// a log segment. Starts at 1 on first call. Used to generate unique,
+    /// ordered log entry keys in the form `"{seq:016x}"`.
+    fn next_log_seq(&self, namespace: &str) -> anyhow::Result<u64>;
+
+    /// Atomically increment and return the next version number for a scratch
+    /// key. Starts at 1 on first call. Prevents two concurrent writers from
+    /// both producing the same version number for the same key.
+    fn next_scratch_version(&self, namespace: &str, key: &str) -> anyhow::Result<u64>;
 }
 
 /// Validate that a namespace or key string conforms to the allowed grammar.

@@ -557,7 +557,7 @@ readable after a fresh boot (2-boot QA); wiping `/run/output` / `make clean` doe
 memory; default `store_path` unchanged. (redb is single-writer → sequential container
 generations; concurrent multi-container needs the Layer-2 KB service.)
 
-### ▢ p5.4 — Shared KB MVP (namespace + mutability classes + provenance)
+### ✓ p5.4 — Shared KB MVP (namespace + mutability classes + provenance)
 **Depends on:** p5.3. Multi-agent segmented KB: one namespace axis, three classes
 (`canon` read-only / `log` append-only / `scratch` mutable LWW+version). `kb_put`/
 `kb_get`; `KbRead`/`KbWrite` enforced across agents; `[[memory.segments]]` config

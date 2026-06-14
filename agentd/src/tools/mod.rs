@@ -200,6 +200,45 @@ impl ToolRegistry {
                     }),
                 );
             }
+            "kb_put" => {
+                let class = serde_json::from_str::<serde_json::Value>(&result)
+                    .ok()
+                    .and_then(|v| v["class"].as_str().map(String::from))
+                    .unwrap_or_default();
+                recorder.record(
+                    &ctx.agent_id,
+                    None,
+                    EventKind::MemoryWrite,
+                    serde_json::json!({
+                        "agent": &ctx.agent_id,
+                        "tier": 4,
+                        "class": class,
+                        "bytes": result.len(),
+                    }),
+                );
+            }
+            "kb_get" => {
+                let found = !result.is_empty();
+                let class = if found {
+                    serde_json::from_str::<serde_json::Value>(&result)
+                        .ok()
+                        .and_then(|v| v["class"].as_str().map(String::from))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                recorder.record(
+                    &ctx.agent_id,
+                    None,
+                    EventKind::MemoryRead,
+                    serde_json::json!({
+                        "agent": &ctx.agent_id,
+                        "tier": 4,
+                        "class": class,
+                        "found": found,
+                    }),
+                );
+            }
             _ => {}
         }
 
@@ -376,24 +415,53 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use crate::memory::MemoryStore;
 
-    struct SimpleStore(Mutex<HashMap<String, String>>);
+    struct SimpleStore {
+        data: Mutex<HashMap<String, String>>,
+        classes: Mutex<HashMap<String, crate::memory::MutabilityClass>>,
+        seqs: Mutex<HashMap<String, u64>>,
+        scratch_versions: Mutex<HashMap<String, u64>>,
+    }
     impl SimpleStore {
         fn new_arc() -> Arc<Self> {
-            Arc::new(SimpleStore(Mutex::new(HashMap::new())))
+            Arc::new(SimpleStore {
+                data: Mutex::new(HashMap::new()),
+                classes: Mutex::new(HashMap::new()),
+                seqs: Mutex::new(HashMap::new()),
+                scratch_versions: Mutex::new(HashMap::new()),
+            })
         }
     }
     impl MemoryStore for SimpleStore {
         fn get(&self, ns: &str, key: &str) -> anyhow::Result<Option<String>> {
-            Ok(self.0.lock().unwrap().get(&format!("{}\x00{}", ns, key)).cloned())
+            Ok(self.data.lock().unwrap().get(&format!("{}\x00{}", ns, key)).cloned())
         }
         fn put(&self, ns: &str, key: &str, value: &str) -> anyhow::Result<()> {
-            self.0.lock().unwrap().insert(format!("{}\x00{}", ns, key), value.to_string());
+            self.data.lock().unwrap().insert(format!("{}\x00{}", ns, key), value.to_string());
             Ok(())
         }
         fn append(&self, _ns: &str, _key: &str, _value: &str) -> anyhow::Result<()> { Ok(()) }
         fn delete(&self, _ns: &str, _key: &str) -> anyhow::Result<bool> { Ok(false) }
         fn iter(&self, _ns: &str) -> anyhow::Result<Vec<(String, String)>> { Ok(vec![]) }
         fn meta_version(&self) -> anyhow::Result<u64> { Ok(1) }
+        fn segment_class(&self, namespace: &str) -> anyhow::Result<Option<crate::memory::MutabilityClass>> {
+            Ok(self.classes.lock().unwrap().get(namespace).cloned())
+        }
+        fn set_segment_class(&self, namespace: &str, class: crate::memory::MutabilityClass) -> anyhow::Result<()> {
+            self.classes.lock().unwrap().insert(namespace.to_string(), class);
+            Ok(())
+        }
+        fn next_log_seq(&self, namespace: &str) -> anyhow::Result<u64> {
+            let mut seqs = self.seqs.lock().unwrap();
+            let seq = seqs.entry(namespace.to_string()).or_insert(0);
+            *seq += 1;
+            Ok(*seq)
+        }
+        fn next_scratch_version(&self, namespace: &str, key: &str) -> anyhow::Result<u64> {
+            let mut versions = self.scratch_versions.lock().unwrap();
+            let v = versions.entry(format!("{namespace}\x00{key}")).or_insert(0);
+            *v += 1;
+            Ok(*v)
+        }
     }
 
     #[test]
@@ -479,6 +547,112 @@ mod tests {
         assert_eq!(event["kind"], "memory_write");
         assert_eq!(event["data"]["agent"], "agent1");
         assert!(event["data"]["bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn kb_put_invoke_emits_memory_write_event_tier4() {
+        use crate::memory::MutabilityClass;
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:events", MutabilityClass::Log).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_put".to_string()],
+            None,
+            Some(store),
+        )
+        .unwrap();
+        let (rec, tmp) = recorder();
+        let caps = [Capability::KbWrite { segment: "kb:events".to_string() }];
+        reg.invoke(
+            "kb_put",
+            serde_json::json!({"segment": "kb:events", "content": "hello"}),
+            &ctx("agent-kb"),
+            Some(&caps),
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["kind"], "memory_write");
+        assert_eq!(event["data"]["agent"], "agent-kb");
+        assert_eq!(event["data"]["tier"], 4u64, "kb_put must emit tier=4");
+        assert_eq!(event["data"]["class"], "log", "kb_put must emit class field");
+        assert!(event["data"]["bytes"].as_u64().unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn kb_get_invoke_emits_memory_read_event_tier4_found_true() {
+        use crate::memory::MutabilityClass;
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:notes", MutabilityClass::Scratch).unwrap();
+        // Pre-seed an entry so kb_get finds it (found=true path).
+        let entry = serde_json::to_string(&serde_json::json!({
+            "content": "seeded",
+            "class": "scratch",
+            "version": 1,
+            "provenance": {"agent_id": "x", "turn": 0, "task_fp": "", "ts": "2025-01-01T00:00:00Z", "citation": null},
+        })).unwrap();
+        store.put("kb:notes", "mykey", &entry).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_get".to_string()],
+            None,
+            Some(store),
+        )
+        .unwrap();
+        let (rec, tmp) = recorder();
+        let caps = [Capability::KbRead { segment: "kb:notes".to_string() }];
+        reg.invoke(
+            "kb_get",
+            serde_json::json!({"segment": "kb:notes", "key": "mykey"}),
+            &ctx("agent-kb"),
+            Some(&caps),
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["kind"], "memory_read");
+        assert_eq!(event["data"]["agent"], "agent-kb");
+        assert_eq!(event["data"]["tier"], 4u64, "kb_get must emit tier=4");
+        assert_eq!(event["data"]["found"], true, "found=true when key exists");
+        assert_eq!(event["data"]["class"], "scratch", "kb_get must emit class field");
+    }
+
+    #[tokio::test]
+    async fn kb_get_invoke_emits_memory_read_event_tier4_found_false() {
+        use crate::memory::MutabilityClass;
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:events", MutabilityClass::Log).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_get".to_string()],
+            None,
+            Some(store),
+        )
+        .unwrap();
+        let (rec, tmp) = recorder();
+        let caps = [Capability::KbRead { segment: "kb:events".to_string() }];
+        reg.invoke(
+            "kb_get",
+            serde_json::json!({"segment": "kb:events", "key": "absent"}),
+            &ctx("agent-kb"),
+            Some(&caps),
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(event["kind"], "memory_read");
+        assert_eq!(event["data"]["tier"], 4u64, "kb_get must emit tier=4");
+        assert_eq!(event["data"]["found"], false, "found=false when key absent");
+        assert_eq!(event["data"]["class"], "", "class must be empty string on miss");
     }
 
     #[tokio::test]

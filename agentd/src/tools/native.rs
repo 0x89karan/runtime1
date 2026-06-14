@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::capability::Capability;
 use crate::config::AgentCard;
-use crate::memory::{validate_segment, MemoryStore};
+use crate::memory::{validate_segment, MemoryStore, MutabilityClass};
 use super::{Tool, ToolContext, ToolRegistry};
 
 const READ_FILE_MAX: usize = 100_000;
@@ -36,6 +36,18 @@ pub struct MemRemember {
 /// Search Tier-3 long-term memory for entries matching a query string.
 /// NOT registered under `native = ["all"]` — requires explicit listing.
 pub struct MemRecall {
+    pub store: Arc<dyn MemoryStore>,
+}
+
+/// Write an entry to a shared knowledge-base segment (Tier 4, p5.4+).
+/// NOT registered under `native = ["all"]` — requires explicit listing.
+pub struct KbPut {
+    pub store: Arc<dyn MemoryStore>,
+}
+
+/// Read a single entry from a shared knowledge-base segment (Tier 4, p5.4+).
+/// NOT registered under `native = ["all"]` — requires explicit listing.
+pub struct KbGet {
     pub store: Arc<dyn MemoryStore>,
 }
 
@@ -291,6 +303,21 @@ impl Tool for KvSet {
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let (namespace, key) = extract_ns_key(&input)?;
+        // Guard canon and log segments — only scratch/unclassified is writable
+        // via kv_set. kb_put enforces this for the structured KB path; kv_set
+        // must enforce the same invariant on the raw KV path.
+        match self.store.segment_class(&namespace)? {
+            Some(MutabilityClass::Canon) => {
+                anyhow::bail!("namespace {namespace:?} is canon: agent writes are denied");
+            }
+            Some(MutabilityClass::Log) => {
+                anyhow::bail!(
+                    "namespace {namespace:?} is a log segment: \
+                     use kb_put to append a structured log entry"
+                );
+            }
+            _ => {} // Scratch or unclassified — allow
+        }
         let value = input["value"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("value must be a string"))?
@@ -488,6 +515,184 @@ impl Tool for MemRecall {
     }
 }
 
+// ── Shared KB tools (Tier 4, p5.4) ─────────────────────────────────────────
+
+#[async_trait]
+impl Tool for KbPut {
+    fn name(&self) -> &str { "kb_put" }
+
+    fn description(&self) -> &str {
+        "Write an entry to a shared knowledge-base segment (Tier 4). \
+         The segment's mutability class is set by operator config: \
+         canon segments deny agent writes; log segments append a new immutable \
+         entry on each call (key auto-generated); scratch segments do \
+         last-writer-wins with a caller-provided key and an incrementing version."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "segment": {
+                    "type": "string",
+                    "description": "KB segment name (namespace)"
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Content to store (max 8 KiB)"
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Entry key — required for scratch segments, ignored for log"
+                },
+                "citation": {
+                    "type": "string",
+                    "description": "Optional source citation stored in provenance"
+                }
+            },
+            "required": ["segment", "content"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        let segment = input["segment"].as_str().unwrap_or("");
+        Some(Capability::KbWrite { segment: segment.to_string() })
+    }
+
+    async fn invoke(&self, input: Value, ctx: &ToolContext) -> Result<String> {
+        let segment = input["segment"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("segment must be a string"))?;
+        validate_segment(segment, "segment")?;
+
+        let content = input["content"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("content must be a string"))?;
+
+        let citation: Option<&str> = input["citation"].as_str();
+
+        let class = self.store.segment_class(segment)?
+            .unwrap_or(MutabilityClass::Scratch);
+
+        match class {
+            MutabilityClass::Canon => {
+                anyhow::bail!("segment {segment:?} is canon: agent writes are denied");
+            }
+            MutabilityClass::Log => {
+                let seq = self.store.next_log_seq(segment)?;
+                let key = format!("{seq:016x}");
+                let ts = chrono::Utc::now().to_rfc3339();
+                let entry = serde_json::to_string(&json!({
+                    "content": content,
+                    "class": "log",
+                    "version": 1,
+                    "provenance": {
+                        "agent_id": &ctx.agent_id,
+                        "turn": ctx.turn,
+                        "task_fp": &ctx.task_fp,
+                        "ts": ts,
+                        "citation": citation,
+                    }
+                }))?;
+                anyhow::ensure!(
+                    entry.len() <= MAX_MEM_CONTENT_BYTES,
+                    "entry too large: {} bytes exceeds limit of {} bytes",
+                    entry.len(),
+                    MAX_MEM_CONTENT_BYTES
+                );
+                self.store.put(segment, &key, &entry)?;
+                Ok(serde_json::to_string(&json!({"key": key, "class": "log"}))?)
+            }
+            MutabilityClass::Scratch => {
+                let key = input["key"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("key is required for scratch segments"))?;
+                validate_segment(key, "key")?;
+                // Atomic version bump — prevents two concurrent writers from both
+                // producing the same version number for the same key.
+                let version = self.store.next_scratch_version(segment, key)?;
+                let ts = chrono::Utc::now().to_rfc3339();
+                let entry = serde_json::to_string(&json!({
+                    "content": content,
+                    "class": "scratch",
+                    "version": version,
+                    "provenance": {
+                        "agent_id": &ctx.agent_id,
+                        "turn": ctx.turn,
+                        "task_fp": &ctx.task_fp,
+                        "ts": ts,
+                        "citation": citation,
+                    }
+                }))?;
+                anyhow::ensure!(
+                    entry.len() <= MAX_MEM_CONTENT_BYTES,
+                    "entry too large: {} bytes exceeds limit of {} bytes",
+                    entry.len(),
+                    MAX_MEM_CONTENT_BYTES
+                );
+                self.store.put(segment, key, &entry)?;
+                Ok(serde_json::to_string(&json!({
+                    "key": key,
+                    "class": "scratch",
+                    "version": version,
+                }))?)
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for KbGet {
+    fn name(&self) -> &str { "kb_get" }
+
+    fn description(&self) -> &str {
+        "Read a single knowledge-base entry by segment and key. \
+         Returns the full entry JSON (including provenance), or an empty string \
+         when the key does not exist."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "segment": {
+                    "type": "string",
+                    "description": "KB segment name"
+                },
+                "key": {
+                    "type": "string",
+                    "description": "Entry key (as returned by kb_put)"
+                }
+            },
+            "required": ["segment", "key"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        let segment = input["segment"].as_str().unwrap_or("");
+        Some(Capability::KbRead { segment: segment.to_string() })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
+        let segment = input["segment"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("segment must be a string"))?;
+        validate_segment(segment, "segment")?;
+
+        let key = input["key"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("key must be a string"))?;
+        validate_segment(key, "key")?;
+
+        match self.store.get(segment, key)? {
+            Some(entry) => Ok(entry),
+            None => Ok(String::new()),
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for SpawnAgentTool {
     fn name(&self) -> &str {
@@ -598,11 +803,10 @@ impl Tool for SendMessageTool {
 ///
 /// `cards` is required when registering `list_agents`; ignored otherwise.
 ///
-/// **Note:** `kv_get` and `kv_set` are NOT included in `"all"`. They must be
-/// requested explicitly (e.g. `native = ["kv_get", "kv_set"]`) because they
-/// require `KbRead`/`KbWrite` capability grants — auto-registering them for
-/// every agent would produce noisy capability-denied events for agents that
-/// have no memory capability.
+/// **Note:** `kv_get`, `kv_set`, `mem_remember`, `mem_recall`, `kb_put`, and
+/// `kb_get` are NOT included in `"all"`. They must be requested explicitly
+/// because they require memory capability grants — auto-registering them for
+/// every agent would produce noisy capability-denied events.
 pub fn register_native(
     reg: &mut ToolRegistry,
     names: &[String],
@@ -650,6 +854,17 @@ pub fn register_native(
     if names.iter().any(|n| n == "mem_recall") {
         if let Some(s) = store.clone() {
             reg.register(Box::new(MemRecall { store: s }))?;
+        }
+    }
+    // kb_put / kb_get — NOT included in "all"; require explicit opt-in.
+    if names.iter().any(|n| n == "kb_put") {
+        if let Some(s) = store.clone() {
+            reg.register(Box::new(KbPut { store: s }))?;
+        }
+    }
+    if names.iter().any(|n| n == "kb_get") {
+        if let Some(s) = store.clone() {
+            reg.register(Box::new(KbGet { store: s }))?;
         }
     }
     Ok(())
@@ -812,6 +1027,9 @@ mod tests {
         // kv tools must NOT be in "all"
         assert!(!names.contains(&"kv_get".to_string()), "kv_get must not be in 'all'");
         assert!(!names.contains(&"kv_set".to_string()), "kv_set must not be in 'all'");
+        // kb tools must NOT be in "all"
+        assert!(!names.contains(&"kb_put".to_string()), "kb_put must not be in 'all'");
+        assert!(!names.contains(&"kb_get".to_string()), "kb_get must not be in 'all'");
     }
 
     #[test]
@@ -852,42 +1070,71 @@ mod tests {
 
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use crate::memory::MemoryStore;
+    use crate::memory::{MemoryStore, MutabilityClass};
 
-    struct SimpleStore(Mutex<HashMap<String, String>>);
+    struct SimpleStore {
+        data: Mutex<HashMap<String, String>>,
+        classes: Mutex<HashMap<String, MutabilityClass>>,
+        seqs: Mutex<HashMap<String, u64>>,
+        scratch_versions: Mutex<HashMap<String, u64>>,
+    }
     impl SimpleStore {
         fn new_arc() -> Arc<Self> {
-            Arc::new(SimpleStore(Mutex::new(HashMap::new())))
+            Arc::new(SimpleStore {
+                data: Mutex::new(HashMap::new()),
+                classes: Mutex::new(HashMap::new()),
+                seqs: Mutex::new(HashMap::new()),
+                scratch_versions: Mutex::new(HashMap::new()),
+            })
         }
     }
     impl MemoryStore for SimpleStore {
         fn get(&self, ns: &str, key: &str) -> anyhow::Result<Option<String>> {
-            Ok(self.0.lock().unwrap().get(&format!("{}\x00{}", ns, key)).cloned())
+            Ok(self.data.lock().unwrap().get(&format!("{}\x00{}", ns, key)).cloned())
         }
         fn put(&self, ns: &str, key: &str, value: &str) -> anyhow::Result<()> {
-            self.0.lock().unwrap().insert(format!("{}\x00{}", ns, key), value.to_string());
+            self.data.lock().unwrap().insert(format!("{}\x00{}", ns, key), value.to_string());
             Ok(())
         }
         fn append(&self, ns: &str, key: &str, value: &str) -> anyhow::Result<()> {
             let k = format!("{}\x00{}", ns, key);
-            let mut m = self.0.lock().unwrap();
+            let mut m = self.data.lock().unwrap();
             let e = m.entry(k).or_default();
             if !e.is_empty() { e.push('\n'); }
             e.push_str(value);
             Ok(())
         }
         fn delete(&self, ns: &str, key: &str) -> anyhow::Result<bool> {
-            Ok(self.0.lock().unwrap().remove(&format!("{}\x00{}", ns, key)).is_some())
+            Ok(self.data.lock().unwrap().remove(&format!("{}\x00{}", ns, key)).is_some())
         }
         fn iter(&self, ns: &str) -> anyhow::Result<Vec<(String, String)>> {
             let prefix = format!("{}\x00", ns);
-            let m = self.0.lock().unwrap();
+            let m = self.data.lock().unwrap();
             Ok(m.iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
                 .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
                 .collect())
         }
         fn meta_version(&self) -> anyhow::Result<u64> { Ok(1) }
+        fn segment_class(&self, namespace: &str) -> anyhow::Result<Option<MutabilityClass>> {
+            Ok(self.classes.lock().unwrap().get(namespace).cloned())
+        }
+        fn set_segment_class(&self, namespace: &str, class: MutabilityClass) -> anyhow::Result<()> {
+            self.classes.lock().unwrap().insert(namespace.to_string(), class);
+            Ok(())
+        }
+        fn next_log_seq(&self, namespace: &str) -> anyhow::Result<u64> {
+            let mut seqs = self.seqs.lock().unwrap();
+            let seq = seqs.entry(namespace.to_string()).or_insert(0);
+            *seq += 1;
+            Ok(*seq)
+        }
+        fn next_scratch_version(&self, namespace: &str, key: &str) -> anyhow::Result<u64> {
+            let mut versions = self.scratch_versions.lock().unwrap();
+            let v = versions.entry(format!("{namespace}\x00{key}")).or_insert(0);
+            *v += 1;
+            Ok(*v)
+        }
     }
 
     // ── Gap ④: extract_ns_key error paths ───────────────────────────────────
@@ -924,6 +1171,30 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("value"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kv_set_canon_segment_denied() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:canon", MutabilityClass::Canon).unwrap();
+        let tool = KvSet { store };
+        let err = tool
+            .invoke(json!({"namespace": "kb:canon", "key": "any", "value": "data"}), &ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("canon"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kv_set_log_segment_denied() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:events", MutabilityClass::Log).unwrap();
+        let tool = KvSet { store };
+        let err = tool
+            .invoke(json!({"namespace": "kb:events", "key": "any", "value": "data"}), &ctx())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("log segment"), "got: {err}");
     }
 
     // ── Gap ⑥: KvGet miss path returns "" ───────────────────────────────────
@@ -1168,6 +1439,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_native_kb_tools_without_store_silently_skips() {
+        let mut reg = ToolRegistry::new();
+        register_native(
+            &mut reg,
+            &["kb_put".to_string(), "kb_get".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            !reg.tool_names().contains(&"kb_put".to_string()),
+            "kb_put must not be registered without store"
+        );
+        assert!(
+            !reg.tool_names().contains(&"kb_get".to_string()),
+            "kb_get must not be registered without store"
+        );
+    }
+
+    #[tokio::test]
     async fn remember_missing_content_field_errors() {
         let tool = MemRemember { store: SimpleStore::new_arc() };
         let err = tool.invoke(json!({}), &mem_ctx("agent-a")).await.unwrap_err();
@@ -1265,6 +1556,371 @@ mod tests {
         assert!(
             parsed[2]["content"].as_str().unwrap().contains("100"),
             "expected ts=100 third"
+        );
+    }
+
+    // ── p5.4: shared KB (kb_put / kb_get) tests ──────────────────────────────
+
+    fn kb_ctx(agent_id: &str) -> ToolContext {
+        ToolContext {
+            agent_id: agent_id.to_string(),
+            turn: 2,
+            task_fp: "fp1234567890abcd".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn log_segment_is_append_only_immutable() {
+        // Log segments produce a new, unique key on every kb_put.
+        // Each key is monotonically increasing (can be ordered by key).
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:events", MutabilityClass::Log).unwrap();
+        let put = KbPut { store: store.clone() };
+
+        let r1 = put.invoke(json!({"segment": "kb:events", "content": "first"}),
+            &kb_ctx("agent-a")).await.unwrap();
+        let r2 = put.invoke(json!({"segment": "kb:events", "content": "second"}),
+            &kb_ctx("agent-a")).await.unwrap();
+
+        let v1: serde_json::Value = serde_json::from_str(&r1).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&r2).unwrap();
+
+        let k1 = v1["key"].as_str().unwrap().to_string();
+        let k2 = v2["key"].as_str().unwrap().to_string();
+        assert_ne!(k1, k2, "log segment must produce unique keys per write");
+        assert!(k1 < k2, "log keys must be monotonically increasing");
+        assert_eq!(v1["class"], "log");
+        assert_eq!(v2["class"], "log");
+
+        // Verify both entries exist in the store with distinct content.
+        let e1 = store.get("kb:events", &k1).unwrap().unwrap();
+        let e2 = store.get("kb:events", &k2).unwrap().unwrap();
+        let e1v: serde_json::Value = serde_json::from_str(&e1).unwrap();
+        let e2v: serde_json::Value = serde_json::from_str(&e2).unwrap();
+        assert_eq!(e1v["content"], "first");
+        assert_eq!(e2v["content"], "second");
+    }
+
+    #[tokio::test]
+    async fn scratch_last_writer_wins_increments_version() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:notes", MutabilityClass::Scratch).unwrap();
+        let put = KbPut { store: store.clone() };
+
+        let r1 = put.invoke(
+            json!({"segment": "kb:notes", "content": "v1", "key": "status"}),
+            &kb_ctx("agent-a"),
+        ).await.unwrap();
+        let r2 = put.invoke(
+            json!({"segment": "kb:notes", "content": "v2", "key": "status"}),
+            &kb_ctx("agent-a"),
+        ).await.unwrap();
+
+        let v1: serde_json::Value = serde_json::from_str(&r1).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&r2).unwrap();
+        assert_eq!(v1["version"], 1, "first write must be version 1");
+        assert_eq!(v2["version"], 2, "second write must be version 2");
+        assert_eq!(v1["key"], "status");
+        assert_eq!(v2["key"], "status");
+
+        // Verify only the latest content survives.
+        let stored = store.get("kb:notes", "status").unwrap().unwrap();
+        let sv: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        assert_eq!(sv["content"], "v2", "scratch must store latest content");
+        assert_eq!(sv["version"], 2u64);
+    }
+
+    #[tokio::test]
+    async fn canon_write_by_agent_denied() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:canon", MutabilityClass::Canon).unwrap();
+        let put = KbPut { store };
+        let err = put.invoke(
+            json!({"segment": "kb:canon", "content": "attempt"}),
+            &kb_ctx("agent-a"),
+        ).await.unwrap_err();
+        assert!(
+            err.to_string().contains("canon"),
+            "must mention canon in error; got: {err}"
+        );
+        assert!(
+            err.to_string().contains("denied"),
+            "must mention denied; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_stamped_and_unforgeable() {
+        // The provenance block must be stamped from ToolContext — not from tool input.
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:data", MutabilityClass::Log).unwrap();
+        let put = KbPut { store: store.clone() };
+
+        let ctx = ToolContext {
+            agent_id: "agent-prov".to_string(),
+            turn: 7,
+            task_fp: "deadbeef00000000".to_string(),
+        };
+        let result = put.invoke(
+            json!({"segment": "kb:data", "content": "important", "citation": "src:42"}),
+            &ctx,
+        ).await.unwrap();
+        let rv: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let key = rv["key"].as_str().unwrap();
+
+        let stored = store.get("kb:data", key).unwrap().unwrap();
+        let sv: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        let prov = &sv["provenance"];
+
+        assert_eq!(prov["agent_id"], "agent-prov", "agent_id must come from ToolContext");
+        assert_eq!(prov["turn"], 7u64, "turn must come from ToolContext");
+        assert_eq!(prov["task_fp"], "deadbeef00000000", "task_fp must come from ToolContext");
+        assert_eq!(prov["citation"], "src:42");
+        assert!(prov["ts"].as_str().is_some(), "ts must be an RFC3339 string");
+    }
+
+    #[tokio::test]
+    async fn worked_example_a_logs_b_retrieves() {
+        // Agent A writes to a shared log segment; agent B reads the entry back.
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("shared:log", MutabilityClass::Log).unwrap();
+        let put = KbPut { store: store.clone() };
+        let get = KbGet { store: store.clone() };
+
+        let put_result = put.invoke(
+            json!({"segment": "shared:log", "content": "hello from agent-a"}),
+            &kb_ctx("agent-a"),
+        ).await.unwrap();
+        let pv: serde_json::Value = serde_json::from_str(&put_result).unwrap();
+        let key = pv["key"].as_str().unwrap().to_string();
+
+        let get_result = get.invoke(
+            json!({"segment": "shared:log", "key": key}),
+            &kb_ctx("agent-b"),
+        ).await.unwrap();
+
+        assert!(!get_result.is_empty(), "agent-b must see agent-a's entry");
+        let gv: serde_json::Value = serde_json::from_str(&get_result).unwrap();
+        assert_eq!(gv["content"], "hello from agent-a");
+        assert_eq!(gv["provenance"]["agent_id"], "agent-a");
+        assert_eq!(gv["class"], "log");
+    }
+
+    // ── p5.4 gap tests: KbGet paths ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kb_get_miss_returns_empty_string() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:log", MutabilityClass::Log).unwrap();
+        let get = KbGet { store };
+        let result = get
+            .invoke(json!({"segment": "kb:log", "key": "nonexistent"}), &kb_ctx("agent-a"))
+            .await
+            .unwrap();
+        assert_eq!(result, "", "absent key must return empty string");
+    }
+
+    #[tokio::test]
+    async fn kb_get_missing_segment_field_errors() {
+        let get = KbGet { store: SimpleStore::new_arc() };
+        let err = get
+            .invoke(json!({"key": "k"}), &kb_ctx("agent-a"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("segment"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kb_get_missing_key_field_errors() {
+        let get = KbGet { store: SimpleStore::new_arc() };
+        let err = get
+            .invoke(json!({"segment": "kb:log"}), &kb_ctx("agent-a"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("key"), "got: {err}");
+    }
+
+    #[test]
+    fn kb_get_required_cap_null_returns_empty_segment() {
+        let get = KbGet { store: SimpleStore::new_arc() };
+        let cap = get.required_capability_for(&Value::Null);
+        assert!(matches!(&cap, Some(Capability::KbRead { segment }) if segment.is_empty()));
+    }
+
+    #[test]
+    fn kb_get_required_cap_with_segment_returns_it() {
+        let get = KbGet { store: SimpleStore::new_arc() };
+        let cap = get.required_capability_for(&json!({"segment": "kb:notes", "key": "k"}));
+        assert!(matches!(&cap, Some(Capability::KbRead { segment }) if segment == "kb:notes"));
+    }
+
+    #[test]
+    fn kb_put_required_cap_null_returns_empty_segment() {
+        let put = KbPut { store: SimpleStore::new_arc() };
+        let cap = put.required_capability_for(&Value::Null);
+        assert!(matches!(&cap, Some(Capability::KbWrite { segment }) if segment.is_empty()));
+    }
+
+    #[test]
+    fn kb_put_required_cap_with_segment_returns_it() {
+        let put = KbPut { store: SimpleStore::new_arc() };
+        let cap = put.required_capability_for(&json!({"segment": "kb:data", "content": "x"}));
+        assert!(matches!(&cap, Some(Capability::KbWrite { segment }) if segment == "kb:data"));
+    }
+
+    // ── p5.4 gap tests: KbPut paths ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn kb_put_unregistered_segment_defaults_to_scratch() {
+        // A segment with no class set should default to Scratch semantics.
+        let store = SimpleStore::new_arc();
+        // Do NOT set any class — segment is unregistered.
+        let put = KbPut { store: store.clone() };
+        let result = put
+            .invoke(
+                json!({"segment": "kb:unknown", "content": "hello", "key": "mykey"}),
+                &kb_ctx("agent-a"),
+            )
+            .await
+            .unwrap();
+        let rv: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(rv["class"], "scratch", "unregistered segment must default to scratch");
+        assert_eq!(rv["version"], 1u64);
+    }
+
+    #[tokio::test]
+    async fn kb_put_oversized_content_log_errors() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:log", MutabilityClass::Log).unwrap();
+        let put = KbPut { store };
+        let big = "x".repeat(MAX_MEM_CONTENT_BYTES + 1);
+        let err = put
+            .invoke(json!({"segment": "kb:log", "content": big}), &kb_ctx("agent-a"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kb_put_oversized_content_scratch_errors() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:scratch", MutabilityClass::Scratch).unwrap();
+        let put = KbPut { store };
+        let big = "x".repeat(MAX_MEM_CONTENT_BYTES + 1);
+        let err = put
+            .invoke(
+                json!({"segment": "kb:scratch", "content": big, "key": "k"}),
+                &kb_ctx("agent-a"),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kb_put_missing_segment_field_errors() {
+        let put = KbPut { store: SimpleStore::new_arc() };
+        let err = put
+            .invoke(json!({"content": "hello"}), &kb_ctx("agent-a"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("segment"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kb_put_missing_content_field_errors() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:log", MutabilityClass::Log).unwrap();
+        let put = KbPut { store };
+        let err = put
+            .invoke(json!({"segment": "kb:log"}), &kb_ctx("agent-a"))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("content"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kb_put_scratch_missing_key_errors() {
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:notes", MutabilityClass::Scratch).unwrap();
+        let put = KbPut { store };
+        let err = put
+            .invoke(
+                json!({"segment": "kb:notes", "content": "hello"}),
+                &kb_ctx("agent-a"),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("key"),
+            "scratch kb_put without key must error; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kbread_outside_grant_denied() {
+        use crate::flight_recorder::FlightRecorder;
+        use tempfile::NamedTempFile;
+
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("shared:log", MutabilityClass::Log).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_get".to_string()],
+            None,
+            Some(store as Arc<dyn MemoryStore>),
+        ).unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = FlightRecorder::new(tmp.path()).unwrap();
+        let ctx = kb_ctx("agent-no-cap");
+
+        let caps: &[crate::capability::Capability] = &[];
+        let err = reg.invoke(
+            "kb_get",
+            json!({"segment": "shared:log", "key": "somekey"}),
+            &ctx,
+            Some(caps),
+            &rec,
+        ).await.unwrap_err();
+        assert!(
+            err.to_string().contains("capability denied"),
+            "must report capability denied; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kbwrite_outside_grant_denied() {
+        use crate::flight_recorder::FlightRecorder;
+        use tempfile::NamedTempFile;
+
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("shared:log", MutabilityClass::Log).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_put".to_string()],
+            None,
+            Some(store as Arc<dyn MemoryStore>),
+        ).unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = FlightRecorder::new(tmp.path()).unwrap();
+        let ctx = kb_ctx("agent-no-cap");
+
+        // No KbWrite cap granted — must be denied.
+        let caps: &[crate::capability::Capability] = &[];
+        let err = reg.invoke(
+            "kb_put",
+            json!({"segment": "shared:log", "content": "unauthorized"}),
+            &ctx,
+            Some(caps),
+            &rec,
+        ).await.unwrap_err();
+        assert!(
+            err.to_string().contains("capability denied"),
+            "must report capability denied; got: {err}"
         );
     }
 }

@@ -31,7 +31,7 @@ is called out explicitly (see §4, storage substrate).
 - **Segmentation that maps to capabilities.** Shared-KB access reuses the p1.4
   least-privilege model: `KbRead { segment }` / `KbWrite { segment }`, prefix-
   matched exactly like `FsRead`/`FsWrite`, deny-by-default.
-- **Hold the "super light" line.** The storage primitive must not breach the 4 MB
+- **Hold the "super light" line.** The storage primitive must not breach the 6 MB
   CI binary guard. This is a hard constraint, not an aspiration (§4).
 - **Zero agent-loop changes.** Memory is exposed as native tools through the
   existing `CallTools` effect. No new `AgentEffect`, no new `Block` types.
@@ -283,10 +283,10 @@ DESIGN.md Part 7 says "SQLite + sqlite-vec + markdown wiki." **We override that 
 Phase 5**, and here is the defense, because the doc line predates the measured
 footprint:
 
-- **The binary is 3.1 MB against a hard 4 MB CI guard** (`.github/workflows/ci.yml`).
-  Headroom ≈ 0.9 MB.
+- **The binary is 3.1 MB against a hard 6 MB CI guard** (`.github/workflows/ci.yml`).
+  Headroom ≈ 2.9 MB (guard raised from 4 MB → 6 MB in p5.3.5 to accommodate redb + memory tier growth).
 - **rusqlite with `bundled` SQLite** compiles the SQLite C amalgamation into the
-  binary — ~1.0–1.5 MB even size-optimized. That **breaches the 4 MB guard.**
+  binary — ~1.0–1.5 MB even size-optimized. That **would breach the original 4 MB guard.**
 - **Non-bundled (dynamic) SQLite** breaks the static-musl property the threat model
   explicitly values (THREAT_MODEL §5.3: "no dynamic library loading ⇒ no LD_PRELOAD").
   Not an option.
@@ -601,6 +601,6 @@ runtime-distillation as an opt-in `[memory] distill_on_complete = true` later.
 ### Summary for the roadmap (Prompt 3 input)
 Central call: **four tiers on one redb-backed, capability-segmented substrate,
 memory-as-tool with zero agent-loop changes, runtime-floor + agent-policy eviction.**
-Storage: **redb** (pure-Rust, ~0.6 MB, fits the 4 MB guard; SQLite bundled would
-breach it). Phase 5 is **~8 increments** (p4.7 prerequisite cleanup → p5.1 storage
+Storage: **redb** (pure-Rust, ~0.6 MB, fits the 6 MB guard; SQLite bundled would
+breach the original 4 MB guard). Phase 5 is **~8 increments** (p4.7 prerequisite cleanup → p5.1 storage
 primitive → p5.7 FUSE → p5.8 hardening), detailed in `docs/PHASE-5-PLAN.md`.

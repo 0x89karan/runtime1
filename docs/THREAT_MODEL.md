@@ -324,3 +324,41 @@ capability check is the weaker of the two layers.
 | MCP server network access | Network namespace isolation by default | — |
 | Supply chain | 15 audited deps; static binary; rustls | No automated CVE scanning in CI |
 | Unsafe MCP server (adversarial) | `isolation = "gvisor"` available | Not the default; requires runsc on PATH |
+| Shared KB poisoning (p5.4+) | See §7.1 | Canon segments writable only via operator config; log entries unforgeable by other agents |
+| Cross-agent KB exfiltration (p5.4+) | See §7.2 | `KbRead` cap required for non-self segments; provenance records the writing agent |
+
+---
+
+## 7. Shared KB (p5.4+)
+
+### 7.1 Poisoning / integrity
+
+Agents write to shared KB segments via `kb_put`. The runtime enforces mutability
+class invariants before every write:
+
+| Class | Write semantics | Agent-write allowed? |
+|---|---|---|
+| `canon` | Operator-seeded at startup via `[[memory.segments]]` | **No** — runtime returns an error |
+| `log` | Append-only; auto-generated monotonic key per write | Yes — entry is immutable once written |
+| `scratch` | Last-writer-wins; version counter incremented atomically | Yes — any agent with `KbWrite` can overwrite |
+
+**Provenance is stamped by the runtime** (from `ToolContext`) — not from tool
+input — so agents cannot forge the `agent_id`, `turn`, `task_fp`, or `ts` fields
+stored with each entry.
+
+**Remaining gap:** Scratch segments allow any `KbWrite`-holding agent to clobber
+another agent's entry. This is by design (LWW semantics) but means a misbehaving
+agent can corrupt shared scratch state. Use `log` or `canon` for append-only or
+immutable data. Verifiable history on scratch is deferred to a later increment.
+
+### 7.2 Cross-agent exfiltration
+
+`kb_put`/`kb_get` both require a `KbWrite`/`KbRead` capability for any segment
+outside the agent's implicit self-namespace (`agent/<id>`). An agent without the
+appropriate capability receives a `capability_denied` event and an error — it
+cannot read or write shared segments it wasn't granted access to.
+
+**Remaining gap:** There is no output-side redaction. An agent that legitimately
+holds `KbRead { segment: "project:notes" }` can read all entries in that segment
+and include excerpts in its response. The operator is responsible for only granting
+`KbRead` to agents that should see that data.

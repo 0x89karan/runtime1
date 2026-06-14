@@ -340,7 +340,7 @@ The audit recommends it and Phase 5 depends on it. Written in full increment for
 
 ---
 
-> #### ▢ p5.3.5 — Detachable memory volume (distro/infra)
+> #### ✓ p5.3.5 — Detachable memory volume (distro/infra)
 >
 > **Depends on:** p5.1 (`store_path`). Independent of p5.4+ — infra-only, parallelizable.
 > **Sequence:** run next / in parallel with p5.4; land before relying on container-respawn

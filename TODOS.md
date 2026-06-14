@@ -1,6 +1,17 @@
 # TODOS
 
-## Phase 5 — Open (deferred from p5.1 + p5.2 adversarial reviews)
+## Phase 5 — Open (deferred from p5.1–p5.4 adversarial reviews)
+
+**p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
+- `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment
+  (`next_log_seq` / `next_scratch_version`) commits in its own write transaction before
+  `store.put()`. If the `anyhow::ensure!` size check fires between the two calls, the counter
+  is permanently advanced (version gap in Scratch; sequence gap in Log). A deliberately oversized
+  `content` field reliably triggers this.
+- Impact: low — single-tenant cooperative agents are not adversarial. Consumers of log streams
+  may see non-consecutive sequence numbers.
+- Fix: move the size check on raw content before the counter call, or combine counter increment
+  and entry write in a single redb write transaction. Defer to p5.5 or the next tool-ABI revision.
 
 **kv-ar-01 (P2) — `kv_get` returns `""` for both missing key and empty stored value**
 - `tools/native.rs:KvGet::invoke`: `None` and `Some("")` both return `Ok(String::new())`.

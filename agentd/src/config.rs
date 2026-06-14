@@ -43,13 +43,34 @@ pub struct Config {
     pub log_path: Option<String>,
 }
 
+/// Mutability class for a declared knowledge-base segment (p5.4+).
+/// Re-exported from `memory::MutabilityClass` so config and runtime share one type.
+pub use crate::memory::MutabilityClass as SegmentClass;
+
+/// A declared knowledge-base segment (p5.4+).
+///
+/// ```toml
+/// [[memory.segments]]
+/// name  = "project:notes"    # namespace agents reference in kb_put/kb_get
+/// class = "log"              # "canon" | "log" | "scratch"
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SegmentConfig {
+    pub name: String,
+    pub class: SegmentClass,
+}
+
 /// Configuration for the durable key/value memory store (p5.1+).
 ///
 /// ```toml
-/// # Durable key/value memory store (p5.1+):
-/// # [memory]
-/// # store_path = "memory.redb"   # relative to CWD or absolute; defaults to "memory.redb"
-/// # enabled    = true            # set false to run without any persistent memory
+/// [memory]
+/// store_path = "memory.redb"   # relative to CWD or absolute
+/// enabled    = true
+///
+/// [[memory.segments]]          # p5.4: declare shared KB segments
+/// name  = "project:notes"
+/// class = "log"
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +86,10 @@ pub struct MemoryConfig {
     /// When false, `kv_get` and `kv_set` tools are not registered.
     #[serde(default = "default_memory_enabled")]
     pub enabled: bool,
+    /// Declared shared KB segments (p5.4+). Each entry fixes the segment's
+    /// mutability class in the store at startup.
+    #[serde(default)]
+    pub segments: Vec<SegmentConfig>,
 }
 
 fn default_memory_store_path() -> String {
@@ -80,6 +105,7 @@ impl Default for MemoryConfig {
         Self {
             store_path: default_memory_store_path(),
             enabled: default_memory_enabled(),
+            segments: Vec::new(),
         }
     }
 }
@@ -838,6 +864,107 @@ capabilities = [{ KbRead = { segment = "agent:scratch" } }]
             caps[0].capabilities,
             Some(vec![Capability::KbRead { segment: "agent:scratch".to_string() }])
         );
+    }
+
+    // ── p5.4: SegmentConfig / SegmentClass tests ──────────────────────────────
+
+    #[test]
+    fn segment_config_log_class_parses() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[memory.segments]]
+name = "kb:events"
+class = "log"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.memory.segments.len(), 1);
+        assert_eq!(cfg.memory.segments[0].name, "kb:events");
+        assert!(matches!(cfg.memory.segments[0].class, crate::config::SegmentClass::Log));
+    }
+
+    #[test]
+    fn segment_config_canon_class_parses() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[memory.segments]]
+name = "kb:docs"
+class = "canon"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(matches!(cfg.memory.segments[0].class, crate::config::SegmentClass::Canon));
+    }
+
+    #[test]
+    fn segment_config_scratch_class_parses() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[memory.segments]]
+name = "kb:scratch"
+class = "scratch"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(matches!(cfg.memory.segments[0].class, crate::config::SegmentClass::Scratch));
+    }
+
+    #[test]
+    fn segment_config_multiple_segments_parse() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[memory.segments]]
+name = "kb:log"
+class = "log"
+
+[[memory.segments]]
+name = "kb:canon"
+class = "canon"
+
+[[memory.segments]]
+name = "kb:notes"
+class = "scratch"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.memory.segments.len(), 3);
+        assert_eq!(cfg.memory.segments[0].name, "kb:log");
+        assert_eq!(cfg.memory.segments[1].name, "kb:canon");
+        assert_eq!(cfg.memory.segments[2].name, "kb:notes");
+    }
+
+    #[test]
+    fn segment_config_invalid_class_is_error() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[memory.segments]]
+name = "kb:bad"
+class = "invalid"
+"#;
+        let result: Result<Config, _> = toml::from_str(raw);
+        assert!(result.is_err(), "unknown segment class must fail to parse");
+    }
+
+    #[test]
+    fn memory_config_defaults_have_empty_segments() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.memory.segments.is_empty(), "default segments must be empty");
     }
 
     // ── p1.6: AgentCard tests ─────────────────────────────────────────────────

@@ -3,13 +3,17 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::memory::{MemoryStore, SCHEMA_VERSION};
+use crate::memory::{MemoryStore, MutabilityClass, SCHEMA_VERSION};
 
 /// Composite entry key: `"{namespace}\x00{key}"`.
 /// The `\x00` separator is safe because our namespace/key grammar disallows
 /// null bytes — so splitting on the first `\x00` is unambiguous.
 const ENTRIES: TableDefinition<&str, &str> = TableDefinition::new("entries");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+
+const SEG_CLASS_PREFIX: &str = "seg_class:";
+const LOG_SEQ_PREFIX: &str = "log_seq:";
+const SCRATCH_VER_PREFIX: &str = "scratch_ver:";
 
 fn entry_key(namespace: &str, key: &str) -> String {
     format!("{}\x00{}", namespace, key)
@@ -204,6 +208,80 @@ impl MemoryStore for RedbStore {
             .unwrap_or(0);
         Ok(v)
     }
+
+    fn segment_class(&self, namespace: &str) -> anyhow::Result<Option<MutabilityClass>> {
+        let meta_key = format!("{SEG_CLASS_PREFIX}{namespace}");
+        let txn = self.db.begin_read().context("beginning read transaction")?;
+        let table = txn.open_table(META).context("opening meta table")?;
+        let result = table
+            .get(meta_key.as_str())
+            .context("reading segment class")?
+            .and_then(|g| match g.value() {
+                0 => Some(MutabilityClass::Canon),
+                1 => Some(MutabilityClass::Log),
+                2 => Some(MutabilityClass::Scratch),
+                _ => None,
+            });
+        Ok(result)
+    }
+
+    fn set_segment_class(&self, namespace: &str, class: MutabilityClass) -> anyhow::Result<()> {
+        let meta_key = format!("{SEG_CLASS_PREFIX}{namespace}");
+        let encoded: u64 = match class {
+            MutabilityClass::Canon => 0,
+            MutabilityClass::Log => 1,
+            MutabilityClass::Scratch => 2,
+        };
+        let txn = self.db.begin_write().context("beginning write transaction")?;
+        {
+            let mut table = txn.open_table(META).context("opening meta table")?;
+            table
+                .insert(meta_key.as_str(), encoded)
+                .context("writing segment class")?;
+        }
+        txn.commit().context("committing segment class")?;
+        Ok(())
+    }
+
+    fn next_log_seq(&self, namespace: &str) -> anyhow::Result<u64> {
+        let meta_key = format!("{LOG_SEQ_PREFIX}{namespace}");
+        let txn = self.db.begin_write().context("beginning write transaction")?;
+        let next = {
+            let mut table = txn.open_table(META).context("opening meta table")?;
+            let current = table
+                .get(meta_key.as_str())
+                .context("reading log seq")?
+                .map(|g| g.value())
+                .unwrap_or(0);
+            let next = current + 1;
+            table
+                .insert(meta_key.as_str(), next)
+                .context("writing log seq")?;
+            next
+        };
+        txn.commit().context("committing log seq")?;
+        Ok(next)
+    }
+
+    fn next_scratch_version(&self, namespace: &str, key: &str) -> anyhow::Result<u64> {
+        let meta_key = format!("{SCRATCH_VER_PREFIX}{namespace}\x00{key}");
+        let txn = self.db.begin_write().context("beginning write transaction")?;
+        let next = {
+            let mut table = txn.open_table(META).context("opening meta table")?;
+            let current = table
+                .get(meta_key.as_str())
+                .context("reading scratch version")?
+                .map(|g| g.value())
+                .unwrap_or(0);
+            let next = current + 1;
+            table
+                .insert(meta_key.as_str(), next)
+                .context("writing scratch version")?;
+            next
+        };
+        txn.commit().context("committing scratch version")?;
+        Ok(next)
+    }
 }
 
 #[cfg(test)]
@@ -319,5 +397,84 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = open_store(&dir);
         assert_eq!(store.meta_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    // ── segment_class / set_segment_class / next_log_seq ────────────────────
+
+    #[test]
+    fn segment_class_returns_none_for_unset_namespace() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        assert!(store.segment_class("kb:unknown").unwrap().is_none());
+    }
+
+    #[test]
+    fn segment_class_round_trips_all_three_variants() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.set_segment_class("kb:canon", MutabilityClass::Canon).unwrap();
+        store.set_segment_class("kb:log", MutabilityClass::Log).unwrap();
+        store.set_segment_class("kb:scratch", MutabilityClass::Scratch).unwrap();
+        assert_eq!(store.segment_class("kb:canon").unwrap(), Some(MutabilityClass::Canon));
+        assert_eq!(store.segment_class("kb:log").unwrap(), Some(MutabilityClass::Log));
+        assert_eq!(store.segment_class("kb:scratch").unwrap(), Some(MutabilityClass::Scratch));
+    }
+
+    #[test]
+    fn segment_class_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("seg_class.redb");
+        {
+            let (store, _) = RedbStore::open(&path).unwrap();
+            store.set_segment_class("kb:events", MutabilityClass::Log).unwrap();
+        }
+        let (store2, _) = RedbStore::open(&path).unwrap();
+        assert_eq!(store2.segment_class("kb:events").unwrap(), Some(MutabilityClass::Log));
+    }
+
+    #[test]
+    fn next_log_seq_starts_at_1_and_increments() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        assert_eq!(store.next_log_seq("kb:events").unwrap(), 1);
+        assert_eq!(store.next_log_seq("kb:events").unwrap(), 2);
+        assert_eq!(store.next_log_seq("kb:events").unwrap(), 3);
+    }
+
+    #[test]
+    fn next_log_seq_is_independent_per_namespace() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        assert_eq!(store.next_log_seq("kb:a").unwrap(), 1);
+        assert_eq!(store.next_log_seq("kb:b").unwrap(), 1);
+        assert_eq!(store.next_log_seq("kb:a").unwrap(), 2);
+        assert_eq!(store.next_log_seq("kb:b").unwrap(), 2);
+    }
+
+    #[test]
+    fn next_scratch_version_starts_at_1_and_increments() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        assert_eq!(store.next_scratch_version("kb:notes", "status").unwrap(), 1);
+        assert_eq!(store.next_scratch_version("kb:notes", "status").unwrap(), 2);
+        assert_eq!(store.next_scratch_version("kb:notes", "status").unwrap(), 3);
+    }
+
+    #[test]
+    fn next_scratch_version_is_independent_per_key() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        assert_eq!(store.next_scratch_version("kb:notes", "a").unwrap(), 1);
+        assert_eq!(store.next_scratch_version("kb:notes", "b").unwrap(), 1);
+        assert_eq!(store.next_scratch_version("kb:notes", "a").unwrap(), 2);
+        assert_eq!(store.next_scratch_version("kb:notes", "b").unwrap(), 2);
+    }
+
+    #[test]
+    fn next_scratch_version_is_independent_per_namespace() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        assert_eq!(store.next_scratch_version("kb:x", "key").unwrap(), 1);
+        assert_eq!(store.next_scratch_version("kb:y", "key").unwrap(), 1);
     }
 }

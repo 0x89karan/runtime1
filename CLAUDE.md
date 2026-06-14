@@ -67,7 +67,19 @@ thresholds (75%/90%); `short_term: Vec<MemItem>` on `AgentTask` + checkpoint;
 (`mem_remember`) + `MemRecall` (`mem_recall`) tools under implicit self-grant; nanosecond
 key, 8 KiB limit, provenance JSON; `task_fp` = FNV-1a 64-bit hash of initial task text;
 `EventKind::MemoryDistilled`; cross-agent namespace isolation via `agent/{id}`; 336 tests.
-**Next: p5.4 (shared KB MVP) — see `docs/ROADMAP.md`.**
+**p5.3.5 complete.** Detachable memory volume (infra-only, no crate changes): `memory.redb`
+moved to a persistent 9p virtfs mount (`memory0` → `~/.agentos-memory/` → `/run/memory`);
+three-mount model (`secrets0`/`output0`/`memory0`); `store_path = "/run/memory/memory.redb"`
+in the demo agent.toml; CI guard confirmed at 6 MB; stale "≤ 4 MB" doc refs fixed.
+**p5.4 complete (v0.21.0).** Shared KB MVP — multi-agent segmented KB with three mutability
+classes: `canon` (operator-seeded, deny agent writes), `log` (append-only, monotonic key),
+`scratch` (last-writer-wins, version counter); `kb_put`/`kb_get` tools with `KbWrite`/`KbRead`
+capability enforcement; `[[memory.segments]]` TOML config seeds classes at startup;
+`MemoryStore` trait extended with `segment_class`/`set_segment_class`/`next_log_seq`/
+`next_scratch_version` (atomic version counter, fixes TOCTOU); `config::SegmentClass` unified
+with `memory::MutabilityClass`; `kv_set` canon/log bypass fixed; provenance stamped by runtime;
+`memory_write`/`memory_read` events with `tier:4` + `class`; THREAT_MODEL §7.1/7.2; 376 tests.
+**Next: p5.5 (retrieval as tool / lexical search) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

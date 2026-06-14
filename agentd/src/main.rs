@@ -157,6 +157,18 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         None
     };
 
+    // Initialise declared KB segment classes (p5.4). Done before registering tools so
+    // that `kb_put` enforces the correct class from the first invocation.
+    if let Some(ref store) = memory_store {
+        for seg in &cfg.memory.segments {
+            if let Err(e) = store.set_segment_class(&seg.name, seg.class.clone()) {
+                tracing::warn!(segment = %seg.name, error = %e, "failed to initialise segment class");
+            } else {
+                tracing::debug!(segment = %seg.name, class = ?seg.class, "KB segment initialised");
+            }
+        }
+    }
+
     register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store)?;
 
     // Pass 1: validate capabilities and isolation settings before spawning any process.
