@@ -37,6 +37,15 @@ Phase 5 hardening: security invariants, FUSE inode pruning, memory store index, 
   `getattr_short_term_ok_when_no_store`), 2 main.rs tests
   (`store_path_inside_sandbox_prefix_fails_startup`, `event_taxonomy_completeness`).
 
+### Fixed
+- **NAMESPACES backfill non-fatal**: a transient I/O failure (ENOSPC, NFS timeout) during the
+  one-time post-upgrade backfill no longer quarantines a valid pre-p5.8 store. On write failure
+  the store opens successfully; `list_namespaces()` falls back to O(n) scan until next restart.
+- **`ar-03` guard extended to `is_dir_ino()` and `parent_kind()`**: the `getattr()` ENOENT guard
+  for `memory/` and `long_term/` when no memory store is configured is now also applied in
+  `is_dir_ino()` (prevents stale-inode `opendir` success) and `parent_kind()` (prevents `readdir`
+  returning a partial listing instead of propagating ENOENT to the caller).
+
 ### Changed
 - `agents.toml` rewritten as a memory demo (writer + spawned reader, `project:meta` canon seed,
   `project:research` scratch segment, `claude-haiku-4-5-20251001`, 100k global budget).
