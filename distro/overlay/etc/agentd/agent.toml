@@ -17,3 +17,6 @@ model_id = "claude-haiku-4-5-20251001"
 
 [tools]
 native = ["all"]
+
+[memory]
+store_path = "/run/memory/memory.redb"   # detachable volume — survives container respawn
