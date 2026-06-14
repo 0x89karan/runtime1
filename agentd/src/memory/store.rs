@@ -170,14 +170,31 @@ impl RedbStore {
                 namespaces = counts.len(),
                 "namespaces: backfilling from existing store entries"
             );
-            let wtxn = self.db.begin_write().context("beginning write for backfill")?;
-            {
-                let mut ns_tbl = wtxn.open_table(NAMESPACES).context("opening namespaces for backfill")?;
-                for (ns, count) in &counts {
-                    ns_tbl.insert(ns.as_str(), *count).context("writing backfill namespace")?;
+            // Backfill write is non-fatal: a transient I/O failure (ENOSPC, etc.)
+            // must not quarantine a valid store.  On failure, list_namespaces()
+            // falls back to O(n) scan until the next restart succeeds.
+            let backfill_write: anyhow::Result<()> = (|| {
+                let wtxn = self.db.begin_write().context("beginning write for backfill")?;
+                {
+                    let mut ns_tbl = wtxn
+                        .open_table(NAMESPACES)
+                        .context("opening namespaces for backfill")?;
+                    for (ns, count) in &counts {
+                        ns_tbl
+                            .insert(ns.as_str(), *count)
+                            .context("writing backfill namespace")?;
+                    }
                 }
+                wtxn.commit().context("committing backfill")?;
+                Ok(())
+            })();
+            if let Err(e) = backfill_write {
+                tracing::warn!(
+                    error = %e,
+                    "namespaces: backfill write failed; list_namespaces falls back to \
+                     O(n) scan until next restart — store remains usable"
+                );
             }
-            wtxn.commit().context("committing backfill")?;
         }
 
         Ok(())

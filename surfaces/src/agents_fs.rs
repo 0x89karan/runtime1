@@ -349,6 +349,13 @@ impl AgentsFs {
         if let Some(agent_id) = self.inode_to_id.get(&ino) {
             let base = self.dir_inodes[agent_id];
             let offset = ino.wrapping_sub(base);
+            // ar-03: mirror the getattr() guard — memory/ and long_term/ do not
+            // exist as directories when no memory store is configured.
+            if (offset == OFF_MEMORY_DIR || offset == OFF_LONG_TERM_DIR)
+                && self.memory.is_none()
+            {
+                return false;
+            }
             return matches!(offset, 0) || offset == OFF_MEMORY_DIR || offset == OFF_LONG_TERM_DIR;
         }
         if let Some(DynInoKind::KbSeg { .. }) = self.dyn_ino_kind.get(&ino) {

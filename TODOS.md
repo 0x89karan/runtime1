@@ -4,11 +4,12 @@
 
 **~~p5.7-ar-01 (P2) — Inode map entries are never pruned for terminated agents~~** ✓ Fixed in p5.8.
 - `prune_dead_agent()` method added to `AgentsFs`; called in `readdir(Root)` for every agent ID
-  in the current snapshot that is absent from the live agent set. Cleans all 5 maps: `dir_inodes`,
-  `inode_to_id`, `dyn_ino_kind`, `lt_key_ino`, `kb_seg_ino`.
+  in the current snapshot that is absent from the live agent set. Cleans all 6 maps: `dir_inodes`,
+  `inode_to_id`, `dyn_ino_kind`, `lt_key_ino`, `kb_seg_ino`, `kb_key_ino`.
 
 **~~p5.7-ar-02 (P2) — HashMap lookup in `getattr`/`read` does not assert inode kind~~** ✓ Fixed in p5.8.
-- `debug_assert!(matches!(...))` added in `dyn_file_content()` for LtFile and KbFile dispatch paths.
+- Tautological `debug_assert!(matches!(...))` removed from `dyn_file_content()` LtFile and KbFile arms;
+  the enclosing `match` already guarantees the variant — explanatory `// ar-02:` comments added instead.
 
 **~~p5.7-ar-03 (P2) — `getattr` returns `Directory` for `memory/` and `memory/long_term/` even when memory store is not configured~~** ✓ Fixed in p5.8.
 - `getattr()` now returns `ENOENT` for `OFF_MEMORY_DIR` (+5) and `OFF_LONG_TERM_DIR` (+7) inodes when
