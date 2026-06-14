@@ -300,9 +300,13 @@ footprint:
 free in redb — so Phase 5 ships a **simple tokenized inverted index** maintained in
 a second redb table (lowercased word → posting list), with BM25-lite scoring
 computed in Rust. Good enough for a KB MVP; ranked FTS and vectors are deferred
-(§9 Q1). The "compiled markdown wiki" idea from DESIGN.md 4.3 is honored as the
-*content format* of `canon`/`log` entries (markdown bodies), not as a separate
-mechanism.
+(§9 Q1). **Compiled markdown wiki — the content format, not a separate mechanism.**
+Long-term / `canon` / `log` entries are markdown documents, and the Tier-2→Tier-3
+distillation (p5.6) *compiles* salient run knowledge into them — the Karpathy
+"llm-wiki" pattern (DESIGN.md 4.3): a human-readable, agent-maintained wiki written at
+distillation time and read back by lexical search, rather than reconstructed by runtime
+vector retrieval. (Mem0 / `claude-mem` are the auto-capture→compress→inject
+counter-design; see §9 Q2/Q3.)
 
 ### Two storage layers — embedded (Layer 1) + external hybrid KB over MCP (Layer 2)
 
@@ -324,17 +328,24 @@ remote-cognition lock — see embeddings below).
   (+ `Mcp { server, tools }` for the external server). An agent cannot tell whether
   retrieval was lexical-local or hybrid-remote — only the backing changes.
 - **Hybrid engine choice (Layer 2):** an engine that fuses BM25/keyword with vector
-  search (reciprocal-rank fusion). Default recommendation **Postgres + `pgvector` +
-  native FTS** (one container does both halves, simplest to operate); **Qdrant**
-  (Rust, single binary) or **Meilisearch** (Rust, light) are good purpose-built
-  alternatives. The engine, not `agentd`, owns the index.
+  search (reciprocal-rank fusion). Candidates, in ethos-fit order: **HelixDB** (a Rust
+  graph+vector OLTP DB — best fit for the Rust/light line, and its graph layer lets the
+  KB model entry-to-entry links and provenance as a *graph*, not just a flat vector
+  index: the A-MEM / Zettelkasten angle); **Postgres + `pgvector` + native FTS** (one
+  container does both halves — the boring, robust default); **Qdrant** or **Meilisearch**
+  (purpose-built, light). **`gbrain`** (garrytan) is a working reference of this exact
+  pattern — a repo-semantic brain exposed over MCP — and a drop-in candidate for the
+  code-aware case. A KB-builder agent (cf. `Understand-Anything`) can populate a graph
+  segment by turning a codebase/corpus into a queryable knowledge graph. The engine, not
+  `agentd`, owns the index.
 - **Connection mechanism:** today's MCP client is **stdio-only** (p0.5), so the first
   version is a **co-located stdio sidecar** — `agentd` spawns the KB server like the
   filesystem server, zero new runtime code. A **networked KB container** needs an
   **HTTP/SSE MCP transport** added to `agentd` (a later increment); when it lands, the
   p4.6 Landlock V4 TCP-port rules are the enforcement layer — grant the KB server
-  `Net { ports: [<kb-port>] }`. (Heed AUDIT **F-002**: on kernels < 6.7 that port
-  restriction silently degrades to full network — close it in p4.8 first.)
+  `Net { ports: [<kb-port>] }`. (On kernels < 6.7 that port rule degrades to a deny-all
+  network namespace — a safe fallback emitted with a startup warning, fixed in p4.7 /
+  AUDIT F-002.)
 
 **Embeddings — remote API, lock preserved (decided, §9 Q1).** Semantic retrieval needs
 an embedding model, and embeddings are inference-shaped, so the **Layer 2 KB sidecar
@@ -539,14 +550,18 @@ Phase 5's reach.
 only). But a "working-set" of the agent's own most-recent Tier-3 entries, auto-
 injected at low token cost, might measurably improve continuity. Trade-off:
 auditability and budget predictability (against) vs. ergonomics and fewer wasted
-tool-call turns (for). Deferred; revisit with usage data, not speculation.
+tool-call turns (for). Deferred; revisit with usage data, not speculation. (`claude-mem`
+is the reference implementation of this auto-inject path — auto-capture, AI-compress,
+inject into future sessions — to mine if we ever flip the default.)
 
 **Q3 — Distillation trigger for Tier 2 → Tier 3.** Who decides what's worth keeping
 across runs: the agent (an explicit `mem_remember` before completion), an end-of-run
 runtime distillation pass (an extra inference call — costs tokens, needs a budget
 line), or nothing auto-promotes (Phase 5 default)? The default is safe but pushes all
 retention onto the agent's discipline. The runtime-distillation option is the
-ergonomic win but spends cognition the user is metering. Leaning default-for-now,
+ergonomic win but spends cognition the user is metering. When enabled, distillation
+**compiles** the run's salient items into markdown-wiki Tier-3 entries (the llm-wiki
+content format, §4) — distilled and human-readable — not raw copies. Leaning default-for-now,
 runtime-distillation as an opt-in `[memory] distill_on_complete = true` later.
 
 ---

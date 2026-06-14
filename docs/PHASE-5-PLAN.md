@@ -449,7 +449,9 @@ The audit recommends it and Phase 5 depends on it. Written in full increment for
 >
 > **Goal:** The store cannot grow unbounded: per-segment capacity and age floors evict
 > oldest entries (and their index postings). Optionally, an end-of-run distillation
-> pass promotes the run's salient short-term items into Tier 3.
+> pass **compiles** the run's salient short-term items into markdown-wiki Tier-3 entries
+> (the "llm-wiki" content format, DESIGN-memory §4) — distilled, human-readable, and
+> lexically searchable — rather than copying raw turns.
 >
 > **Design reference:** `docs/DESIGN-memory.md` §3 (eviction), §4 (failure modes), §9 Q3.
 >

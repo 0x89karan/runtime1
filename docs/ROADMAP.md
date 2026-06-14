@@ -686,7 +686,9 @@ with `agentd` still ≤ 4 MB.
 Re-homed into Phase 5 (above): the memory substrate (Layer 1 — embedded, lexical).
 Remaining:
 - **Layer 2 — external hybrid (semantic + keyword) KB over MCP.** Attach a real search
-  engine (Postgres+pgvector+FTS, or Qdrant/Meilisearch) as a sandboxed MCP server;
+  engine (**HelixDB** — Rust graph+vector, best ethos fit and adds a provenance/link
+  graph; or Postgres+pgvector+FTS; or Qdrant/Meilisearch) as a sandboxed MCP server
+  (`gbrain` is a working reference of the pattern);
   embeddings come from a **remote embedding API** (Voyage AI canonical; Cohere/OpenAI
   viable), preserving the remote-cognition lock — no embedding weights on the `agentd`
   host. Stdio-sidecar is reachable within Phase 5; a **networked KB needs an HTTP/SSE
