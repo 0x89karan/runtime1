@@ -145,6 +145,15 @@ at-rest encryption: a future increment should encrypt the checkpoint with a key
 derived from the agent's identity so that even a user with read access to the file
 cannot recover the conversation history.
 
+**p5.3.5 note — memory volume durability widens the at-rest window.** `memory.redb`
+(Tiers 3/4) now lives on a *persistent, detachable* host volume (`~/.agentos-memory/`)
+rather than the ephemeral output mount. Unlike `checkpoint.json` (deleted on success),
+this file accumulates long-term agent memory across many runs. It has the same mode-0600
+protection but is never automatically cleaned — the at-rest encryption gap applies with
+a larger window. **Operator action (same as §3.3 above):** keep `~/.agentos-memory/`
+on a LUKS-encrypted or `0700` directory on shared hosts until in-process encryption
+ships.
+
 ---
 
 ## 4. Budget-exhaustion DoS

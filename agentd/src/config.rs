@@ -57,6 +57,8 @@ pub struct MemoryConfig {
     /// Path to the redb database file.
     /// Relative paths are resolved relative to the CWD at startup.
     /// Absolute paths are used as-is.
+    /// Container/production deployments should set an absolute path on a persistent
+    /// mount, e.g. `store_path = "/run/memory/memory.redb"` (p5.3.5 detachable volume).
     #[serde(default = "default_memory_store_path")]
     pub store_path: String,
     /// Set to false to disable the memory store entirely.

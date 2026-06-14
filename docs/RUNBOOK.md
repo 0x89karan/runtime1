@@ -1,12 +1,13 @@
 # RUNBOOK — Operating AgentOS
 
 > The single source of operational truth. Every command is runnable as written.
-> **Current state:** `main` is **v0.18.0** — Phases 0–4 complete (p4.7 hardening
-> landed all P0/P1 audit fixes) + **p5.1** (memory storage primitive) shipped.
-> Phase 5 beyond p5.1, and all of Phase 6, are *designed but not built* — marked
-> ***(lands in pX.Y)*** throughout. Design lives in `DESIGN.md`; threats in
-> `THREAT_MODEL.md` (referenced by §number, not restated); how to extend in
-> `CONVENTIONS.md`.
+> **Current state:** `main` is **v0.20.0** — Phases 0–4 complete (p4.7 hardening
+> landed all P0/P1 audit fixes) + **p5.1** (memory storage primitive) + **p5.2**
+> (per-agent short-term + paging) + **p5.3** (per-agent long-term memory) + **p5.3.5**
+> (detachable memory volume) shipped. Remaining Phase 5 and all of Phase 6 are
+> *designed but not built* — marked ***(lands in pX.Y)*** throughout. Design lives
+> in `DESIGN.md`; threats in `THREAT_MODEL.md` (referenced by §number, not restated);
+> how to extend in `CONVENTIONS.md`.
 
 ---
 
@@ -83,7 +84,9 @@ cat distro/build/output/images/run/flight.jsonl
 `budget_exceeded`) event appears in the flight log — the smoke test.
 
 **Mounts:** `secrets0` → `/run/secrets` (read the key from `agentos.env`), `output0`
-→ `/run/output` (flight logs, checkpoints). DNS resolves via QEMU SLIRP (10.0.2.3).
+→ `/run/output` (flight logs, checkpoints), `memory0` → `/run/memory` (durable store —
+persists across container respawns; host path `~/.agentos-memory/`). DNS resolves via
+QEMU SLIRP (10.0.2.3).
 **Clean shutdown:** the agent completing exits `agentd`; the kernel then halts cleanly
 (`-no-reboot`). For a long-running agent, the SIGTERM drain (§2a) applies.
 
@@ -183,7 +186,7 @@ TOML capability syntax: `capabilities = [ { FsRead = { prefix = "/workspace" } }
 |---|---|---|
 | flight log | `./flight.jsonl` (or `--log-path`) | `/run/output/flight.jsonl` → host `distro/build/output/images/run/` |
 | checkpoint | `./checkpoint.json` (mode 0600) | `/run/output/checkpoint.json` |
-| memory store (p5.1) | `./memory.redb` (mode 0600) | `/run/output/memory.redb` (set `store_path`) |
+| memory store (p5.1+) | `./memory.redb` (mode 0600) | `/run/memory/memory.redb` (detachable `memory0` volume — `~/.agentos-memory/`) |
 | FUSE mount | `/agents/` (dev only; `--no-fuse` to skip) | not mounted in the minimal boot |
 
 ### Secrets handling
@@ -436,7 +439,10 @@ binary, restart (agents restore from `checkpoint.json`). Keep `checkpoint_interv
 - **`checkpoint.json`** — contains full conversation history; **sensitive** (treat like
   your home dir; THREAT_MODEL §3). Ephemeral (deleted on success), so back it up only if
   you need crash forensics.
-- **`memory.redb`** (p5.1) — durable; back it up with `agentd` stopped (mode 0600).
+- **`memory.redb`** (p5.1+) — durable; back it up with `agentd` stopped (mode 0600).
+  In QEMU mode this lives at `~/.agentos-memory/memory.redb` (the detachable volume,
+  p5.3.5). **Do not `make clean` this directory** — clean only deletes `output/`, not the
+  memory volume.
 - **Flight logs grow unbounded** — rotate (see §7). Put `--log-path` on a volume with
   room.
 
@@ -513,10 +519,12 @@ What's landed vs coming, with operational implications. Design: `DESIGN-memory.m
 - *p5.1 (landed, v0.18.0):* durable kv store (`memory.redb`), `kv_get`/`kv_set` tools,
   `KbRead`/`KbWrite` caps, events `memory_read` / `memory_write` / `memory_unavailable`
   / `memory_quarantined`. Ops: back up `memory.redb`; grant KB caps deny-by-default.
-- *(lands in p5.2):* per-agent short-term + token-budget paging; `checkpoint.json` format
-  bumps to v2 (a v1 checkpoint still loads).
-- *(lands in p5.3):* per-agent long-term memory persisting across runs (don't delete
-  `memory.redb` on success, unlike `checkpoint.json`).
+- *p5.2 (landed, v0.19.0):* per-agent short-term + token-budget paging; `checkpoint.json`
+  format bumps to v2 (a v1 checkpoint still loads).
+- *p5.3 (landed, v0.20.0):* per-agent long-term memory (`mem_remember`/`mem_recall`) persisting
+  across runs; don't delete `memory.redb` on success, unlike `checkpoint.json`.
+- *p5.3.5 (landed):* detachable memory volume — `memory0` 9p mount (`~/.agentos-memory/`
+  → `/run/memory`); store survives container respawn; `make run/test` wired automatically.
 - *(lands in p5.4):* shared KB segments with provenance — new backup surface; segment
   capabilities become a real authorization boundary.
 - *(lands in p5.5–p5.6):* `kb_search` (lexical) + eviction/age floors (a growth knob to
@@ -529,7 +537,7 @@ What's landed vs coming, with operational implications. Design: `DESIGN-memory.m
   server. See ROADMAP "Beyond".
 
 **Phase 6 — interface** *(lands in p6.x)*. A `ratatui` TUI as a separate **`agentctl`**
-binary (not in `agentd`; the 4 MB guard is untouched). Runs on the QEMU serial console
+binary (not in `agentd`; the 6 MB CI guard is untouched). Runs on the QEMU serial console
 or over SSH; read-only over `/agents` + `flight.jsonl`; spawning agents from a template
 catalogue. It is an optional addition to the QEMU image — headless deployments omit it.
 The Watcher (daemon-shaped) template needs an event-trigger surface that lands *after*

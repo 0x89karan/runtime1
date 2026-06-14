@@ -9,7 +9,7 @@ mount -t proc    none /proc
 mount -t sysfs   none /sys
 mount -t devtmpfs none /dev 2>/dev/null || mdev -s
 
-mkdir -p /run/secrets /run/output
+mkdir -p /run/secrets /run/output /run/memory
 
 # Mount host-shared directories injected by QEMU -virtfs.
 mount -t 9p -o trans=virtio,version=9p2000.L secrets0 /run/secrets || {
@@ -20,6 +20,12 @@ mount -t 9p -o trans=virtio,version=9p2000.L secrets0 /run/secrets || {
 
 mount -t 9p -o trans=virtio,version=9p2000.L output0 /run/output || {
     echo "ERROR: failed to mount output0 via 9p." >&2
+    exec sh
+}
+
+mount -t 9p -o trans=virtio,version=9p2000.L memory0 /run/memory || {
+    echo "ERROR: failed to mount memory0 via 9p." >&2
+    echo "       Is -virtfs ...,mount_tag=memory0 in the QEMU command?" >&2
     exec sh
 }
 

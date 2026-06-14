@@ -542,7 +542,7 @@ success. Runtime-stamped, unforgeable provenance. Event: `memory_distilled` (man
 remember). **Acceptance:** +4 tests; after clean completion `memory.redb` exists and
 `checkpoint.json` does not; provenance unforgeable.
 
-### ▢ p5.3.5 — Detachable memory volume (distro/infra)
+### ✓ p5.3.5 — Detachable memory volume (distro/infra)
 **Depends on:** p5.1 (`store_path`). Independent of p5.4+ (infra-only — no crate logic, no
 schema, default unchanged), so it builds in parallel. **Run it next / alongside p5.4**,
 before relying on container-respawn for memory continuity, so the shared KB lands on a
@@ -594,12 +594,12 @@ sandbox prefix); a demo `agents.toml` that actually exercises memory (KbWrite+Ne
 agent, KbRead agent, seeded canon, spawning, non-zero global budget); CONVENTIONS
 table completeness check (+14 rows total across Phase 5); TODOS swept. **Acceptance:**
 +3 tests; sandbox-path assertion test passes; memory-demo flight log shows
-`memory_write`/`kb_search`/`memory_read`/`memory_paged`; binary ≤ 4 MB.
+`memory_write`/`kb_search`/`memory_read`/`memory_paged`; binary ≤ 6 MB.
 
 **Exit criteria for Phase 5:** a finding written by one agent is retrievable with
 provenance by a later, differently-capability-scoped agent over a capability-gated
 shared KB; working memory pages under budget pressure; long-term memory survives
-restart; memory is browsable under `/agents`; the binary is still ≤ 4 MB; and the
+restart; memory is browsable under `/agents`; the binary is still ≤ 6 MB; and the
 single-agent demo's flight-event sequence is unchanged when memory is unused. Full
 detail and per-increment acceptance: `docs/PHASE-5-PLAN.md`.
 

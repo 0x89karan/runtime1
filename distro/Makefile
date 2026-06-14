@@ -14,7 +14,8 @@ QEMU_FLAGS  := \
 	-append "console=ttyS0 quiet ip=dhcp" \
 	-netdev user,id=net0 \
 	-device virtio-net-pci,netdev=net0 \
-	-virtfs local,path=$(HOME)/.agentos-secrets,mount_tag=secrets0,security_model=none,id=secrets0
+	-virtfs local,path=$(HOME)/.agentos-secrets,mount_tag=secrets0,security_model=none,id=secrets0 \
+	-virtfs local,path=$(HOME)/.agentos-memory,mount_tag=memory0,security_model=none,id=memory0
 
 .PHONY: all prereqs build run test clean distclean
 
@@ -37,6 +38,7 @@ prereqs:
 		echo "ERROR: ANTHROPIC_API_KEY not set in $(HOME)/.agentos-secrets/agentos.env"; \
 		exit 1; \
 	}
+	@mkdir -p $(HOME)/.agentos-memory
 	@echo "prereqs OK."
 
 $(BR_TARBALL):
@@ -80,12 +82,13 @@ run: prereqs build
 		-virtfs local,path=$(CURDIR)/$(OUTPUT_DIR)/run,mount_tag=output0,security_model=none,id=output0
 
 test: prereqs build
-	mkdir -p $(CURDIR)/$(OUTPUT_DIR)/test-run
+	mkdir -p $(CURDIR)/$(OUTPUT_DIR)/test-run $(CURDIR)/$(OUTPUT_DIR)/test-memory
 	@rm -f $(CURDIR)/$(OUTPUT_DIR)/test-run/flight.jsonl
 	@echo "Booting AgentOS for acceptance test (timeout 120s)..."
 	@timeout 120 $(QEMU) $(QEMU_FLAGS) \
 		-no-reboot \
 		-virtfs local,path=$(CURDIR)/$(OUTPUT_DIR)/test-run,mount_tag=output0,security_model=none,id=output0 \
+		-virtfs local,path=$(CURDIR)/$(OUTPUT_DIR)/test-memory,mount_tag=memory0,security_model=none,id=memory0 \
 		-serial file:$(CURDIR)/$(OUTPUT_DIR)/console.log \
 		2>/dev/null || true
 	@echo "Checking flight log..."
