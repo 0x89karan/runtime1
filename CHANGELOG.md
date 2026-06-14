@@ -3,6 +3,50 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.5] - 2026-06-14 (v0.22.0)
+
+Retrieval as tool: `kb_search` with BM25-lite inverted index over the shared KB.
+
+### Added
+- **`kb_search` tool** (`tools/native.rs`): BM25-lite ranked retrieval over a KB
+  segment. Requires `KbRead` capability. Inputs: `segment`, `query`, optional `author`
+  filter, optional `limit` (default 10, max 50). Output: flat JSON with `hits` (content +
+  provenance expanded), `terms_matched`. All-stopword queries return a structured empty
+  with `note` field.
+- **Inverted index** (`memory/index.rs`): `tokenize()` (lowercase, split non-alphanumeric,
+  skip stopwords + >64-byte tokens), `term_frequencies()`. 21-word stoplist.
+- **`INDEX` redb table**: key = `"{namespace}\x00{word}"`, value = JSON posting list.
+  ENTRIES + INDEX + META updated atomically in a single write transaction per put/append/delete.
+- **`doc_count:{namespace}` META key**: tracks corpus size for BM25 IDF; incremented on
+  new-key writes, decremented on delete.
+- **`MemoryStore::search()`** trait method: `(hits, terms_matched)` return; `SearchHit`
+  struct; `RedbStore` implements full BM25-lite; `SimpleStore` test mock uses brute-force
+  linear scan.
+- **`KbSearch` flight event**: `agent_id`, `segment`, `query_preview` (64-char truncated),
+  `hits`, `terms_matched`.
+- 397 tests (up from 376): 7 new `store::tests` (ranking, namespace isolation, author
+  filter, write/delete round-trip, append indexing, posting-list pruning, stopword guard),
+  5 `store::tests` coverage additions (put-overwrite deindex, search-None error, author
+  no-provenance include), 2 `tools::tests` flight-event + query-preview tests,
+  1 integration test (multi-write ordered hits with provenance), 2 `native::tests`
+  (KbSearch missing-segment and empty-query guards).
+
+### Fixed
+- `append()` used `is_empty()` on a `String` to detect new keys; replaced with
+  `is_none()` on the `Option` so an existing entry whose value is `""` does not
+  re-increment `doc_count`, preventing permanent BM25 IDF drift.
+- `search()` now skips zero-score candidates (consistent with `SimpleStore` mock) so
+  documents whose only posting-list entry is a race artifact do not appear in results.
+- Query terms are deduplicated and capped at 64 unique terms before scoring to bound
+  worst-case BM25 work regardless of repeated terms in the LLM-supplied query.
+
+### Security
+- `kb_search` gated behind `KbRead` capability on the queried segment — same enforcement
+  as `kb_get`.
+- Cross-segment search returns an error (not silently returning cross-namespace data).
+- Stale posting entries (post-delete race) silently skipped during scoring.
+- Query term deduplication + 64-term cap prevents adversarial O(n²) scoring via repeated terms.
+
 ## [p5.4] - 2026-06-14 (v0.21.0)
 
 Shared KB MVP: multi-agent segmented knowledge base with three mutability classes

@@ -91,6 +91,7 @@ Phase 0 kinds (canonical — do not rename):
 | `memory_quarantined` | corrupt store renamed to `.corrupt`; fresh store opened (path) (p5.1+) |
 | `memory_pressure_advisory` | token spend reached SOFT_THRESHOLD (75%); advisory only, no eviction (agent, turn, tokens_spent_pct, soft_threshold) (p5.2+) |
 | `memory_paged` | oldest turn pairs evicted from active context to short_term Tier 2 (agent, turn, pages_moved, short_term_depth, tokens_spent_pct) (p5.2+) |
+| `kb_search` | `kb_search` tool invoked; inverted index queried (agent_id, segment, query_preview, hits: usize, terms_matched: usize) (p5.5+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

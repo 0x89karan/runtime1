@@ -1,6 +1,29 @@
 # TODOS
 
-## Phase 5 — Open (deferred from p5.1–p5.4 adversarial reviews)
+## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
+
+**p5.5-ar-01 (P3) — Posting list loading is O(n) RAM at query time**
+- `RedbStore::search()` fetches the full posting list for each query term into a Vec,
+  then unions candidates in a HashSet. For large segments (>100k entries), a common
+  term's posting list could consume significant memory.
+- Fix path: lazy iterator over posting list entries; avoid materializing the full Vec.
+  Or add a cap on posting-list size returned (top-k by recency). Defer to p5.6
+  or a dedicated search-performance pass.
+
+**p5.5-ar-02 (P3) — Provenance metadata tokenized alongside content for BM25 scoring**
+- `store.rs`: the full raw stored JSON (including `agent_id`, `ts`, `class`, `task_fp`
+  fields from provenance) is passed to `index::tokenize()` at both write and score time.
+  Queries for structural terms like `"scratch"` or `"agent"` match documents whose
+  provenance contains those strings, not based on content relevance.
+- Fix: extract `value["content"]` before tokenizing; fall back to raw string only when
+  the value is not parseable JSON. Defer to p5.6.
+
+**p5.5-ar-03 (P3) — Author filter silently passes entries that lack provenance**
+- `store.rs:526`: `unwrap_or(true)` means entries without a parseable `provenance.agent_id`
+  field always pass an `author` filter, regardless of who the caller is filtering for.
+  The behavior is intentional and tested, but the tool description doesn't document it.
+- Fix: add a `provenance_unknown: true` flag on affected hits, or document the inclusive
+  default in the `kb_search` tool's description string. Defer to p5.6.
 
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment

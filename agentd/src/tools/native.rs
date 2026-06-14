@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use crate::capability::Capability;
 use crate::config::AgentCard;
-use crate::memory::{validate_segment, MemoryStore, MutabilityClass};
+use crate::memory::{index, validate_segment, MemoryStore, MutabilityClass};
 use super::{Tool, ToolContext, ToolRegistry};
 
 const READ_FILE_MAX: usize = 100_000;
@@ -48,6 +48,12 @@ pub struct KbPut {
 /// Read a single entry from a shared knowledge-base segment (Tier 4, p5.4+).
 /// NOT registered under `native = ["all"]` — requires explicit listing.
 pub struct KbGet {
+    pub store: Arc<dyn MemoryStore>,
+}
+
+/// Search a KB segment using BM25-lite ranked retrieval (Tier 4, p5.5+).
+/// NOT registered under `native = ["all"]` — requires explicit listing.
+pub struct KbSearch {
     pub store: Arc<dyn MemoryStore>,
 }
 
@@ -694,6 +700,112 @@ impl Tool for KbGet {
 }
 
 #[async_trait]
+impl Tool for KbSearch {
+    fn name(&self) -> &str { "kb_search" }
+
+    fn description(&self) -> &str {
+        "Search a shared knowledge-base segment using BM25-lite ranked retrieval. \
+         Returns entries matching the query sorted by relevance, with content and \
+         provenance expanded. Fields: segment (required), query (required), \
+         author (optional agent_id filter), limit (optional integer, default 10, max 50). \
+         MVP: single-segment search only. Requires KbRead capability."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "segment": {
+                    "type": "string",
+                    "description": "KB segment to search"
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Free-text query — tokenized and ranked via BM25-lite"
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Optional: filter to entries written by this agent_id"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum results to return (default 10, max 50)"
+                }
+            },
+            "required": ["segment", "query"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, input: &Value) -> Option<Capability> {
+        let segment = input["segment"].as_str().unwrap_or("");
+        Some(Capability::KbRead { segment: segment.to_string() })
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
+        let segment = input["segment"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("segment must be a string"))?;
+        validate_segment(segment, "segment")?;
+
+        let query = input["query"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("query must be a string"))?;
+        anyhow::ensure!(!query.is_empty(), "query must not be empty");
+
+        let query_terms = index::tokenize(query);
+        if query_terms.is_empty() {
+            return Ok(serde_json::to_string(&serde_json::json!({
+                "hits": [],
+                "terms_matched": 0,
+                "note": "query contained no indexable terms (all stopwords or too short)"
+            }))?);
+        }
+
+        let author = input["author"].as_str().map(String::from);
+        let limit = input["limit"].as_u64().unwrap_or(10).min(50) as usize;
+
+        let store = Arc::clone(&self.store);
+        let seg = segment.to_string();
+        let q = query.to_string();
+        let (hits, terms_matched) = tokio::task::spawn_blocking(move || {
+            store.search(Some(&seg), &q, author.as_deref(), limit)
+        })
+        .await
+        .context("kb_search spawn_blocking join")??;
+
+        // Expand content/provenance from inner JSON for flat, agent-readable output.
+        let expanded: Vec<serde_json::Value> = hits
+            .into_iter()
+            .map(|h| {
+                let mut obj = serde_json::json!({
+                    "segment": h.namespace,
+                    "key": h.key,
+                    "score": h.score,
+                });
+                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&h.value) {
+                    if let Some(map) = obj.as_object_mut() {
+                        for field in ["content", "provenance", "class"] {
+                            if let Some(v) = inner.get(field) {
+                                map.insert(field.to_string(), v.clone());
+                            }
+                        }
+                    }
+                } else if let Some(map) = obj.as_object_mut() {
+                    map.insert("content".to_string(), serde_json::Value::String(h.value));
+                }
+                obj
+            })
+            .collect();
+
+        Ok(serde_json::to_string(&serde_json::json!({
+            "hits": expanded,
+            "terms_matched": terms_matched,
+        }))?)
+    }
+}
+
+#[async_trait]
 impl Tool for SpawnAgentTool {
     fn name(&self) -> &str {
         "spawn_agent"
@@ -856,7 +968,7 @@ pub fn register_native(
             reg.register(Box::new(MemRecall { store: s }))?;
         }
     }
-    // kb_put / kb_get — NOT included in "all"; require explicit opt-in.
+    // kb_put / kb_get / kb_search — NOT included in "all"; require explicit opt-in.
     if names.iter().any(|n| n == "kb_put") {
         if let Some(s) = store.clone() {
             reg.register(Box::new(KbPut { store: s }))?;
@@ -865,6 +977,11 @@ pub fn register_native(
     if names.iter().any(|n| n == "kb_get") {
         if let Some(s) = store.clone() {
             reg.register(Box::new(KbGet { store: s }))?;
+        }
+    }
+    if names.iter().any(|n| n == "kb_search") {
+        if let Some(s) = store.clone() {
+            reg.register(Box::new(KbSearch { store: s }))?;
         }
     }
     Ok(())
@@ -1030,6 +1147,7 @@ mod tests {
         // kb tools must NOT be in "all"
         assert!(!names.contains(&"kb_put".to_string()), "kb_put must not be in 'all'");
         assert!(!names.contains(&"kb_get".to_string()), "kb_get must not be in 'all'");
+        assert!(!names.contains(&"kb_search".to_string()), "kb_search must not be in 'all'");
     }
 
     #[test]
@@ -1134,6 +1252,49 @@ mod tests {
             let v = versions.entry(format!("{namespace}\x00{key}")).or_insert(0);
             *v += 1;
             Ok(*v)
+        }
+        fn search(
+            &self,
+            namespace: Option<&str>,
+            query: &str,
+            author: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<(Vec<crate::memory::SearchHit>, usize)> {
+            use crate::memory::{index, SearchHit};
+            let ns = match namespace { Some(ns) => ns, None => return Ok((vec![], 0)) };
+            let query_terms = index::tokenize(query);
+            if query_terms.is_empty() { return Ok((vec![], 0)); }
+            let terms_matched = query_terms.len();
+            let data = self.data.lock().unwrap();
+            let ns_prefix = format!("{}\x00", ns);
+            let n_docs = data.keys().filter(|k| k.starts_with(&ns_prefix)).count() as f64;
+            let n_docs = n_docs.max(1.0);
+            let mut hits: Vec<SearchHit> = data.iter()
+                .filter(|(k, _)| k.starts_with(&ns_prefix))
+                .filter_map(|(composite_key, value)| {
+                    if let Some(af) = author {
+                        let ok = serde_json::from_str::<serde_json::Value>(value).ok()
+                            .and_then(|v| v.get("provenance").and_then(|p| p.get("agent_id"))
+                                .and_then(|a| a.as_str()).map(|s| s == af))
+                            .unwrap_or(true);
+                        if !ok { return None; }
+                    }
+                    let doc_tokens = index::tokenize(value);
+                    let tfs = index::term_frequencies(&doc_tokens, &query_terms);
+                    let score: f64 = tfs.iter().map(|&tf| (tf as f64) * (1.0_f64 + n_docs).ln()).sum();
+                    if score <= 0.0 { return None; }
+                    Some(SearchHit {
+                        namespace: ns.to_string(),
+                        key: composite_key[ns_prefix.len()..].to_string(),
+                        score,
+                        value: value.clone(),
+                    })
+                })
+                .collect();
+            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.key.cmp(&b.key)));
+            hits.truncate(limit);
+            Ok((hits, terms_matched))
         }
     }
 
@@ -1443,7 +1604,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_native(
             &mut reg,
-            &["kb_put".to_string(), "kb_get".to_string()],
+            &["kb_put".to_string(), "kb_get".to_string(), "kb_search".to_string()],
             None,
             None,
         )
@@ -1455,6 +1616,10 @@ mod tests {
         assert!(
             !reg.tool_names().contains(&"kb_get".to_string()),
             "kb_get must not be registered without store"
+        );
+        assert!(
+            !reg.tool_names().contains(&"kb_search".to_string()),
+            "kb_search must not be registered without store"
         );
     }
 
@@ -1921,6 +2086,54 @@ mod tests {
         assert!(
             err.to_string().contains("capability denied"),
             "must report capability denied; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kb_search_missing_segment_field_errors() {
+        let tool = KbSearch { store: SimpleStore::new_arc() };
+        let err = tool.invoke(json!({"query": "rust performance"}), &kb_ctx("a")).await.unwrap_err();
+        assert!(err.to_string().contains("segment"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kb_search_empty_query_errors() {
+        let tool = KbSearch { store: SimpleStore::new_arc() };
+        let err = tool.invoke(json!({"segment": "kb:test", "query": ""}), &kb_ctx("a")).await.unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn kb_search_requires_kbread_on_segment() {
+        use crate::flight_recorder::FlightRecorder;
+        use tempfile::NamedTempFile;
+
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:research", MutabilityClass::Scratch).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_search".to_string()],
+            None,
+            Some(store as Arc<dyn MemoryStore>),
+        ).unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = FlightRecorder::new(tmp.path()).unwrap();
+        let ctx = kb_ctx("agent-no-cap");
+
+        // No KbRead cap granted — must be denied.
+        let caps: &[crate::capability::Capability] = &[];
+        let err = reg.invoke(
+            "kb_search",
+            json!({"segment": "kb:research", "query": "rust performance"}),
+            &ctx,
+            Some(caps),
+            &rec,
+        ).await.unwrap_err();
+        assert!(
+            err.to_string().contains("capability denied"),
+            "kb_search without KbRead cap must be denied; got: {err}"
         );
     }
 }

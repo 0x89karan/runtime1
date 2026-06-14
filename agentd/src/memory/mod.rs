@@ -1,4 +1,5 @@
 pub mod context;
+pub mod index;
 pub mod store;
 
 pub use context::MemItem;
@@ -15,6 +16,19 @@ pub enum MutabilityClass {
     Canon,
     Log,
     Scratch,
+}
+
+/// A single result from a `kb_search` query.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    /// The namespace (segment) this entry lives in.
+    pub namespace: String,
+    /// The entry key within the namespace.
+    pub key: String,
+    /// BM25-lite relevance score (higher = more relevant).
+    pub score: f64,
+    /// The raw entry JSON string (same format as `kb_get` returns).
+    pub value: String,
 }
 
 /// Thin abstraction over the durable key/value backend.
@@ -59,6 +73,26 @@ pub trait MemoryStore: Send + Sync {
     /// key. Starts at 1 on first call. Prevents two concurrent writers from
     /// both producing the same version number for the same key.
     fn next_scratch_version(&self, namespace: &str, key: &str) -> anyhow::Result<u64>;
+
+    // ── Retrieval (p5.5) ────────────────────────────────────────────────────
+
+    /// Search entries using BM25-lite ranking over the inverted index.
+    ///
+    /// `namespace`: if `Some`, restrict search to that segment; if `None`,
+    /// search is not yet supported across all segments — callers should always
+    /// pass `Some` for the MVP.
+    ///
+    /// Returns up to `limit` hits sorted by descending score. Returns an empty
+    /// `Vec` when no terms survive tokenization (all stopwords) or no entries
+    /// match — callers must distinguish these via `terms_matched`.
+    fn search(
+        &self,
+        namespace: Option<&str>,
+        query: &str,
+        author: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<SearchHit>, usize)>;
+    // returns (hits, terms_matched)
 }
 
 /// Validate that a namespace or key string conforms to the allowed grammar.

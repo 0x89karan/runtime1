@@ -566,7 +566,7 @@ retrieves with provenance, no Net) ships as an integration test. Extends
 `memory_write`/`memory_read` with `tier:4` + `class`. **Acceptance:** +6 tests;
 worked-example test passes; THREAT_MODEL §7.1/§7.2 stubbed.
 
-### ▢ p5.5 — Retrieval as tool (lexical search)
+### ✅ p5.5 — Retrieval as tool (lexical search)
 **Depends on:** p5.4. `kb_search { segment?, query, author?, limit? }` over a
 tokenized inverted index (`memory/index.rs`, BM25-lite in Rust) maintained
 transactionally with entry writes. No embeddings, no network. Event: `kb_search`.

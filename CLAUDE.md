@@ -79,7 +79,12 @@ capability enforcement; `[[memory.segments]]` TOML config seeds classes at start
 `next_scratch_version` (atomic version counter, fixes TOCTOU); `config::SegmentClass` unified
 with `memory::MutabilityClass`; `kv_set` canon/log bypass fixed; provenance stamped by runtime;
 `memory_write`/`memory_read` events with `tier:4` + `class`; THREAT_MODEL §7.1/7.2; 376 tests.
-**Next: p5.5 (retrieval as tool / lexical search) — see `docs/ROADMAP.md`.**
+**p5.5 complete (v0.22.0).** Retrieval as tool: `kb_search` with BM25-lite inverted index;
+`INDEX` redb table (key=`"{ns}\x00{word}"`, value=JSON posting list); atomic ENTRIES+INDEX+META
+writes; `doc_count:{namespace}` META key for IDF; 21-word stoplist tokenizer in `memory/index.rs`;
+`MemoryStore::search()` + `SearchHit`; flat output with content/provenance expanded; `KbRead`-gated;
+`kb_search` flight event; 390 tests.
+**Next: p5.6 (eviction & summarization) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

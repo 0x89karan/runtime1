@@ -161,6 +161,24 @@ impl ToolRegistry {
             }
         }
 
+        // Capture kb_search input context before input is consumed by invoke.
+        let kb_search_segment = if name == "kb_search" {
+            input["segment"].as_str().map(String::from)
+        } else {
+            None
+        };
+        let kb_search_query_preview = if name == "kb_search" {
+            let q = input["query"].as_str().unwrap_or("");
+            let char_count = q.chars().count();
+            Some(if char_count > 64 {
+                format!("{}...", q.chars().take(64).collect::<String>())
+            } else {
+                q.to_string()
+            })
+        } else {
+            None
+        };
+
         let result = tool.invoke(input, ctx).await?;
 
         // Post-call hook: emit memory events for kv and long-term memory tools.
@@ -236,6 +254,23 @@ impl ToolRegistry {
                         "tier": 4,
                         "class": class,
                         "found": found,
+                    }),
+                );
+            }
+            "kb_search" => {
+                let v = serde_json::from_str::<serde_json::Value>(&result).unwrap_or_default();
+                let hits = v["hits"].as_array().map(|a| a.len()).unwrap_or(0);
+                let terms_matched = v["terms_matched"].as_u64().unwrap_or(0) as usize;
+                recorder.record(
+                    &ctx.agent_id,
+                    None,
+                    EventKind::KbSearch,
+                    serde_json::json!({
+                        "agent_id": &ctx.agent_id,
+                        "segment": kb_search_segment.as_deref().unwrap_or(""),
+                        "query_preview": kb_search_query_preview.as_deref().unwrap_or(""),
+                        "hits": hits,
+                        "terms_matched": terms_matched,
                     }),
                 );
             }
@@ -462,6 +497,73 @@ mod tests {
             *v += 1;
             Ok(*v)
         }
+        fn search(
+            &self,
+            namespace: Option<&str>,
+            query: &str,
+            author: Option<&str>,
+            limit: usize,
+        ) -> anyhow::Result<(Vec<crate::memory::SearchHit>, usize)> {
+            use crate::memory::{index, SearchHit};
+            let ns = match namespace {
+                Some(ns) => ns,
+                None => return Ok((vec![], 0)),
+            };
+            let query_terms = index::tokenize(query);
+            if query_terms.is_empty() {
+                return Ok((vec![], 0));
+            }
+            let terms_matched = query_terms.len();
+            let data = self.data.lock().unwrap();
+            let ns_prefix = format!("{}\x00", ns);
+            let n_docs = data.keys().filter(|k| k.starts_with(&ns_prefix)).count() as f64;
+            let n_docs = n_docs.max(1.0);
+
+            let mut hits: Vec<SearchHit> = data
+                .iter()
+                .filter(|(k, _)| k.starts_with(&ns_prefix))
+                .filter_map(|(composite_key, value)| {
+                    if let Some(author_filter) = author {
+                        let passes = serde_json::from_str::<serde_json::Value>(value)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("provenance")
+                                    .and_then(|p| p.get("agent_id"))
+                                    .and_then(|a| a.as_str())
+                                    .map(|s| s == author_filter)
+                            })
+                            .unwrap_or(true);
+                        if !passes {
+                            return None;
+                        }
+                    }
+                    let doc_tokens = index::tokenize(value);
+                    let tfs = index::term_frequencies(&doc_tokens, &query_terms);
+                    let score: f64 = tfs
+                        .iter()
+                        .map(|&tf| (tf as f64) * (1.0_f64 + n_docs).ln())
+                        .sum();
+                    if score <= 0.0 {
+                        return None;
+                    }
+                    let user_key = composite_key[ns_prefix.len()..].to_string();
+                    Some(SearchHit {
+                        namespace: ns.to_string(),
+                        key: user_key,
+                        score,
+                        value: value.clone(),
+                    })
+                })
+                .collect();
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.key.cmp(&b.key))
+            });
+            hits.truncate(limit);
+            Ok((hits, terms_matched))
+        }
     }
 
     #[test]
@@ -653,6 +755,93 @@ mod tests {
         assert_eq!(event["data"]["tier"], 4u64, "kb_get must emit tier=4");
         assert_eq!(event["data"]["found"], false, "found=false when key absent");
         assert_eq!(event["data"]["class"], "", "class must be empty string on miss");
+    }
+
+    #[tokio::test]
+    async fn kb_search_invoke_emits_kb_search_event() {
+        use crate::memory::MutabilityClass;
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:research", MutabilityClass::Scratch).unwrap();
+        // Pre-seed an entry so the search returns a hit.
+        let entry = serde_json::to_string(&serde_json::json!({
+            "content": "tokamak fusion reactor plasma",
+            "class": "scratch",
+            "version": 1,
+            "provenance": {"agent_id": "agent-seed", "turn": 0, "task_fp": "", "ts": "2025-01-01T00:00:00Z", "citation": null},
+        })).unwrap();
+        store.put("kb:research", "fusion-doc", &entry).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_search".to_string()],
+            None,
+            Some(store as Arc<dyn crate::memory::MemoryStore>),
+        ).unwrap();
+        let (rec, tmp) = recorder();
+        let caps = [Capability::KbRead { segment: "kb:research".to_string() }];
+        reg.invoke(
+            "kb_search",
+            serde_json::json!({"segment": "kb:research", "query": "tokamak fusion"}),
+            &ctx("agent-searcher"),
+            Some(&caps),
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        // The flight log may have multiple lines (capability_denied is not emitted on success).
+        // Find the kb_search event line.
+        let event: serde_json::Value = content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["kind"] == "kb_search")
+            .expect("kb_search event must be emitted");
+        assert_eq!(event["agent"], "agent-searcher");
+        assert_eq!(event["data"]["segment"], "kb:research");
+        assert!(event["data"]["hits"].as_u64().unwrap() >= 1, "hits must be >= 1");
+        assert!(event["data"]["terms_matched"].as_u64().unwrap() >= 1, "terms_matched must be >= 1");
+        let preview = event["data"]["query_preview"].as_str().unwrap();
+        assert!(preview.contains("tokamak"), "query_preview must contain query text");
+    }
+
+    #[tokio::test]
+    async fn kb_search_long_query_preview_truncated() {
+        use crate::memory::MutabilityClass;
+        let mut reg = ToolRegistry::new();
+        let store = SimpleStore::new_arc();
+        store.set_segment_class("kb:notes", MutabilityClass::Scratch).unwrap();
+        register_native(
+            &mut reg,
+            &["kb_search".to_string()],
+            None,
+            Some(store as Arc<dyn crate::memory::MemoryStore>),
+        ).unwrap();
+        let (rec, tmp) = recorder();
+        let caps = [Capability::KbRead { segment: "kb:notes".to_string() }];
+        // 80-char query — well above the 64-char truncation threshold.
+        let long_query = "a".repeat(80);
+        reg.invoke(
+            "kb_search",
+            serde_json::json!({"segment": "kb:notes", "query": long_query}),
+            &ctx("agent-q"),
+            Some(&caps),
+            &rec,
+        )
+        .await
+        .unwrap();
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["kind"] == "kb_search")
+            .expect("kb_search event must be emitted");
+        let preview = event["data"]["query_preview"].as_str().unwrap();
+        assert!(
+            preview.len() <= 67,
+            "preview must be truncated to ≤67 chars (64 + '...'), got {}",
+            preview.len()
+        );
+        assert!(preview.ends_with("..."), "truncated preview must end with '...'");
     }
 
     #[tokio::test]
