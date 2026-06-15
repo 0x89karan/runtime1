@@ -38,7 +38,13 @@ jobs:
           key: buildroot-2024.02.9-${{ hashFiles('distro/buildroot.config', 'distro/kernel-extras.config') }}
 
       - name: Build distro image
-        run: make build
+        run: |
+          # Stage the binary explicitly so make never has to resolve ../agentd/target/
+          mkdir -p overlay/usr/bin
+          cp "$GITHUB_WORKSPACE/agentd/target/x86_64-unknown-linux-musl/release/agentd" \
+             overlay/usr/bin/agentd
+          chmod +x overlay/usr/bin/agentd
+          make build
         working-directory: distro
 
       - name: QEMU 2-boot continuity
