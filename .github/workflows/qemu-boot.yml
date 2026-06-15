@@ -1,0 +1,100 @@
+name: QEMU 2-boot continuity
+
+# Manual trigger only: costs Anthropic API credits and ~25 min on a cold cache.
+# Run before Phase 6 merges and after any change to distro/ or memory/.
+on:
+  workflow_dispatch:
+
+jobs:
+  qemu-boot-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agentd
+
+      - name: Install deps
+        run: |
+          sudo apt-get install -y qemu-system-x86 musl-tools jq
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build agentd (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl
+        working-directory: agentd
+
+      # Cache the full Buildroot build tree. Key covers the defconfig and kernel
+      # fragment; a hit lets Buildroot skip toolchain + kernel compilation (~20 min)
+      # and only repack the rootfs with the fresh agentd binary (~2 min).
+      - name: Cache Buildroot build tree
+        uses: actions/cache@v4
+        with:
+          path: distro/build
+          key: buildroot-2024.02.9-${{ hashFiles('distro/buildroot.config', 'distro/kernel-extras.config') }}
+
+      - name: Build distro image
+        run: make build
+        working-directory: distro
+
+      - name: QEMU 2-boot continuity
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/agentos-secrets /tmp/agentos-memory /tmp/agentos-out
+          printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY" \
+            > /tmp/agentos-secrets/agentos.env
+
+          # Enable KVM acceleration if the runner supports it.
+          KVM_FLAGS=""
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ]; then
+            KVM_FLAGS="-enable-kvm -cpu host"
+            echo "KVM available — using hardware acceleration"
+          else
+            echo "KVM not available — using TCG (slower)"
+          fi
+
+          boot() {
+            local n=$1
+            echo "=== Boot $n ==="
+            rm -f /tmp/agentos-out/flight.jsonl
+            # shellcheck disable=SC2086
+            timeout 180 qemu-system-x86_64 \
+              $KVM_FLAGS \
+              -nographic -m 256M \
+              -kernel distro/output/bzImage \
+              -initrd distro/output/rootfs.cpio.gz \
+              -append "console=ttyS0 quiet ip=dhcp" \
+              -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+              -virtfs local,path=/tmp/agentos-secrets,mount_tag=secrets0,security_model=none,id=secrets0 \
+              -virtfs local,path=/tmp/agentos-memory,mount_tag=memory0,security_model=none,id=memory0 \
+              -virtfs local,path=/tmp/agentos-out,mount_tag=output0,security_model=none,id=output0 \
+              -no-reboot 2>/dev/null || true
+
+            if ! jq -e 'select(.kind == "agent_completed" or .kind == "budget_exceeded")' \
+                /tmp/agentos-out/flight.jsonl 2>/dev/null | head -1 | grep -q .; then
+              echo "FAIL: no completion event after boot $n"
+              echo "--- flight.jsonl ---"
+              cat /tmp/agentos-out/flight.jsonl 2>/dev/null || echo "(missing)"
+              exit 1
+            fi
+            echo "Boot $n: agent completed ✓"
+          }
+
+          boot 1
+
+          if [ ! -f /tmp/agentos-memory/memory.redb ]; then
+            echo "FAIL: memory.redb not written to 9p mount after boot 1"
+            exit 1
+          fi
+          echo "memory.redb persisted on host after boot 1 ✓"
+
+          boot 2
+
+          echo "2-boot continuity: PASS ✓"
