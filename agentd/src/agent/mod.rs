@@ -10,7 +10,7 @@ use crate::{
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceRequest, InferenceResponse, Msg, Role, StopReason, ToolSpec},
     memory::{
-        context::{assess, page_count, page_turns, MemoryPressure, SOFT_THRESHOLD},
+        context::{assess, estimate_context_tokens, page_count, page_turns, MemoryPressure, SOFT_THRESHOLD},
         MemItem,
     },
     tools::{ToolContext, ToolRegistry},
@@ -269,6 +269,50 @@ impl AgentTask {
         self.turn += 1;
     }
 
+    /// F-16: a sole-only tool (`spawn_agent` / `send_message`) was batched with
+    /// other tool calls in one turn. Models routinely batch tool calls, so
+    /// terminating the agent over it (the old behavior) needlessly kills the
+    /// spawn/bus flows. Instead, recover: emit an `is_error` ToolResult for
+    /// EVERY tool_use this turn (none are executed, to keep retries idempotent)
+    /// telling the model to retry the sole tool alone, then re-infer.
+    ///
+    /// Every `tool_use` block must get a matching `tool_result` or the next
+    /// inference request is malformed — so we answer all of `call_blocks`.
+    fn reject_batched_sole_tool(
+        &mut self,
+        sole_name: &str,
+        call_blocks: &[Block],
+        recorder: &FlightRecorder,
+    ) -> AgentEffect {
+        let results: Vec<Block> = call_blocks
+            .iter()
+            .filter_map(|b| {
+                let Block::ToolUse { id, name, .. } = b else {
+                    return None;
+                };
+                let content = if name == sole_name {
+                    format!(
+                        "`{sole_name}` must be the only tool call in a turn. None of \
+                         this turn's tool calls were executed. Retry with `{sole_name}` \
+                         as the sole tool call."
+                    )
+                } else {
+                    format!(
+                        "`{name}` was not executed: it was batched with `{sole_name}`, \
+                         which must be called alone. Call it in a separate turn."
+                    )
+                };
+                Some(Block::ToolResult {
+                    tool_use_id: id.clone(),
+                    content,
+                    is_error: true,
+                })
+            })
+            .collect();
+        self.provide_tool_results(results, recorder);
+        self.step_need_infer(recorder)
+    }
+
     /// Inject pending mailbox messages into this agent before inference.
     ///
     /// Appends each message as a Text block to the last User message in history.
@@ -320,81 +364,91 @@ impl AgentTask {
             ));
         }
 
-        // Memory pressure check: assess current token spend against budget.
-        // Paging gives N+1 relief (the next inference request will be smaller);
-        // it cannot reduce already-spent tokens for the current turn.
-        // Advisory events are edge-triggered (fire once on transition, not every turn).
+        // Memory pressure (p5.2; F-01 fix in p5.9). Two DISTINCT signals:
+        //   - lifetime spend   → budget advisory + telemetry. Monotonic: never falls.
+        //   - retained context → the PAGING decision. Falls after paging, so the
+        //     loop edge-gates instead of re-paging every turn once spend crosses
+        //     90% (the old bug: paging keyed on lifetime spend shredded context).
+        // Paging gives N+1 relief (the next inference request is smaller); it
+        // cannot reduce already-spent tokens for the current turn.
+        // Advisory events are edge-triggered (fire once on transition).
         let total_spent = self.total_input + self.total_output;
         let tokens_spent_pct = if self.cfg.token_budget > 0 {
             total_spent as f64 / self.cfg.token_budget as f64
         } else {
             0.0
         };
-        let current_pressure = assess(total_spent, self.cfg.token_budget);
-        match &current_pressure {
-            MemoryPressure::None => {}
-            MemoryPressure::Soft => {
-                if self.last_pressure == MemoryPressure::None {
-                    recorder.record(
-                        &self.agent_id,
-                        Some(self.turn),
-                        EventKind::MemoryPressureAdvisory,
-                        json!({
-                            "agent":             &self.agent_id,
-                            "turn":              self.turn,
-                            "tokens_spent_pct":  tokens_spent_pct,
-                            "soft_threshold":    SOFT_THRESHOLD,
-                        }),
-                    );
-                }
-            }
-            MemoryPressure::Hard => {
-                let n = page_count(&self.messages);
-                if n > 0 {
-                    match page_turns(&mut self.messages, n, self.turn) {
-                        Ok(items) => {
-                            let pages_moved = items.len();
-                            self.short_term.extend(items);
-                            recorder.record(
-                                &self.agent_id,
-                                Some(self.turn),
-                                EventKind::MemoryPaged,
-                                json!({
-                                    "agent":             &self.agent_id,
-                                    "turn":              self.turn,
-                                    "pages_moved":       pages_moved,
-                                    "short_term_depth":  self.short_term.len(),
-                                    "tokens_spent_pct":  tokens_spent_pct,
-                                }),
-                            );
-                        }
-                        Err(e) => {
-                            recorder.record(
-                                &self.agent_id,
-                                Some(self.turn),
-                                EventKind::Error,
-                                json!({ "stage": "page_turns", "error": e.to_string() }),
-                            );
-                        }
+
+        // Budget advisory — edge-triggered on lifetime spend crossing SOFT.
+        let spend_pressure = assess(total_spent, self.cfg.token_budget);
+        if spend_pressure == MemoryPressure::Soft && self.last_pressure == MemoryPressure::None {
+            recorder.record(
+                &self.agent_id,
+                Some(self.turn),
+                EventKind::MemoryPressureAdvisory,
+                json!({
+                    "agent":            &self.agent_id,
+                    "turn":             self.turn,
+                    "tokens_spent_pct": tokens_spent_pct,
+                    "soft_threshold":   SOFT_THRESHOLD,
+                }),
+            );
+        }
+
+        // Paging — driven by RETAINED CONTEXT SIZE, which shrinks after paging.
+        let retained = estimate_context_tokens(&self.messages);
+        let retained_pct = if self.cfg.token_budget > 0 {
+            retained as f64 / self.cfg.token_budget as f64
+        } else {
+            0.0
+        };
+        if assess(retained, self.cfg.token_budget) == MemoryPressure::Hard {
+            let n = page_count(&self.messages);
+            if n > 0 {
+                match page_turns(&mut self.messages, n, self.turn) {
+                    Ok(items) => {
+                        let pages_moved = items.len();
+                        self.short_term.extend(items);
+                        recorder.record(
+                            &self.agent_id,
+                            Some(self.turn),
+                            EventKind::MemoryPaged,
+                            json!({
+                                "agent":            &self.agent_id,
+                                "turn":             self.turn,
+                                "pages_moved":      pages_moved,
+                                "short_term_depth": self.short_term.len(),
+                                "retained_pct":     retained_pct,
+                                "tokens_spent_pct": tokens_spent_pct,
+                            }),
+                        );
                     }
-                } else if self.last_pressure != MemoryPressure::Hard {
-                    // Hard pressure but context too short to page — log once on entry.
-                    recorder.record(
-                        &self.agent_id,
-                        Some(self.turn),
-                        EventKind::MemoryPressureAdvisory,
-                        json!({
-                            "agent":             &self.agent_id,
-                            "turn":              self.turn,
-                            "tokens_spent_pct":  tokens_spent_pct,
-                            "soft_threshold":    SOFT_THRESHOLD,
-                            "note":              "hard pressure, context too short to page",
-                        }),
-                    );
+                    Err(e) => {
+                        recorder.record(
+                            &self.agent_id,
+                            Some(self.turn),
+                            EventKind::Error,
+                            json!({ "stage": "page_turns", "error": e.to_string() }),
+                        );
+                    }
                 }
+            } else if self.last_pressure != MemoryPressure::Hard {
+                // Hard retained pressure but context too short to page — log once.
+                recorder.record(
+                    &self.agent_id,
+                    Some(self.turn),
+                    EventKind::MemoryPressureAdvisory,
+                    json!({
+                        "agent":          &self.agent_id,
+                        "turn":           self.turn,
+                        "retained_pct":   retained_pct,
+                        "soft_threshold": SOFT_THRESHOLD,
+                        "note":           "hard pressure, context too short to page",
+                    }),
+                );
             }
         }
-        self.last_pressure = current_pressure;
+        self.last_pressure = spend_pressure;
 
         if self.turn == 0 {
             let preview = self
@@ -536,11 +590,10 @@ impl AgentTask {
 
                 if let Some(idx) = spawn_idx {
                     if call_blocks.len() > 1 {
-                        self.terminal = true;
-                        return AgentEffect::Failed(
-                            "spawn_agent must be the sole tool call per turn; \
-                             cannot mix with other tools"
-                                .to_string(),
+                        return self.reject_batched_sole_tool(
+                            "spawn_agent",
+                            &call_blocks,
+                            recorder,
                         );
                     }
                     let Block::ToolUse { id: call_id, input, .. } = &call_blocks[idx] else {
@@ -575,11 +628,10 @@ impl AgentTask {
 
                 if let Some(idx) = send_idx {
                     if call_blocks.len() > 1 {
-                        self.terminal = true;
-                        return AgentEffect::Failed(
-                            "send_message must be the sole tool call per turn; \
-                             cannot mix with other tools"
-                                .to_string(),
+                        return self.reject_batched_sole_tool(
+                            "send_message",
+                            &call_blocks,
+                            recorder,
                         );
                     }
                     let Block::ToolUse { id: call_id, input, .. } = &call_blocks[idx] else {
@@ -1216,7 +1268,11 @@ mod tests {
     }
 
     #[test]
-    fn step_spawn_mixed_with_other_tools_returns_failed() {
+    fn step_spawn_mixed_with_other_tools_recovers_via_is_error() {
+        // F-16: spawn_agent batched with another tool must NOT terminate the
+        // agent. Models routinely batch; the runtime recovers by injecting an
+        // is_error ToolResult for every call and re-inferring so the model can
+        // retry spawn_agent alone.
         let (rec, _tmp) = recorder();
         let cfg = agent_cfg(5, 1_000_000);
         let mut sm = AgentTask::new("spawner-mix", "task", &cfg, &model_cfg(), vec![]);
@@ -1248,9 +1304,19 @@ mod tests {
 
         let eff = sm.step(&rec);
         assert!(
-            matches!(&eff, AgentEffect::Failed(msg) if msg.contains("sole tool call")),
-            "expected Failed when spawn_agent is mixed with other tools"
+            matches!(&eff, AgentEffect::Infer(_)),
+            "expected recovery (Infer) when spawn_agent is batched, not termination"
         );
+        assert!(!sm.terminal, "batched spawn_agent must not terminate the agent");
+        // Every tool_use in the batch must have a matching is_error tool_result.
+        let last = sm.messages.last().expect("a user message with tool results");
+        assert_eq!(last.role, Role::User);
+        let errs: Vec<_> = last
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::ToolResult { is_error: true, .. }))
+            .collect();
+        assert_eq!(errs.len(), 2, "both batched calls must get an is_error result");
     }
 
     #[test]
@@ -1425,7 +1491,12 @@ mod tests {
         };
         task.provide_inference(response, &rec);
         let effect = task.step(&rec);
-        assert!(matches!(effect, AgentEffect::Failed(_)), "mixed send_message + other tool must fail");
+        // F-16: batched send_message recovers via is_error ToolResults, not termination.
+        assert!(
+            matches!(effect, AgentEffect::Infer(_)),
+            "batched send_message must recover (Infer), not fail"
+        );
+        assert!(!task.terminal, "batched send_message must not terminate the agent");
     }
 
     #[test]
@@ -1615,14 +1686,17 @@ mod tests {
     #[test]
     fn step_hard_pressure_emits_memory_paged() {
         let (rec, tmp) = recorder();
-        let budget = 100u64;
+        // F-01: paging is driven by RETAINED CONTEXT size, not lifetime spend.
+        // Build a large working set (big tool results) until it crosses the Hard
+        // threshold (90% of budget). Inference token counts stay tiny so the
+        // budget guard never trips first.
+        let budget = 1_000u64;
         let cfg = agent_cfg(20, budget);
         let mut sm = AgentTask::new("pg", "task", &cfg, &model_cfg(), vec![]);
 
-        // 2 full tool cycles at 20+20=40 tokens each → total=80 → 80% < HARD_THRESHOLD
-        // After each cycle: messages gains 2 entries (Assistant + User)
-        for i in 0..2usize {
-            let _ = sm.step(&rec);
+        let big = "x".repeat(1_300); // ~325 tokens at 4 chars/token
+        for i in 0..3usize {
+            let _ = sm.step(&rec); // → Infer
             sm.provide_inference(
                 InferenceResponse {
                     blocks:        vec![Block::ToolUse {
@@ -1631,50 +1705,24 @@ mod tests {
                         input: serde_json::json!({}),
                     }],
                     stop_reason:   StopReason::ToolUse,
-                    input_tokens:  20,
-                    output_tokens: 20,
+                    input_tokens:  5,
+                    output_tokens: 5,
                 },
                 &rec,
             );
-            let _ = sm.step(&rec); // → CallTools (pushes Assistant msg)
+            let _ = sm.step(&rec); // → CallTools (pushes Assistant tool_use)
             sm.provide_tool_results(
                 vec![Block::ToolResult {
                     tool_use_id: format!("c{i}"),
-                    content:     "r".to_string(),
+                    content:     big.clone(),
                     is_error:    false,
                 }],
                 &rec,
-            ); // pushes User(tool_results)
+            ); // pushes User(big tool result)
         }
-        // total=80, messages.len()=5
+        // messages.len()==7; retained ≈ 3*325 ≈ 975 tokens ≈ 97.5% → Hard.
 
-        // One more inference (5+6=11 tokens) → total=91 → 91% > HARD_THRESHOLD
-        let _ = sm.step(&rec);
-        sm.provide_inference(
-            InferenceResponse {
-                blocks:        vec![Block::ToolUse {
-                    id:    "c2".to_string(),
-                    name:  "no_tool".to_string(),
-                    input: serde_json::json!({}),
-                }],
-                stop_reason:   StopReason::ToolUse,
-                input_tokens:  5,
-                output_tokens: 6,
-            },
-            &rec,
-        );
-        let _ = sm.step(&rec); // → CallTools (pushes Assistant)
-        sm.provide_tool_results(
-            vec![Block::ToolResult {
-                tool_use_id: "c2".to_string(),
-                content:     "r2".to_string(),
-                is_error:    false,
-            }],
-            &rec,
-        );
-        // total=91, messages.len()=7
-
-        // Next step_need_infer: Hard pressure, page_count(7)=1 pair → page!
+        // Next step_need_infer: Hard retained pressure, page_count(7)=1 pair → page!
         let _ = sm.step(&rec);
 
         let log = std::fs::read_to_string(tmp.path()).unwrap();

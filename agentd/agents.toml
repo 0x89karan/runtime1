@@ -23,8 +23,10 @@ max_tokens = 2048
 
 [tools]
 # kv_get, kv_set, kb_put, kb_get, kb_search are NOT included in "all"; list them
-# explicitly.  spawn_agent is always available when the Spawn capability is granted.
-native = ["kb_put", "kb_get", "kb_search", "mem_remember", "mem_recall"]
+# explicitly.  spawn_agent / send_message / list_agents must ALSO be listed here —
+# the Spawn capability authorises the call but the tool is only registered if named
+# (F-15).  spawn_agent additionally still requires the Spawn capability at dispatch.
+native = ["kb_put", "kb_get", "kb_search", "mem_remember", "mem_recall", "spawn_agent", "send_message", "list_agents"]
 
 [scheduler]
 global_token_budget       = 100_000   # ~$0.02 ceiling for this demo

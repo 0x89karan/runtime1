@@ -1,5 +1,29 @@
 # TODOS
 
+## Phase 5 — Open (deferred from p5.9 hardening; all P2, none data-loss-class)
+
+See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2s remain:
+
+- **F-05 (P2) — `checkpoint.save()` has no `fsync` before/after rename.** 4.6 F-012
+  unfixed: a crash mid-rename can leave a zero-length/partial checkpoint. Add
+  data fsync + parent-dir fsync around the atomic rename.
+- **F-06 (P2) — FUSE dynamic-inode counter never reclaimed / unguarded.** Long-lived
+  mounts can exhaust the counter; no overflow guard on the mount thread.
+- **F-07b (P2) — `inject_messages` can append `Text` onto a ToolResult-only User turn.**
+  Reintroduces 4.6 F-006 shape; `page_turns` previews `blocks.first()` (the ToolResult),
+  so a paged inter-agent message is misrepresented in `short_term` / FUSE. (F-07a — the
+  alternation debug-assert — was promoted to a runtime `Err` in p5.9.) Fix needs care:
+  pushing a new User turn risks consecutive-User violations; prefer making the preview
+  pick the first `Text` block, and/or fold injected text into the assistant-adjacent turn.
+- **F-08 (P2) — `short_term` is unbounded and full-cloned every checkpoint + snapshot tick.**
+  Bound it (ring buffer) and avoid the per-tick clone.
+- **F-10 (P2) — private `agent/<id>` tier shares keyspace/delimiter with grantable `kb:*`.**
+  Reserve the `agent/` prefix so it can't be granted via `segment:"agent"`.
+- **F-11 (P2) — unconfigured segments default to writable Scratch (fail-open).**
+  Consider deny-by-default for undeclared segments.
+- **F-12 (P2) — distillation ignores per-agent budget; emits event even if the store
+  write failed.** Charge distillation against budget; only emit on a confirmed write.
+
 ## Phase 5 — Open (deferred from p5.8)
 
 **~~p5.7-ar-01 (P2) — Inode map entries are never pruned for terminated agents~~** ✓ Fixed in p5.8.

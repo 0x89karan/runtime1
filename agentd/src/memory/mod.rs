@@ -72,6 +72,19 @@ pub trait MemoryStore: Send + Sync {
     /// Called at startup for each `[[memory.segments]]` entry.
     fn set_segment_class(&self, namespace: &str, class: MutabilityClass) -> anyhow::Result<()>;
 
+    /// Persist the per-segment eviction floor (F-03). Called at startup for each
+    /// `[[memory.segments]]` entry. When set, writes to a non-`canon` segment
+    /// trim it back to these limits on the live write path. `None` means no
+    /// limit for that dimension. Default is a no-op (for non-redb/mock stores).
+    fn set_segment_limits(
+        &self,
+        _namespace: &str,
+        _max_entries: Option<usize>,
+        _max_age_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Atomically increment and return the next monotonic sequence number for
     /// a log segment. Starts at 1 on first call. Used to generate unique,
     /// ordered log entry keys in the form `"{seq:016x}"`.

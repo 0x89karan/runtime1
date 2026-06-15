@@ -305,3 +305,34 @@ review environment) — run the §6 hand-off before declaring Phase 5 trustworth
 closes the P1s (F-01, F-02, F-03, F-09, F-04) before Phase 6 starts, with the P2s
 tracked in `TODOS.md`. The behavioral QA (Stage 1) and the codex cross-check should run
 as the gate before declaring Phase 5 trustworthy.
+
+---
+
+## 8. Resolution — p5.9 (closed)
+
+p5.9 landed the fixes. Every fix ships with a regression test that fails before it.
+
+| Finding | Pri | Status in p5.9 | Test |
+|---|---|---|---|
+| F-01 paging on lifetime spend | P1 | ✅ Fixed — paging now keyed on a retained-context estimate (`estimate_context_tokens`); edge-gates after paging. Lifetime spend kept for budget guard + advisory. | `paging_stops_when_context_below_target` |
+| F-02 quarantine-on-transient-error | P1 | ✅ Fixed — quarantine only on confirmed corruption (`Corrupted` / `Io(InvalidData)`); permission/transient/upgrade errors surface without renaming; timestamped `.corrupt` path. | `transient_open_error_is_not_quarantined` |
+| F-03 eviction unwired + canon hole | P1 | ✅ Fixed — `set_segment_limits` persists the floor; `put`/`append` self-trim; `evict()` skips canon. | `eviction_runs_through_live_path`, `canon_is_not_evicted` |
+| F-04 counter desync masked | P1 | ✅ Fixed — `debug_assert_counters` reconciles NAMESPACES vs key count after every mutation. | `namespace_counter_matches_key_count` |
+| F-07 (a) alternation debug-assert | P2 | ✅ Fixed — promoted to a runtime `Err` (codex-corroborated `context.rs:85`). | `page_turns_errs_when_index_one_not_assistant` |
+| F-07 (b) inject onto ToolResult turn | P2 | ⏭ Deferred to `TODOS.md` (observability; the suggested fix risks consecutive-User turns and needs care). | — |
+| F-09 unvalidated `child_id` | P1 | ✅ Fixed — `validate_child_id` rejects traversal / namespace separators. | `validate_child_id_*`, `spawn_rejects_invalid_child_id` |
+| F-13 clippy not `--all-targets` | P2 | ✅ Fixed — CI + Makefile use `--all-targets`; all surfaced test-lints fixed. | (CI gate) |
+| F-14 demo doesn't parse | P1 | ✅ Fixed — implemented operator segment `seed`. | `shipped_demo_agents_toml_parses_and_is_runnable` |
+| F-15 demo missing `spawn_agent` | P2 | ✅ Fixed — added to `[tools].native`. | (same) |
+| F-16 spawn/send batch → terminate | P1 | ✅ Fixed — recovers via `is_error` results + re-infer. | `step_spawn_mixed_with_other_tools_recovers_via_is_error`, `step_send_message_sole_call_guard` |
+
+**Deferred P2s (logged in `TODOS.md`):** F-05 (fsync), F-06 (FUSE inode counter),
+F-07b (inject preview), F-08 (`short_term` bound/clone), F-10 (`agent/` prefix
+reservation), F-11 (fail-open default), F-12 (distillation budget). None are
+data-loss-class.
+
+**Build gate:** `cargo build` + `cargo clippy --all-targets -D warnings` + `cargo test`
+clean; release binary warning-free; musl static binary **3.07 MB ≤ 6 MB**.
+
+**Behavioral (Stage 1) re-run + QEMU 2-boot:** to be run against a live key on the
+fixed demo (the demo now parses and spawn batching recovers) — see §6.

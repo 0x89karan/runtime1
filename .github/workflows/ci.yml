@@ -29,7 +29,10 @@ jobs:
         working-directory: agentd
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        # --all-targets lints test + bench code too (F-13); test-only lints
+        # (held locks across await, items after a test module, redundant bounds)
+        # went uncaught for several Phase-5 sprints without it.
+        run: cargo clippy --all-targets -- -D warnings
         working-directory: agentd
 
       - name: Test

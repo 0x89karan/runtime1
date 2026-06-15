@@ -12,7 +12,7 @@ clippy-linux:
 	  -v "$(CURDIR)":/work \
 	  -w /work/agentd \
 	  $(RUST_IMAGE) \
-	  sh -c "apt-get update -qq && apt-get install -y -qq libfuse-dev pkg-config && rustup component add clippy && cargo clippy -- -D warnings"
+	  sh -c "apt-get update -qq && apt-get install -y -qq libfuse-dev pkg-config && rustup component add clippy && cargo clippy --all-targets -- -D warnings"
 
 # Same but also runs the full test suite on Linux.
 .PHONY: test-linux

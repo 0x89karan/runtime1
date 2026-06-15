@@ -672,7 +672,7 @@ The audit recommends it and Phase 5 depends on it. Written in full increment for
 
 ---
 
-> #### ▢ p5.9 — Phase 5 hardening (audit remediation)
+> #### ✓ p5.9 — Phase 5 hardening (audit remediation) — LANDED (resolution: `AUDIT-phase-5.md §8`)
 >
 > **Depends on:** p5.8. **Gate before Phase 6.** Closes the P1 findings from
 > `docs/AUDIT-phase-5.md` (the analogue of p4.7 after the 4.6 audit). P2s → `TODOS.md`.

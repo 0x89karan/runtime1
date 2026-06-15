@@ -28,16 +28,23 @@ pub struct MemItem {
     pub blocks_json:     String,
 }
 
-/// Map token spend fraction to pressure level.
+/// Map a token count to a pressure level relative to `token_budget`.
 ///
 /// Thresholds are static in p5.2; tunable per-agent thresholds are p5.6.
 /// Paging is independent of `memory.enabled` — short_term lives on AgentTask,
 /// not in the redb store.
-pub fn assess(tokens_spent: u64, token_budget: u64) -> MemoryPressure {
+///
+/// **F-01:** the *paging* decision feeds this the RETAINED-CONTEXT estimate
+/// (see [`estimate_context_tokens`]), not lifetime spend. Lifetime spend only
+/// grows, so once it crossed `HARD_THRESHOLD` the old code re-paged every turn
+/// and shredded context. The retained estimate falls after paging, which
+/// edge-gates the loop. Lifetime spend is still used for the budget guard and
+/// advisory telemetry.
+pub fn assess(tokens: u64, token_budget: u64) -> MemoryPressure {
     if token_budget == 0 {
         return MemoryPressure::None;
     }
-    let pct = tokens_spent as f64 / token_budget as f64;
+    let pct = tokens as f64 / token_budget as f64;
     if pct >= HARD_THRESHOLD {
         MemoryPressure::Hard
     } else if pct >= SOFT_THRESHOLD {
@@ -45,6 +52,25 @@ pub fn assess(tokens_spent: u64, token_budget: u64) -> MemoryPressure {
     } else {
         MemoryPressure::None
     }
+}
+
+/// Rough token estimate of the *retained* context — what the next inference
+/// request would resend (`messages`). Uses a ~4-chars-per-token heuristic over
+/// every block's textual payload. This drives the F-01 paging decision: paging
+/// fires when the working set itself is large relative to the budget, and stops
+/// once paging has shrunk it back below threshold (an edge-gate that the old
+/// lifetime-spend signal could never reach, since spend never decreases).
+pub fn estimate_context_tokens(messages: &[Msg]) -> u64 {
+    let chars: usize = messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .map(|b| match b {
+            Block::Text { text } => text.len(),
+            Block::ToolResult { content, .. } => content.len(),
+            Block::ToolUse { name, input, .. } => name.len() + input.to_string().len(),
+        })
+        .sum();
+    (chars / 4) as u64
 }
 
 /// Number of complete turn PAIRS eligible for eviction.
@@ -82,11 +108,16 @@ pub fn page_turns(messages: &mut Vec<Msg>, n: usize, at_turn: u32) -> Result<Vec
         );
     }
 
-    // Defensive: index 1 must be Assistant for the alternating-role invariant to hold.
-    debug_assert!(
-        messages.len() < 2 || messages[1].role == Role::Assistant,
-        "page_turns: messages[1] must be Role::Assistant (alternating-role invariant violated)"
-    );
+    // F-07: index 1 must be Assistant for the alternating-role invariant to hold.
+    // This was a debug_assert! (compiled out in release, where a violation would
+    // silently corrupt the paged history). Promote it to a runtime error so a
+    // release build refuses to page rather than mangling the transcript.
+    if messages.len() >= 2 && messages[1].role != Role::Assistant {
+        anyhow::bail!(
+            "page_turns: messages[1] must be Role::Assistant \
+             (alternating-role invariant violated); refusing to page"
+        );
+    }
 
     // Serialize BEFORE draining so messages is unchanged on failure.
     let mut items = Vec::with_capacity(to_drain);
@@ -278,6 +309,74 @@ mod tests {
     fn assess_zero_budget_returns_none() {
         assert_eq!(assess(0, 0), MemoryPressure::None);
         assert_eq!(assess(100, 0), MemoryPressure::None);
+    }
+
+    // F-01: paging is driven by retained context size, which FALLS after paging,
+    // so the loop converges (bounded pages) instead of re-paging every turn the
+    // way the old lifetime-spend signal did (spend never decreases).
+    #[test]
+    fn paging_stops_when_context_below_target() {
+        let budget = 1_000u64; // tokens
+        let big = "x".repeat(1_000); // ~250 tokens at 4 chars/token
+        // [User task, Assistant big, User big, Assistant big, User big]
+        let mut messages = vec![text_msg(Role::User, "task")];
+        for i in 0..4 {
+            messages.push(if i % 2 == 0 {
+                text_msg(Role::Assistant, &big)
+            } else {
+                text_msg(Role::User, &big)
+            });
+        }
+        // Starts Hard: retained ≈ budget.
+        assert_eq!(
+            assess(estimate_context_tokens(&messages), budget),
+            MemoryPressure::Hard,
+            "test setup must start above the Hard threshold"
+        );
+
+        // Page as the agent loop does, until retained pressure clears.
+        let mut pages = 0;
+        while assess(estimate_context_tokens(&messages), budget) == MemoryPressure::Hard {
+            let n = page_count(&messages);
+            if n == 0 {
+                break;
+            }
+            page_turns(&mut messages, n, 0).unwrap();
+            pages += 1;
+            assert!(pages <= 4, "paging must converge, not loop unbounded (F-01)");
+        }
+        assert!(pages >= 1, "should have paged at least once");
+        assert_ne!(
+            assess(estimate_context_tokens(&messages), budget),
+            MemoryPressure::Hard,
+            "paging must drop retained context below the Hard threshold and stop"
+        );
+    }
+
+    #[test]
+    fn estimate_context_tokens_grows_and_shrinks() {
+        let mut messages = vec![text_msg(Role::User, "task")];
+        let before = estimate_context_tokens(&messages);
+        messages.push(text_msg(Role::Assistant, &"y".repeat(400)));
+        let after = estimate_context_tokens(&messages);
+        assert!(after > before, "estimate must grow with added content");
+        assert_eq!(estimate_context_tokens(&[]), 0);
+    }
+
+    // F-07: alternating-role violation must be a runtime Err (not a debug-only
+    // assert that compiles out in release and silently mangles the transcript).
+    #[test]
+    fn page_turns_errs_when_index_one_not_assistant() {
+        let mut messages = vec![
+            text_msg(Role::User, "task"),
+            text_msg(Role::User, "not-assistant"), // invariant violation
+            text_msg(Role::Assistant, "a"),
+            text_msg(Role::User, "u"),
+            text_msg(Role::Assistant, "a2"),
+        ];
+        let before = messages.len();
+        assert!(page_turns(&mut messages, 1, 0).is_err());
+        assert_eq!(messages.len(), before, "messages unchanged on Err");
     }
 
     #[test]

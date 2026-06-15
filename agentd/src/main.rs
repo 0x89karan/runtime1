@@ -243,6 +243,23 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             } else {
                 tracing::debug!(segment = %seg.name, class = ?seg.class, "KB segment initialised");
             }
+            // F-03: persist the eviction floor so live writes self-trim. The
+            // limits are global defaults (cfg.memory), applied to every non-canon
+            // segment; evict() itself skips canon.
+            let max_age_secs = cfg.memory.max_entry_age_days.map(|d| d * 86_400);
+            if let Err(e) =
+                store.set_segment_limits(&seg.name, cfg.memory.max_entries_per_segment, max_age_secs)
+            {
+                tracing::warn!(segment = %seg.name, error = %e, "failed to initialise segment limits");
+            }
+            // F-14: operator-seed declared entries (e.g. canon trust anchors).
+            // This is an operator write at startup; it intentionally bypasses the
+            // agent-facing canon write-protection enforced by the kb_put tool.
+            for entry in &seg.seed {
+                if let Err(e) = store.put(&seg.name, &entry.key, &entry.value) {
+                    tracing::warn!(segment = %seg.name, key = %entry.key, error = %e, "failed to seed segment entry");
+                }
+            }
         }
     }
 
@@ -741,6 +758,96 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
     rules
 }
 
+async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
+    use agentd::inference::{Block, InferenceGateway, InferenceRequest, Msg, Role};
+
+    let model = "claude-sonnet-4-6";
+    let recorder = FlightRecorder::new(&log_path)?;
+
+    let gateway = AnthropicGateway::from_env(model).context("initializing Anthropic gateway")?;
+
+    recorder.record(
+        "probe",
+        None,
+        EventKind::InferenceRequest,
+        serde_json::json!({
+            "model": gateway.model_id(),
+            "msg_count": 1,
+            "tool_count": 0,
+        }),
+    );
+
+    tracing::info!(
+        model,
+        prompt = %prompt.chars().take(PREVIEW_CHARS).collect::<String>(),
+        "probe: sending request"
+    );
+
+    let request = InferenceRequest {
+        system: None,
+        messages: vec![Msg {
+            role: Role::User,
+            blocks: vec![Block::Text {
+                text: prompt.to_string(),
+            }],
+        }],
+        tools: vec![],
+        max_tokens: 4096,
+    };
+
+    let response = match gateway.infer(request).await {
+        Ok(r) => r,
+        Err(e) => {
+            recorder.record(
+                "probe",
+                None,
+                EventKind::Error,
+                serde_json::json!({"stage": "inference", "error": e.to_string()}),
+            );
+            return Err(e);
+        }
+    };
+
+    let preview: String = response
+        .blocks
+        .iter()
+        .find_map(|b| {
+            if let Block::Text { text } = b {
+                Some(text.chars().take(PREVIEW_CHARS).collect())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default();
+
+    recorder.record(
+        "probe",
+        None,
+        EventKind::InferenceResponse,
+        serde_json::json!({
+            "stop_reason": response.stop_reason.as_str(),
+            "input_tokens": response.input_tokens,
+            "output_tokens": response.output_tokens,
+            "preview": preview,
+        }),
+    );
+
+    tracing::info!(
+        input_tokens = response.input_tokens,
+        output_tokens = response.output_tokens,
+        stop_reason = response.stop_reason.as_str(),
+        "probe: response received"
+    );
+
+    for block in &response.blocks {
+        if let Block::Text { text } = block {
+            println!("{text}");
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,92 +1248,3 @@ mod tests {
     }
 }
 
-async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
-    use agentd::inference::{Block, InferenceGateway, InferenceRequest, Msg, Role};
-
-    let model = "claude-sonnet-4-6";
-    let recorder = FlightRecorder::new(&log_path)?;
-
-    let gateway = AnthropicGateway::from_env(model).context("initializing Anthropic gateway")?;
-
-    recorder.record(
-        "probe",
-        None,
-        EventKind::InferenceRequest,
-        serde_json::json!({
-            "model": gateway.model_id(),
-            "msg_count": 1,
-            "tool_count": 0,
-        }),
-    );
-
-    tracing::info!(
-        model,
-        prompt = %prompt.chars().take(PREVIEW_CHARS).collect::<String>(),
-        "probe: sending request"
-    );
-
-    let request = InferenceRequest {
-        system: None,
-        messages: vec![Msg {
-            role: Role::User,
-            blocks: vec![Block::Text {
-                text: prompt.to_string(),
-            }],
-        }],
-        tools: vec![],
-        max_tokens: 4096,
-    };
-
-    let response = match gateway.infer(request).await {
-        Ok(r) => r,
-        Err(e) => {
-            recorder.record(
-                "probe",
-                None,
-                EventKind::Error,
-                serde_json::json!({"stage": "inference", "error": e.to_string()}),
-            );
-            return Err(e);
-        }
-    };
-
-    let preview: String = response
-        .blocks
-        .iter()
-        .find_map(|b| {
-            if let Block::Text { text } = b {
-                Some(text.chars().take(PREVIEW_CHARS).collect())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-
-    recorder.record(
-        "probe",
-        None,
-        EventKind::InferenceResponse,
-        serde_json::json!({
-            "stop_reason": response.stop_reason.as_str(),
-            "input_tokens": response.input_tokens,
-            "output_tokens": response.output_tokens,
-            "preview": preview,
-        }),
-    );
-
-    tracing::info!(
-        input_tokens = response.input_tokens,
-        output_tokens = response.output_tokens,
-        stop_reason = response.stop_reason.as_str(),
-        "probe: response received"
-    );
-
-    for block in &response.blocks {
-        if let Block::Text { text } = block {
-            println!("{text}");
-        }
-    }
-
-    Ok(())
-}

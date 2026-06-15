@@ -101,7 +101,35 @@ env) → `Tool` trait + `ToolRegistry` → native tools (`read_file`, `write_fil
   now honours `--log-path`. CRITICAL BUG fixed: net-only configs previously caused
   complete FS lockout (handled_access_fs set with zero path rules). 253 tests.
 
-**Current version: v0.16.0. Phase 4 complete. Phase 5 not yet planned.**
+**Phase 4 complete (v0.16.0).**
+
+### Phase 5 — Memory substrate (p5.1–p5.8 shipped; built by the build session)
+redb-backed `MemoryStore`; four tiers (working / short-term / per-agent long-term /
+shared KB); `KbRead`/`KbWrite` capabilities; canon/log/scratch segment classes;
+BM25-lite `kb_search`; eviction; FUSE memory surface; detachable memory volume
+(`/run/memory`). See `CLAUDE.md` for the per-increment detail.
+
+### p5.9 — Phase 5 hardening (audit remediation) — **gate before Phase 6**
+Landed on branch `p5.9-hardening` (review session, not the build session). Closes the
+P1s from `docs/AUDIT-phase-5.md` — resolution table in **§8** of that file. Summary:
+- **F-01** paging now keyed on retained-context size (not lifetime spend);
+  **F-02** store quarantines only confirmed corruption; **F-03** eviction wired to the
+  live path + canon protected; **F-04** counter reconciliation; **F-07a** alternation
+  invariant → runtime `Err`; **F-09** `child_id` validation; **F-16** batched
+  spawn/send recovers via `is_error` instead of terminating; **F-14/F-15** the
+  `agents.toml` demo parses + runs (operator `seed` + `spawn_agent`); **F-13** CI
+  clippy `--all-targets`.
+- Each fix has a regression test that fails pre-fix. All gates green: `cargo build` +
+  `clippy --all-targets` + `test` + `make clippy-linux`; musl 3.07 MB. Deferred P2s in
+  `TODOS.md`. Stage-1 live dev QA PASSED (cross-agent KB flow, 0 errors, 0 leaks).
+
+**HAND-OFF — what still needs a Linux host (build session owns QEMU):**
+- The **QEMU 2-boot continuity** check could not run in the review env (macOS has no
+  Buildroot toolchain; Buildroot refuses to build as root in Docker). The persistence
+  contract IS unit-tested (`memory::store::tests::two_boot_continuity_at_store_level`).
+  To finish: on a Linux host with qemu, `cd distro && make build && make run` twice,
+  confirming `~/.agentos-memory/memory.redb` persists across reboots.
+- Do NOT redo the p5.9 code — it's complete on `p5.9-hardening` (open the PR / merge it).
 
 ---
 

@@ -848,6 +848,19 @@ fn enqueue_or_defer(
     }
 }
 
+/// F-09: validate an agent-supplied `child_id`. It becomes the child's agent_id
+/// and memory-namespace prefix, so it must be a flat identifier: no namespace
+/// separators (`:`, `/`), no path traversal (`.`), no whitespace or null bytes.
+fn validate_child_id(id: &str) -> anyhow::Result<()> {
+    crate::memory::validate_segment(id, "child_id")?;
+    anyhow::ensure!(
+        id.bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')),
+        "child_id must match [a-zA-Z0-9_-]; ':', '/', and '.' are reserved"
+    );
+    Ok(())
+}
+
 /// Handle an AgentEffect::SpawnAgent: validate, create the child, seed it.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_spawn(
@@ -922,12 +935,46 @@ fn dispatch_spawn(
         return;
     }
 
-    // 3. Generate child ID.
-    let child_id = config.child_id.clone().unwrap_or_else(|| {
-        let id = format!("{parent_id}-child-{}", state.child_seq);
-        state.child_seq += 1;
-        id
-    });
+    // 3. Generate or validate the child ID.
+    // F-09: an agent-SUPPLIED child_id is untrusted — it becomes the child's
+    // agent_id and memory-namespace prefix. Reject traversal / namespace
+    // separators so a child can't escape its namespace or impersonate another
+    // agent. Auto-generated ids are trusted (derived from parent_id + a counter).
+    let child_id = match config.child_id.clone() {
+        Some(supplied) => {
+            if let Err(reason) = validate_child_id(&supplied) {
+                recorder.record(
+                    &parent_id,
+                    Some(parent_turn),
+                    EventKind::Error,
+                    json!({ "stage": "spawn", "error": "invalid child_id", "child_id": &supplied, "reason": reason.to_string() }),
+                );
+                let priority = state.agents[&parent_id].priority();
+                let caps = state.agents[&parent_id].cap_set_cloned();
+                let (parent_effect, next_turn) = {
+                    let parent = state.agents.get_mut(&parent_id).unwrap();
+                    parent.provide_tool_results(
+                        vec![Block::ToolResult {
+                            tool_use_id: call_id,
+                            content: format!("spawn denied: invalid child_id {supplied:?}: {reason}"),
+                            is_error: true,
+                        }],
+                        recorder,
+                    );
+                    let t = parent.turn();
+                    (parent.step(recorder), t)
+                };
+                enqueue_or_defer(parent_effect, parent_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
+                return;
+            }
+            supplied
+        }
+        None => {
+            let id = format!("{parent_id}-child-{}", state.child_seq);
+            state.child_seq += 1;
+            id
+        }
+    };
 
     // 4. Build child AgentConfig (inherit caps + budget from parent).
     let child_caps = parent_cap_set.clone();
@@ -1375,7 +1422,7 @@ mod tests {
     fn make_scheduler(
         agents: Vec<AgentConfig>,
         sched: SchedulerConfig,
-        gw: impl InferenceGateway + Send + Sync + 'static,
+        gw: impl InferenceGateway + 'static,
     ) -> Scheduler {
         let (rec, _tmp) = recorder();
         Scheduler::new(
@@ -1394,7 +1441,7 @@ mod tests {
     fn make_scheduler_with_registry(
         agents: Vec<AgentConfig>,
         sched: SchedulerConfig,
-        gw: impl InferenceGateway + Send + Sync + 'static,
+        gw: impl InferenceGateway + 'static,
         registry: ToolRegistry,
     ) -> (Scheduler, Arc<FlightRecorder>, NamedTempFile) {
         let (rec, tmp) = recorder();
@@ -1972,6 +2019,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_child_id_accepts_flat_ids_rejects_traversal() {
+        assert!(validate_child_id("worker-1").is_ok());
+        assert!(validate_child_id("Child_2").is_ok());
+        // Traversal / namespace separators / empties must be rejected (F-09).
+        assert!(validate_child_id("../evil").is_err());
+        assert!(validate_child_id("kb:secret").is_err());
+        assert!(validate_child_id("a/b").is_err());
+        assert!(validate_child_id("dot.name").is_err());
+        assert!(validate_child_id("").is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_invalid_child_id() {
+        // F-09: an agent-supplied child_id with traversal / namespace separators
+        // must be rejected (is_error) instead of used to spawn. The parent
+        // recovers and completes; no child under that id is created.
+        use crate::{capability::Capability, tools::native::register_native};
+
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+
+        let spawn_response = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id:    "spawn_1".to_string(),
+                name:  "spawn_agent".to_string(),
+                input: serde_json::json!({
+                    "task":     "evil",
+                    "child_id": "../evil"
+                }),
+            }],
+            stop_reason:   StopReason::ToolUse,
+            input_tokens:  10,
+            output_tokens: 5,
+        };
+
+        let gw = MockGateway::new(vec![
+            spawn_response,
+            end_turn("parent recovered", 10, 5),
+        ]);
+
+        let parent = AgentConfig {
+            capabilities: Some(vec![Capability::Spawn]),
+            ..agent_cfg("parent-bad-id", "spawn evil child")
+        };
+
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![parent], unlimited(), gw, registry);
+        let outcomes = sched.run().await;
+
+        assert_eq!(outcomes.len(), 1, "rejected child must not be spawned");
+        assert!(outcomes.contains_key("parent-bad-id"));
+        assert!(
+            !outcomes.keys().any(|k| k.contains("evil")),
+            "no evil child id may appear in outcomes"
+        );
+        assert!(
+            outcomes["parent-bad-id"].is_ok(),
+            "parent must recover and complete: {:?}",
+            outcomes["parent-bad-id"]
+        );
+    }
+
     #[tokio::test]
     async fn scheduler_spawn_child_with_explicit_token_budget() {
         // When SpawnConfig.token_budget is Some, the child uses that budget
@@ -2115,6 +2225,9 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    // The serial guard is intentionally held across awaits to serialize this
+    // SIGTERM test against the periodic-checkpoint test (shared CWD file).
+    #[allow(clippy::await_holding_lock)]
     async fn sigterm_drains_scheduler() {
         // Must not run concurrently with checkpoint_all_emits_agent_checkpointed_event:
         // both tests fire / react to process-level SIGTERM and write to the shared CWD
@@ -2658,6 +2771,9 @@ mod tests {
     }
 
     #[tokio::test]
+    // Serial guard intentionally held across awaits to serialize against
+    // sigterm_drains_scheduler (shared CWD checkpoint file).
+    #[allow(clippy::await_holding_lock)]
     async fn checkpoint_all_emits_agent_checkpointed_event() {
         use tempfile::TempDir;
         // Must not run concurrently with sigterm_drains_scheduler: that test fires a

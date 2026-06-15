@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
+use redb::{
+    Database, DatabaseError, ReadableDatabase, ReadableTable, ReadableTableMetadata, StorageError,
+    TableDefinition,
+};
 
 use crate::memory::{index, EvictedEntry, MemoryStore, MutabilityClass, SearchHit, SCHEMA_VERSION};
 
@@ -23,6 +26,9 @@ const SEG_CLASS_PREFIX: &str = "seg_class:";
 const LOG_SEQ_PREFIX: &str = "log_seq:";
 const SCRATCH_VER_PREFIX: &str = "scratch_ver:";
 const DOC_COUNT_PREFIX: &str = "doc_count:";
+/// Per-segment eviction floor (F-03). `0` is the sentinel for "unset".
+const SEG_MAX_ENTRIES_PREFIX: &str = "seg_max_entries:";
+const SEG_MAX_AGE_PREFIX: &str = "seg_max_age_secs:";
 
 fn entry_key(namespace: &str, key: &str) -> String {
     format!("{}\x00{}", namespace, key)
@@ -43,6 +49,56 @@ pub struct RedbStore {
     db: Database,
 }
 
+/// Why an open attempt failed — drives the F-02 quarantine decision.
+///
+/// Only `Corrupt` (a confirmed `StorageError::Corrupted` from redb) is safe to
+/// quarantine; `Locked` and `Other` (permissions, transient I/O, upgrade
+/// required, schema init) must leave a potentially-valid file in place.
+enum OpenFailure {
+    Locked(anyhow::Error),
+    Corrupt(anyhow::Error),
+    Other(anyhow::Error),
+}
+
+impl OpenFailure {
+    fn into_inner(self) -> anyhow::Error {
+        match self {
+            OpenFailure::Locked(e) | OpenFailure::Corrupt(e) | OpenFailure::Other(e) => e,
+        }
+    }
+}
+
+/// Classify a redb `DatabaseError` from `Database::open` to decide whether
+/// quarantine is safe.
+///
+/// Quarantine ONLY when the file's bytes are genuinely not a usable redb
+/// database:
+///   - `StorageError::Corrupted` — redb's explicit corruption signal, and
+///   - `StorageError::Io(InvalidData)` — what redb returns for a file whose
+///     header/magic isn't a valid redb database (e.g. truncated or non-redb).
+///
+/// Everything else must leave a potentially-valid file in place:
+///   - `DatabaseAlreadyOpen` → another process holds the lock (Locked),
+///   - other `Io` kinds (PermissionDenied, NotFound, transient disk errors),
+///     `UpgradeRequired` (a valid OLD store), `RepairAborted`,
+///     `TransactionInProgress`, etc. → Other.
+fn classify_db_error(e: DatabaseError) -> OpenFailure {
+    if matches!(e, DatabaseError::DatabaseAlreadyOpen) {
+        return OpenFailure::Locked(anyhow::Error::new(e));
+    }
+    let is_corruption = matches!(&e, DatabaseError::Storage(StorageError::Corrupted(_)))
+        || matches!(
+            &e,
+            DatabaseError::Storage(StorageError::Io(io))
+                if io.kind() == std::io::ErrorKind::InvalidData
+        );
+    if is_corruption {
+        OpenFailure::Corrupt(anyhow::Error::new(e))
+    } else {
+        OpenFailure::Other(anyhow::Error::new(e))
+    }
+}
+
 impl RedbStore {
     /// Open or create the store at `path`.
     ///
@@ -54,66 +110,81 @@ impl RedbStore {
     pub fn open(path: &Path) -> anyhow::Result<(Self, Option<PathBuf>)> {
         match Self::try_open(path) {
             Ok(store) => Ok((store, None)),
-            Err(e) => {
-                let msg = format!("{e:?}");
-                // DatabaseAlreadyOpen is a lock error — do NOT quarantine.
-                if msg.contains("AlreadyOpen")
-                    || msg.to_lowercase().contains("already open")
-                    || msg.to_lowercase().contains("already locked")
-                {
-                    return Err(e.context(
-                        "memory.redb is held by another process; stop the other \
-                         agentd instance or set a unique memory.store_path",
-                    ));
-                }
-                // All other errors are treated as potential corruption.
-                // Quarantine the file and open a fresh store.
+            // F-02: NEVER quarantine on a lock or transient/permission error — a
+            // valid store hit by such an error must be left untouched. Only a
+            // CONFIRMED redb corruption variant (StorageError::Corrupted) is
+            // safe to quarantine.
+            Err(OpenFailure::Locked(e)) => Err(e.context(
+                "memory.redb is held by another process; stop the other \
+                 agentd instance or set a unique memory.store_path",
+            )),
+            Err(OpenFailure::Other(e)) => Err(e.context(
+                "memory store could not be opened; this is NOT corruption, so the \
+                 file was left in place (fix the underlying cause — e.g. \
+                 permissions, disk, or an old format requiring upgrade — and retry)",
+            )),
+            Err(OpenFailure::Corrupt(e)) => {
+                // Confirmed corruption — quarantine the file and start fresh.
                 let corrupt_path = Self::quarantine_path(path);
-                std::fs::rename(path, &corrupt_path).with_context(|| {
-                    format!(
-                        "quarantining corrupt store: {path:?} → {corrupt_path:?}"
-                    )
-                })?;
+                std::fs::rename(path, &corrupt_path)
+                    .with_context(|| {
+                        format!("quarantining corrupt store: {path:?} → {corrupt_path:?}")
+                    })
+                    .with_context(|| format!("original corruption: {e:#}"))?;
                 let store = Self::try_open(path)
+                    .map_err(OpenFailure::into_inner)
                     .context("opening fresh store after quarantine")?;
                 Ok((store, Some(corrupt_path)))
             }
         }
     }
 
+    /// Unique, timestamped quarantine path so a second quarantine can't clobber
+    /// the evidence from the first (F-02).
     fn quarantine_path(path: &Path) -> PathBuf {
+        let ts = unix_now_secs();
         let name = path
             .file_name()
-            .map(|n| format!("{}.corrupt", n.to_string_lossy()))
-            .unwrap_or_else(|| "memory.redb.corrupt".to_string());
-        path.parent()
-            .unwrap_or(Path::new("."))
-            .join(name)
+            .map(|n| format!("{}.{ts}.corrupt", n.to_string_lossy()))
+            .unwrap_or_else(|| format!("memory.redb.{ts}.corrupt"));
+        path.parent().unwrap_or(Path::new(".")).join(name)
     }
 
-    fn try_open(path: &Path) -> anyhow::Result<Self> {
+    fn try_open(path: &Path) -> Result<Self, OpenFailure> {
         // redb 4.x splits open (existing) and create (new) — implement open-or-create.
+        // Classify the open/create error so the caller knows whether quarantine is
+        // safe: only StorageError::Corrupted is confirmed corruption.
         let db = if path.exists() {
-            Database::open(path)
+            Database::open(path).map_err(classify_db_error)?
         } else {
-            Database::create(path)
-        }
-        .with_context(|| format!("opening memory store at {path:?}"))?;
+            // A create failure means there's no existing file to quarantine.
+            Database::create(path).map_err(|e| {
+                OpenFailure::Other(
+                    anyhow::Error::new(e)
+                        .context(format!("creating memory store at {path:?}")),
+                )
+            })?
+        };
 
         // Set mode 0600 immediately after open so the file is not world-readable.
+        // A chmod failure is NOT corruption — surface it as Other (no quarantine).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(path)
-                .context("reading store file metadata")?
+                .map_err(|e| OpenFailure::Other(anyhow::Error::new(e).context("reading store file metadata")))?
                 .permissions();
             perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)
-                .context("setting store permissions to 0600")?;
+            std::fs::set_permissions(path, perms).map_err(|e| {
+                OpenFailure::Other(anyhow::Error::new(e).context("setting store permissions to 0600"))
+            })?;
         }
 
         let store = Self { db };
-        store.init_schema().context("initialising store schema")?;
+        // A schema-init failure is also not corruption of the file format.
+        store
+            .init_schema()
+            .map_err(|e| OpenFailure::Other(e.context("initialising store schema")))?;
         Ok(store)
     }
 
@@ -335,6 +406,11 @@ impl RedbStore {
             }
         }
         txn.commit().context("committing put")?;
+        self.debug_assert_counters(namespace);
+        // F-03: best-effort eviction — a trim failure must not fail the write.
+        if let Err(e) = self.enforce_segment_limits(namespace, now_secs) {
+            tracing::warn!(namespace, error = %e, "segment eviction after put failed");
+        }
         Ok(())
     }
 
@@ -393,8 +469,78 @@ impl RedbStore {
             }
         }
         txn.commit().context("committing append")?;
+        self.debug_assert_counters(namespace);
+        // F-03: best-effort eviction — a trim failure must not fail the write.
+        if let Err(e) = self.enforce_segment_limits(namespace, now_secs) {
+            tracing::warn!(namespace, error = %e, "segment eviction after append failed");
+        }
         Ok(())
     }
+
+    /// F-03: apply the persisted per-segment eviction floor on the live write
+    /// path. No-op when no limits are configured or the segment is `canon`.
+    /// Best-effort: an eviction failure must not fail the write that triggered
+    /// it, so callers log-and-continue on `Err`.
+    fn enforce_segment_limits(&self, namespace: &str, now_secs: u64) -> anyhow::Result<()> {
+        let entries_key = format!("{SEG_MAX_ENTRIES_PREFIX}{namespace}");
+        let age_key = format!("{SEG_MAX_AGE_PREFIX}{namespace}");
+        let (max_entries_raw, max_age_raw) = {
+            let txn = self.db.begin_read().context("beginning read for segment limits")?;
+            let table = txn.open_table(META).context("opening meta table")?;
+            let me = table
+                .get(entries_key.as_str())
+                .context("reading segment max_entries")?
+                .map(|g| g.value())
+                .unwrap_or(0);
+            let ma = table
+                .get(age_key.as_str())
+                .context("reading segment max_age")?
+                .map(|g| g.value())
+                .unwrap_or(0);
+            (me, ma)
+        };
+        // 0 is the unset sentinel for both dimensions.
+        let max_entries = (max_entries_raw > 0).then_some(max_entries_raw as usize);
+        let max_age_secs = (max_age_raw > 0).then_some(max_age_raw);
+        if max_entries.is_none() && max_age_secs.is_none() {
+            return Ok(());
+        }
+        // evict() itself early-returns on canon, so no extra class check needed.
+        self.evict(namespace, max_entries, max_age_secs, now_secs)?;
+        Ok(())
+    }
+
+    /// Read the persisted NAMESPACES counter for `namespace` (0 if absent).
+    /// Used by the F-04 counter reconciliation (debug builds) and tests; in a
+    /// release build with assertions off it has no caller.
+    #[allow(dead_code)]
+    pub(crate) fn namespace_count(&self, namespace: &str) -> anyhow::Result<u64> {
+        let txn = self.db.begin_read().context("beginning read for namespace count")?;
+        let table = txn.open_table(NAMESPACES).context("opening namespaces table")?;
+        let n = table
+            .get(namespace)
+            .context("reading namespace count")?
+            .map(|g| g.value())
+            .unwrap_or(0);
+        Ok(n)
+    }
+
+    /// F-04: in debug builds, assert the persisted NAMESPACES counter matches the
+    /// actual entry-key count for `namespace`. Compiled out in release (the live
+    /// path stays allocation-free; the invariant is enforced in tests + dev).
+    #[cfg(debug_assertions)]
+    fn debug_assert_counters(&self, namespace: &str) {
+        let actual = self.list_keys(namespace).map(|k| k.len()).unwrap_or(0);
+        let counter = self.namespace_count(namespace).unwrap_or(0) as usize;
+        debug_assert_eq!(
+            counter, actual,
+            "NAMESPACES counter drift for {namespace}: counter={counter}, actual={actual}"
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn debug_assert_counters(&self, _namespace: &str) {}
 }
 
 impl MemoryStore for RedbStore {
@@ -469,6 +615,7 @@ impl MemoryStore for RedbStore {
             }
         };
         txn.commit().context("committing delete")?;
+        self.debug_assert_counters(namespace);
         Ok(existed)
     }
 
@@ -564,6 +711,31 @@ impl MemoryStore for RedbStore {
                 .context("writing segment class")?;
         }
         txn.commit().context("committing segment class")?;
+        Ok(())
+    }
+
+    fn set_segment_limits(
+        &self,
+        namespace: &str,
+        max_entries: Option<usize>,
+        max_age_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let entries_key = format!("{SEG_MAX_ENTRIES_PREFIX}{namespace}");
+        let age_key = format!("{SEG_MAX_AGE_PREFIX}{namespace}");
+        // 0 is the "unset" sentinel.
+        let entries_val = max_entries.map(|n| n as u64).unwrap_or(0);
+        let age_val = max_age_secs.unwrap_or(0);
+        let txn = self.db.begin_write().context("beginning write transaction")?;
+        {
+            let mut table = txn.open_table(META).context("opening meta table")?;
+            table
+                .insert(entries_key.as_str(), entries_val)
+                .context("writing segment max_entries")?;
+            table
+                .insert(age_key.as_str(), age_val)
+                .context("writing segment max_age_secs")?;
+        }
+        txn.commit().context("committing segment limits")?;
         Ok(())
     }
 
@@ -735,6 +907,13 @@ impl MemoryStore for RedbStore {
         max_age_secs: Option<u64>,
         now_secs: u64,
     ) -> anyhow::Result<Vec<EvictedEntry>> {
+        // F-03: canon segments are immutable history — never evict, regardless of
+        // who calls. (The live write path also skips them, but guard here too so
+        // a direct evict() call can't violate the invariant.)
+        if self.segment_class(namespace)? == Some(MutabilityClass::Canon) {
+            return Ok(vec![]);
+        }
+
         let prefix_start = format!("{}\x00", namespace);
         let prefix_end = format!("{}\x01", namespace);
         let ns_prefix_len = namespace.len() + 1;
@@ -863,6 +1042,7 @@ impl MemoryStore for RedbStore {
             }
         }
         txn.commit().context("committing eviction")?;
+        self.debug_assert_counters(namespace);
 
         Ok(evicted)
     }
@@ -919,9 +1099,78 @@ mod tests {
         );
         let corrupt_path = quarantined.unwrap();
         assert!(corrupt_path.exists(), "quarantine file must exist");
-        assert!(corrupt_path.ends_with("corrupt.redb.corrupt"));
+        // F-02: quarantine name is timestamped (corrupt.redb.<unix_secs>.corrupt)
+        // so a second quarantine can't clobber the first.
+        let fname = corrupt_path.file_name().unwrap().to_string_lossy();
+        assert!(
+            fname.starts_with("corrupt.redb.") && fname.ends_with(".corrupt"),
+            "unexpected quarantine name: {fname}"
+        );
         // Fresh store should be empty.
         assert_eq!(store.get("agent:scratch", "any").unwrap(), None);
+    }
+
+    // F-02: a transient open failure (here: permission denied) on a VALID store
+    // must surface as an error WITHOUT quarantining/renaming the file. The old
+    // code treated every non-lock error as corruption and renamed the good file.
+    #[cfg(unix)]
+    #[test]
+    fn transient_open_error_is_not_quarantined() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("valid.redb");
+        // Create a real, populated, valid store.
+        {
+            let (store, _) = RedbStore::open(&path).unwrap();
+            store.put("agent:scratch", "k", "v").unwrap();
+        }
+        // Make it unreadable → Database::open fails with a transient I/O error,
+        // NOT StorageError::Corrupted.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Skip on root, where 0o000 is bypassed (open would still succeed).
+        if std::fs::File::open(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+
+        let result = RedbStore::open(&path);
+        assert!(
+            result.is_err(),
+            "a transient I/O error must surface as Err, not a silent quarantine"
+        );
+        assert!(path.exists(), "the valid store must be left in place");
+        // No .corrupt sibling may have been created.
+        let any_corrupt = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".corrupt"));
+        assert!(!any_corrupt, "must NOT quarantine on a non-corruption error");
+
+        // Restore perms so TempDir cleanup succeeds.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    // F-04: the NAMESPACES counter must equal the actual key count after a mix
+    // of puts and deletes — the invariant the audit flagged as unasserted.
+    #[test]
+    fn namespace_counter_matches_key_count() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        for i in 0..5 {
+            store.put("kb:count", &format!("k{i}"), "v").unwrap();
+        }
+        store.delete("kb:count", "k0").unwrap();
+        store.delete("kb:count", "k1").unwrap();
+        // Re-put an existing key (must NOT change the count).
+        store.put("kb:count", "k2", "v2").unwrap();
+
+        let actual_keys = store.list_keys("kb:count").unwrap().len();
+        let counter = store.namespace_count("kb:count").unwrap();
+        assert_eq!(
+            counter as usize, actual_keys,
+            "NAMESPACES counter ({counter}) must equal actual key count ({actual_keys})"
+        );
+        assert_eq!(actual_keys, 3, "expected 3 surviving keys");
     }
 
     #[cfg(unix)]
@@ -1201,7 +1450,86 @@ mod tests {
         assert_eq!(hits[0].key, "plain");
     }
 
+    // F-03/p5.9: 2-boot continuity at the store level (the QEMU version that
+    // additionally exercises the 9p mount needs a live model + qemu host). Boot 1
+    // seeds canon + writes an agent finding; after "reboot" (drop + reopen the
+    // same path) the finding survives and canon re-seeds idempotently.
+    #[test]
+    fn two_boot_continuity_at_store_level() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("memory.redb");
+
+        // ── Boot 1 ──
+        {
+            let (store, q) = RedbStore::open(&path).unwrap();
+            assert!(q.is_none());
+            store.set_segment_class("kb:meta", MutabilityClass::Canon).unwrap();
+            store.put("kb:meta", "guidelines", "cite evidence").unwrap(); // operator seed
+            store.put("kb:research", "finding", "rust is memory-safe").unwrap(); // agent write
+        }
+
+        // ── Boot 2 (reopen same path) ──
+        let (store2, q2) = RedbStore::open(&path).unwrap();
+        assert!(q2.is_none(), "a clean store must not quarantine on reboot");
+        assert_eq!(
+            store2.get("kb:research", "finding").unwrap().as_deref(),
+            Some("rust is memory-safe"),
+            "agent finding must survive a reboot"
+        );
+        assert_eq!(
+            store2.get("kb:meta", "guidelines").unwrap().as_deref(),
+            Some("cite evidence"),
+            "canon seed must persist across reboot"
+        );
+        assert_eq!(
+            store2.segment_class("kb:meta").unwrap(),
+            Some(MutabilityClass::Canon),
+            "segment class must persist across reboot"
+        );
+    }
+
     // ── p5.6: eviction ──────────────────────────────────────────────────────
+
+    // F-03: eviction actually runs on the live write path once limits are set —
+    // not just when a test calls evict() directly (the bug: evict() was dead code).
+    #[test]
+    fn eviction_runs_through_live_path() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.set_segment_class("kb:rolling", MutabilityClass::Log).unwrap();
+        store.set_segment_limits("kb:rolling", Some(3), None).unwrap();
+
+        // Write 6 entries; each put self-trims to the 3-entry floor.
+        for i in 0..6 {
+            store.put("kb:rolling", &format!("k{i}"), "v").unwrap();
+        }
+        let keys = store.list_keys("kb:rolling").unwrap();
+        assert_eq!(keys.len(), 3, "live write path must trim to max_entries=3");
+        // The 3 OLDEST must be gone; the 3 newest survive.
+        assert_eq!(store.namespace_count("kb:rolling").unwrap(), 3);
+        assert!(store.get("kb:rolling", "k5").unwrap().is_some());
+        assert!(store.get("kb:rolling", "k0").unwrap().is_none());
+    }
+
+    // F-03: canon segments are immutable — eviction must never remove from them,
+    // even when limits are configured and exceeded.
+    #[test]
+    fn canon_is_not_evicted() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.set_segment_class("kb:law", MutabilityClass::Canon).unwrap();
+        store.set_segment_limits("kb:law", Some(1), Some(1)).unwrap();
+
+        for i in 0..5 {
+            store.put("kb:law", &format!("k{i}"), "v").unwrap();
+        }
+        // Despite max_entries=1, all 5 survive (canon protected on live path).
+        assert_eq!(store.list_keys("kb:law").unwrap().len(), 5);
+        // A direct evict() call must also refuse to touch canon.
+        let evicted = store.evict("kb:law", Some(1), Some(1), 9_999_999_999).unwrap();
+        assert!(evicted.is_empty(), "direct evict() must skip canon segments");
+        assert_eq!(store.list_keys("kb:law").unwrap().len(), 5);
+    }
 
     #[test]
     fn evict_empty_namespace_returns_empty() {

@@ -484,7 +484,7 @@ mod tests {
         // Write a valid tmp file directly so write_mode_600 succeeds.
         let cp = minimal_scheduler_checkpoint();
         let json = serde_json::to_string(&cp).unwrap();
-        std::fs::write(&store.tmp_path(), &json).unwrap();
+        std::fs::write(store.tmp_path(), &json).unwrap();
         // Now lock the directory — rename requires write permission on the parent dir.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
         // save() will try write_mode_600 (fails on read-only dir), so the error

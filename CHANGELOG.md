@@ -3,6 +3,40 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p5.9] - 2026-06-16 (v0.26.0)
+
+Phase 5 hardening (audit remediation) — closes the P1 findings from `docs/AUDIT-phase-5.md`
+(resolution table in §8). Each fix ships with a regression test that fails pre-fix. Gate before Phase 6.
+
+### Fixed
+- **F-01:** working-memory paging is keyed on a retained-context estimate
+  (`memory::context::estimate_context_tokens`) instead of cumulative lifetime spend, which only grew
+  and re-paged every turn once budget crossed 90%. Lifetime spend still drives the budget guard +
+  advisory. Test: `paging_stops_when_context_below_target`.
+- **F-02:** `RedbStore::open` quarantines only on confirmed corruption
+  (`StorageError::Corrupted` / `Io(InvalidData)`); lock, permission, transient I/O, and
+  upgrade-required errors surface without renaming a valid store. Timestamped `.corrupt` path.
+  Test: `transient_open_error_is_not_quarantined`.
+- **F-03:** eviction floor is wired to the live write path (`set_segment_limits` → `put`/`append`
+  self-trim); canon segments are never evicted (guarded in `evict()`). Tests:
+  `eviction_runs_through_live_path`, `canon_is_not_evicted`.
+- **F-04:** `debug_assert_counters` reconciles the NAMESPACES counter vs actual key count after every
+  mutation. Test: `namespace_counter_matches_key_count`.
+- **F-07a:** `page_turns` alternating-role invariant is a runtime `Err` (was a `debug_assert!`).
+- **F-09:** `spawn_agent.child_id` is validated (`validate_child_id`) — rejects traversal / namespace
+  separators. Tests: `validate_child_id_*`, `spawn_rejects_invalid_child_id`.
+- **F-16:** `spawn_agent`/`send_message` batched with other tools no longer terminates the agent; it
+  returns `is_error` results for every call and re-infers so the model retries the sole tool alone.
+
+### Added
+- Operator segment seeding: `[[memory.segments]]` `seed = [{ key, value }]` (F-14); demo `agents.toml`
+  now parses + runs (also adds `spawn_agent`/`send_message`/`list_agents` to `native`, F-15).
+- Root `.gitignore` (workspace `target/`, `*.redb`, `.gstack/`, `.DS_Store`).
+- 2-boot continuity test: `two_boot_continuity_at_store_level`.
+
+### Changed
+- CI + `make clippy-linux` run `cargo clippy --all-targets` (F-13); fixed all surfaced test-only lints.
+
 ## [p5.8] - 2026-06-15 (v0.25.0)
 
 Phase 5 hardening: security invariants, FUSE inode pruning, memory store index, docs completeness.

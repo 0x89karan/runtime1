@@ -47,18 +47,35 @@ pub struct Config {
 /// Re-exported from `memory::MutabilityClass` so config and runtime share one type.
 pub use crate::memory::MutabilityClass as SegmentClass;
 
+/// A single operator-seeded entry written to a segment at startup (p5.9/F-14).
+///
+/// Used to populate `canon` trust anchors that agents cannot write themselves.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedEntry {
+    pub key: String,
+    pub value: String,
+}
+
 /// A declared knowledge-base segment (p5.4+).
 ///
 /// ```toml
 /// [[memory.segments]]
 /// name  = "project:notes"    # namespace agents reference in kb_put/kb_get
 /// class = "log"              # "canon" | "log" | "scratch"
+/// seed  = [                  # p5.9: operator-seeded entries (e.g. canon anchors)
+///   { key = "guidelines", value = "Cite evidence." },
+/// ]
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SegmentConfig {
     pub name: String,
     pub class: SegmentClass,
+    /// Operator-seeded entries written to the segment at startup (F-14). The
+    /// operator write bypasses agent-facing canon protection by design.
+    #[serde(default)]
+    pub seed: Vec<SeedEntry>,
 }
 
 /// Configuration for the durable key/value memory store (p5.1+).
@@ -349,6 +366,42 @@ native = ["read_file", "list_dir"]
         assert_eq!(cfg.model.model, "claude-sonnet-4-6");
         assert_eq!(cfg.model.max_tokens, 2048);
         assert_eq!(cfg.tools.native, vec!["read_file", "list_dir"]);
+    }
+
+    // F-14/F-15: the shipped multi-agent memory demo MUST parse and be runnable.
+    // It is the smoke test for the whole memory subsystem; CI runs `cargo test`,
+    // so this guards against a non-parsing demo shipping again.
+    #[test]
+    fn shipped_demo_agents_toml_parses_and_is_runnable() {
+        let raw = include_str!("../agents.toml");
+        let cfg: Config = toml::from_str(raw)
+            .expect("shipped agents.toml must parse (F-14: e.g. unknown `seed` field)");
+
+        // F-15: the writer needs spawn_agent registered, not just the Spawn cap.
+        assert!(
+            cfg.tools.native.iter().any(|t| t == "spawn_agent"),
+            "demo grants Spawn but must also list spawn_agent in [tools].native (F-15)"
+        );
+
+        // F-14: the canon segment must carry its operator seed.
+        let canon = cfg
+            .memory
+            .segments
+            .iter()
+            .find(|s| matches!(s.class, SegmentClass::Canon))
+            .expect("demo must declare a canon segment");
+        assert!(
+            !canon.seed.is_empty(),
+            "canon trust-anchor segment must be operator-seeded (F-14)"
+        );
+
+        // The writer agent must hold Spawn so the spawn flow actually runs.
+        let writer = cfg
+            .agents
+            .iter()
+            .find(|a| a.id == "writer")
+            .expect("demo must define the writer agent");
+        assert!(writer.capabilities.is_some(), "writer must declare capabilities");
     }
 
     #[test]

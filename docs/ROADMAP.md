@@ -596,7 +596,12 @@ table completeness check (+14 rows total across Phase 5); TODOS swept. **Accepta
 +3 tests; sandbox-path assertion test passes; memory-demo flight log shows
 `memory_write`/`kb_search`/`memory_read`/`memory_paged`; binary ≤ 6 MB.
 
-### ▢ p5.9 — Phase 5 hardening (audit remediation) — **gate before Phase 6**
+### ✓ p5.9 — Phase 5 hardening (audit remediation) — **gate before Phase 6**
+**Status:** landed. All P1s closed (F-01/02/03/04/09/16) + F-07a/13/14/15; each with a
+regression test that fails pre-fix. `cargo build`/`clippy --all-targets`/`test` +
+`make clippy-linux` clean; musl 3.07 MB. Remaining P2s in `TODOS.md`. Resolution table
+in `docs/AUDIT-phase-5.md §8`. Live Stage-1 re-run + QEMU 2-boot pending a fresh key.
+
 **Depends on:** p5.8. Closes the P1 findings from `docs/AUDIT-phase-5.md` (the analogue of
 p4.7 after the 4.6 audit): **F-01** paging driven by lifetime spend, not context size →
 re-target + edge-gate so it stops shredding context; **F-02** `store.open()` quarantines a

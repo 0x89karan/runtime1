@@ -1,0 +1,14 @@
+# Rust build output (workspace builds to repo-root target/)
+/target/
+target/
+
+# Runtime/memory artifacts (never commit)
+*.redb
+*.redb.corrupt
+flight.jsonl
+checkpoint.json
+checkpoint.json.corrupt
+
+# OS + tooling cruft
+.DS_Store
+.gstack/
