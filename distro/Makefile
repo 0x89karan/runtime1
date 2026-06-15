@@ -49,13 +49,13 @@ $(BR_DIR): $(BR_TARBALL)
 	tar xzf $< -C build/
 
 overlay/usr/bin/agentd:
-	@[ -f ../agentd/target/x86_64-unknown-linux-musl/release/agentd ] || { \
+	@[ -f ../target/x86_64-unknown-linux-musl/release/agentd ] || { \
 		echo "ERROR: musl binary not found. Build it first:"; \
-		echo "  cd ../agentd && cross build --target x86_64-unknown-linux-musl --release"; \
+		echo "  cross build --target x86_64-unknown-linux-musl --release"; \
 		exit 1; \
 	}
 	mkdir -p overlay/usr/bin
-	cp ../agentd/target/x86_64-unknown-linux-musl/release/agentd $@
+	cp ../target/x86_64-unknown-linux-musl/release/agentd $@
 	chmod +x $@
 
 $(OUTPUT_DIR)/bzImage: $(BR_DIR) overlay/usr/bin/agentd
