@@ -14,19 +14,27 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: agentd
+          targets: x86_64-unknown-linux-musl
 
       - name: Install deps
-        run: |
-          sudo apt-get install -y qemu-system-x86 musl-tools jq
-          rustup target add x86_64-unknown-linux-musl
+        run: sudo apt-get install -y qemu-system-x86 musl-tools jq
 
       - name: Build agentd (musl static)
         run: cargo build --release --target x86_64-unknown-linux-musl
         working-directory: agentd
+
+      - name: Locate binary
+        id: binary
+        run: |
+          BIN="$GITHUB_WORKSPACE/agentd/target/x86_64-unknown-linux-musl/release/agentd"
+          if [ ! -f "$BIN" ]; then
+            echo "Expected path missing — searching..."
+            find "$GITHUB_WORKSPACE" -name "agentd" -type f ! -path "*/registry/*" 2>/dev/null
+            exit 1
+          fi
+          echo "path=$BIN" >> "$GITHUB_OUTPUT"
+          echo "Binary found: $BIN ($(du -sh "$BIN" | cut -f1))"
 
       # Cache the full Buildroot build tree. Key covers the defconfig and kernel
       # fragment; a hit lets Buildroot skip toolchain + kernel compilation (~20 min)
@@ -39,10 +47,8 @@ jobs:
 
       - name: Build distro image
         run: |
-          # Stage the binary explicitly so make never has to resolve ../agentd/target/
           mkdir -p overlay/usr/bin
-          cp "$GITHUB_WORKSPACE/agentd/target/x86_64-unknown-linux-musl/release/agentd" \
-             overlay/usr/bin/agentd
+          cp "${{ steps.binary.outputs.path }}" overlay/usr/bin/agentd
           chmod +x overlay/usr/bin/agentd
           make build
         working-directory: distro
