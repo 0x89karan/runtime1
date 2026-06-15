@@ -672,6 +672,80 @@ The audit recommends it and Phase 5 depends on it. Written in full increment for
 
 ---
 
+> #### ▢ p5.9 — Phase 5 hardening (audit remediation)
+>
+> **Depends on:** p5.8. **Gate before Phase 6.** Closes the P1 findings from
+> `docs/AUDIT-phase-5.md` (the analogue of p4.7 after the 4.6 audit). P2s → `TODOS.md`.
+>
+> **Goal:** the memory subsystem no longer (a) shreds working context once an agent nears
+> its budget, (b) destroys a valid store on a transient I/O error, (c) grows unbounded, or
+> (d) accepts a forgeable memory namespace — and the behavioral QA the fast ships skipped
+> actually runs.
+>
+> **Design reference:** `docs/AUDIT-phase-5.md` F-01, F-02, F-03, F-09, F-04, F-16
+> (+ F-07, F-13, F-14, F-15 — the Stage-1 live findings).
+>
+> **Scope — files modified:**
+> - `agentd/src/agent/mod.rs` + `agentd/src/memory/context.rs` — **F-01:** drive paging
+>   pressure from a *retained-context-size* estimate (sum of current `messages` block
+>   lengths / next-request input estimate), not `total_input+total_output`; edge-gate with
+>   a post-page target so paging stops once active context is below threshold. Keep
+>   lifetime spend for the budget guard + telemetry. Promote the `page_turns` alternation
+>   `debug_assert!` (`context.rs:85`) to a runtime `Err` (**F-07**).
+> - `agentd/src/memory/store.rs` — **F-02:** classify open errors — only quarantine on a
+>   confirmed redb corruption variant from `Database::open`; return chmod / schema-init /
+>   ordinary I/O failures as errors **without** renaming (consider a typed
+>   `OpenFailure::{Locked,Corrupt,Io}`). Make the `.corrupt` path unique (timestamp) so a
+>   second quarantine can't clobber evidence. **F-04:** `debug_assert!` (or reconcile) that
+>   `doc_count`/NAMESPACES counters equal the actual key count after each mutation.
+> - `agentd/src/memory/store.rs` + `agentd/src/scheduler.rs` — **F-03:** wire `evict()` to
+>   the live write path / a periodic per-segment sweep honoring `max_entries_per_segment` +
+>   `max_entry_age_days`; early-return on `canon` segments.
+> - `agentd/src/scheduler.rs` (`dispatch_spawn`) — **F-09:** `validate_segment(child_id)`;
+>   reject ids colliding with configured agents or containing traversal (or auto-generate
+>   `child_id` and ignore the agent-supplied value).
+> - `.github/workflows/ci.yml` — **F-13:** add `--all-targets` to the clippy gate (lint
+>   test code too).
+> - `agentd/src/agent/mod.rs` — **F-16 (Stage-1, live-confirmed):** when `spawn_agent`
+>   (`:540`) / `send_message` (`:579`) is batched with other tool calls, return an
+>   `is_error` tool result the agent can retry (call it alone) instead of
+>   `AgentEffect::Failed` — models routinely batch, and terminating kills the
+>   spawn/bus flows. Update the test at `:1251`.
+> - `agentd/agents.toml` — **F-14/F-15 (Stage-1):** make the demo actually run — remove or
+>   replace the unsupported `seed` field (or implement segment seeding) and add
+>   `spawn_agent` (+ `send_message`/`list_agents`) to `native`. The demo IS the smoke test;
+>   add a CI step (or `/qa`) that boots it on the MockGateway so a non-parsing demo fails CI.
+>
+> **Capability additions:** none. **Event additions:** none (eviction reuses
+> `memory_evicted`, now actually emitted once wired).
+>
+> **Tests added:**
+> - `memory::context::tests::paging_stops_when_context_below_target` (F-01: under a budget
+>   that triggers Hard, paging fires a bounded number of times, not every turn).
+> - `memory::store::tests::transient_open_error_is_not_quarantined` (F-02).
+> - `memory::store::tests::eviction_runs_through_live_path` + `canon_is_not_evicted` (F-03).
+> - `scheduler::tests::spawn_rejects_invalid_child_id` (F-09).
+> - `memory::store::tests::namespace_counter_matches_key_count` (F-04).
+> - The **2-boot continuity** + **distillation** integration tests the coverage audit
+>   found missing.
+>
+> **Test invariants:** the single-agent/multi-agent demo flight sequences are unchanged
+> when memory is unused.
+>
+> **Acceptance criteria:**
+> - `cargo build` + `cargo clippy --all-targets -- -D warnings` + `cargo test` +
+>   `make clippy-linux` clean; musl binary still ≤ 6 MB.
+> - The Stage-1 behavioral QA from `AUDIT-phase-5.md §6` runs green.
+> - Each F-01/F-02/F-03/F-09/F-04 has a regression test that **fails before the fix**.
+> - `docs/AUDIT-phase-5.md` P1 rows marked resolved; P2s logged in `TODOS.md`.
+>
+> **Out of scope (P2 → TODOS):** F-05 fsync, F-06 FUSE inode counter, F-08 `short_term`
+> bound, F-10 `agent/` prefix reservation, F-11 fail-open default, F-12 distillation
+> budget — none are data-loss-class; pick up in a later polish pass.
+>
+> **Known risks:** F-01's fix changes paging behavior — guard the demo-flight-parity
+> invariant carefully; the retained-context estimate may need the real tokenizer.
+
 ## D. Phase 5 exit criteria
 
 After p5.8 ships, all of these are observable:

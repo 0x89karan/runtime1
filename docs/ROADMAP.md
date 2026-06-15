@@ -596,6 +596,24 @@ table completeness check (+14 rows total across Phase 5); TODOS swept. **Accepta
 +3 tests; sandbox-path assertion test passes; memory-demo flight log shows
 `memory_write`/`kb_search`/`memory_read`/`memory_paged`; binary ≤ 6 MB.
 
+### ▢ p5.9 — Phase 5 hardening (audit remediation) — **gate before Phase 6**
+**Depends on:** p5.8. Closes the P1 findings from `docs/AUDIT-phase-5.md` (the analogue of
+p4.7 after the 4.6 audit): **F-01** paging driven by lifetime spend, not context size →
+re-target + edge-gate so it stops shredding context; **F-02** `store.open()` quarantines a
+valid store on a transient I/O error → classify errors, only quarantine real corruption;
+**F-03** the p5.6 eviction floor is implemented but never called → wire it + protect canon;
+**F-09** validate `spawn_agent.child_id` (forgeable memory namespace/provenance); **F-04**
+assert counter/key consistency (silent "empty memory" via the FUSE surface); **F-16**
+spawn_agent/send_message mixed with other tools terminates the agent → return a
+recoverable `is_error` (Stage-1 live finding — it kills the flagship multi-agent demo);
+**F-14/F-15** fix the broken `agents.toml` demo (unsupported `seed` field; missing
+`spawn_agent` tool). Plus run the behavioral QA the fast ships skipped (single/multi-agent,
+kv/mem/kb paths, capability denial, sandbox enforcement, 2-boot continuity) and close the
+`clippy --all-targets` gate. P2s tracked in `TODOS.md`. Full spec + exact diffs:
+`docs/PHASE-5-PLAN.md` p5.9. **Acceptance:** each P1 has a regression test that fails
+pre-fix; behavioral QA green; musl ≤ 6 MB. F-01/F-02 corroborated by an independent codex
+cross-check; F-14/F-15/F-16 confirmed live against the API (audit §6/§7).
+
 **Exit criteria for Phase 5:** a finding written by one agent is retrievable with
 provenance by a later, differently-capability-scoped agent over a capability-gated
 shared KB; working memory pages under budget pressure; long-term memory survives
