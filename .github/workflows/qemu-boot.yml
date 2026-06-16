@@ -18,7 +18,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Install deps
-        run: sudo apt-get install -y qemu-system-x86 musl-tools jq
+        run: sudo apt-get install -y qemu-system-x86 musl-tools jq libelf-dev
 
       - name: Build agentd (musl static)
         # Root Cargo.toml is the workspace root; artifacts go to $GITHUB_WORKSPACE/target/
