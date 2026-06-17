@@ -1,0 +1,15 @@
+[package]
+name = "agentctl"
+version = "0.28.0"
+edition = "2021"
+
+[[bin]]
+name = "agentctl"
+path = "src/main.rs"
+
+[dependencies]
+agentd = { path = "../agentd" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = "3"
+toml = "0.8"

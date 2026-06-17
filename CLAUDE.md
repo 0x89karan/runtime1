@@ -118,7 +118,13 @@ with `TemplateConfig`, `TemplateMeta`, `TemplateCapabilities`, `TemplateCard`, `
 `templates/scout.template.toml` first catalogue entry; path-traversal rejection; name identity
 check; `[capabilities]` deny-by-default; `TemplateResolver::from_env()` for `~/.agentos/templates/`;
 `Config` + sub-structs gain `Serialize`+`Clone` unblocking p6.2; 22 tests.
-**Next: p6.2 — `agentctl list-templates` / `agentctl spawn <template>` — see `docs/ROADMAP.md`.**
+**p6.2 complete (v0.28.0).** Operator CLI: `agentctl/` workspace crate; `[lib]` on `agentd`;
+`TemplateCard.suggested_caps: Vec<Capability>`; `agentctl list-templates` (tab-aligned, user/repo);
+`agentctl spawn <name> --task "..." [--cap-add ...] [--dry-run]`; `parse_cap_alias()` flat CLI
+syntax → `Capability`; `cap_add_allowed_by_suggestion()` guard; `--force` bypass;
+`ANTHROPIC_API_KEY` pre-exec check; `arg_required_else_help`; `tempfile` atomic write; sibling+PATH
+agentd resolution; `--dry-run` provenance header; distro Makefile adds `/etc/agentd/templates/`; 18 new tests.
+**Next: p6.3 — read-only TUI dashboard — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

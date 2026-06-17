@@ -32,6 +32,7 @@ subsystem, tool, or provider. (For *what* to build, see `ROADMAP.md`; for *why*,
 | `memory` | `MemoryStore` trait + `RedbStore` backend; `context` pressure manager + Tier-2 `MemItem`; `validate_segment` | scheduling, agent loop logic |
 | `surfaces` | FUSE virtual filesystem (`AgentsFs`), `SchedulerSnapshot`, `MemoryAccess` bridge trait | business logic, scheduling internals |
 | `sandbox` | `SandboxRule` enum, `compile()`/`apply_compiled()` for Landlock + seccomp-bpf | agent loop logic, scheduling |
+| `agentctl` | operator CLI binary; `list-templates` + `spawn`; `parse_cap_alias()`; `cap_add_allowed_by_suggestion()` | runtime logic, scheduler, memory |
 
 When a new subsystem appears in the roadmap, add a module; don't bolt it onto an
 existing one.
