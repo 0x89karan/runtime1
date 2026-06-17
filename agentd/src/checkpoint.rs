@@ -45,7 +45,8 @@ async fn write_mode_600(path: &std::path::Path, data: &[u8]) -> std::io::Result<
         }
         Err(e) => return Err(e),
     };
-    f.write_all(data).await
+    f.write_all(data).await?;
+    f.flush().await
 }
 
 #[cfg(not(unix))]
