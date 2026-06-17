@@ -3,6 +3,34 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.2] - 2026-06-17 (v0.28.0)
+
+Operator CLI. Agents can now be spawned from templates without editing TOML files.
+
+### Added
+- `agentctl/` workspace crate — new operator CLI binary.
+- `agentctl list-templates` — tab-aligned table of templates from repo catalogue and
+  `~/.agentos/templates/`, showing name, source (Repo/User), and showcases.
+- `agentctl spawn <name> --task "..." [--cap-add ...] [--dry-run]` — resolves a template,
+  lowers it to an `agent.toml`, writes it atomically via tempfile rename, then `exec`s agentd.
+- `TemplateCard.suggested_caps: Vec<Capability>` — guards `--cap-add` without `--force`;
+  uses real `Capability` type (single vocabulary, not alias strings).
+- `parse_cap_alias()` — maps flat CLI syntax (`fs-read:<path>`, `net:<ports>`, etc.) to
+  `Capability` values; rejects relative paths, bare `net`, and `mcp:...`.
+- `cap_add_allowed_by_suggestion()` — FsRead/FsWrite ancestor-of semantics; KbRead/KbWrite
+  prefix match; Net port-subset check; Spawn exact match.
+- `--dry-run` — prints parseable TOML to stdout with provenance header; does not require
+  agentd to be on PATH.
+- `--force` — bypasses suggested_caps guard.
+- `ANTHROPIC_API_KEY` preflight check before exec.
+- Sibling + PATH agentd resolution; `--agentd-path` override.
+- Distro: `/usr/bin/agentctl` + `/etc/agentd/templates/` in QEMU image overlay.
+
+### Changed
+- `agentd` gains a `[lib]` target so `agentctl` can import `agentd::template`,
+  `agentd::capability`, and `agentd::config` types.
+- `agentd` version bumped to `0.28.0`.
+
 ## [p6.1] - 2026-06-17 (v0.27.0)
 
 Phase 6 begins. Agents are now discoverable before they run: `*.template.toml` files in `templates/` describe an agent's capabilities, tools, and sample tasks. `TemplateResolver` loads from the repo catalogue and `~/.agentos/templates/` (user overrides), then lowers to a plain `Config` for `agentd`.
