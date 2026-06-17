@@ -2,7 +2,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use agentd::capability::{normalize_path, Capability};
+use agentd::capability::{kb_segment_satisfies, normalize_path, Capability};
 use agentd::template::TemplateSource;
 
 #[derive(clap::Args)]
@@ -57,24 +57,35 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         extra_caps.push(cap);
     }
 
-    // Cap guard: check extra_caps against template's suggested_caps.
-    if let Some(card) = &template.card {
-        for cap in &extra_caps {
-            if !args.force && !cap_add_allowed_by_suggestion(cap, &card.suggested_caps) {
-                if card.suggested_caps.is_empty() {
-                    anyhow::bail!(
-                        "template '{}' has empty suggested_caps — all --cap-add requires --force",
-                        args.name
-                    );
-                }
-                let suggested: Vec<String> =
-                    card.suggested_caps.iter().map(format_cap).collect();
+    // Cap guard: absent [card] is treated the same as [card] with empty suggested_caps —
+    // all --cap-add requires --force.
+    if !args.force && !extra_caps.is_empty() {
+        match &template.card {
+            None => {
                 anyhow::bail!(
-                    "capability '{}' not in template '{}' suggested_caps ({}); use --force to override",
-                    format_cap(cap),
-                    args.name,
-                    suggested.join(", ")
+                    "template '{}' has no [card] section — --cap-add requires --force",
+                    args.name
                 );
+            }
+            Some(card) => {
+                for cap in &extra_caps {
+                    if !cap_add_allowed_by_suggestion(cap, &card.suggested_caps) {
+                        if card.suggested_caps.is_empty() {
+                            anyhow::bail!(
+                                "template '{}' has empty suggested_caps — all --cap-add requires --force",
+                                args.name
+                            );
+                        }
+                        let suggested: Vec<String> =
+                            card.suggested_caps.iter().map(format_cap).collect();
+                        anyhow::bail!(
+                            "capability '{}' not in template '{}' suggested_caps ({}); use --force to override",
+                            format_cap(cap),
+                            args.name,
+                            suggested.join(", ")
+                        );
+                    }
+                }
             }
         }
     }
@@ -268,21 +279,15 @@ pub fn cap_add_allowed_by_suggestion(cap: &Capability, suggested: &[Capability])
                     return true;
                 }
             }
-            // KbRead: exact or prefix segment match (suggested is ancestor of requested).
+            // KbRead: delegate to the canonical kb_segment_satisfies in capability.rs.
             (Capability::KbRead { segment: req }, Capability::KbRead { segment: sug }) => {
-                if req == sug
-                    || req.starts_with(&format!("{sug}:"))
-                    || req.starts_with(&format!("{sug}/"))
-                {
+                if kb_segment_satisfies(sug, req) {
                     return true;
                 }
             }
             // KbWrite: same semantics as KbRead.
             (Capability::KbWrite { segment: req }, Capability::KbWrite { segment: sug }) => {
-                if req == sug
-                    || req.starts_with(&format!("{sug}:"))
-                    || req.starts_with(&format!("{sug}/"))
-                {
+                if kb_segment_satisfies(sug, req) {
                     return true;
                 }
             }
@@ -443,6 +448,60 @@ mod tests {
         assert!(err.to_string().contains("unknown capability alias"), "{err}");
     }
 
+    #[test]
+    fn alias_fs_write_valid() {
+        let cap = parse_cap_alias("fs-write:/out").unwrap();
+        assert_eq!(cap, Capability::FsWrite { prefix: "/out".into() });
+    }
+
+    #[test]
+    fn alias_fs_write_relative_rejected() {
+        assert!(parse_cap_alias("fs-write:out/subdir").is_err());
+    }
+
+    #[test]
+    fn alias_fs_write_empty_path_rejected() {
+        assert!(parse_cap_alias("fs-write:").is_err());
+    }
+
+    #[test]
+    fn alias_kb_read_valid() {
+        let cap = parse_cap_alias("kb-read:agent:notes").unwrap();
+        assert_eq!(cap, Capability::KbRead { segment: "agent:notes".into() });
+    }
+
+    #[test]
+    fn alias_kb_read_empty_rejected() {
+        assert!(parse_cap_alias("kb-read:").is_err());
+    }
+
+    #[test]
+    fn alias_kb_write_valid() {
+        let cap = parse_cap_alias("kb-write:shared:logs").unwrap();
+        assert_eq!(cap, Capability::KbWrite { segment: "shared:logs".into() });
+    }
+
+    #[test]
+    fn alias_kb_write_empty_rejected() {
+        assert!(parse_cap_alias("kb-write:").is_err());
+    }
+
+    #[test]
+    fn alias_spawn_valid() {
+        let cap = parse_cap_alias("spawn").unwrap();
+        assert_eq!(cap, Capability::Spawn);
+    }
+
+    #[test]
+    fn alias_net_empty_after_colon_rejected() {
+        assert!(parse_cap_alias("net:").is_err(), "empty port string must be rejected");
+    }
+
+    #[test]
+    fn alias_net_trailing_comma_rejected() {
+        assert!(parse_cap_alias("net:443,").is_err(), "trailing comma must be rejected");
+    }
+
     // ── cap_add_allowed_by_suggestion ─────────────────────────────────────────
 
     #[test]
@@ -471,6 +530,95 @@ mod tests {
             &suggested
         ));
         assert!(!cap_add_allowed_by_suggestion(&Capability::Spawn, &suggested));
+    }
+
+    #[test]
+    fn guard_fs_write_allows_subpath() {
+        let suggested = vec![Capability::FsWrite { prefix: "/out".into() }];
+        assert!(cap_add_allowed_by_suggestion(
+            &Capability::FsWrite { prefix: "/out/results".into() },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_fs_write_denies_superpath() {
+        let suggested = vec![Capability::FsWrite { prefix: "/out".into() }];
+        assert!(!cap_add_allowed_by_suggestion(
+            &Capability::FsWrite { prefix: "/".into() },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_spawn_allows_exact() {
+        let suggested = vec![Capability::Spawn];
+        assert!(cap_add_allowed_by_suggestion(&Capability::Spawn, &suggested));
+    }
+
+    #[test]
+    fn guard_spawn_denies_wrong_type() {
+        let suggested = vec![Capability::Spawn];
+        assert!(!cap_add_allowed_by_suggestion(
+            &Capability::FsRead { prefix: "/".into() },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_net_allows_port_subset() {
+        let suggested = vec![Capability::Net { hosts: vec![], ports: vec![443, 80, 8080] }];
+        assert!(cap_add_allowed_by_suggestion(
+            &Capability::Net { hosts: vec![], ports: vec![443, 80] },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_net_denies_port_superset() {
+        let suggested = vec![Capability::Net { hosts: vec![], ports: vec![443] }];
+        assert!(!cap_add_allowed_by_suggestion(
+            &Capability::Net { hosts: vec![], ports: vec![443, 22] },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_net_empty_req_ports_denied() {
+        // Empty req_ports must NOT pass vacuously (was a vacuous-truth hole).
+        let suggested = vec![Capability::Net { hosts: vec![], ports: vec![443] }];
+        assert!(!cap_add_allowed_by_suggestion(
+            &Capability::Net { hosts: vec![], ports: vec![] },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_kb_read_allows_sub_segment() {
+        let suggested = vec![Capability::KbRead { segment: "agent".into() }];
+        assert!(cap_add_allowed_by_suggestion(
+            &Capability::KbRead { segment: "agent:notes".into() },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_kb_read_denies_squatting() {
+        // "agent:scratch" must NOT satisfy "agent:scratchpad" — delimiter is required.
+        let suggested = vec![Capability::KbRead { segment: "agent:scratch".into() }];
+        assert!(!cap_add_allowed_by_suggestion(
+            &Capability::KbRead { segment: "agent:scratchpad".into() },
+            &suggested
+        ));
+    }
+
+    #[test]
+    fn guard_kb_write_allows_sub_segment() {
+        let suggested = vec![Capability::KbWrite { segment: "shared".into() }];
+        assert!(cap_add_allowed_by_suggestion(
+            &Capability::KbWrite { segment: "shared:logs".into() },
+            &suggested
+        ));
     }
 
     // ── spawn integration ─────────────────────────────────────────────────────
@@ -539,9 +687,9 @@ task = ""
     }
 
     #[test]
-    fn spawn_absent_card_allows_all() {
-        // When template has no [card], the guard is skipped entirely in the spawn flow.
-        // Verify the template parses without a card section.
+    fn spawn_absent_card_requires_force_for_cap_add() {
+        // Absent [card] is treated the same as empty suggested_caps:
+        // --cap-add without --force must be rejected.
         let raw = r#"
 [template]
 name = "nocard"
@@ -553,6 +701,15 @@ task = "t"
 "#;
         let cfg: agentd::template::TemplateConfig = toml::from_str(raw).unwrap();
         assert!(cfg.card.is_none(), "template without [card] must parse cleanly");
+        // Simulate the guard: absent card + extra_caps + force=false → denied.
+        let extra_caps = vec![Capability::FsRead { prefix: "/anywhere".into() }];
+        let force = false;
+        let denied = !force && !extra_caps.is_empty() && cfg.card.is_none();
+        assert!(denied, "absent [card] must deny --cap-add without --force");
+        // With force=true, the guard is bypassed regardless.
+        let force = true;
+        let denied = !force && !extra_caps.is_empty() && cfg.card.is_none();
+        assert!(!denied, "--force must bypass absent-card guard");
     }
 
     #[test]

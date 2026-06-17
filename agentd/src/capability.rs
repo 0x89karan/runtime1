@@ -190,7 +190,7 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
 /// the FsRead empty-prefix guard). Otherwise, `required` must equal `granted`
 /// or start with `granted` followed by a segment delimiter (`:` or `/`).
 /// This prevents `"agent:scratch"` from matching `"agent:scratchpad"`.
-fn kb_segment_satisfies(granted: &str, required: &str) -> bool {
+pub fn kb_segment_satisfies(granted: &str, required: &str) -> bool {
     if granted.is_empty() {
         return false; // empty grant is not valid
     }

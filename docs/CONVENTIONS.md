@@ -249,5 +249,12 @@ files but `to_agent_config()` on them will error).
 `TemplateConfig::to_agent_config()`. Runtime `AgentCard` is always derived from `[agent]`
 fields (id, name, description, skills).
 
+**`[card]` and `--cap-add` enforcement:** `agentctl spawn --cap-add` checks each
+requested capability against `[card].suggested_caps`. Absent `[card]` is treated the
+same as `[card]` with empty `suggested_caps` — all `--cap-add` requires `--force`.
+Templates that intentionally accept any capability must include `[card]` with the
+appropriate `suggested_caps` list. This prevents silent unguarded surfaces when
+authors forget the `[card]` section.
+
 **`~/.agentos/templates/`:** not created automatically. Operators create it themselves and
 drop `*.template.toml` files there to override or extend the repo catalogue.
