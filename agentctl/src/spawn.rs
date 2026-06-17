@@ -702,7 +702,7 @@ task = "t"
         let cfg: agentd::template::TemplateConfig = toml::from_str(raw).unwrap();
         assert!(cfg.card.is_none(), "template without [card] must parse cleanly");
         // Simulate the guard: absent card + extra_caps + force=false → denied.
-        let extra_caps = vec![Capability::FsRead { prefix: "/anywhere".into() }];
+        let extra_caps = [Capability::FsRead { prefix: "/anywhere".into() }];
         let force = false;
         let denied = !force && !extra_caps.is_empty() && cfg.card.is_none();
         assert!(denied, "absent [card] must deny --cap-add without --force");
@@ -736,5 +736,78 @@ task = ""
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("agentd not found"), "error must mention 'agentd not found'");
         assert!(msg.contains("/nonexistent/agentd"), "error must include the path");
+    }
+
+    /// Exercises the dry-run branch in `run()` end-to-end. This path must succeed
+    /// even when agentd is not on PATH — dry-run never execs.
+    #[test]
+    fn run_dry_run_succeeds_without_agentd() {
+        let repo = TempDir::new().unwrap();
+        write_template(&repo, "scout", SCOUT_LIKE);
+        let user_dir = TempDir::new().unwrap();
+        let args = Args {
+            name: "scout".into(),
+            task: Some("check /workspace".into()),
+            cap_add: vec![],
+            force: false,
+            user_templates_dir: Some(user_dir.path().to_path_buf()),
+            repo_dir: Some(repo.path().to_path_buf()),
+            agentd_path: Some(PathBuf::from("/nonexistent/agentd")),
+            output_dir: None,
+            dry_run: true,
+        };
+        // Dry-run must return Ok even though agentd_path doesn't exist.
+        assert!(run(args).is_ok(), "dry-run must succeed without a real agentd binary");
+    }
+
+    /// Exercises the ANTHROPIC_API_KEY preflight in `run()` (live path).
+    /// Provides a real executable as agentd so resolve_agentd succeeds, then
+    /// verifies the error fires before any file write or exec attempt.
+    #[test]
+    fn run_missing_api_key_errors_before_exec() {
+        let repo = TempDir::new().unwrap();
+        write_template(&repo, "scout", SCOUT_LIKE);
+        let user_dir = TempDir::new().unwrap();
+
+        // Create a fake agentd that resolve_agentd will accept (must exist on disk).
+        let fake_bin_dir = TempDir::new().unwrap();
+        let fake_agentd = fake_bin_dir.path().join("agentd");
+        std::fs::write(&fake_agentd, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&fake_agentd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Capture any existing key so we can restore it afterward.
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        // Safety: test-scoped removal is safe for this single-threaded check.
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        let args = Args {
+            name: "scout".into(),
+            task: Some("check /workspace".into()),
+            cap_add: vec![],
+            force: false,
+            user_templates_dir: Some(user_dir.path().to_path_buf()),
+            repo_dir: Some(repo.path().to_path_buf()),
+            agentd_path: Some(fake_agentd),
+            output_dir: Some(fake_bin_dir.path().to_path_buf()),
+            dry_run: false,
+        };
+        let result = run(args);
+
+        // Restore env before any assertion so failures don't leave env dirty.
+        match saved {
+            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ANTHROPIC_API_KEY"),
+            "error must mention ANTHROPIC_API_KEY, got: {msg}"
+        );
     }
 }

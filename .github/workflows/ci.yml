@@ -18,42 +18,71 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: agentd
+          workspaces: |
+            agentd
+            agentctl
 
-      - name: Build (debug)
+      - name: Build agentd (debug)
         run: cargo build --verbose
         working-directory: agentd
 
-      - name: Build (release)
+      - name: Build agentctl (debug)
+        run: cargo build --verbose
+        working-directory: agentctl
+
+      - name: Build agentd (release)
         run: cargo build --release --verbose
         working-directory: agentd
 
-      - name: Clippy
+      - name: Build agentctl (release)
+        run: cargo build --release --verbose
+        working-directory: agentctl
+
+      - name: Clippy agentd
         # --all-targets lints test + bench code too (F-13); test-only lints
         # (held locks across await, items after a test module, redundant bounds)
         # went uncaught for several Phase-5 sprints without it.
         run: cargo clippy --all-targets -- -D warnings
         working-directory: agentd
 
-      - name: Test
+      - name: Clippy agentctl
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: agentctl
+
+      - name: Test agentd
         run: cargo test --verbose
         working-directory: agentd
+
+      - name: Test agentctl
+        run: cargo test --verbose
+        working-directory: agentctl
 
       - name: Install musl target + tools
         run: |
           rustup target add x86_64-unknown-linux-musl
           sudo apt-get install -y musl-tools
 
-      - name: Build static musl binary
+      - name: Build agentd static musl binary
         run: cargo build --release --target x86_64-unknown-linux-musl
         working-directory: agentd
 
-      - name: Binary size guard (≤ 6 MB)
+      - name: Build agentctl static musl binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
+        working-directory: agentctl
+
+      - name: Binary size guard (agentd ≤ 6 MB)
         run: |
           SIZE=$(stat -c %s target/x86_64-unknown-linux-musl/release/agentd)
           echo "agentd musl binary: ${SIZE} bytes"
           MAX_BYTES=6291456  # 6 MB = 6 * 1024 * 1024
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
+
+      - name: Binary size guard (agentctl ≤ 4 MB)
+        run: |
+          SIZE=$(stat -c %s target/x86_64-unknown-linux-musl/release/agentctl)
+          echo "agentctl musl binary: ${SIZE} bytes"
+          MAX_BYTES=4194304  # 4 MB = 4 * 1024 * 1024
+          [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 4 MB limit"; exit 1; }
 
   audit:
     runs-on: ubuntu-latest
