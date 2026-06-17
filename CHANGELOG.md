@@ -3,6 +3,41 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.1] - 2026-06-17 (v0.27.0)
+
+Phase 6 begins. Agents are now discoverable before they run: `*.template.toml` files in `templates/` describe an agent's capabilities, tools, and sample tasks. `TemplateResolver` loads from the repo catalogue and `~/.agentos/templates/` (user overrides), then lowers to a plain `Config` for `agentd`.
+
+### Added
+- `agentd::template` — new public module with `TemplateConfig`, `TemplateMeta`,
+  `TemplateCapabilities`, `TemplateCard`, `TemplateResolver`, `TemplateSource`,
+  `TemplateEntry`. `TemplateConfig::to_agent_config()` lowers a template to a plain
+  `Config` with template-only keys stripped.
+- `templates/scout.template.toml` — scout agent as first catalogue entry.
+- `TemplateResolver::from_env()` convenience constructor (`~/.agentos/templates/`).
+- Path-traversal rejection in `TemplateResolver::resolve()`.
+- Name identity check in `resolve()` and `list()` — mismatched `[template].name` vs
+  filename stem is rejected (`resolve`) or skipped with `tracing::warn!` (`list`).
+- Absolute path validation on `[capabilities].fs_read`/`fs_write` in `to_agent_config()`.
+- `list()` deduplicates by name (user dir wins); emits `tracing::warn!` on parse errors
+  instead of silently discarding the file.
+- 22 unit tests.
+
+### Changed
+- `to_agent_config()` now preserves `[agent].capabilities` (e.g. `Mcp` grants with no
+  sugar form): sugar caps are built first, then existing agent caps are appended, so
+  previously-discarded `Mcp` grants are no longer lost.
+- `Config`, `ToolsConfig`, `SchedulerConfig`, `MemoryConfig`, `McpServerConfig`,
+  `IsolationMode`, `SeedEntry`, `SegmentConfig`, `MutabilityClass` now derive
+  `Serialize` (and `Clone` where missing), unblocking `agentctl` TOML write in p6.2.
+- `CONVENTIONS.md` — new "Templates" section.
+
+### Security
+- Missing `[capabilities]` in a template lowers to `agent.capabilities = Some([])`
+  (deny-all), never `None` (unrestricted).
+- Relative paths in `[capabilities].fs_read`/`fs_write` are rejected at lowering time.
+
+---
+
 ## [p5.9] - 2026-06-16 (v0.26.0)
 
 Phase 5 hardening (audit remediation) — closes the P1 findings from `docs/AUDIT-phase-5.md`

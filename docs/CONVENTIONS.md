@@ -217,3 +217,36 @@ pipeline-friendly.
   the JSON-RPC handshake) rather than a real external server.
 - Keep `agent.toml`'s demo as a living smoke test: its flight-event sequence is the
   regression baseline for the single-agent path — don't let refactors change it.
+
+## Templates (p6.1+)
+
+Agent templates live in `templates/` (repo) and `~/.agentos/templates/` (user). User dir
+takes precedence on name collision.
+
+**Naming:** filename must be `{name}.template.toml` where `name` matches the
+`[template].name` field. No slashes or `..` in the name (enforced by `resolve()`;
+`list()` checks name identity but does not reject traversal characters in filenames).
+
+**File layout:** `sample_tasks` is a **top-level key** — it must appear *before* the first
+table header (`[template]`, `[model]`, etc.). Keys placed after a table header belong to
+that table. Putting `sample_tasks` after `[card]` makes it `card.sample_tasks`, which
+causes an explicit parse error (unknown field `sample_tasks` in `TemplateCard`).
+
+**Required sections:** `[template]` (name, description, showcases) and either `[agent]`
+(single-agent) or `[[agents]]` (multi-agent). Everything else is optional.
+`[template]` is required for parsing; `[agent]`/`[[agents]]` are required for lowering
+(enforced by `to_agent_config()`, not by the parser — a `list()` call accepts template-only
+files but `to_agent_config()` on them will error).
+
+**Capabilities (`[capabilities]`):** flat sugar; absent = deny-all in the lowered
+`AgentConfig`. Available fields: `fs_read`, `fs_write`, `kb_read`, `kb_write`,
+`net_ports`, `net_hosts`, `spawn`. Paths must be absolute.
+`Capability::Mcp` cannot be expressed here — put Mcp grants directly in
+`[agent].capabilities` using the struct form: `capabilities = [{ Mcp = { server = "fs", tools = [] } }]`.
+
+**`[card]`:** catalogue metadata only. Not visible at runtime; stripped by
+`TemplateConfig::to_agent_config()`. Runtime `AgentCard` is always derived from `[agent]`
+fields (id, name, description, skills).
+
+**`~/.agentos/templates/`:** not created automatically. Operators create it themselves and
+drop `*.template.toml` files there to override or extend the repo catalogue.

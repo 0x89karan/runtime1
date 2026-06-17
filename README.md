@@ -14,7 +14,7 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phases 0–5 complete (v0.25.0).** `agentd` is a working Rust binary.
+**Phases 0–6.1 complete (v0.27.0).** `agentd` is a working Rust binary.
 Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
 inference gateway, tools, MCP stdio client, cooperative scheduler, capability
 system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
@@ -27,7 +27,8 @@ Landlock V4 TCP port enforcement. Phase 5 added the persistent memory substrate
 (redb-backed `MemoryStore`, short-term paging, long-term per-agent memory,
 shared KB with mutability classes, BM25 search, eviction + summarization, FUSE
 memory surface, and a hardening pass covering the OV-1 startup invariant and
-inode pruning). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
+inode pruning). Phase 6 began with the template schema + on-disk catalogue
+(`agentd::template`, `templates/` directory, `TemplateResolver`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
 
@@ -44,6 +45,7 @@ agentos/                   ← run `claude` here
 ├── agentd/                the runtime (Rust crate)
 │   ├── agent.toml         single-agent example
 │   └── agents.toml        multi-agent example (p1.2+)
+├── templates/             Phase 6: agent template catalogue (p6.1+)
 ├── surfaces/              Phase 3: /agents FUSE virtual filesystem (p3.1+)
 ├── sandbox/               Phase 3: Landlock LSM + seccomp-bpf sandbox (p3.3+)
 └── distro/                Phase 2: Buildroot external tree + QEMU boot

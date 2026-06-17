@@ -106,7 +106,19 @@ for terminated agents, all 6 maps); `getattr` ENOENT guard for `memory/` and `lo
 when store is absent; `memory_distilled` row added to CONVENTIONS.md event table;
 THREAT_MODEL.md §7 expanded to §7.1–7.6 (memory substrate threats); memory-demo `agents.toml`;
 `event_taxonomy_completeness` test; 476 tests.
-**Next: Phase 6 (Interface and agent catalogue) — see `docs/ROADMAP.md`.**
+**p5.9 complete (v0.26.0).** Phase 5 audit remediation: paging keyed on retained-context estimate
+(fixes re-paging every turn); quarantine only on confirmed corruption (timestamped `.corrupt`);
+eviction floor wired to live write path; NAMESPACES counter reconciliation; `page_turns`
+alternating-role invariant promoted to runtime `Err`; `spawn_agent`/`send_message` batch
+rejection returns `is_error` and re-infers; `validate_child_id` rejects traversal separators;
+operator segment seeding (`seed = [{ key, value }]`); root `.gitignore`; 476+ tests.
+**p6.1 complete (v0.27.0).** Template schema + on-disk catalogue: `agentd::template` module
+with `TemplateConfig`, `TemplateMeta`, `TemplateCapabilities`, `TemplateCard`, `TemplateResolver`,
+`TemplateSource`, `TemplateEntry`; `to_agent_config()` lowers template to plain `Config`;
+`templates/scout.template.toml` first catalogue entry; path-traversal rejection; name identity
+check; `[capabilities]` deny-by-default; `TemplateResolver::from_env()` for `~/.agentos/templates/`;
+`Config` + sub-structs gain `Serialize`+`Clone` unblocking p6.2; 22 tests.
+**Next: p6.2 — `agentctl list-templates` / `agentctl spawn <template>` — see `docs/ROADMAP.md`.**
 
 ## How to work here
 
@@ -214,6 +226,8 @@ agentos/                   the repo root (run `claude` here)
         mod.rs             Tool trait + registry
         native.rs          built-in read_file / write_file / list_dir
         mcp.rs             real MCP stdio client -> tools
+  templates/               Phase 6: agent template catalogue (p6.1+)
+    scout.template.toml    read-only researcher; first catalogue entry
   surfaces/                Phase 3: system surfaces (p3.1+)
     Cargo.toml             manifest (fuser dep Linux-only)
     src/
@@ -238,7 +252,7 @@ agentos/                   the repo root (run `claude` here)
           agent.toml       demo agent config
 ```
 
-Future phases add further siblings: Phase 4 hardens the sandbox (net enforcement, mandatory capabilities, clone3 filter).
+Phase 6 adds further siblings: `agentctl/` (p6.2 operator CLI), more templates (p6.7 starter catalogue).
 
 When in doubt about *what* to build next, the roadmap decides. When in doubt
 about *how*, conventions decide. When in doubt about *why*, the design doc decides.

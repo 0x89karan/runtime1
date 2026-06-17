@@ -25,7 +25,7 @@ impl From<&AgentConfig> for AgentCard {
 
 // deny_unknown_fields is intentionally omitted here to allow both [agent] and [[agents]]
 // forms to coexist in the schema without serde rejecting the other key.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub agent: Option<AgentConfig>,
     #[serde(default)]
@@ -50,7 +50,7 @@ pub use crate::memory::MutabilityClass as SegmentClass;
 /// A single operator-seeded entry written to a segment at startup (p5.9/F-14).
 ///
 /// Used to populate `canon` trust anchors that agents cannot write themselves.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedEntry {
     pub key: String,
@@ -67,7 +67,7 @@ pub struct SeedEntry {
 ///   { key = "guidelines", value = "Cite evidence." },
 /// ]
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SegmentConfig {
     pub name: String,
@@ -92,7 +92,7 @@ pub struct SegmentConfig {
 /// name  = "project:notes"
 /// class = "log"
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Path to the redb database file.
@@ -164,7 +164,7 @@ impl Config {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// Global token ceiling across all agents. 0 = unlimited.
@@ -287,7 +287,7 @@ impl Default for ModelConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ToolsConfig {
     #[serde(default)]
@@ -301,7 +301,7 @@ pub struct ToolsConfig {
 }
 
 /// Isolation mode for an MCP server subprocess.
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IsolationMode {
     /// Default: Landlock + seccomp + Linux namespaces applied via pre_exec.
@@ -313,7 +313,7 @@ pub enum IsolationMode {
     Gvisor,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,

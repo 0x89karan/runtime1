@@ -10,7 +10,7 @@ pub const SCHEMA_VERSION: u64 = 1;
 
 /// Mutability class for shared KB segments (p5.4).
 /// Enforced by the `kb_put` / `kb_get` Tier-4 tools.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MutabilityClass {
     Canon,

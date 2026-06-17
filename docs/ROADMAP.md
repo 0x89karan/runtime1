@@ -643,13 +643,15 @@ narrow `/agents/control` endpoint; everything else stays daemon-free. **Template
 (`*.template.toml`, a superset of `agent.toml`) make agents discoverable before they
 run; `agentctl spawn <template>` generates an `agent.toml` and execs `agentd`.
 
-### ▢ p6.1 — Template schema + on-disk catalogue
-**Depends on:** Phase 4.6. `*.template.toml` schema (superset of `agent.toml`:
-`[template]`, suggested `[capabilities]` deny-by-default, `[[tools.mcp_servers]]`,
-`[memory]` segments, `[card]`, `sample_tasks`). On-disk: `templates/` (repo) +
-`~/.agentos/templates/` (user), user-overrides-repo precedence. CLI-consumable, no UI.
+### ✅ p6.1 — Template schema + on-disk catalogue (v0.27.0)
+**Depends on:** p5.1 (Capability vocab + MemoryConfig). `*.template.toml` schema (superset
+of `agent.toml`: `[template]`, suggested `[capabilities]` deny-by-default, `[card]`,
+`sample_tasks`). On-disk: `templates/` (repo) + `~/.agentos/templates/` (user),
+user-overrides-repo precedence. CLI-consumable, no UI. `Config` + sub-structs gain
+`Serialize` unblocking p6.2 TOML write. 22 tests.
 **Acceptance:** a template parses, resolves by name with correct precedence, and
-generates a valid `agent.toml`; tests cover precedence + the strip-template-keys path.
+lowers to a valid `Config` when a task override is provided (templates with `task = ""`
+require a caller-supplied task); tests cover precedence + the strip-template-keys path.
 
 ### ▢ p6.2 — `agentctl list-templates` / `agentctl spawn <template>`
 **Depends on:** p6.1. New `agentctl/` workspace member (the operator CLI). `spawn`

@@ -1,0 +1,35 @@
+# templates/scout.template.toml — Read-only filesystem researcher
+# The Phase-0 demo agent, formalized as a catalogue entry.
+
+# sample_tasks is a top-level key. It must appear BEFORE any table header.
+sample_tasks = [
+  "List the project directory and summarize Cargo.toml.",
+  "Find all .rs files under src/ and count lines of code.",
+]
+
+[template]
+name        = "scout"
+description = "Read-only researcher using native tools. The minimal honest agent."
+showcases   = "The bare perceive→infer→act→observe loop + flight recording."
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 2048
+
+[capabilities]
+fs_read = ["/workspace"]
+
+[tools]
+native = ["read_file", "list_dir"]
+
+[card]
+name        = "Scout"
+description = "Read-only filesystem researcher."
+skills      = ["research", "summarization"]
+
+[agent]
+id           = "scout"
+task         = ""
+max_turns    = 10
+token_budget = 50_000
