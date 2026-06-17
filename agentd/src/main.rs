@@ -311,6 +311,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // std::process::exit() bypasses Drop, so we must return Err instead of
     // calling exit() while mcp_clients is still in scope.
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
+    let mut any_sandbox_applied = false;
     for server in &cfg.tools.mcp_servers {
         // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn},{Net}])
         // when only spawn/net caps are present with no FS rules.
@@ -373,6 +374,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         let enforcement = effective_compiled.as_ref().map(|c| c.enforcement_status());
 
         let had_sandbox = effective_compiled.is_some() || is_gvisor;
+        any_sandbox_applied |= had_sandbox;
         tracing::info!(
             name = %server.name,
             command = %server.command,
@@ -499,6 +501,13 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
 
     let snapshot: Arc<RwLock<SchedulerSnapshot>> =
         Arc::new(RwLock::new(SchedulerSnapshot::default()));
+
+    // Set static snapshot fields (provider model + sandbox status) once at startup,
+    // before the FUSE mount, so the /agents/system/ files are accurate from first access.
+    if let Ok(mut snap) = snapshot.write() {
+        snap.provider_model  = cfg.model.model.clone();
+        snap.sandbox_applied = any_sandbox_applied;
+    }
 
     #[cfg(target_os = "linux")]
     let fuse_mountpoint = PathBuf::from("/agents");

@@ -661,7 +661,7 @@ generates an `agent.toml` from a template + `--task`/`--cap-add` overrides
 name·source·showcases; capability overrides never exceed the template's suggestions
 without an explicit flag.
 
-### ▢ p6.3 — Read-only TUI: dashboard + agent detail + system
+### ✅ p6.3 — Read-only TUI: dashboard + agent detail + system (v0.29.0)
 **Depends on:** p6.2, p3.1 (FUSE). `ratatui`+`crossterm` in `agentctl`; reads
 `/agents/<id>/{status,context_size,budget,flight}` + the proposed `/agents/system`
 surface. Requires `surfaces/` amendments: status enrichment (awaiting-inference vs

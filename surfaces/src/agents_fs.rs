@@ -8,7 +8,12 @@ use crate::{snapshot::SchedulerSnapshot, MemoryAccess};
 /// Inode assignments:
 ///   1      = root directory  "/"
 ///   9      = kb/ directory   (shared KB segments)
-///   1010   = first agent directory  (step 10 per agent)
+///   10     = system/ directory (global stats)
+///   11     = system/budget file
+///   12     = system/queue file
+///   13     = system/sandbox file
+///   14     = system/provider file
+///   1010   = first agent directory  (step 20 per agent since p6.3)
 ///   +1     = status file
 ///   +2     = context_size file
 ///   +3     = budget file
@@ -16,27 +21,46 @@ use crate::{snapshot::SchedulerSnapshot, MemoryAccess};
 ///   +5     = memory/ subdir
 ///   +6     = memory/short_term file
 ///   +7     = memory/long_term/ subdir
+///   +8     = tools file
 ///
 ///   1_000_000+ = dynamic pool for memory/long_term/<key>,
 ///                kb/<segment>/, and kb/<segment>/<key>
 ///
 /// Used by the Linux FUSE impl and by tests on all platforms.
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) const DIR_STEP:         u64 = 10;
+pub(crate) const DIR_STEP:          u64 = 20;
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) const OFF_STATUS:       u64 = 1;
+pub(crate) const OFF_STATUS:        u64 = 1;
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) const OFF_CONTEXT:      u64 = 2;
+pub(crate) const OFF_CONTEXT:       u64 = 2;
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) const OFF_BUDGET:       u64 = 3;
+pub(crate) const OFF_BUDGET:        u64 = 3;
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) const OFF_FLIGHT:       u64 = 4;
+pub(crate) const OFF_FLIGHT:        u64 = 4;
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) const OFF_MEMORY_DIR:   u64 = 5;
+pub(crate) const OFF_MEMORY_DIR:    u64 = 5;
 #[cfg(any(test, target_os = "linux"))]
-pub(crate) const OFF_SHORT_TERM:   u64 = 6;
+pub(crate) const OFF_SHORT_TERM:    u64 = 6;
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const OFF_LONG_TERM_DIR: u64 = 7;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const OFF_TOOLS:         u64 = 8;
+
+/// System directory and file inodes (not in inode_to_id; handled explicitly).
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYSTEM:       u64 = 10;
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYS_BUDGET:   u64 = 11;
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYS_QUEUE:    u64 = 12;
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYS_SANDBOX:  u64 = 13;
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYS_PROVIDER: u64 = 14;
+
+// Invariant: all per-agent file offsets must fit within DIR_STEP - 1 slots.
+#[cfg(any(test, target_os = "linux"))]
+const _: () = assert!(OFF_TOOLS < DIR_STEP - 1, "OFF_TOOLS must be < DIR_STEP - 1");
 
 /// Last 64 KB of flight.jsonl to scan for per-agent events.
 #[cfg(any(test, target_os = "linux"))]
@@ -74,6 +98,14 @@ const DIR_START: u64 = 1010;
 #[cfg(any(test, target_os = "linux"))]
 const DYNAMIC_INO_START: u64 = 1_000_000;
 
+/// Sentinel values written to agent virtual files.
+/// Must stay in sync with BUDGET_UNLIMITED_SENTINEL / TOOLS_NONE_SENTINEL in
+/// agentctl/src/watch/reader.rs.
+#[cfg(any(test, target_os = "linux"))]
+const BUDGET_UNLIMITED_SENTINEL: &str = "unlimited";
+#[cfg(any(test, target_os = "linux"))]
+const TOOLS_NONE_SENTINEL: &str = "(none)";
+
 /// Describes the kind of entity behind a dynamic inode.
 #[cfg(any(test, target_os = "linux"))]
 enum DynInoKind {
@@ -110,6 +142,25 @@ fn value_bytes(val: &str) -> Vec<u8> {
     format!("{val}\n").into_bytes()
 }
 
+/// Produce a properly escaped JSON string value (without surrounding quotes).
+/// Handles `"`, `\`, and all ASCII control characters (U+0000–U+001F).
+#[cfg(any(test, target_os = "linux"))]
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c    => out.push(c),
+        }
+    }
+    out
+}
+
 /// Return up to `MAX_DIR_KEYS` keys for a namespace, applying the cap consistently.
 #[cfg(any(test, target_os = "linux"))]
 fn capped_keys(mem: &dyn MemoryAccess, namespace: &str) -> Vec<String> {
@@ -141,7 +192,7 @@ impl AgentsFs {
         if let Some(&ino) = self.dir_inodes.get(agent_id) {
             return ino;
         }
-        debug_assert!(
+        assert!(
             self.next_dir_inode < DYNAMIC_INO_START,
             "fixed inode pool reached dynamic inode range at {}",
             self.next_dir_inode
@@ -149,10 +200,10 @@ impl AgentsFs {
         let ino = self.next_dir_inode;
         self.next_dir_inode += DIR_STEP;
         self.dir_inodes.insert(agent_id.to_string(), ino);
-        // Register all 8 fixed inodes so inode_to_id lookups work.
+        // Register all 9 fixed inodes so inode_to_id lookups work.
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
-            OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR,
+            OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS,
         ] {
             self.inode_to_id.insert(ino + offset, agent_id.to_string());
         }
@@ -208,6 +259,9 @@ impl AgentsFs {
         if parent == INO_KB {
             return Some(ParentKind::Kb);
         }
+        if parent == INO_SYSTEM {
+            return Some(ParentKind::SystemDir);
+        }
         if let Some(agent_id) = self.inode_to_id.get(&parent) {
             let base = self.dir_inodes[agent_id];
             let offset = parent.wrapping_sub(base);
@@ -251,7 +305,7 @@ impl AgentsFs {
             OFF_CONTEXT => format!("{}\n", agent.context_tokens).into_bytes(),
             OFF_BUDGET => {
                 if agent.token_budget == 0 {
-                    b"unlimited\n".to_vec()
+                    format!("{BUDGET_UNLIMITED_SENTINEL}\n").into_bytes()
                 } else {
                     format!("{}\n", agent.token_budget).into_bytes()
                 }
@@ -264,10 +318,42 @@ impl AgentsFs {
                     format!("{}\n", agent.short_term_previews.join("\n")).into_bytes()
                 }
             }
+            OFF_TOOLS => {
+                if agent.tools.is_empty() {
+                    format!("{TOOLS_NONE_SENTINEL}\n").into_bytes()
+                } else {
+                    format!("{}\n", agent.tools.join("\n")).into_bytes()
+                }
+            }
             // OFF_MEMORY_DIR and OFF_LONG_TERM_DIR are directories — not served here.
             _ => return None,
         };
         Some(content)
+    }
+
+    /// Content for /agents/system/{budget,queue,sandbox,provider} virtual files.
+    fn sys_file_content(&self, ino: u64) -> Option<Vec<u8>> {
+        let snap = self.snapshot.read().ok()?;
+        let content = match ino {
+            INO_SYS_BUDGET => format!(
+                "{{\"spent\":{},\"total\":0}}\n",
+                snap.global_tokens_spent
+            ),
+            INO_SYS_QUEUE => format!(
+                "{{\"depth\":{}}}\n",
+                snap.queue_depth
+            ),
+            INO_SYS_SANDBOX => format!(
+                "{{\"applied\":{}}}\n",
+                snap.sandbox_applied
+            ),
+            INO_SYS_PROVIDER => {
+                let escaped = json_escape_str(&snap.provider_model);
+                format!("{{\"model\":\"{escaped}\",\"backend\":\"anthropic\"}}\n")
+            }
+            _ => return None,
+        };
+        Some(content.into_bytes())
     }
 
     /// Content for dynamic file inodes (long_term/<key>, kb/<seg>/<key>).
@@ -296,10 +382,10 @@ impl AgentsFs {
     /// into a `Vec<String>` before calling this (Rust borrow checker requires it).
     fn prune_dead_agent(&mut self, agent_id: &str) {
         if let Some(base) = self.dir_inodes.remove(agent_id) {
-            // Remove all 8 fixed per-agent inodes (dir + offsets 1–7).
+            // Remove all 9 fixed per-agent inodes (dir + offsets 1–8).
             for offset in [
                 0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
-                OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR,
+                OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS,
             ] {
                 self.inode_to_id.remove(&(base + offset));
             }
@@ -351,6 +437,7 @@ impl AgentsFs {
     fn is_dir_ino(&self, ino: u64) -> bool {
         if ino == ROOT_INO { return true; }
         if ino == INO_KB { return true; }
+        if ino == INO_SYSTEM { return true; }
         if let Some(agent_id) = self.inode_to_id.get(&ino) {
             let base = self.dir_inodes[agent_id];
             let offset = ino.wrapping_sub(base);
@@ -375,23 +462,26 @@ impl AgentsFs {
 enum ParentKind {
     Root,
     Kb,
-    AgentDir(String),
+    SystemDir,
+    // Fields used in Linux-gated FUSE handlers (dead_code from macOS test perspective).
+    #[allow(dead_code)] AgentDir(String),
     MemoryDir(String),
     LongTermDir(String),
-    KbSegDir(String),
+    #[allow(dead_code)] KbSegDir(String),
 }
 
 /// Only used in tests (the FUSE impl hard-codes file names in readdir).
 #[cfg(test)]
 fn file_name_for_offset(offset: u64) -> Option<&'static str> {
     match offset {
-        OFF_STATUS       => Some("status"),
-        OFF_CONTEXT      => Some("context_size"),
-        OFF_BUDGET       => Some("budget"),
-        OFF_FLIGHT       => Some("flight"),
-        OFF_MEMORY_DIR   => Some("memory"),
-        OFF_SHORT_TERM   => Some("short_term"),
+        OFF_STATUS        => Some("status"),
+        OFF_CONTEXT       => Some("context_size"),
+        OFF_BUDGET        => Some("budget"),
+        OFF_FLIGHT        => Some("flight"),
+        OFF_MEMORY_DIR    => Some("memory"),
+        OFF_SHORT_TERM    => Some("short_term"),
         OFF_LONG_TERM_DIR => Some("long_term"),
+        OFF_TOOLS         => Some("tools"),
         _ => None,
     }
 }
@@ -496,6 +586,11 @@ impl fuser::Filesystem for AgentsFs {
                     reply.entry(&TTL, &make_file_attr(INO_KB, 0, fuser::FileType::Directory), 0);
                     return;
                 }
+                // system/ dir (always present)
+                if name_str == "system" {
+                    reply.entry(&TTL, &make_file_attr(INO_SYSTEM, 0, fuser::FileType::Directory), 0);
+                    return;
+                }
                 // Check existence before allocating inode to avoid leaking inode state on ENOENT.
                 let snap = match self.snapshot.read() {
                     Ok(s) => s,
@@ -508,6 +603,18 @@ impl fuser::Filesystem for AgentsFs {
                 } else {
                     reply.error(libc::ENOENT);
                 }
+            }
+
+            Some(ParentKind::SystemDir) => {
+                let ino = match name_str {
+                    "budget"   => INO_SYS_BUDGET,
+                    "queue"    => INO_SYS_QUEUE,
+                    "sandbox"  => INO_SYS_SANDBOX,
+                    "provider" => INO_SYS_PROVIDER,
+                    _ => { reply.error(libc::ENOENT); return; }
+                };
+                let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
+                reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
             }
 
             Some(ParentKind::Kb) => {
@@ -542,6 +649,11 @@ impl fuser::Filesystem for AgentsFs {
                     }
                     "flight" => {
                         let ino = dir_ino + OFF_FLIGHT;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    "tools" => {
+                        let ino = dir_ino + OFF_TOOLS;
                         let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
                         reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
                     }
@@ -605,6 +717,15 @@ impl fuser::Filesystem for AgentsFs {
             reply.attr(&TTL, &make_file_attr(INO_KB, 0, fuser::FileType::Directory));
             return;
         }
+        if ino == INO_SYSTEM {
+            reply.attr(&TTL, &make_file_attr(INO_SYSTEM, 0, fuser::FileType::Directory));
+            return;
+        }
+        if (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) {
+            let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
+            reply.attr(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile));
+            return;
+        }
         if let Some(agent_id) = self.inode_to_id.get(&ino).cloned() {
             let base   = self.dir_inodes[&agent_id];
             let offset = ino.wrapping_sub(base);
@@ -656,6 +777,8 @@ impl fuser::Filesystem for AgentsFs {
         let content = if let Some(c) = self.file_content_for_ino(ino) {
             c
         } else if let Some(c) = self.dyn_file_content(ino) {
+            c
+        } else if let Some(c) = self.sys_file_content(ino) {
             c
         } else {
             reply.error(libc::ENOENT);
@@ -715,7 +838,19 @@ impl fuser::Filesystem for AgentsFs {
                 if self.memory.is_some() {
                     v.push((INO_KB, fuser::FileType::Directory, "kb".to_string()));
                 }
+                v.push((INO_SYSTEM, fuser::FileType::Directory, "system".to_string()));
                 v
+            }
+
+            Some(ParentKind::SystemDir) => {
+                vec![
+                    (INO_SYSTEM,       fuser::FileType::Directory,   ".".to_string()),
+                    (ROOT_INO,         fuser::FileType::Directory,   "..".to_string()),
+                    (INO_SYS_BUDGET,   fuser::FileType::RegularFile, "budget".to_string()),
+                    (INO_SYS_QUEUE,    fuser::FileType::RegularFile, "queue".to_string()),
+                    (INO_SYS_SANDBOX,  fuser::FileType::RegularFile, "sandbox".to_string()),
+                    (INO_SYS_PROVIDER, fuser::FileType::RegularFile, "provider".to_string()),
+                ]
             }
 
             Some(ParentKind::Kb) => {
@@ -748,6 +883,7 @@ impl fuser::Filesystem for AgentsFs {
                     (dir_ino + OFF_CONTEXT, fuser::FileType::RegularFile, "context_size".to_string()),
                     (dir_ino + OFF_BUDGET,  fuser::FileType::RegularFile, "budget".to_string()),
                     (dir_ino + OFF_FLIGHT,  fuser::FileType::RegularFile, "flight".to_string()),
+                    (dir_ino + OFF_TOOLS,   fuser::FileType::RegularFile, "tools".to_string()),
                 ];
                 if self.memory.is_some() {
                     v.push((dir_ino + OFF_MEMORY_DIR, fuser::FileType::Directory, "memory".to_string()));
@@ -833,7 +969,7 @@ impl fuser::Filesystem for AgentsFs {
         } else if let Some(kind) = self.dyn_ino_kind.get(&ino) {
             !matches!(kind, DynInoKind::KbSeg { .. })
         } else {
-            false
+            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
         };
         if is_file {
             reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
@@ -889,7 +1025,27 @@ mod tests {
         Arc::new(RwLock::new(SchedulerSnapshot {
             agents,
             global_tokens_spent: 0,
-            in_flight: 0,
+            in_flight:           0,
+            queue_depth:         0,
+            provider_model:      String::new(),
+            sandbox_applied:     false,
+        }))
+    }
+
+    fn make_snap_with_sys(
+        agents:          Vec<AgentSnapshot>,
+        global_spent:    u64,
+        queue_depth:     usize,
+        sandbox_applied: bool,
+        provider_model:  &str,
+    ) -> Arc<RwLock<SchedulerSnapshot>> {
+        Arc::new(RwLock::new(SchedulerSnapshot {
+            agents,
+            global_tokens_spent: global_spent,
+            in_flight:           0,
+            queue_depth,
+            provider_model:      provider_model.to_string(),
+            sandbox_applied,
         }))
     }
 
@@ -901,6 +1057,7 @@ mod tests {
             context_tokens:      100,
             token_budget:        50_000,
             task_preview:        "do something".to_string(),
+            tools:               vec![],
             short_term_previews: vec![],
         }
     }
@@ -1059,13 +1216,13 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_inodes_registered_after_alloc() {
+    fn all_nine_inodes_registered_after_alloc() {
         let snap = make_snap(vec![]);
         let mut fs = AgentsFs::new(snap, None);
         let dir_ino = fs.alloc_dir("x");
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
-            OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR,
+            OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS,
         ] {
             assert!(
                 fs.inode_to_id.contains_key(&(dir_ino + offset)),
@@ -1449,7 +1606,7 @@ mod tests {
         mock.insert("scratch", "clean", "v1");
         mock.insert("scratch", "a/b", "v2");  // slash
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, Some(mock));
+        let fs = AgentsFs::new(snap, Some(mock));
 
         let mem = fs.memory.as_ref().unwrap();
         let raw_keys = capped_keys(&**mem, "scratch");
@@ -1503,7 +1660,7 @@ mod tests {
         // All agent-a entries must be gone from every map
         assert!(!fs.dir_inodes.contains_key("agent-a"), "dir_inodes must be cleared");
         for offset in [0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
-                       OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR] {
+                       OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS] {
             assert!(!fs.inode_to_id.contains_key(&(base + offset)),
                 "inode_to_id must not contain base+{offset} after prune");
         }
@@ -1600,5 +1757,256 @@ mod tests {
         fs.prune_dead_agent("ghost");
         assert!(fs.dir_inodes.is_empty());
         assert!(fs.inode_to_id.is_empty());
+    }
+
+    // ── p6.3: DIR_STEP=20, OFF_TOOLS=8, const invariant ──────────────────────
+
+    #[test]
+    fn dir_step_is_twenty() {
+        assert_eq!(DIR_STEP, 20, "DIR_STEP must be 20 to fit all per-agent offsets");
+    }
+
+    #[test]
+    fn off_tools_is_eight() {
+        assert_eq!(OFF_TOOLS, 8);
+    }
+
+    #[test]
+    fn off_tools_fits_within_dir_step() {
+        // Compile-time check exists as `const _: ()` above. This test ensures
+        // the relationship is also visible in test output.
+        #[allow(clippy::assertions_on_constants)]
+        { assert!(OFF_TOOLS < DIR_STEP - 1, "OFF_TOOLS must be < DIR_STEP - 1"); }
+    }
+
+    #[test]
+    fn alloc_dir_step_20_increments() {
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None);
+        let ino_a = fs.alloc_dir("a");
+        let ino_b = fs.alloc_dir("b");
+        assert_eq!(ino_b, ino_a + 20, "second agent dir inode must be exactly 20 after the first");
+    }
+
+    #[test]
+    fn off_tools_inode_registered_in_inode_map() {
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None);
+        let dir_ino = fs.alloc_dir("agent-x");
+        assert!(
+            fs.inode_to_id.contains_key(&(dir_ino + OFF_TOOLS)),
+            "dir+OFF_TOOLS inode must be in inode_to_id after alloc_dir"
+        );
+    }
+
+    #[test]
+    fn file_name_for_offset_tools_returns_tools() {
+        assert_eq!(file_name_for_offset(OFF_TOOLS), Some("tools"));
+    }
+
+    // ── p6.3: tools file rendering ────────────────────────────────────────────
+
+    #[test]
+    fn tools_file_empty_tools_renders_none() {
+        let snap = make_snap(vec![AgentSnapshot {
+            tools: vec![],
+            ..agent_snap("a", AgentStatus::Running)
+        }]);
+        let mut fs = AgentsFs::new(snap, None);
+        fs.alloc_dir("a");
+        let dir_ino = fs.dir_inodes["a"];
+        let content = fs.file_content_for_ino(dir_ino + OFF_TOOLS).unwrap();
+        assert_eq!(content, b"(none)\n");
+    }
+
+    #[test]
+    fn tools_file_single_tool_renders_with_newline() {
+        let snap = make_snap(vec![AgentSnapshot {
+            tools: vec!["read_file".to_string()],
+            ..agent_snap("a", AgentStatus::Running)
+        }]);
+        let mut fs = AgentsFs::new(snap, None);
+        fs.alloc_dir("a");
+        let dir_ino = fs.dir_inodes["a"];
+        let content = fs.file_content_for_ino(dir_ino + OFF_TOOLS).unwrap();
+        assert_eq!(content, b"read_file\n");
+    }
+
+    #[test]
+    fn tools_file_multiple_tools_newline_separated() {
+        let snap = make_snap(vec![AgentSnapshot {
+            tools: vec!["read_file".to_string(), "write_file".to_string(), "list_dir".to_string()],
+            ..agent_snap("a", AgentStatus::Running)
+        }]);
+        let mut fs = AgentsFs::new(snap, None);
+        fs.alloc_dir("a");
+        let dir_ino = fs.dir_inodes["a"];
+        let content = fs.file_content_for_ino(dir_ino + OFF_TOOLS).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "read_file\nwrite_file\nlist_dir\n");
+    }
+
+    // ── p6.3: system dir parent_kind ─────────────────────────────────────────
+
+    #[test]
+    fn parent_kind_ino_system_returns_system_dir() {
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None);
+        match fs.parent_kind(INO_SYSTEM) {
+            Some(ParentKind::SystemDir) => {}
+            other => panic!("expected SystemDir, got {:?}", other.map(|_| "other")),
+        }
+    }
+
+    #[test]
+    fn parent_kind_sys_file_inodes_return_none() {
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None);
+        // System file inodes are not parents — parent_kind must return None.
+        for ino in [INO_SYS_BUDGET, INO_SYS_QUEUE, INO_SYS_SANDBOX, INO_SYS_PROVIDER] {
+            assert!(
+                fs.parent_kind(ino).is_none(),
+                "parent_kind({ino}) must return None (system files are not parents)"
+            );
+        }
+    }
+
+    #[test]
+    fn is_dir_ino_system_dir_returns_true() {
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None);
+        assert!(fs.is_dir_ino(INO_SYSTEM), "INO_SYSTEM must be reported as a directory");
+    }
+
+    #[test]
+    fn is_dir_ino_system_file_inodes_return_false() {
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None);
+        for ino in [INO_SYS_BUDGET, INO_SYS_QUEUE, INO_SYS_SANDBOX, INO_SYS_PROVIDER] {
+            assert!(
+                !fs.is_dir_ino(ino),
+                "system file inode {ino} must NOT be reported as a directory"
+            );
+        }
+    }
+
+    // ── p6.3: sys_file_content ────────────────────────────────────────────────
+
+    #[test]
+    fn sys_budget_renders_correct_json() {
+        let snap = make_snap_with_sys(vec![], 42_000, 0, false, "");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_BUDGET).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"spent\":42000,\"total\":0}\n");
+    }
+
+    #[test]
+    fn sys_budget_zero_spent() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_BUDGET).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"spent\":0,\"total\":0}\n");
+    }
+
+    #[test]
+    fn sys_queue_renders_depth() {
+        let snap = make_snap_with_sys(vec![], 0, 3, false, "");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_QUEUE).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"depth\":3}\n");
+    }
+
+    #[test]
+    fn sys_queue_zero_depth() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_QUEUE).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"depth\":0}\n");
+    }
+
+    #[test]
+    fn sys_sandbox_renders_false() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"applied\":false}\n");
+    }
+
+    #[test]
+    fn sys_sandbox_renders_true() {
+        let snap = make_snap_with_sys(vec![], 0, 0, true, "");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"applied\":true}\n");
+    }
+
+    #[test]
+    fn sys_provider_renders_model_and_backend() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "claude-sonnet-4-6");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"model\":\"claude-sonnet-4-6\",\"backend\":\"anthropic\"}\n");
+    }
+
+    #[test]
+    fn sys_provider_escapes_quotes_in_model() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "model-with-\"quotes\"");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains("\\\"quotes\\\""), "double-quotes in model name must be escaped");
+    }
+
+    #[test]
+    fn sys_provider_escapes_control_chars_in_model() {
+        // Regression: json_escape_str must handle \n, \r, \t (not just " and \).
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "model\nwith\rnewline\ttab");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        // Output must be valid JSON (parseable) and must not contain bare control chars.
+        assert!(s.contains("\\n"), "newline must be escaped as \\n");
+        assert!(s.contains("\\r"), "CR must be escaped as \\r");
+        assert!(s.contains("\\t"), "tab must be escaped as \\t");
+        assert!(!s.contains('\n') || s.ends_with('\n'), "bare newlines only permitted as line terminator");
+    }
+
+    #[test]
+    fn sys_provider_escapes_backslash_in_model() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, r"model\path\name");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains(r"\\"), "backslash in model name must be escaped as \\\\");
+    }
+
+    #[test]
+    fn sys_file_content_unknown_ino_returns_none() {
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None);
+        assert!(fs.sys_file_content(999).is_none(), "unknown ino must return None");
+    }
+
+    // ── p6.3: snapshot new fields ─────────────────────────────────────────────
+
+    #[test]
+    fn scheduler_snapshot_default_new_fields() {
+        let s = crate::snapshot::SchedulerSnapshot::default();
+        assert_eq!(s.queue_depth, 0);
+        assert_eq!(s.provider_model, "");
+        assert!(!s.sandbox_applied);
+    }
+
+    #[test]
+    fn agent_snapshot_tools_field_is_empty_by_default_in_helper() {
+        let snap = agent_snap("x", AgentStatus::Running);
+        assert!(snap.tools.is_empty(), "agent_snap helper must default tools to vec![]");
     }
 }

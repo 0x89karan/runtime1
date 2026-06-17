@@ -10,6 +10,13 @@ pub struct SchedulerSnapshot {
     pub agents:              Vec<AgentSnapshot>,
     pub global_tokens_spent: u64,
     pub in_flight:           usize,
+    /// Number of agents currently deferred (waiting for an inference slot).
+    pub queue_depth:         usize,
+    /// Model identifier for the configured inference backend (e.g. "claude-sonnet-4-6").
+    /// Set once at startup before the FUSE mount; empty string until then.
+    pub provider_model:      String,
+    /// True if at least one MCP server had a kernel sandbox applied at startup.
+    pub sandbox_applied:     bool,
 }
 
 #[derive(Clone)]
@@ -20,6 +27,8 @@ pub struct AgentSnapshot {
     pub context_tokens: u64,
     pub token_budget:  u64,
     pub task_preview:  String,
+    /// Capability-filtered list of tool names available to this agent.
+    pub tools:         Vec<String>,
     /// Bounded preview of Tier-2 short-term memory (max 20 items).
     /// Each entry is formatted as `"t{turn} {role}: {content_preview}"`.
     /// Empty when the agent has no paged turns or memory is disabled.

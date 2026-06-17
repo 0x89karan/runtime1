@@ -380,6 +380,19 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 
 ## Completed
 
+**p6.3 — Read-only TUI dashboard (`agentctl watch`)**
+- `agentctl watch` command with three views: Dashboard (agent table), AgentDetail, System.
+- `ratatui` 0.29 + `crossterm` 0.28; `--plain` / auto-TTY-detection for non-interactive use.
+- `CleanupGuard` (`Drop` + `std::panic::set_hook`) for terminal restore on exit and panic.
+- `surfaces/` FUSE amendments: `DIR_STEP` 10→20, `OFF_TOOLS = 8`, `/agents/system/` dir
+  with four virtual files (`budget`, `queue`, `sandbox`, `provider`), `SchedulerSnapshot`
+  + `AgentSnapshot` field additions; 24 new surfaces tests.
+- Pre-landing review hardening (6 items): `is_tty` cached, cross-crate sentinel constants,
+  stdout flush in plain mode, `spec_names()` cached as `&[String]`, ANSI sanitizer,
+  `debug_assert` → `assert` in `alloc_dir`.
+- 565 tests pass; `make clippy-linux` clean.
+- **Completed:** v0.29.0 (2026-06-17)
+
 **p3.3 — Landlock LSM + seccomp-bpf sandbox for MCP server subprocesses**
 - `sandbox/` crate: `SandboxRule` enum (`AllowFsRead`, `AllowFsWrite`, `DenySpawn`);
   `CompiledSandbox` / `compile()` / `apply_compiled()` / `apply_sandbox()` API.

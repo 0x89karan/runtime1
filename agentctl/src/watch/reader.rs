@@ -1,0 +1,398 @@
+use std::{fs, path::Path};
+
+use serde::Deserialize;
+
+/// Sentinel values written by the surfaces crate into FUSE virtual files.
+/// Must stay in sync with BUDGET_UNLIMITED_SENTINEL / TOOLS_NONE_SENTINEL in
+/// surfaces/src/agents_fs.rs.
+const BUDGET_UNLIMITED_SENTINEL: &str = "unlimited";
+const TOOLS_NONE_SENTINEL: &str = "(none)";
+
+/// Parsed content of /agents/system/budget
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SysBudget {
+    pub spent: u64,
+    // Reserved for when the FUSE system/budget file emits the real total.
+    #[allow(dead_code)]
+    pub total: u64,
+}
+
+/// Parsed content of /agents/system/queue
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SysQueue {
+    pub depth: usize,
+}
+
+/// Parsed content of /agents/system/sandbox
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SysSandbox {
+    pub applied: bool,
+}
+
+/// Parsed content of /agents/system/provider
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SysProvider {
+    pub model: String,
+    pub backend: String,
+}
+
+/// Snapshot of one running agent, assembled from per-file reads.
+#[derive(Debug, Clone)]
+pub struct AgentInfo {
+    pub id:             String,
+    pub status:         String,
+    pub context_tokens: u64,
+    pub budget:         BudgetKind,
+    pub tools:          Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BudgetKind {
+    Unlimited,
+    Tokens(u64),
+}
+
+impl BudgetKind {
+    pub fn display(&self) -> String {
+        match self {
+            BudgetKind::Unlimited  => "unlimited".to_string(),
+            BudgetKind::Tokens(n)  => format!("{n}"),
+        }
+    }
+}
+
+fn read_trimmed(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    serde_json::from_str(&read_trimmed(path)?).ok()
+}
+
+/// Read and sort the list of agent IDs from the FUSE mountpoint root.
+pub fn read_agent_ids(agents_dir: &Path) -> anyhow::Result<Vec<String>> {
+    let mut ids = Vec::new();
+    for entry in fs::read_dir(agents_dir)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "system" || name == "kb" || name.starts_with('.') {
+            continue;
+        }
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            ids.push(name);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+/// Read all virtual files for one agent directory.
+pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
+    let dir = agents_dir.join(id);
+    let status = read_trimmed(&dir.join("status")).unwrap_or_else(|| "unknown".to_string());
+    let context_tokens = read_trimmed(&dir.join("context_size"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let budget = match read_trimmed(&dir.join("budget")).as_deref() {
+        Some(s) if s == BUDGET_UNLIMITED_SENTINEL => BudgetKind::Unlimited,
+        None => BudgetKind::Unlimited,
+        Some(s) => s.parse::<u64>().map(BudgetKind::Tokens).unwrap_or(BudgetKind::Unlimited),
+    };
+    let tools = match read_trimmed(&dir.join("tools")).as_deref() {
+        Some(s) if s == TOOLS_NONE_SENTINEL => vec![],
+        None => vec![],
+        Some(s) => s.lines().map(str::to_string).collect(),
+    };
+    AgentInfo { id: id.to_string(), status, context_tokens, budget, tools }
+}
+
+/// Read /agents/system/budget
+pub fn read_sys_budget(agents_dir: &Path) -> Option<SysBudget> {
+    read_json(&agents_dir.join("system").join("budget"))
+}
+
+/// Read /agents/system/queue
+pub fn read_sys_queue(agents_dir: &Path) -> Option<SysQueue> {
+    read_json(&agents_dir.join("system").join("queue"))
+}
+
+/// Read /agents/system/sandbox
+pub fn read_sys_sandbox(agents_dir: &Path) -> Option<SysSandbox> {
+    read_json(&agents_dir.join("system").join("sandbox"))
+}
+
+/// Read /agents/system/provider
+pub fn read_sys_provider(agents_dir: &Path) -> Option<SysProvider> {
+    read_json(&agents_dir.join("system").join("provider"))
+}
+
+/// Load a full snapshot: agent list + system files.
+pub struct Snapshot {
+    pub agents:   Vec<AgentInfo>,
+    pub budget:   Option<SysBudget>,
+    pub queue:    Option<SysQueue>,
+    pub sandbox:  Option<SysSandbox>,
+    pub provider: Option<SysProvider>,
+    pub error:    Option<String>,
+}
+
+pub fn load_snapshot(agents_dir: &Path) -> Snapshot {
+    let (agents, error) = match read_agent_ids(agents_dir) {
+        Ok(ids) => {
+            let agents = ids.iter().map(|id| read_agent_info(agents_dir, id)).collect();
+            (agents, None)
+        }
+        Err(e) => (vec![], Some(format!("{e:#}"))),
+    };
+    Snapshot {
+        budget:   read_sys_budget(agents_dir),
+        queue:    read_sys_queue(agents_dir),
+        sandbox:  read_sys_sandbox(agents_dir),
+        provider: read_sys_provider(agents_dir),
+        agents,
+        error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sys_budget_parses_json() {
+        let s: SysBudget = serde_json::from_str(r#"{"spent":12345,"total":0}"#).unwrap();
+        assert_eq!(s.spent, 12345);
+        assert_eq!(s.total, 0);
+    }
+
+    #[test]
+    fn sys_queue_parses_json() {
+        let s: SysQueue = serde_json::from_str(r#"{"depth":3}"#).unwrap();
+        assert_eq!(s.depth, 3);
+    }
+
+    #[test]
+    fn sys_sandbox_false_parses() {
+        let s: SysSandbox = serde_json::from_str(r#"{"applied":false}"#).unwrap();
+        assert!(!s.applied);
+    }
+
+    #[test]
+    fn sys_sandbox_true_parses() {
+        let s: SysSandbox = serde_json::from_str(r#"{"applied":true}"#).unwrap();
+        assert!(s.applied);
+    }
+
+    #[test]
+    fn sys_provider_parses_json() {
+        let s: SysProvider = serde_json::from_str(
+            r#"{"model":"claude-sonnet-4-6","backend":"anthropic"}"#
+        ).unwrap();
+        assert_eq!(s.model, "claude-sonnet-4-6");
+        assert_eq!(s.backend, "anthropic");
+    }
+
+    #[test]
+    fn budget_kind_unlimited_displays_correctly() {
+        assert_eq!(BudgetKind::Unlimited.display(), "unlimited");
+    }
+
+    #[test]
+    fn budget_kind_tokens_displays_number() {
+        assert_eq!(BudgetKind::Tokens(50_000).display(), "50000");
+    }
+
+    #[test]
+    fn sys_budget_default_is_zero() {
+        let b = SysBudget::default();
+        assert_eq!(b.spent, 0);
+        assert_eq!(b.total, 0);
+    }
+
+    // ── BudgetKind edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn budget_kind_zero_tokens() {
+        assert_eq!(BudgetKind::Tokens(0).display(), "0");
+    }
+
+    #[test]
+    fn budget_kind_large_tokens() {
+        assert_eq!(BudgetKind::Tokens(u64::MAX).display(), u64::MAX.to_string());
+    }
+
+    // ── read_agent_ids: filesystem-based tests ───────────────────────────────
+
+    #[test]
+    fn read_agent_ids_skips_system_kb_and_dotfiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Create directories that should be skipped.
+        std::fs::create_dir(dir.join("system")).unwrap();
+        std::fs::create_dir(dir.join("kb")).unwrap();
+        std::fs::create_dir(dir.join(".hidden")).unwrap();
+        // Create one real agent dir.
+        std::fs::create_dir(dir.join("scout-1")).unwrap();
+        let ids = read_agent_ids(dir).unwrap();
+        assert_eq!(ids, vec!["scout-1"]);
+    }
+
+    #[test]
+    fn read_agent_ids_skips_plain_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A plain file must not be returned — only dirs.
+        std::fs::write(dir.join("not-a-dir"), b"content").unwrap();
+        std::fs::create_dir(dir.join("real-agent")).unwrap();
+        let ids = read_agent_ids(dir).unwrap();
+        assert_eq!(ids, vec!["real-agent"]);
+    }
+
+    #[test]
+    fn read_agent_ids_returns_sorted_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for name in &["gamma", "alpha", "beta"] {
+            std::fs::create_dir(dir.join(name)).unwrap();
+        }
+        let ids = read_agent_ids(dir).unwrap();
+        assert_eq!(ids, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn read_agent_ids_empty_dir_returns_empty_vec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ids = read_agent_ids(tmp.path()).unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn read_agent_ids_nonexistent_dir_returns_err() {
+        let result = read_agent_ids(std::path::Path::new("/nonexistent/no/such/path"));
+        assert!(result.is_err());
+    }
+
+    // ── read_agent_info: filesystem-based tests ──────────────────────────────
+
+    fn write_agent_files(dir: &std::path::Path, id: &str, files: &[(&str, &str)]) {
+        let agent_dir = dir.join(id);
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        for (name, content) in files {
+            std::fs::write(agent_dir.join(name), content).unwrap();
+        }
+    }
+
+    #[test]
+    fn read_agent_info_returns_unknown_status_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        let info = read_agent_info(tmp.path(), "a");
+        assert_eq!(info.status, "unknown");
+    }
+
+    #[test]
+    fn read_agent_info_reads_status_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("status", "running\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert_eq!(info.status, "running");
+    }
+
+    #[test]
+    fn read_agent_info_reads_context_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("context_size", "4321\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert_eq!(info.context_tokens, 4321);
+    }
+
+    #[test]
+    fn read_agent_info_context_tokens_defaults_to_zero_on_missing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        let info = read_agent_info(tmp.path(), "a");
+        assert_eq!(info.context_tokens, 0);
+    }
+
+    #[test]
+    fn read_agent_info_context_tokens_defaults_to_zero_on_unparseable() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("context_size", "not-a-number\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert_eq!(info.context_tokens, 0);
+    }
+
+    #[test]
+    fn read_agent_info_budget_unlimited_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("budget", "unlimited\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(matches!(info.budget, BudgetKind::Unlimited));
+    }
+
+    #[test]
+    fn read_agent_info_budget_numeric_string() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("budget", "100000\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(matches!(info.budget, BudgetKind::Tokens(100_000)));
+    }
+
+    #[test]
+    fn read_agent_info_budget_unparseable_falls_back_to_unlimited() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("budget", "garbage\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(matches!(info.budget, BudgetKind::Unlimited),
+            "unparseable budget must fall back to Unlimited");
+    }
+
+    #[test]
+    fn read_agent_info_tools_none_string_returns_empty_vec() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("tools", "(none)\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(info.tools.is_empty());
+    }
+
+    #[test]
+    fn read_agent_info_tools_missing_file_returns_empty_vec() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(info.tools.is_empty());
+    }
+
+    #[test]
+    fn read_agent_info_tools_newline_separated_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("tools", "read_file\nwrite_file\nlist_dir\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert_eq!(info.tools, vec!["read_file", "write_file", "list_dir"]);
+    }
+
+    // ── load_snapshot: error path ─────────────────────────────────────────────
+
+    #[test]
+    fn load_snapshot_nonexistent_dir_produces_error_field() {
+        let snap = load_snapshot(std::path::Path::new("/nonexistent/no/such/path"));
+        assert!(snap.error.is_some(), "load_snapshot must populate error when dir doesn't exist");
+        assert!(snap.agents.is_empty(), "agents must be empty on error");
+    }
+
+    #[test]
+    fn load_snapshot_valid_dir_has_no_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap = load_snapshot(tmp.path());
+        assert!(snap.error.is_none());
+        assert!(snap.agents.is_empty());
+    }
+
+    #[test]
+    fn read_agent_info_budget_negative_string_falls_back_to_unlimited() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("budget", "-1\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(matches!(info.budget, BudgetKind::Unlimited),
+            "negative budget string must fall back to Unlimited");
+    }
+}

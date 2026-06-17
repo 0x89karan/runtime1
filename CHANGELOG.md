@@ -3,6 +3,50 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.3] - 2026-06-17 (v0.29.0)
+
+Read-only TUI dashboard. `agentctl watch` opens a live ratatui view of all running agents,
+their status, token budgets, and tools. Three views: Dashboard (agent table), Agent Detail
+(expanded per-agent), and System (provider, tokens, queue, sandbox status).
+
+### Added
+- `agentctl watch [--agents-dir /agents] [--interval N] [--plain] [--no-plain]` — live TUI dashboard.
+  - **Dashboard view**: agent table with ID / Status (colour-coded) / Context tokens / Budget / Tool count.
+  - **Agent detail view**: expanded view showing status, context, budget, and tool list for the selected agent.
+  - **System view**: provider model+backend, global tokens spent, deferred queue depth, sandbox status.
+  - **Plain mode**: `--plain` or auto-detected non-TTY stdout emits plain-text snapshots; `--no-plain` forces TUI.
+  - **Startup validation**: fails fast with a clear error if `{agents-dir}/system/` is not mounted.
+  - **CleanupGuard**: restores terminal on both normal exit and panic via `Drop` + `std::panic::set_hook`.
+  - Key bindings: ↑/↓/j/k select, Enter → detail, `s` → system, `q`/Ctrl-C → quit, Esc → back.
+- `surfaces/`: FUSE virtual filesystem amendments (Linux-gated):
+  - `DIR_STEP` bumped 10→20 to accommodate 9 per-agent virtual files without inode collision.
+  - `OFF_TOOLS = 8` — new `tools` virtual file per agent directory listing capability-filtered tool names.
+  - `/agents/system/` directory with four virtual files: `budget` (`{spent, total}`), `queue` (`{depth}`),
+    `sandbox` (`{applied}`), `provider` (`{model, backend}`).
+  - `SchedulerSnapshot` gains `queue_depth`, `provider_model`, `sandbox_applied` fields.
+  - `AgentSnapshot` gains `tools: Vec<String>` populated from `AgentTask::spec_names()`.
+- `agentd`: `AgentTask::spec_names()` returns capability-filtered tool names from pre-built `specs`.
+- `agentd/src/scheduler.rs`: `update_snapshot()` sets `tools` + `queue_depth`; `main.rs` sets
+  `provider_model` and tracks `any_sandbox_applied` across MCP server loop.
+- CI: agentctl binary size guard bumped 4 MB → 6 MB (ratatui+crossterm add ~1–1.5 MB).
+
+### Changed
+- `agentctl` version bumped to `0.29.0`.
+- `agentd` version bumped to `0.29.0`.
+
+### Fixed (pre-landing review)
+- `io::stdout().is_terminal()` called twice in `run()` → cached as `is_tty` local.
+- Cross-crate sentinel literals (`"unlimited"`, `"(none)"`) replaced with named constants in
+  both `surfaces/src/agents_fs.rs` and `agentctl/src/watch/reader.rs` with sync comments.
+- `run_plain`: flush stdout after each snapshot block so piped readers see complete output;
+  SIGINT terminates cleanly via OS default handler (no raw mode is active).
+- `AgentTask::spec_names()` now returns `&[String]` from a cached `tool_names` field
+  built at construction, eliminating per-tick per-element String allocation in snapshot path.
+- `sanitize()` helper added to `views.rs`: strips control chars (< 0x20 except tab) from
+  error strings before rendering, preventing ANSI injection via OS error messages.
+- `debug_assert!` in `AgentsFs::alloc_dir()` promoted to `assert!` so inode pool exhaustion
+  is caught in release builds before silent corruption occurs.
+
 ## [p6.2] - 2026-06-17 (v0.28.0)
 
 Operator CLI. Agents can now be spawned from templates without editing TOML files.

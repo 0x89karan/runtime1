@@ -1194,6 +1194,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 context_tokens: task.context_tokens(),
                 token_budget:   task.token_budget(),
                 task_preview:   task.task_preview(80),
+                tools:          task.spec_names().to_vec(),
                 short_term_previews: task
                     .short_term
                     .iter()
@@ -1217,6 +1218,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         s.agents              = agents;
         s.global_tokens_spent = state.tokens_spent;
         s.in_flight           = state.in_flight;
+        s.queue_depth         = state.deferred.len();
     }
 }
 

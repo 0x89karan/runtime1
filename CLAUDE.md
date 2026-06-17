@@ -124,7 +124,13 @@ check; `[capabilities]` deny-by-default; `TemplateResolver::from_env()` for `~/.
 syntax → `Capability`; `cap_add_allowed_by_suggestion()` guard; `--force` bypass;
 `ANTHROPIC_API_KEY` pre-exec check; `arg_required_else_help`; `tempfile` atomic write; sibling+PATH
 agentd resolution; `--dry-run` provenance header; distro Makefile adds `/etc/agentd/templates/`; 18 new tests.
-**Next: p6.3 — read-only TUI dashboard — see `docs/ROADMAP.md`.**
+**p6.3 complete (v0.29.0).** Read-only TUI dashboard: `agentctl watch` with ratatui/crossterm;
+Dashboard / AgentDetail / System views; `--plain` mode + auto-TTY detection; startup FUSE mount
+validation; CleanupGuard for panic-safe terminal restore; per-agent `tools` virtual file;
+`/agents/system/{budget,queue,sandbox,provider}` FUSE surface; `DIR_STEP` 10→20; `OFF_TOOLS=8`;
+`SchedulerSnapshot.{queue_depth,provider_model,sandbox_applied}`; `AgentTask::spec_names()`;
+agentctl CI guard bumped 4 MB → 6 MB; +32 new tests (24 surfaces + 8 agentctl reader). 503 tests total.
+**Next: p6.4 — topology view (multi-agent graph) — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

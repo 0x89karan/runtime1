@@ -51,6 +51,9 @@ pub struct AgentTask {
     model_cfg:       ModelConfig,
     messages:        Vec<Msg>,
     specs:           Vec<ToolSpec>,
+    /// Cached tool names derived from `specs` at construction time; avoids
+    /// per-element String allocation on every scheduler snapshot tick.
+    tool_names:      Vec<String>,
     total_input:     u64,
     total_output:    u64,
     turn:            u32,
@@ -76,6 +79,7 @@ impl AgentTask {
         model_cfg: &ModelConfig,
         specs: Vec<ToolSpec>,
     ) -> Self {
+        let tool_names = specs.iter().map(|s| s.name.clone()).collect();
         Self {
             agent_id: agent_id.to_string(),
             cfg: cfg.clone(),
@@ -87,6 +91,7 @@ impl AgentTask {
                 }],
             }],
             specs,
+            tool_names,
             total_input: 0,
             total_output: 0,
             turn: 0,
@@ -107,6 +112,12 @@ impl AgentTask {
     /// Stable fingerprint of the initial task, for Tier-3 provenance stamps.
     pub fn task_fp(&self) -> &str {
         &self.task_fp
+    }
+
+    /// Names of tools visible to this agent.
+    /// The `specs` list is already capability-filtered at construction time.
+    pub fn spec_names(&self) -> &[String] {
+        &self.tool_names
     }
 
     /// Scheduling priority from config. Higher value = runs before lower.
@@ -164,12 +175,14 @@ impl AgentTask {
             .and_then(|m| m.blocks.first())
             .and_then(|b| if let Block::Text { text } = b { Some(text.clone()) } else { None })
             .unwrap_or_default();
+        let tool_names = specs.iter().map(|s| s.name.clone()).collect();
         Self {
             agent_id:        cp.agent_id,
             cfg:             cp.cfg,
             model_cfg:       cp.model_cfg,
             messages:        cp.messages,
             specs,
+            tool_names,
             total_input:     cp.total_input,
             total_output:    cp.total_output,
             turn:            cp.turn,

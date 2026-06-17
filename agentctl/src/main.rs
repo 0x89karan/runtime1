@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod list;
 mod spawn;
+mod watch;
 
 #[derive(Parser)]
 #[command(
@@ -22,6 +23,7 @@ struct Cli {
 enum Commands {
     ListTemplates(list::Args),
     Spawn(spawn::Args),
+    Watch(watch::Args),
 }
 
 fn main() {
@@ -29,6 +31,7 @@ fn main() {
     let result = match cli.command {
         Commands::ListTemplates(args) => list::run(args),
         Commands::Spawn(args) => spawn::run(args),
+        Commands::Watch(args) => watch::run(args),
     };
     if let Err(e) = result {
         eprintln!("error: {e:#}");
