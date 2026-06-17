@@ -670,13 +670,14 @@ awaiting-tool), `/agents/<id>/tools`, `/agents/system/{budget,queue,sandbox,prov
 three views render live against a running multi-agent demo over both a local mount and a
 QEMU serial console; `make clippy-linux` clean for the FUSE amendments.
 
-### ▢ p6.4 — Topology view (multi-agent graph)
-**Depends on:** p6.3, p1.5/p1.6 (bus + cards). The spawn tree + message graph, derived
-from `flight.jsonl` (`agent_spawned.parent_id`, `agent_child_result_delivered`,
-`message_sent/received`) + snapshot `AwaitingChild`. The hard view — a time-evolving
-derived graph. v1: spawn tree + completed edges; message edges layered after. Optional
-`/agents/<id>/edges` surface to avoid log-scraping. **Acceptance:** a coordinator demo's
-spawn tree and at least one live message edge render correctly.
+### ✅ p6.4 — Topology view (multi-agent graph) — v0.30.0
+**Depends on:** p6.3, p1.5/p1.6 (bus + cards). `parent_id: Option<String>` on
+`AgentSnapshot`; `parent_map: HashMap<String,String>` (insert-only) in `SchedulerState`
++ checkpoint; `OFF_PARENT = 9` FUSE virtual file `/agents/<id>/parent`; `topology.rs`
+module with `TopologyGraph`, `build_graph()` (512KB flight.jsonl tail, directed edges,
+cycle guard), `render_tree()`; `View::Topology` in `agentctl watch` (`[t]` key, scroll,
+fixed legend footer, min 60 cols guard); `--log-path` arg; plain mode topology section;
+`coordinator-demo.agents.toml` acceptance fixture; 455 tests pass. **Acceptance met.**
 
 ### ▢ p6.5 — Memory view
 **Depends on:** **p5.7** (`/agents/<id>/memory/`, `/agents/kb/<segment>/`) and the

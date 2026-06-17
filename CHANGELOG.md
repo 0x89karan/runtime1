@@ -3,6 +3,39 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.4] - 2026-06-18 (v0.30.0)
+
+Topology view for `agentctl watch`. The new `[t]opology` view renders the live spawn tree
+and directed message graph derived from the scheduler snapshot and an optional
+`flight.jsonl` tail (up to 512 KB). Key additions:
+
+- **`parent_id: Option<String>`** on `AgentSnapshot`; populated from an insert-only
+  `parent_map: HashMap<String,String>` in `SchedulerState`, persisted in checkpoints
+  with `#[serde(default)]` for backwards compatibility.
+- **`OFF_PARENT = 9`** — new FUSE virtual file `/agents/<id>/parent`; `reader.rs` reads
+  it into `AgentInfo.parent_id`.
+- **`agentctl/src/watch/topology.rs`** — `TopologyGraph`, `build_graph()` (512 KB tail
+  cap, directed edges from `message_sent` events, cycle guard), `render_tree()`,
+  `status_badge()`, `parse_message_edges()`.
+- **`View::Topology`** in `agentctl watch`; key `t` from Dashboard; `Esc`/`q` returns
+  to Dashboard; ↑/↓/j/k scrolls; fixed legend footer outside scrollable region; minimum
+  terminal width 60 cols.
+- **`--log-path`** CLI flag on `agentctl watch` for message edge data.
+- **Plain mode topology section**: `topology: <id> parent=<id>|none status=<status>`.
+- **`coordinator-demo.agents.toml`** — acceptance fixture: coordinator + 2 scouts.
+- 455 tests pass (macOS; Linux adds FUSE surface + sandbox tests); `make clippy-linux`
+  required for FUSE surface changes.
+
+### Fixed (adversarial review)
+- `parse_message_edges` now reads `data.to` (not top-level `to`) to match the
+  `FlightRecorder` event schema — message edges were always empty against real
+  `flight.jsonl` because `"to"` is nested under `"data"`.
+- Test fixtures updated to use the correct flight-log event structure.
+- `topology_scroll` reset to 0 when switching into the Topology view so
+  scroll state does not carry over stale offsets from a prior visit.
+- Clippy: `map_or(true, …)` → `is_none_or`; `map_or(false, …)` → `is_some_and`;
+  `#[allow(clippy::too_many_arguments)]` on the private recursive tree renderer.
+
 ## [p6.3] - 2026-06-17 (v0.29.0)
 
 Read-only TUI dashboard. `agentctl watch` opens a live ratatui view of all running agents,

@@ -14,6 +14,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 pub mod app;
 pub mod reader;
+pub mod topology;
 pub mod views;
 
 use app::{App, View};
@@ -36,11 +37,16 @@ pub struct Args {
     /// Force TUI mode even when stdout is not a TTY (overrides auto-detection)
     #[arg(long, conflicts_with = "plain")]
     pub no_plain: bool,
+
+    /// Path to flight.jsonl for message edge data in the Topology view
+    #[arg(long)]
+    pub log_path: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
     let agents_dir = args.agents_dir;
     let interval   = Duration::from_secs(args.interval.max(1));
+    let log_path   = args.log_path;
 
     // Startup mount validation: require system/ subdir to be present.
     let sys_dir = agents_dir.join("system");
@@ -61,14 +67,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         if !is_tty && !args.plain {
             eprintln!("note: stdout is not a TTY — using plain text mode (--plain)");
         }
-        run_plain(agents_dir, interval)
+        run_plain(agents_dir, interval, log_path)
     } else {
-        run_tui(agents_dir, interval)
+        run_tui(agents_dir, interval, log_path)
     }
 }
 
-fn run_plain(agents_dir: PathBuf, interval: Duration) -> anyhow::Result<()> {
+fn run_plain(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -> anyhow::Result<()> {
     let mut app = App::new(agents_dir.clone());
+    app.log_path = log_path;
     loop {
         let snap = load_snapshot(&agents_dir);
         app.apply_snapshot(snap);
@@ -83,7 +90,7 @@ fn run_plain(agents_dir: PathBuf, interval: Duration) -> anyhow::Result<()> {
     }
 }
 
-fn run_tui(agents_dir: PathBuf, interval: Duration) -> anyhow::Result<()> {
+fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -> anyhow::Result<()> {
     let stdout = io::stdout();
 
     // CleanupGuard: restores terminal on both normal exit and panic.
@@ -114,6 +121,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration) -> anyhow::Result<()> {
     let mut term = Terminal::new(backend).context("creating terminal")?;
 
     let mut app  = App::new(agents_dir.clone());
+    app.log_path = log_path;
     let tick_ms  = interval.as_millis().max(100) as u64;
 
     loop {
@@ -133,7 +141,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration) -> anyhow::Result<()> {
                     }
                     // Capture view BEFORE dispatch: q should quit only if we
                     // were already on the Dashboard, not if we just navigated
-                    // back to it from AgentDetail/System.
+                    // back to it from AgentDetail/System/Topology.
                     let was_dashboard = app.view == View::Dashboard;
                     match app.view {
                         View::Dashboard => handle_dashboard_key(key.code, &mut app),
@@ -141,6 +149,20 @@ fn run_tui(agents_dir: PathBuf, interval: Duration) -> anyhow::Result<()> {
                             match key.code {
                                 KeyCode::Char('q') | KeyCode::Esc => {
                                     app.view = View::Dashboard;
+                                }
+                                _ => {}
+                            }
+                        }
+                        View::Topology => {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    app.view = View::Dashboard;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    app.topology_scroll = app.topology_scroll.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    app.topology_scroll += 1;
                                 }
                                 _ => {}
                             }
@@ -172,7 +194,8 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App) {
                 app.view = View::AgentDetail;
             }
         }
-        KeyCode::Char('s')                 => app.view = View::System,
+        KeyCode::Char('s') => app.view = View::System,
+        KeyCode::Char('t') => { app.view = View::Topology; app.topology_scroll = 0; }
         _ => {}
     }
 }
@@ -189,11 +212,12 @@ mod tests {
     fn make_snapshot(ids: &[&str]) -> Snapshot {
         Snapshot {
             agents: ids.iter().map(|id| AgentInfo {
-                id: id.to_string(),
-                status: "running".to_string(),
+                id:             id.to_string(),
+                status:         "running".to_string(),
                 context_tokens: 0,
-                budget: BudgetKind::Unlimited,
-                tools: vec![],
+                budget:         BudgetKind::Unlimited,
+                tools:          vec![],
+                parent_id:      None,
             }).collect(),
             budget: None, queue: None, sandbox: None, provider: None, error: None,
         }
@@ -258,6 +282,13 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         handle_dashboard_key(KeyCode::Char('s'), &mut app);
         assert_eq!(app.view, View::System);
+    }
+
+    #[test]
+    fn dashboard_key_t_switches_to_topology_view() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        handle_dashboard_key(KeyCode::Char('t'), &mut app);
+        assert_eq!(app.view, View::Topology);
     }
 
     #[test]

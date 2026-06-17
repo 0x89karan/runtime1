@@ -92,6 +92,8 @@ pub struct SchedulerCheckpoint {
     pub tokens_spent:   u64,
     pub child_seq:      u64,
     pub spawn_depths:   HashMap<String, u32>,
+    #[serde(default)]
+    pub parent_map:     HashMap<String, String>,
 }
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
@@ -222,6 +224,7 @@ mod tests {
             tokens_spent:   15,
             child_seq:      0,
             spawn_depths:   [("agent-a".to_string(), 0)].into_iter().collect(),
+            parent_map:     HashMap::new(),
         }
     }
 

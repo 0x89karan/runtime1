@@ -88,6 +88,8 @@ struct SchedulerState {
     child_seq:        u64,
     /// agent_id → nesting depth (0 = top-level, 1 = child of top-level, …).
     spawn_depths:     HashMap<String, u32>,
+    /// child_id → parent_id: insert-only, never removed, so completed spawns remain visible.
+    parent_map:       HashMap<String, String>,
     max_spawn_depth:  u32,
     /// Per-agent pending mailboxes. Drained into the agent before each inference step.
     mailboxes:        Mailboxes,
@@ -103,6 +105,7 @@ struct SchedulerRestored {
     tokens_spent: u64,
     child_seq:    u64,
     spawn_depths: HashMap<String, u32>,
+    parent_map:   HashMap<String, String>,
 }
 
 pub struct Scheduler {
@@ -145,6 +148,7 @@ impl Scheduler {
                 tokens_spent: cp_tokens,
                 child_seq:   cp_child_seq,
                 spawn_depths: cp_spawn_depths,
+                parent_map:  cp_parent_map,
                 ..
             } = cp;
 
@@ -185,6 +189,7 @@ impl Scheduler {
                 tokens_spent: cp_tokens,
                 child_seq:    cp_child_seq,
                 spawn_depths: cp_spawn_depths,
+                parent_map:   cp_parent_map,
             });
         } else {
             agents.reserve(agent_configs.len());
@@ -253,6 +258,7 @@ impl Scheduler {
             awaiting:           HashMap::new(),
             child_seq:          0,
             spawn_depths:       HashMap::new(),
+            parent_map:         HashMap::new(),
             max_spawn_depth,
             mailboxes:          HashMap::new(),
             shutdown_requested: false,
@@ -263,6 +269,7 @@ impl Scheduler {
             state.tokens_spent = r.tokens_spent;
             state.child_seq    = r.child_seq;
             state.spawn_depths = r.spawn_depths;
+            state.parent_map   = r.parent_map;
             for entry in r.awaiting {
                 state.awaiting.insert(entry.child_id, AwaitingParent {
                     parent_id: entry.parent_id,
@@ -1050,6 +1057,7 @@ fn dispatch_spawn(
         AwaitingParent { parent_id: parent_id.clone(), call_id },
     );
     state.spawn_depths.insert(child_id.clone(), parent_depth + 1);
+    state.parent_map.insert(child_id.clone(), parent_id.clone());
     state.mailboxes.entry(child_id.clone()).or_default();
 
     // 7. Record agent_spawned flight event.
@@ -1210,6 +1218,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                         format!("t{} {}: {}", item.turn, role, preview)
                     })
                     .collect(),
+                parent_id: state.parent_map.get(id).cloned(),
             }
         })
         .collect();
@@ -1252,6 +1261,7 @@ fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
         tokens_spent: state.tokens_spent,
         child_seq:    state.child_seq,
         spawn_depths: state.spawn_depths.clone(),
+        parent_map:   state.parent_map.clone(),
     }
 }
 
@@ -2298,6 +2308,7 @@ mod tests {
             awaiting:           HashMap::new(),
             child_seq:          0,
             spawn_depths:       HashMap::new(),
+            parent_map:         HashMap::new(),
             max_spawn_depth:    0,
             mailboxes:          HashMap::new(),
             shutdown_requested: false,
@@ -2485,6 +2496,7 @@ mod tests {
             tokens_spent:  20,
             child_seq:     3,
             spawn_depths:  ids.iter().map(|id| (id.to_string(), 0u32)).collect(),
+            parent_map:    HashMap::new(),
         }
     }
 
@@ -2583,6 +2595,7 @@ mod tests {
             tokens_spent:   42,
             child_seq:      7,
             spawn_depths:   [("agent".to_string(), 0u32)].into_iter().collect(),
+            parent_map:     HashMap::new(),
         };
         let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
         let (rec, _tmp) = recorder();

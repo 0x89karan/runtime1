@@ -130,7 +130,15 @@ validation; CleanupGuard for panic-safe terminal restore; per-agent `tools` virt
 `/agents/system/{budget,queue,sandbox,provider}` FUSE surface; `DIR_STEP` 10→20; `OFF_TOOLS=8`;
 `SchedulerSnapshot.{queue_depth,provider_model,sandbox_applied}`; `AgentTask::spec_names()`;
 agentctl CI guard bumped 4 MB → 6 MB; +32 new tests (24 surfaces + 8 agentctl reader). 503 tests total.
-**Next: p6.4 — topology view (multi-agent graph) — see `docs/ROADMAP.md`.**
+**p6.4 complete (v0.30.0).** Topology view: `parent_id: Option<String>` on `AgentSnapshot`;
+insert-only `parent_map: HashMap<String,String>` in `SchedulerState` + checkpoint (`#[serde(default)]`
+for compat); `OFF_PARENT = 9` — new FUSE virtual file `/agents/<id>/parent`; `reader.rs` reads it
+into `AgentInfo.parent_id`; `agentctl/src/watch/topology.rs` with `TopologyGraph`, `build_graph()`
+(512 KB tail cap, directed `message_sent` edges, cycle guard), `render_tree()`, `status_badge()`,
+`parse_message_edges()`; `View::Topology` in `agentctl watch` (`[t]` key; `Esc`/`q` back to
+Dashboard; ↑/↓/j/k scroll; fixed legend footer; min 60 cols guard); `--log-path` CLI flag for message
+edge data; plain-mode topology section; `coordinator-demo.agents.toml` acceptance fixture; 455 tests.
+**Next: p6.5 — memory view — see `docs/ROADMAP.md`.**
 
 ## How to work here
 
@@ -265,6 +273,24 @@ agentos/                   the repo root (run `claude` here)
 ```
 
 Phase 6 adds further siblings: `agentctl/` (p6.2 operator CLI), more templates (p6.7 starter catalogue).
+
+`agentctl/` layout (p6.2+):
+
+```
+agentctl/                operator CLI binary
+  src/
+    main.rs              arg dispatch
+    list.rs              list-templates subcommand (p6.2)
+    spawn.rs             spawn <template> subcommand (p6.2)
+    watch/
+      mod.rs             watch entry point; run_plain / run_tui
+      app.rs             App state machine + View enum
+      reader.rs          reads /agents/ FUSE files → AgentInfo
+      views.rs           ratatui render functions
+      topology.rs        TopologyGraph + build_graph() + render_tree() (p6.4)
+```
+
+`agentd/coordinator-demo.agents.toml` — multi-agent fixture for topology testing (coordinator + 2 scouts).
 
 When in doubt about *what* to build next, the roadmap decides. When in doubt
 about *how*, conventions decide. When in doubt about *why*, the design doc decides.

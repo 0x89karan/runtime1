@@ -1,0 +1,54 @@
+# p6.4 Coordinator demo — exercises the Topology view
+#
+# Spawn tree:   coordinator → scout-0, scout-1
+# Message flow: scouts send_message back to coordinator with their findings
+#
+# Usage (two terminals):
+#
+#   Terminal 1 — run agentd:
+#     export ANTHROPIC_API_KEY=sk-...
+#     cargo run -- coordinator-demo.agents.toml
+#
+#   Terminal 2 — watch topology:
+#     cargo run --bin agentctl -- watch --agents-dir /agents --log-path flight.jsonl
+#     (press 't' to switch to the Topology view)
+#
+# Expected topology view output:
+#   coordinator ●running / ✓done
+#     ├─spawn→ scout-0 ●running / ✓done
+#     └─spawn→ scout-1 ●running / ✓done
+#     ←╌ scout-0  received N
+#     ←╌ scout-1  received N
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 2048
+
+[tools]
+native = ["spawn_agent", "send_message", "list_agents"]
+
+[scheduler]
+global_token_budget       = 60_000
+max_concurrent_inferences = 3
+
+[[agents]]
+id          = "coordinator"
+name        = "Coordinator"
+description = "Orchestrates two scout sub-agents and collects their reports."
+task        = """
+You are a coordinator. Your job:
+1. Use spawn_agent to launch a child agent named "scout-0" with task:
+   "Research the history of Rust (the programming language) in 2-3 sentences, then use send_message to send your findings to the coordinator agent."
+   Grant the child: no special capabilities (defaults only).
+2. Use spawn_agent to launch a second child agent named "scout-1" with task:
+   "Research the history of Go (the programming language) in 2-3 sentences, then use send_message to send your findings to the coordinator agent."
+   Grant the child: no special capabilities (defaults only).
+3. Wait for both scouts to report back (their messages will arrive via send_message).
+4. Summarise what both scouts reported and output the combined summary.
+"""
+max_turns    = 12
+token_budget = 30_000
+capabilities = [
+  { Spawn = {} },
+]

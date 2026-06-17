@@ -37,17 +37,19 @@ pub struct SysProvider {
 }
 
 /// Snapshot of one running agent, assembled from per-file reads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AgentInfo {
     pub id:             String,
     pub status:         String,
     pub context_tokens: u64,
     pub budget:         BudgetKind,
     pub tools:          Vec<String>,
+    pub parent_id:      Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum BudgetKind {
+    #[default]
     Unlimited,
     Tokens(u64),
 }
@@ -102,7 +104,11 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
         None => vec![],
         Some(s) => s.lines().map(str::to_string).collect(),
     };
-    AgentInfo { id: id.to_string(), status, context_tokens, budget, tools }
+    let parent_id = match read_trimmed(&dir.join("parent")).as_deref() {
+        Some("(none)") | None => None,
+        Some(s)               => Some(s.to_string()),
+    };
+    AgentInfo { id: id.to_string(), status, context_tokens, budget, tools, parent_id }
 }
 
 /// Read /agents/system/budget
@@ -368,6 +374,33 @@ mod tests {
         write_agent_files(tmp.path(), "a", &[("tools", "read_file\nwrite_file\nlist_dir\n")]);
         let info = read_agent_info(tmp.path(), "a");
         assert_eq!(info.tools, vec!["read_file", "write_file", "list_dir"]);
+    }
+
+    // ── read_agent_info: parent_id ───────────────────────────────────────────
+
+    #[test]
+    fn read_agent_info_parent_missing_file_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Only create the agent dir, no "parent" file.
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(info.parent_id.is_none(), "missing parent file must yield None");
+    }
+
+    #[test]
+    fn read_agent_info_parent_sentinel_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("parent", "(none)\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(info.parent_id.is_none(), "\"(none)\" sentinel must yield None");
+    }
+
+    #[test]
+    fn read_agent_info_parent_id_returns_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("parent", "coordinator\n")]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert_eq!(info.parent_id.as_deref(), Some("coordinator"));
     }
 
     // ── load_snapshot: error path ─────────────────────────────────────────────

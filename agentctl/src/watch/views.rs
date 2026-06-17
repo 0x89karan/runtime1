@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use super::app::{App, View};
+use super::topology::render_tree;
 
 /// Strip ASCII control characters (< 0x20, except tab) from a string before
 /// rendering it in a TUI widget or plain-text output. Guards against ANSI
@@ -15,11 +16,14 @@ fn sanitize(s: &str) -> String {
     s.chars().filter(|&c| c >= ' ' || c == '\t').collect()
 }
 
+const MIN_TOPOLOGY_WIDTH: u16 = 60;
+
 pub fn render(f: &mut Frame, app: &App) {
     match app.view {
         View::Dashboard   => render_dashboard(f, app),
         View::AgentDetail => render_agent_detail(f, app),
         View::System      => render_system(f, app),
+        View::Topology    => render_topology(f, app),
     }
 }
 
@@ -107,7 +111,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     }
 
     // Footer
-    let hints = " ↑/↓ select  Enter detail  s system  q quit ";
+    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  q quit ";
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_area,
@@ -208,6 +212,67 @@ fn render_system(f: &mut Frame, app: &App) {
     );
 }
 
+fn render_topology(f: &mut Frame, app: &App) {
+    let area = f.area();
+
+    // Min-width guard.
+    if area.width < MIN_TOPOLOGY_WIDTH {
+        f.render_widget(
+            Paragraph::new(format!("terminal too narrow (min {} cols)", MIN_TOPOLOGY_WIDTH))
+                .style(Style::default().fg(Color::Red)),
+            area,
+        );
+        return;
+    }
+
+    // Split: header, scrollable body, fixed legend footer.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header
+            Constraint::Min(1),    // scrollable tree
+            Constraint::Length(1), // legend footer
+        ])
+        .split(area);
+    let (header_area, body_area, legend_area) = (chunks[0], chunks[1], chunks[2]);
+
+    f.render_widget(
+        Paragraph::new(" agentctl watch › topology ")
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        header_area,
+    );
+
+    let all_lines = render_tree(&app.topology);
+    let scroll    = app.topology_scroll.min(all_lines.len().saturating_sub(1));
+    let height    = body_area.height as usize;
+    let visible: Vec<Line> = all_lines
+        .iter()
+        .skip(scroll)
+        .take(height)
+        .map(|l| Line::from(l.as_str()))
+        .collect();
+
+    let parse_err_note = if app.topology.parse_errors > 0 {
+        format!("  ({} parse errors in flight log)", app.topology.parse_errors)
+    } else {
+        String::new()
+    };
+    f.render_widget(
+        Paragraph::new(visible)
+            .block(Block::default().borders(Borders::ALL).title(" spawn tree ")),
+        body_area,
+    );
+
+    let legend = format!(
+        " ├─spawn→ child  ╌→ sent  ←╌ received  ●live ✓done ✗failed  Esc/q back{}",
+        parse_err_note
+    );
+    f.render_widget(
+        Paragraph::new(legend).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        legend_area,
+    );
+}
+
 /// Render a plain-text snapshot to a string (for --plain mode, no ANSI).
 pub fn render_plain(app: &App) -> String {
     let mut out = String::new();
@@ -238,6 +303,12 @@ pub fn render_plain(app: &App) -> String {
             ));
         }
     }
+    // Topology section
+    out.push_str("topology:\n");
+    for a in &app.agents {
+        let parent = a.parent_id.as_deref().unwrap_or("none");
+        out.push_str(&format!("  topology: {} parent={} status={}\n", a.id, parent, a.status));
+    }
     out
 }
 
@@ -256,6 +327,7 @@ mod tests {
             context_tokens: ctx,
             budget:         BudgetKind::Unlimited,
             tools,
+            parent_id:      None,
         }
     }
 
@@ -383,6 +455,33 @@ mod tests {
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("tools=0"));
+    }
+
+    // ── topology section in render_plain ────────────────────────────────────
+
+    #[test]
+    fn render_plain_topology_section_no_parent() {
+        let mut a = make_agent("root", "running", 0, vec![]);
+        a.parent_id = None;
+        let snap = Snapshot {
+            agents: vec![a],
+            budget: None, queue: None, sandbox: None, provider: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("topology:"), "topology header must appear");
+        assert!(out.contains("parent=none"), "top-level agent must show parent=none");
+    }
+
+    #[test]
+    fn render_plain_topology_section_with_parent() {
+        let mut child = make_agent("scout", "done", 0, vec![]);
+        child.parent_id = Some("coordinator".to_string());
+        let snap = Snapshot {
+            agents: vec![child],
+            budget: None, queue: None, sandbox: None, provider: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("parent=coordinator"), "child agent must show parent id");
     }
 
     // ── status_style: coverage via plain-text content (not TUI) ─────────────

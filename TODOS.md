@@ -380,6 +380,15 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 
 ## Completed
 
+**p6.4 — Topology view (multi-agent graph)**
+- `parent_id: Option<String>` on `AgentSnapshot`; insert-only `parent_map` in `SchedulerState` + checkpoint (`#[serde(default)]` for compat).
+- `OFF_PARENT = 9`: new FUSE virtual file `/agents/<id>/parent`; `reader.rs` reads it into `AgentInfo.parent_id`.
+- `agentctl/src/watch/topology.rs`: `TopologyGraph`, `build_graph()` (512 KB tail cap, directed `message_sent` edges, cycle guard), `render_tree()`, `status_badge()`, `parse_message_edges()`.
+- `View::Topology` in `agentctl watch`; `[t]` key; `Esc`/`q` back to Dashboard; ↑/↓ scroll; fixed legend; min 60 cols guard.
+- `--log-path` CLI arg; plain-mode topology section; `coordinator-demo.agents.toml` acceptance fixture.
+- 455 tests pass; `make clippy-linux` required for surfaces changes.
+- **Completed:** v0.30.0 (2026-06-18)
+
 **p6.3 — Read-only TUI dashboard (`agentctl watch`)**
 - `agentctl watch` command with three views: Dashboard (agent table), AgentDetail, System.
 - `ratatui` 0.29 + `crossterm` 0.28; `--plain` / auto-TTY-detection for non-interactive use.

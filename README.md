@@ -14,7 +14,7 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phases 0–6.1 complete (v0.27.0).** `agentd` is a working Rust binary.
+**Phases 0–6.4 complete (v0.30.0).** `agentd` is a working Rust binary.
 Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
 inference gateway, tools, MCP stdio client, cooperative scheduler, capability
 system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
@@ -27,8 +27,12 @@ Landlock V4 TCP port enforcement. Phase 5 added the persistent memory substrate
 (redb-backed `MemoryStore`, short-term paging, long-term per-agent memory,
 shared KB with mutability classes, BM25 search, eviction + summarization, FUSE
 memory surface, and a hardening pass covering the OV-1 startup invariant and
-inode pruning). Phase 6 began with the template schema + on-disk catalogue
-(`agentd::template`, `templates/` directory, `TemplateResolver`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
+inode pruning). Phase 6 added the template schema + on-disk catalogue
+(`agentd::template`, `templates/` directory, `TemplateResolver`), the
+`agentctl` operator CLI (`list-templates`, `spawn`), a live TUI dashboard
+(`agentctl watch` with Dashboard / AgentDetail / System views), and the
+topology view (`[t]` key — spawn tree + message graph derived from
+`/agents/<id>/parent` and `flight.jsonl`). See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
 
@@ -46,6 +50,7 @@ agentos/                   ← run `claude` here
 │   ├── agent.toml         single-agent example
 │   └── agents.toml        multi-agent example (p1.2+)
 ├── templates/             Phase 6: agent template catalogue (p6.1+)
+├── agentctl/              Phase 6: operator CLI — list-templates, spawn, watch (p6.2+)
 ├── surfaces/              Phase 3: /agents FUSE virtual filesystem (p3.1+)
 ├── sandbox/               Phase 3: Landlock LSM + seccomp-bpf sandbox (p3.3+)
 └── distro/                Phase 2: Buildroot external tree + QEMU boot

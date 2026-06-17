@@ -33,6 +33,9 @@ pub struct AgentSnapshot {
     /// Each entry is formatted as `"t{turn} {role}: {content_preview}"`.
     /// Empty when the agent has no paged turns or memory is disabled.
     pub short_term_previews: Vec<String>,
+    /// Parent agent ID if this agent was spawned by another agent; None for
+    /// top-level agents loaded from config.
+    pub parent_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

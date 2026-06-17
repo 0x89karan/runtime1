@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use super::reader::{AgentInfo, Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox};
+use super::topology::{build_graph, TopologyGraph};
 
 /// Which view is currently displayed.
 #[derive(Debug, Clone, PartialEq)]
@@ -11,32 +12,43 @@ pub enum View {
     AgentDetail,
     /// Global system statistics.
     System,
+    /// Multi-agent spawn tree and message graph.
+    Topology,
 }
 
 /// Full application state, updated on each tick.
 pub struct App {
-    pub view:        View,
+    pub view:            View,
     /// Agent ID of the currently selected row (stable across snapshot refreshes).
-    pub selected_id: Option<String>,
-    pub agents:      Vec<AgentInfo>,
-    pub budget:      Option<SysBudget>,
-    pub queue:       Option<SysQueue>,
-    pub sandbox:     Option<SysSandbox>,
-    pub provider:    Option<SysProvider>,
-    pub error:       Option<String>,
+    pub selected_id:     Option<String>,
+    pub agents:          Vec<AgentInfo>,
+    pub budget:          Option<SysBudget>,
+    pub queue:           Option<SysQueue>,
+    pub sandbox:         Option<SysSandbox>,
+    pub provider:        Option<SysProvider>,
+    pub error:           Option<String>,
+    /// Topology graph, rebuilt on every tick.
+    pub topology:        TopologyGraph,
+    /// Vertical scroll offset for the Topology view.
+    pub topology_scroll: usize,
+    /// Optional path to flight.jsonl for message edge data.
+    pub log_path:        Option<PathBuf>,
 }
 
 impl App {
     pub fn new(_agents_dir: PathBuf) -> Self {
         Self {
-            view:        View::Dashboard,
-            selected_id: None,
-            agents:      vec![],
-            budget:      None,
-            queue:       None,
-            sandbox:     None,
-            provider:    None,
-            error:       None,
+            view:            View::Dashboard,
+            selected_id:     None,
+            agents:          vec![],
+            budget:          None,
+            queue:           None,
+            sandbox:         None,
+            provider:        None,
+            error:           None,
+            topology:        TopologyGraph::default(),
+            topology_scroll: 0,
+            log_path:        None,
         }
     }
 
@@ -58,12 +70,16 @@ impl App {
         if self.selected_id.is_none() {
             self.selected_id = snap.agents.first().map(|a| a.id.clone());
         }
-        self.agents  = snap.agents;
-        self.budget  = snap.budget;
-        self.queue   = snap.queue;
-        self.sandbox = snap.sandbox;
+        self.agents   = snap.agents;
+        self.budget   = snap.budget;
+        self.queue    = snap.queue;
+        self.sandbox  = snap.sandbox;
         self.provider = snap.provider;
-        self.error   = snap.error;
+        self.error    = snap.error;
+        // Parse flight.jsonl for message edges only while the Topology view is
+        // active — reading up to 512 KB on every tick in other views causes stutter.
+        let log = if self.view == View::Topology { self.log_path.as_deref() } else { None };
+        self.topology = build_graph(&self.agents, log);
     }
 
     /// Index of the selected agent in the current list, or None.
@@ -112,6 +128,7 @@ mod tests {
             context_tokens: 0,
             budget:         BudgetKind::Unlimited,
             tools:          vec![],
+            parent_id:      None,
         }
     }
 
