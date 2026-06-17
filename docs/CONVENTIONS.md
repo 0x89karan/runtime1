@@ -32,6 +32,7 @@ subsystem, tool, or provider. (For *what* to build, see `ROADMAP.md`; for *why*,
 | `memory` | `MemoryStore` trait + `RedbStore` backend; `context` pressure manager + Tier-2 `MemItem`; `validate_segment` | scheduling, agent loop logic |
 | `surfaces` | FUSE virtual filesystem (`AgentsFs`), `SchedulerSnapshot`, `MemoryAccess` bridge trait | business logic, scheduling internals |
 | `sandbox` | `SandboxRule` enum, `compile()`/`apply_compiled()` for Landlock + seccomp-bpf | agent loop logic, scheduling |
+| `agentctl` | operator CLI binary; `list-templates` + `spawn`; `parse_cap_alias()`; `cap_add_allowed_by_suggestion()` | runtime logic, scheduler, memory |
 
 When a new subsystem appears in the roadmap, add a module; don't bolt it onto an
 existing one.
@@ -247,6 +248,13 @@ files but `to_agent_config()` on them will error).
 **`[card]`:** catalogue metadata only. Not visible at runtime; stripped by
 `TemplateConfig::to_agent_config()`. Runtime `AgentCard` is always derived from `[agent]`
 fields (id, name, description, skills).
+
+**`[card]` and `--cap-add` enforcement:** `agentctl spawn --cap-add` checks each
+requested capability against `[card].suggested_caps`. Absent `[card]` is treated the
+same as `[card]` with empty `suggested_caps` — all `--cap-add` requires `--force`.
+Templates that intentionally accept any capability must include `[card]` with the
+appropriate `suggested_caps` list. This prevents silent unguarded surfaces when
+authors forget the `[card]` section.
 
 **`~/.agentos/templates/`:** not created automatically. Operators create it themselves and
 drop `*.template.toml` files there to override or extend the repo catalogue.

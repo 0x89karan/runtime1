@@ -51,14 +51,29 @@ $(BR_DIR): $(BR_TARBALL)
 overlay/usr/bin/agentd:
 	@[ -f ../target/x86_64-unknown-linux-musl/release/agentd ] || { \
 		echo "ERROR: musl binary not found. Build it first:"; \
-		echo "  cross build --target x86_64-unknown-linux-musl --release"; \
+		echo "  cross build --target x86_64-unknown-linux-musl --release -p agentd -p agentctl"; \
 		exit 1; \
 	}
 	mkdir -p overlay/usr/bin
 	cp ../target/x86_64-unknown-linux-musl/release/agentd $@
 	chmod +x $@
 
-$(OUTPUT_DIR)/bzImage: $(BR_DIR) overlay/usr/bin/agentd
+overlay/usr/bin/agentctl:
+	@[ -f ../target/x86_64-unknown-linux-musl/release/agentctl ] || { \
+		echo "ERROR: musl binary not found. Build it first:"; \
+		echo "  cross build --target x86_64-unknown-linux-musl --release -p agentd -p agentctl"; \
+		exit 1; \
+	}
+	mkdir -p overlay/usr/bin
+	cp ../target/x86_64-unknown-linux-musl/release/agentctl $@
+	chmod +x $@
+
+overlay/etc/agentd/templates/.gitkeep:
+	mkdir -p overlay/etc/agentd/templates
+	cp ../templates/*.template.toml overlay/etc/agentd/templates/
+	touch $@
+
+$(OUTPUT_DIR)/bzImage: $(BR_DIR) overlay/usr/bin/agentd overlay/usr/bin/agentctl overlay/etc/agentd/templates/.gitkeep
 	mkdir -p build/output $(OUTPUT_DIR)
 	chmod +x overlay/init
 	cd $(BR_DIR) && make \
@@ -103,7 +118,7 @@ test: prereqs build
 		}
 
 clean:
-	rm -rf $(OUTPUT_DIR) overlay/usr/bin/agentd
+	rm -rf $(OUTPUT_DIR) overlay/usr/bin/agentd overlay/usr/bin/agentctl overlay/etc/agentd/templates/.gitkeep
 
 distclean: clean
 	rm -rf build/

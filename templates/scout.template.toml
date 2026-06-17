@@ -24,9 +24,10 @@ fs_read = ["/workspace"]
 native = ["read_file", "list_dir"]
 
 [card]
-name        = "Scout"
-description = "Read-only filesystem researcher."
-skills      = ["research", "summarization"]
+name           = "Scout"
+description    = "Read-only filesystem researcher."
+skills         = ["research", "summarization"]
+suggested_caps = [{ FsRead = { prefix = "/workspace" } }]
 
 [agent]
 id           = "scout"

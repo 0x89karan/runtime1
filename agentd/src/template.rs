@@ -97,6 +97,13 @@ pub struct TemplateCard {
     pub description: String,
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Capabilities that `agentctl spawn --cap-add` is allowed to grant without `--force`.
+    /// Uses the real `Capability` type (single vocabulary — no alias strings stored here).
+    /// TOML syntax: `suggested_caps = [{ FsRead = { prefix = "/workspace" } }]`
+    /// Absent field (default) = no guard applied (legacy template compat).
+    /// Empty vec = all `--cap-add` requires `--force`.
+    #[serde(default)]
+    pub suggested_caps: Vec<Capability>,
 }
 
 /// A parsed `*.template.toml` file.
@@ -341,6 +348,14 @@ impl TemplateResolver {
             }
         }
         Ok(entries)
+    }
+
+    pub fn repo_dir(&self) -> &std::path::Path {
+        &self.repo_dir
+    }
+
+    pub fn user_dir(&self) -> &std::path::Path {
+        &self.user_dir
     }
 
     fn parse_file(path: &std::path::Path) -> anyhow::Result<TemplateConfig> {

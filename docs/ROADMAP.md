@@ -653,7 +653,7 @@ user-overrides-repo precedence. CLI-consumable, no UI. `Config` + sub-structs ga
 lowers to a valid `Config` when a task override is provided (templates with `task = ""`
 require a caller-supplied task); tests cover precedence + the strip-template-keys path.
 
-### ▢ p6.2 — `agentctl list-templates` / `agentctl spawn <template>`
+### ✅ p6.2 — `agentctl list-templates` / `agentctl spawn <template>`
 **Depends on:** p6.1. New `agentctl/` workspace member (the operator CLI). `spawn`
 generates an `agent.toml` from a template + `--task`/`--cap-add` overrides
 (deny-by-default base) and execs `agentd`. No daemon, works in QEMU. **Acceptance:**
