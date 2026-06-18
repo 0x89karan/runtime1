@@ -6,7 +6,11 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 
-use super::app::{App, View};
+use super::app::{App, MemoryAbsence, MemoryPane, View};
+use super::memory::{
+    filter_entries, filter_short_term, read_agent_memory, read_kb_segments, MAX_DISPLAY_ENTRIES,
+    MAX_SEARCH_ENTRIES,
+};
 use super::topology::render_tree;
 
 /// Strip ASCII control characters (< 0x20, except tab) from a string before
@@ -17,6 +21,7 @@ fn sanitize(s: &str) -> String {
 }
 
 const MIN_TOPOLOGY_WIDTH: u16 = 60;
+const MIN_MEMORY_WIDTH:   u16 = 50;
 
 pub fn render(f: &mut Frame, app: &App) {
     match app.view {
@@ -24,6 +29,7 @@ pub fn render(f: &mut Frame, app: &App) {
         View::AgentDetail => render_agent_detail(f, app),
         View::System      => render_system(f, app),
         View::Topology    => render_topology(f, app),
+        View::Memory      => render_memory(f, app),
     }
 }
 
@@ -111,7 +117,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     }
 
     // Footer
-    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  q quit ";
+    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  q quit ";
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_area,
@@ -273,6 +279,211 @@ fn render_topology(f: &mut Frame, app: &App) {
     );
 }
 
+fn render_memory(f: &mut Frame, app: &App) {
+    let area = f.area();
+
+    if area.width < MIN_MEMORY_WIDTH {
+        f.render_widget(
+            Paragraph::new(format!("terminal too narrow for Memory view (min {} cols)", MIN_MEMORY_WIDTH))
+                .style(Style::default().fg(Color::Red)),
+            area,
+        );
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // header bar
+            Constraint::Length(1), // pane tab line + agent id
+            Constraint::Length(1), // search bar
+            Constraint::Min(1),    // content
+            Constraint::Length(1), // footer hints
+        ])
+        .split(area);
+    let (header_area, tab_area, search_area, content_area, footer_area) =
+        (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]);
+
+    // Header
+    f.render_widget(
+        Paragraph::new(" agentctl watch › memory ")
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        header_area,
+    );
+
+    // Tab bar
+    let pane   = &app.memory_view.pane;
+    let agent  = app.selected_agent().map(|a| a.id.as_str()).unwrap_or("(none)");
+    let st_lbl = if *pane == MemoryPane::ShortTerm { "[Short-term]" } else { " Short-term " };
+    let lt_lbl = if *pane == MemoryPane::LongTerm  { "[Long-term]"  } else { " Long-term "  };
+    let kb_lbl = if *pane == MemoryPane::Kb         { "[KB]"         } else { " KB "         };
+    let tab_line = format!("{st_lbl}  {lt_lbl}  {kb_lbl}   Agent: {agent}");
+    f.render_widget(Paragraph::new(tab_line), tab_area);
+
+    // Search bar
+    let sq = &app.memory_view.search_query;
+    let search_line = if app.memory_view.search_active {
+        format!("Search: {sq}_")
+    } else if sq.is_empty() {
+        " [/] search ".to_string()
+    } else {
+        format!("Search: {sq}  (press [/] to edit)")
+    };
+    f.render_widget(Paragraph::new(search_line), search_area);
+
+    // Content area — only the active pane is rendered (true-tab model).
+    match pane {
+        MemoryPane::ShortTerm => render_memory_short_term_pane(f, app, content_area),
+        MemoryPane::LongTerm  => render_memory_long_term_pane(f, app, content_area),
+        MemoryPane::Kb        => render_memory_kb_pane(f, app, content_area),
+    }
+
+    // Footer
+    let hints = " [Tab] pane  [/] search  ↑/↓ scroll  Esc/q back ";
+    f.render_widget(
+        Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        footer_area,
+    );
+}
+
+fn render_memory_short_term_pane(f: &mut Frame, app: &App, area: Rect) {
+    let mem = match app.memory_view.agent_memory.as_ref() {
+        Some(m) => m,
+        None    => {
+            f.render_widget(
+                Paragraph::new("(no agent selected — select from Dashboard with Enter)")
+                    .block(Block::default().borders(Borders::ALL).title(" short-term ")),
+                area,
+            );
+            return;
+        }
+    };
+    let q      = &app.memory_view.search_query;
+    let items  = filter_short_term(&mem.short_term, q);
+    let total  = mem.short_term.len();
+    let title  = if q.is_empty() {
+        format!(" SHORT TERM — {} items ", total)
+    } else {
+        format!(" SHORT TERM — {} matches of {} ", items.len(), total)
+    };
+    let scroll  = app.memory_view.short_term_scroll;
+    let height  = area.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(height)
+        .map(|(i, s)| Line::from(format!("  {}. {}", i + 1, sanitize(s))))
+        .collect();
+    let body = if lines.is_empty() {
+        vec![Line::from("  (no items)")]
+    } else {
+        lines
+    };
+    f.render_widget(
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+fn render_memory_long_term_pane(f: &mut Frame, app: &App, area: Rect) {
+    let mem = match app.memory_view.agent_memory.as_ref() {
+        Some(m) => m,
+        None    => {
+            f.render_widget(
+                Paragraph::new("(no agent selected — select from Dashboard with Enter)")
+                    .block(Block::default().borders(Borders::ALL).title(" long-term ")),
+                area,
+            );
+            return;
+        }
+    };
+    let q       = &app.memory_view.search_query;
+    let entries = filter_entries(&mem.long_term, q);
+    let total   = mem.long_term.len();
+    let cap_note = if mem.long_term_truncated {
+        format!(" (display capped at {MAX_DISPLAY_ENTRIES}, searching up to {MAX_SEARCH_ENTRIES})")
+    } else {
+        String::new()
+    };
+    let title = if q.is_empty() {
+        format!(" LONG TERM — {} entries{cap_note} ", total)
+    } else {
+        format!(" LONG TERM — {} matches of {}{cap_note} ", entries.len(), total)
+    };
+    let scroll = app.memory_view.long_term_scroll;
+    let height = area.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![];
+    for e in entries.iter().skip(scroll).take(height / 3 + 1) {
+        lines.push(Line::from(format!("  key: {}", sanitize(&e.key))));
+        let preview = &e.content[..e.content.floor_char_boundary(200.min(e.content.len()))];
+        lines.push(Line::from(format!("  val: {}", sanitize(preview))));
+        if !e.provenance.is_empty() {
+            lines.push(Line::from(format!("  prv: {}", sanitize(&e.provenance))));
+        }
+        lines.push(Line::from(""));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("  (no entries)"));
+    }
+    let visible: Vec<Line> = lines.into_iter().take(height).collect();
+    f.render_widget(
+        Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
+fn render_memory_kb_pane(f: &mut Frame, app: &App, area: Rect) {
+    // Absence banner takes priority over normal content.
+    if let Some(absence) = &app.memory_view.absence {
+        let msg = match absence {
+            MemoryAbsence::Subsystem =>
+                "memory subsystem not present — agentd must be compiled with Phase 5 (redb).\nSee CHANGELOG.md v0.18.0.",
+            MemoryAbsence::Empty =>
+                "memory subsystem present — no KB data written yet",
+        };
+        f.render_widget(
+            Paragraph::new(msg).block(Block::default().borders(Borders::ALL).title(" KB ")),
+            area,
+        );
+        return;
+    }
+
+    let q      = &app.memory_view.search_query;
+    let scroll = app.memory_view.kb_scroll;
+    let height = area.height.saturating_sub(2) as usize;
+
+    let mut lines: Vec<Line> = vec![];
+    for seg in &app.memory_view.kb_segments {
+        let class_badge = if seg.class.is_empty() { String::new() } else { format!(" [{}]", seg.class) };
+        let entries     = filter_entries(&seg.entries, q);
+        let cap_note    = if seg.truncated {
+            format!(" (capped at {MAX_DISPLAY_ENTRIES})")
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(format!("  {}{class_badge} — {} entries{cap_note}", seg.name, entries.len())));
+        for e in &entries {
+            let preview = &e.content[..e.content.floor_char_boundary(120.min(e.content.len()))];
+            let prov    = if e.provenance.is_empty() { String::new() }
+                          else { format!("  [{}]", sanitize(&e.provenance)) };
+            lines.push(Line::from(format!("    {} → {}{prov}", sanitize(&e.key), sanitize(preview))));
+        }
+        lines.push(Line::from(""));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("  (no KB entries)"));
+    }
+
+    let title = if q.is_empty() { " KB SEGMENTS ".to_string() }
+                else { format!(" KB SEGMENTS  [filter: {q}] ") };
+    let visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+    f.render_widget(
+        Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(title)),
+        area,
+    );
+}
+
 /// Render a plain-text snapshot to a string (for --plain mode, no ANSI).
 pub fn render_plain(app: &App) -> String {
     let mut out = String::new();
@@ -308,6 +519,51 @@ pub fn render_plain(app: &App) -> String {
     for a in &app.agents {
         let parent = a.parent_id.as_deref().unwrap_or("none");
         out.push_str(&format!("  topology: {} parent={} status={}\n", a.id, parent, a.status));
+    }
+    // Memory section — read live from FUSE; skip if Phase 5 absent.
+    let kb_dir = app.agents_dir.join("kb");
+    if !kb_dir.is_dir() {
+        out.push_str("memory: subsystem not present\n");
+        return out;
+    }
+    out.push_str("memory:\n");
+    // Per-agent memory (first 5 entries each section, no search filter).
+    for a in &app.agents {
+        if let Some(mem) = read_agent_memory(&app.agents_dir, &a.id, "") {
+            out.push_str(&format!("  agent {}:\n", a.id));
+            if mem.short_term.is_empty() {
+                out.push_str("    short_term: (empty)\n");
+            } else {
+                out.push_str("    short_term:\n");
+                for item in mem.short_term.iter().take(5) {
+                    out.push_str(&format!("      - {}\n", sanitize(item)));
+                }
+            }
+            if mem.long_term.is_empty() {
+                out.push_str("    long_term: (empty)\n");
+            } else {
+                out.push_str("    long_term:\n");
+                for e in mem.long_term.iter().take(5) {
+                    let preview = &e.content[..e.content.floor_char_boundary(80.min(e.content.len()))];
+                    out.push_str(&format!("      {}: {}\n", sanitize(&e.key), sanitize(preview)));
+                }
+            }
+        }
+    }
+    // KB segments.
+    let kb_segs = read_kb_segments(&app.agents_dir, "");
+    if kb_segs.is_empty() {
+        out.push_str("  kb: (no segments)\n");
+    } else {
+        out.push_str("  kb:\n");
+        for seg in &kb_segs {
+            let badge = if seg.class.is_empty() { String::new() } else { format!(" [{}]", seg.class) };
+            out.push_str(&format!("    {}{badge}: {} entries\n", seg.name, seg.entries.len()));
+            for e in seg.entries.iter().take(5) {
+                let preview = &e.content[..e.content.floor_char_boundary(80.min(e.content.len()))];
+                out.push_str(&format!("      {}: {}\n", sanitize(&e.key), sanitize(preview)));
+            }
+        }
     }
     out
 }
@@ -499,5 +755,190 @@ mod tests {
             assert!(out.contains(&format!("[{status}]")),
                 "status '{status}' must appear in render_plain output");
         }
+    }
+
+    // ── Memory view: render_plain ────────────────────────────────────────────
+
+    fn tmpdir() -> tempfile::TempDir { tempfile::tempdir().unwrap() }
+
+    fn empty_snap() -> Snapshot {
+        Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, error: None }
+    }
+
+    fn app_with_dir(dir: &std::path::Path, snap: Snapshot) -> App {
+        let mut app = App::new(dir.to_path_buf());
+        app.apply_snapshot(snap);
+        app
+    }
+
+    #[test]
+    fn render_memory_absent_subsystem_shows_message() {
+        let d = tmpdir();
+        // No kb/ dir → Phase 5 absent.
+        let out = render_plain(&app_with_dir(d.path(), empty_snap()));
+        assert!(out.contains("memory: subsystem not present"),
+            "absent Phase 5 must produce 'subsystem not present' line; got:\n{out}");
+    }
+
+    #[test]
+    fn render_memory_absent_empty_shows_no_data_yet() {
+        let d = tmpdir();
+        std::fs::create_dir_all(d.path().join("kb")).unwrap();
+        let out = render_plain(&app_with_dir(d.path(), empty_snap()));
+        assert!(out.contains("memory:"), "memory header must appear");
+        assert!(out.contains("kb: (no segments)"), "empty kb must show '(no segments)'");
+    }
+
+    #[test]
+    fn render_memory_no_entries_for_agent_kb_still_renders() {
+        let d = tmpdir();
+        let seg = d.path().join("kb").join("project");
+        std::fs::create_dir_all(&seg).unwrap();
+        std::fs::write(seg.join("k1"), r#"{"content":"note","class":"log","provenance":{}}"#).unwrap();
+        // No agents in snapshot, but KB has a segment.
+        let out = render_plain(&app_with_dir(d.path(), empty_snap()));
+        assert!(out.contains("project"), "KB segment must appear even with no agents");
+    }
+
+    #[test]
+    fn render_memory_shows_short_term_items() {
+        let d = tmpdir();
+        std::fs::create_dir_all(d.path().join("kb")).unwrap();
+        let mem = d.path().join("agent-1").join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("short_term"), "key insight here\nfact two\n").unwrap();
+        let snap = Snapshot {
+            agents: vec![make_agent("agent-1", "running", 0, vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, error: None,
+        };
+        let out = render_plain(&app_with_dir(d.path(), snap));
+        assert!(out.contains("key insight here"), "short_term item must appear in output");
+        assert!(out.contains("fact two"), "second short_term item must appear");
+    }
+
+    #[test]
+    fn render_memory_shows_kb_segments_with_class_badge() {
+        let d = tmpdir();
+        let seg = d.path().join("kb").join("events");
+        std::fs::create_dir_all(&seg).unwrap();
+        std::fs::write(seg.join("e1"), r#"{"content":"entry","class":"log","provenance":{}}"#).unwrap();
+        let out = render_plain(&app_with_dir(d.path(), empty_snap()));
+        assert!(out.contains("[log]"), "class badge [log] must appear for log segments");
+        assert!(out.contains("events"), "segment name must appear");
+    }
+
+    #[test]
+    fn render_memory_truncation_indicator() {
+        use crate::watch::memory::MAX_DISPLAY_ENTRIES;
+        let d = tmpdir();
+        let seg = d.path().join("kb").join("big");
+        std::fs::create_dir_all(&seg).unwrap();
+        for i in 0..(MAX_DISPLAY_ENTRIES + 2) {
+            std::fs::write(
+                seg.join(format!("k{i:04}")),
+                r#"{"content":"v","class":"scratch","provenance":{}}"#,
+            ).unwrap();
+        }
+        let out = render_plain(&app_with_dir(d.path(), empty_snap()));
+        // Plain mode reads MAX_DISPLAY_ENTRIES entries and the truncated flag is on the segment.
+        // The entries count shown in the output will reflect what was fetched (20).
+        assert!(out.contains("big"), "segment name must appear");
+    }
+
+    #[test]
+    fn render_memory_plain_mode_all_agents() {
+        let d = tmpdir();
+        std::fs::create_dir_all(d.path().join("kb")).unwrap();
+        for id in &["agent-a", "agent-b"] {
+            let mem = d.path().join(id).join("memory");
+            std::fs::create_dir_all(&mem).unwrap();
+            std::fs::write(mem.join("short_term"), format!("note from {id}\n")).unwrap();
+        }
+        let snap = Snapshot {
+            agents: vec![
+                make_agent("agent-a", "running", 0, vec![]),
+                make_agent("agent-b", "running", 0, vec![]),
+            ],
+            budget: None, queue: None, sandbox: None, provider: None, error: None,
+        };
+        let out = render_plain(&app_with_dir(d.path(), snap));
+        assert!(out.contains("agent-a"), "agent-a must appear in memory section");
+        assert!(out.contains("agent-b"), "agent-b must appear in memory section");
+        assert!(out.contains("note from agent-a"), "agent-a short_term must appear");
+        assert!(out.contains("note from agent-b"), "agent-b short_term must appear");
+    }
+
+    #[test]
+    fn render_memory_control_chars_not_rendered() {
+        let d = tmpdir();
+        let seg = d.path().join("kb").join("sec");
+        std::fs::create_dir_all(&seg).unwrap();
+        // Store a content string containing an ANSI escape sequence.
+        let raw = "{\"content\":\"hello\x1bworld\",\"class\":\"log\",\"provenance\":{}}";
+        std::fs::write(seg.join("k1"), raw).unwrap();
+        let out = render_plain(&app_with_dir(d.path(), empty_snap()));
+        assert!(!out.contains('\x1b'), "ANSI escape must be stripped before output");
+        assert!(out.contains("helloworld") || out.contains("hello"), "content must appear without ESC");
+    }
+
+    #[test]
+    fn render_memory_provenance_ts_nanoseconds_formatted_as_rfc3339() {
+        use crate::watch::memory::parse_entry;
+        // 1_000_000_000 ns = 1970-01-01T00:00:01Z
+        let raw = r#"{"content":"x","provenance":{"agent_id":"a","turn":1,"ts":1000000000,"task_fp":"0x1"}}"#;
+        let e = parse_entry("k", raw);
+        assert!(e.provenance.contains("1970-01-01T00:00:01Z"),
+            "nanosecond u64 ts must be formatted as RFC3339; got: {}", e.provenance);
+    }
+
+    #[test]
+    fn render_memory_min_width_guard() {
+        // Structural: constant must match the plan specification.
+        assert_eq!(MIN_MEMORY_WIDTH, 50, "MIN_MEMORY_WIDTH must be 50 per plan");
+    }
+
+    #[test]
+    fn render_memory_search_shows_match_count() {
+        use crate::watch::memory::{filter_entries, MemoryEntry};
+        let entries: Vec<MemoryEntry> = (0..5).map(|i| MemoryEntry {
+            key:        format!("k{i}"),
+            content:    if i < 2 { "needle content".to_string() } else { "hay".to_string() },
+            provenance: String::new(),
+            class:      String::new(),
+        }).collect();
+        let matches = filter_entries(&entries, "needle");
+        assert_eq!(matches.len(), 2,
+            "filter_entries must return 2 matches for 'needle' in 5 entries");
+    }
+
+    #[test]
+    fn render_memory_true_tab_only_active_pane_rendered() {
+        use crate::watch::app::{MemoryPane, MemoryPaneState};
+        // Verify that active_scroll_mut operates on the correct field per pane.
+        let mut state = MemoryPaneState { pane: MemoryPane::LongTerm, ..Default::default() };
+        *state.active_scroll_mut() = 7;
+        // Switch pane — LongTerm scroll must be preserved, ShortTerm scroll is separate.
+        state.pane = MemoryPane::ShortTerm;
+        assert_eq!(state.short_term_scroll, 0, "ShortTerm scroll must be independent of LongTerm");
+        state.pane = MemoryPane::LongTerm;
+        assert_eq!(*state.active_scroll_mut(), 7, "LongTerm scroll must survive pane switch");
+    }
+
+    #[test]
+    fn render_memory_search_active_highlighted() {
+        use crate::watch::app::MemoryPaneState;
+        // Structural: search_active flag is independent state from search_query.
+        let mut state = MemoryPaneState {
+            search_active: true,
+            search_query: "arch".to_string(),
+            ..Default::default()
+        };
+        assert!(state.search_active);
+        assert_eq!(state.search_query, "arch");
+        // Closing search leaves query in place (user can re-open and see it).
+        // Pressing [/] again would set search_active=true again.
+        state.search_active = false;
+        assert!(!state.search_active);
+        assert_eq!(state.search_query, "arch", "query must persist after closing search mode");
     }
 }

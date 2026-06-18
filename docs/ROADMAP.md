@@ -679,7 +679,7 @@ cycle guard), `render_tree()`; `View::Topology` in `agentctl watch` (`[t]` key, 
 fixed legend footer, min 60 cols guard); `--log-path` arg; plain mode topology section;
 `coordinator-demo.agents.toml` acceptance fixture; 455 tests pass. **Acceptance met.**
 
-### ▢ p6.5 — Memory view
+### ✅ p6.5 — Memory view
 **Depends on:** **p5.7** (`/agents/<id>/memory/`, `/agents/kb/<segment>/`) and the
 `PHASE-5-PLAN.md §E` contracts (provenance schema, versioned store, `memory_*`/`kb_*`
 events). Read-only browse of per-agent short/long-term stores and shared KB segments,

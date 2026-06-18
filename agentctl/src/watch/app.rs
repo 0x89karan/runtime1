@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
 use super::reader::{AgentInfo, Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox};
 use super::topology::{build_graph, TopologyGraph};
 
@@ -14,6 +15,59 @@ pub enum View {
     System,
     /// Multi-agent spawn tree and message graph.
     Topology,
+    /// Browse per-agent and shared KB memory stores.
+    Memory,
+}
+
+/// Which pane is active in the Memory view (true-tab model).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum MemoryPane {
+    #[default]
+    ShortTerm,
+    LongTerm,
+    Kb,
+}
+
+/// Why the Memory view shows a degraded state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MemoryAbsence {
+    /// `/agents/kb/` directory absent — Phase 5 not compiled / deployed.
+    Subsystem,
+    /// `/agents/kb/` present but empty — Phase 5 present, no KB data yet.
+    Empty,
+}
+
+/// UI state for the Memory view.
+#[derive(Debug, Default)]
+pub struct MemoryPaneState {
+    /// Per-agent memory for the currently selected agent.  None when no agent is
+    /// selected or the agent has no memory dir.
+    pub agent_memory:      Option<AgentMemory>,
+    /// All shared KB segments.
+    pub kb_segments:       Vec<KbSegment>,
+    /// Current search query (empty = no filter).
+    pub search_query:      String,
+    /// True while the user is typing into the search box.
+    pub search_active:     bool,
+    /// Per-pane scroll offsets — only the active pane is rendered (true-tab).
+    pub short_term_scroll: usize,
+    pub long_term_scroll:  usize,
+    pub kb_scroll:         usize,
+    /// Which pane is currently visible.
+    pub pane:              MemoryPane,
+    /// None = subsystem present (or not yet checked).
+    pub absence:           Option<MemoryAbsence>,
+}
+
+impl MemoryPaneState {
+    /// Return a mutable reference to the scroll counter for the active pane.
+    pub fn active_scroll_mut(&mut self) -> &mut usize {
+        match self.pane {
+            MemoryPane::ShortTerm => &mut self.short_term_scroll,
+            MemoryPane::LongTerm  => &mut self.long_term_scroll,
+            MemoryPane::Kb        => &mut self.kb_scroll,
+        }
+    }
 }
 
 /// Full application state, updated on each tick.
@@ -33,10 +87,14 @@ pub struct App {
     pub topology_scroll: usize,
     /// Optional path to flight.jsonl for message edge data.
     pub log_path:        Option<PathBuf>,
+    /// FUSE mount point — needed by memory readers in apply_snapshot.
+    pub agents_dir:      PathBuf,
+    /// UI state for the Memory view.
+    pub memory_view:     MemoryPaneState,
 }
 
 impl App {
-    pub fn new(_agents_dir: PathBuf) -> Self {
+    pub fn new(agents_dir: PathBuf) -> Self {
         Self {
             view:            View::Dashboard,
             selected_id:     None,
@@ -49,6 +107,8 @@ impl App {
             topology:        TopologyGraph::default(),
             topology_scroll: 0,
             log_path:        None,
+            agents_dir,
+            memory_view:     MemoryPaneState::default(),
         }
     }
 
@@ -80,6 +140,24 @@ impl App {
         // active — reading up to 512 KB on every tick in other views causes stutter.
         let log = if self.view == View::Topology { self.log_path.as_deref() } else { None };
         self.topology = build_graph(&self.agents, log);
+
+        // Read memory only while the Memory view is active to avoid FUSE I/O on
+        // every tick when the user is not looking at memory data.
+        if self.view == View::Memory {
+            let q = self.memory_view.search_query.clone();
+            self.memory_view.agent_memory = self.selected_id
+                .as_deref()
+                .and_then(|id| read_agent_memory(&self.agents_dir, id, &q));
+            self.memory_view.kb_segments = read_kb_segments(&self.agents_dir, &q);
+            let kb_dir = self.agents_dir.join("kb");
+            self.memory_view.absence = if !kb_dir.is_dir() {
+                Some(MemoryAbsence::Subsystem)
+            } else if self.memory_view.kb_segments.is_empty() {
+                Some(MemoryAbsence::Empty)
+            } else {
+                None
+            };
+        }
     }
 
     /// Index of the selected agent in the current list, or None.
@@ -322,5 +400,136 @@ mod tests {
         app.apply_snapshot(make_snapshot(&["a"]));
         app.selected_id = Some("z".to_string()); // stale id
         assert!(app.selected_agent().is_none());
+    }
+
+    // ── Memory view: agents_dir stored ───────────────────────────────────────
+
+    #[test]
+    fn app_agents_dir_stored_in_new() {
+        let app = App::new(PathBuf::from("/test/agents"));
+        assert_eq!(app.agents_dir, PathBuf::from("/test/agents"),
+            "agents_dir must be stored (not discarded with _ prefix)");
+    }
+
+    // ── Memory view: absence detection ───────────────────────────────────────
+
+    #[test]
+    fn app_view_memory_absent_subsystem_when_kb_dir_missing() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = App::new(d.path().to_path_buf());
+        app.view = View::Memory;
+        // No kb/ dir in tmpdir → Phase 5 absent.
+        app.apply_snapshot(make_snapshot(&[]));
+        assert_eq!(app.memory_view.absence, Some(MemoryAbsence::Subsystem));
+    }
+
+    #[test]
+    fn app_view_memory_absent_empty_when_kb_dir_exists_but_no_segs() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("kb")).unwrap();
+        let mut app = App::new(d.path().to_path_buf());
+        app.view = View::Memory;
+        app.apply_snapshot(make_snapshot(&[]));
+        assert_eq!(app.memory_view.absence, Some(MemoryAbsence::Empty));
+    }
+
+    #[test]
+    fn app_view_memory_absence_none_when_kb_has_segments() {
+        let d = tempfile::tempdir().unwrap();
+        let seg = d.path().join("kb").join("project");
+        std::fs::create_dir_all(&seg).unwrap();
+        std::fs::write(seg.join("k1"), r#"{"content":"x","class":"log","provenance":{}}"#).unwrap();
+        let mut app = App::new(d.path().to_path_buf());
+        app.view = View::Memory;
+        app.apply_snapshot(make_snapshot(&[]));
+        assert_eq!(app.memory_view.absence, None);
+    }
+
+    // ── Memory view: MemoryPaneState scroll helpers ───────────────────────────
+
+    #[test]
+    fn active_scroll_mut_returns_correct_field_per_pane() {
+        let mut state = MemoryPaneState {
+            short_term_scroll: 1,
+            long_term_scroll: 2,
+            kb_scroll: 3,
+            ..Default::default()
+        };
+
+        state.pane = MemoryPane::ShortTerm;
+        assert_eq!(*state.active_scroll_mut(), 1);
+        state.pane = MemoryPane::LongTerm;
+        assert_eq!(*state.active_scroll_mut(), 2);
+        state.pane = MemoryPane::Kb;
+        assert_eq!(*state.active_scroll_mut(), 3);
+    }
+
+    #[test]
+    fn memory_pane_per_pane_scroll_preserved_across_tab() {
+        let mut state = MemoryPaneState::default();
+        // Set different scroll values per pane.
+        *state.active_scroll_mut() = 5; // pane starts at ShortTerm (the default)
+        state.pane = MemoryPane::LongTerm;
+        *state.active_scroll_mut() = 10;
+
+        // Switch back to ShortTerm — value must be preserved.
+        state.pane = MemoryPane::ShortTerm;
+        assert_eq!(*state.active_scroll_mut(), 5,
+            "ShortTerm scroll must survive pane switch to LongTerm and back");
+    }
+
+    #[test]
+    fn memory_pane_tab_cycles_shortterm_longterm_kb_repeat() {
+        let mut pane = MemoryPane::ShortTerm;
+        pane = match pane { MemoryPane::ShortTerm => MemoryPane::LongTerm,
+                             MemoryPane::LongTerm  => MemoryPane::Kb,
+                             MemoryPane::Kb        => MemoryPane::ShortTerm };
+        assert_eq!(pane, MemoryPane::LongTerm);
+        pane = match pane { MemoryPane::ShortTerm => MemoryPane::LongTerm,
+                             MemoryPane::LongTerm  => MemoryPane::Kb,
+                             MemoryPane::Kb        => MemoryPane::ShortTerm };
+        assert_eq!(pane, MemoryPane::Kb);
+        pane = match pane { MemoryPane::ShortTerm => MemoryPane::LongTerm,
+                             MemoryPane::LongTerm  => MemoryPane::Kb,
+                             MemoryPane::Kb        => MemoryPane::ShortTerm };
+        assert_eq!(pane, MemoryPane::ShortTerm, "cycle must wrap back to ShortTerm");
+    }
+
+    #[test]
+    fn memory_search_active_toggled_by_slash() {
+        let mut state = MemoryPaneState::default();
+        assert!(!state.search_active);
+        state.search_active = true;
+        assert!(state.search_active);
+    }
+
+    #[test]
+    fn memory_search_query_cleared_on_esc() {
+        let mut state = MemoryPaneState::default();
+        state.search_query.push_str("arch");
+        state.search_active = true;
+        state.search_active = false;
+        state.search_query.clear();
+        assert!(state.search_query.is_empty());
+        assert!(!state.search_active);
+    }
+
+    #[test]
+    fn memory_view_stays_active_when_agent_disappears_kb_still_shows() {
+        let d = tempfile::tempdir().unwrap();
+        let seg = d.path().join("kb").join("project");
+        std::fs::create_dir_all(&seg).unwrap();
+        std::fs::write(seg.join("k1"), r#"{"content":"x","class":"log","provenance":{}}"#).unwrap();
+
+        let mut app = App::new(d.path().to_path_buf());
+        app.apply_snapshot(make_snapshot(&["a"]));
+        app.view = View::Memory;
+
+        // Agent "a" disappears — view must stay Memory (KB is still browsable).
+        app.apply_snapshot(make_snapshot(&[]));
+        assert_eq!(app.view, View::Memory,
+            "Memory view must stay active when selected agent disappears — KB still browsable");
+        assert!(!app.memory_view.kb_segments.is_empty(),
+            "KB segments must remain loaded even with no selected agent");
     }
 }

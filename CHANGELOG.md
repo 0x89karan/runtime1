@@ -3,6 +3,34 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.5] - 2026-06-18 (v0.31.0)
+
+Memory view for `agentctl watch`. The new `[m]emory` view lets operators browse
+per-agent short-term and long-term memory stores, plus shared KB segments, all
+with provenance metadata. Data flows through the existing FUSE virtual filesystem
+— no direct redb dependency in agentctl. Degrades gracefully when Phase 5 is absent.
+
+- **`agentctl/src/watch/memory.rs`** — new module: `MemoryEntry`, `AgentMemory`,
+  `KbSegment` data types; `read_agent_memory()`/`read_kb_segments()` FUSE readers;
+  `filter_entries()`/`filter_short_term()` client-side substring filters;
+  `MAX_DISPLAY_ENTRIES = 20` / `MAX_SEARCH_ENTRIES = 100` constants.
+- **`View::Memory`** in `agentctl watch`; `[m]` from Dashboard; true-tab pane model
+  (`[Tab]` cycles Short-term → Long-term → KB); per-pane scroll offsets preserved
+  across tab switches; `[/]` search mode filters all three panes; `Esc`/`q` back.
+- **`MemoryPaneState`** — `search_query`, `search_active`, `short_term_scroll`,
+  `long_term_scroll`, `kb_scroll`, `pane`, `absence`; `active_scroll_mut()` helper.
+- **KB pane** always accessible regardless of selected agent — KB data is persistent
+  and independent of live agent state.
+- **Absence handling** — `MemoryAbsence::Subsystem` when `/agents/kb/` missing;
+  `MemoryAbsence::Empty` when present but no segments written; documented messages
+  with doc pointer in both cases.
+- **Provenance formatting** — nanosecond u64 `ts` (long-term) → RFC3339 UTC via
+  chrono; RFC3339 string `ts` (KB) displayed as-is with sub-second stripped;
+  `[log]`/`[scratch]`/`[canon]` class badges on KB segments.
+- **Plain mode** — `render_plain` dumps all agents' short-term + long-term (first 5
+  entries each) plus all KB segments; skips cleanly when Phase 5 absent.
+- **727 tests** (+55 new: 22 memory.rs, 14 app.rs, 13 views.rs, 3 mod.rs, 3 other).
+
 ## [p6.4] - 2026-06-18 (v0.30.0)
 
 Topology view for `agentctl watch`. The new `[t]opology` view renders the live spawn tree

@@ -138,7 +138,14 @@ into `AgentInfo.parent_id`; `agentctl/src/watch/topology.rs` with `TopologyGraph
 `parse_message_edges()`; `View::Topology` in `agentctl watch` (`[t]` key; `Esc`/`q` back to
 Dashboard; ↑/↓/j/k scroll; fixed legend footer; min 60 cols guard); `--log-path` CLI flag for message
 edge data; plain-mode topology section; `coordinator-demo.agents.toml` acceptance fixture; 455 tests.
-**Next: p6.5 — memory view — see `docs/ROADMAP.md`.**
+**p6.5 complete (v0.31.0).** Memory view for `agentctl watch`: `agentctl/src/watch/memory.rs` new module
+with `MemoryEntry`/`AgentMemory`/`KbSegment` data types; `read_agent_memory()`/`read_kb_segments()` FUSE
+readers; `filter_entries()`/`filter_short_term()` client-side substring filters;
+`MAX_DISPLAY_ENTRIES=20`/`MAX_SEARCH_ENTRIES=100`; `View::Memory` TUI with `[m]` key; true-tab pane model
+(Short-term/Long-term/KB) with per-pane scroll; `[/]` search; KB always accessible without live agent;
+`MemoryAbsence::Subsystem`/`Empty` graceful degradation; ns u64 → RFC3339 provenance via chrono;
+`[log]`/`[scratch]`/`[canon]` class badges; plain-mode memory dump; 727 tests.
+**Next: p6.6 — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

@@ -13,11 +13,12 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 pub mod app;
+pub mod memory;
 pub mod reader;
 pub mod topology;
 pub mod views;
 
-use app::{App, View};
+use app::{App, MemoryPane, View};
 use reader::load_snapshot;
 
 #[derive(clap::Args)]
@@ -141,7 +142,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
                     }
                     // Capture view BEFORE dispatch: q should quit only if we
                     // were already on the Dashboard, not if we just navigated
-                    // back to it from AgentDetail/System/Topology.
+                    // back to it from AgentDetail/System/Topology/Memory.
                     let was_dashboard = app.view == View::Dashboard;
                     match app.view {
                         View::Dashboard => handle_dashboard_key(key.code, &mut app),
@@ -167,6 +168,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
                                 _ => {}
                             }
                         }
+                        View::Memory => handle_memory_key(key.code, &mut app),
                     }
                     if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
                         break;
@@ -185,6 +187,47 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
     Ok(())
 }
 
+fn handle_memory_key(code: KeyCode, app: &mut App) {
+    match code {
+        // Search mode: [/] enters, Esc exits + clears query.
+        KeyCode::Char('/') if !app.memory_view.search_active => {
+            app.memory_view.search_active = true;
+        }
+        KeyCode::Esc if app.memory_view.search_active => {
+            app.memory_view.search_active = false;
+            app.memory_view.search_query.clear();
+        }
+        // Typed characters → query while in search mode.
+        KeyCode::Char(c) if app.memory_view.search_active => {
+            app.memory_view.search_query.push(c);
+        }
+        KeyCode::Backspace if app.memory_view.search_active => {
+            app.memory_view.search_query.pop();
+        }
+        // Pane cycling (true-tab model — each pane keeps its own scroll).
+        KeyCode::Tab if !app.memory_view.search_active => {
+            app.memory_view.pane = match app.memory_view.pane {
+                MemoryPane::ShortTerm => MemoryPane::LongTerm,
+                MemoryPane::LongTerm  => MemoryPane::Kb,
+                MemoryPane::Kb        => MemoryPane::ShortTerm,
+            };
+        }
+        // Per-pane scroll.
+        KeyCode::Up | KeyCode::Char('k') if !app.memory_view.search_active => {
+            let s = app.memory_view.active_scroll_mut();
+            *s = s.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if !app.memory_view.search_active => {
+            *app.memory_view.active_scroll_mut() += 1;
+        }
+        // Back to dashboard.
+        KeyCode::Esc | KeyCode::Char('q') if !app.memory_view.search_active => {
+            app.view = View::Dashboard;
+        }
+        _ => {}
+    }
+}
+
 fn handle_dashboard_key(code: KeyCode, app: &mut App) {
     match code {
         KeyCode::Up | KeyCode::Char('k')   => app.select_prev(),
@@ -196,6 +239,16 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App) {
         }
         KeyCode::Char('s') => app.view = View::System,
         KeyCode::Char('t') => { app.view = View::Topology; app.topology_scroll = 0; }
+        KeyCode::Char('m') => {
+            app.view = View::Memory;
+            // Reset memory navigation state on every entry.
+            app.memory_view.short_term_scroll = 0;
+            app.memory_view.long_term_scroll  = 0;
+            app.memory_view.kb_scroll         = 0;
+            app.memory_view.pane              = MemoryPane::ShortTerm;
+            app.memory_view.search_query.clear();
+            app.memory_view.search_active     = false;
+        }
         _ => {}
     }
 }
@@ -206,7 +259,8 @@ mod tests {
 
     use crossterm::event::KeyCode;
 
-    use super::{handle_dashboard_key, App, View};
+    use super::{handle_dashboard_key, handle_memory_key, App, View};
+    use crate::watch::app::MemoryPane;
     use crate::watch::reader::{AgentInfo, BudgetKind, Snapshot};
 
     fn make_snapshot(ids: &[&str]) -> Snapshot {
@@ -298,5 +352,120 @@ mod tests {
         handle_dashboard_key(KeyCode::F(1), &mut app);
         assert_eq!(app.view, View::Dashboard);
         assert_eq!(app.selected_id, original_id);
+    }
+
+    #[test]
+    fn dashboard_key_m_switches_to_memory_view() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        handle_dashboard_key(KeyCode::Char('m'), &mut app);
+        assert_eq!(app.view, View::Memory);
+    }
+
+    // ── handle_memory_key ────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_key_slash_enters_search_mode() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        assert!(!app.memory_view.search_active);
+        handle_memory_key(KeyCode::Char('/'), &mut app);
+        assert!(app.memory_view.search_active, "/ must activate search mode");
+    }
+
+    #[test]
+    fn memory_key_esc_exits_search_mode_and_clears_query() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.memory_view.search_active = true;
+        app.memory_view.search_query  = "foo".to_string();
+        handle_memory_key(KeyCode::Esc, &mut app);
+        assert!(!app.memory_view.search_active, "Esc must exit search mode");
+        assert!(app.memory_view.search_query.is_empty(), "Esc must clear query");
+    }
+
+    #[test]
+    fn memory_key_char_appends_to_query_when_searching() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.memory_view.search_active = true;
+        app.memory_view.search_query  = "fo".to_string();
+        handle_memory_key(KeyCode::Char('o'), &mut app);
+        assert_eq!(app.memory_view.search_query, "foo");
+    }
+
+    #[test]
+    fn memory_key_backspace_pops_query_char() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.memory_view.search_active = true;
+        app.memory_view.search_query  = "foo".to_string();
+        handle_memory_key(KeyCode::Backspace, &mut app);
+        assert_eq!(app.memory_view.search_query, "fo");
+    }
+
+    #[test]
+    fn memory_key_tab_cycles_shortterm_longterm_kb() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        assert_eq!(app.memory_view.pane, MemoryPane::ShortTerm);
+        handle_memory_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.memory_view.pane, MemoryPane::LongTerm);
+        handle_memory_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.memory_view.pane, MemoryPane::Kb);
+        handle_memory_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.memory_view.pane, MemoryPane::ShortTerm, "tab must wrap around");
+    }
+
+    #[test]
+    fn memory_key_up_decrements_active_pane_scroll() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.memory_view.short_term_scroll = 3;
+        handle_memory_key(KeyCode::Up, &mut app);
+        assert_eq!(app.memory_view.short_term_scroll, 2);
+    }
+
+    #[test]
+    fn memory_key_scroll_saturates_at_zero() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.memory_view.short_term_scroll = 0;
+        handle_memory_key(KeyCode::Char('k'), &mut app);
+        assert_eq!(app.memory_view.short_term_scroll, 0, "scroll must not underflow");
+    }
+
+    #[test]
+    fn memory_key_j_increments_active_pane_scroll() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        handle_memory_key(KeyCode::Char('j'), &mut app);
+        assert_eq!(app.memory_view.short_term_scroll, 1);
+    }
+
+    #[test]
+    fn memory_key_q_returns_to_dashboard() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Memory;
+        handle_memory_key(KeyCode::Char('q'), &mut app);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn memory_key_esc_returns_to_dashboard_when_not_searching() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Memory;
+        handle_memory_key(KeyCode::Esc, &mut app);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn app_memory_state_resets_on_m_key() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        // Pre-set stale state.
+        app.memory_view.short_term_scroll = 10;
+        app.memory_view.long_term_scroll  = 5;
+        app.memory_view.kb_scroll         = 3;
+        app.memory_view.search_query      = "old query".to_string();
+        app.memory_view.search_active     = true;
+        handle_dashboard_key(KeyCode::Char('m'), &mut app);
+        assert_eq!(app.memory_view.short_term_scroll, 0, "short_term_scroll must reset");
+        assert_eq!(app.memory_view.long_term_scroll,  0, "long_term_scroll must reset");
+        assert_eq!(app.memory_view.kb_scroll,         0, "kb_scroll must reset");
+        assert!(app.memory_view.search_query.is_empty(), "search_query must clear");
+        assert!(!app.memory_view.search_active,           "search_active must clear");
+        assert_eq!(app.memory_view.pane, crate::watch::app::MemoryPane::ShortTerm,
+            "pane must reset to ShortTerm");
     }
 }
