@@ -313,7 +313,7 @@ pub fn cap_add_allowed_by_suggestion(cap: &Capability, suggested: &[Capability])
 }
 
 /// Format a `Capability` as a human-readable CLI alias string for error messages.
-fn format_cap(cap: &Capability) -> String {
+pub(crate) fn format_cap(cap: &Capability) -> String {
     match cap {
         Capability::FsRead { prefix } => format!("fs-read:{prefix}"),
         Capability::FsWrite { prefix } => format!("fs-write:{prefix}"),
@@ -329,7 +329,7 @@ fn format_cap(cap: &Capability) -> String {
 }
 
 /// Resolve the agentd binary path.
-fn resolve_agentd(override_path: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_agentd(override_path: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
     if let Some(p) = override_path {
         if !p.exists() {
             anyhow::bail!(
@@ -372,7 +372,7 @@ fn resolve_agentd(override_path: &Option<PathBuf>) -> anyhow::Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn exec_agentd(agentd: &Path, config_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn exec_agentd(agentd: &Path, config_path: &Path) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt as _;
     let err = std::process::Command::new(agentd).arg(config_path).exec();
     Err(anyhow::anyhow!(
@@ -382,7 +382,7 @@ fn exec_agentd(agentd: &Path, config_path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn exec_agentd(agentd: &Path, config_path: &Path) -> anyhow::Result<()> {
+pub(crate) fn exec_agentd(agentd: &Path, config_path: &Path) -> anyhow::Result<()> {
     let status = std::process::Command::new(agentd)
         .arg(config_path)
         .status()

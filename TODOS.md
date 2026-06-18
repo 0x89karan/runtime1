@@ -221,6 +221,21 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - Fix (or document): either treat empty-ports `Net` as "unrestricted but acknowledged" (add a warn event),
   or change the semantics to treat empty ports as equivalent to `IsolateNetwork`. Decide in Phase 5.
 
+## Phase 6 — Open (deferred from p6.6 adversarial review)
+
+**p6.6-ar-01 (P3) — `execute_pending_spawn` leaks a NamedTempFile in `/tmp`**
+- `agentctl/src/watch/mod.rs:execute_pending_spawn`: `tmpfile.keep()` makes the tempfile
+  permanent. On every spawn, a `/tmp/<random>` agent config is left behind and never cleaned up.
+  Single-tenant tool; no secrets in the file. Accepted in QA but noted for housekeeping.
+- Fix: write the config to a deterministic path (e.g. `~/.agentos/last-spawn.toml`) and
+  overwrite on each spawn; or pass the config via stdin/env rather than a file.
+
+**p6.6-ar-02 (P3) — Template picker does not scroll to keep `template_idx` in view**
+- `views.rs:render_spawn`: the picker renders a fixed window; if `template_idx` scrolls out
+  of the visible region, the selected template is invisible.
+- Fix: track a `template_scroll_offset` that follows `template_idx` (clamp to keep the selected
+  row in the visible window). Deferred to next surface polish pass.
+
 ## Phase 0 — Technical Debt
 
 **~~P2 — Sync I/O in native tool impls (p0.5)~~** ✓ Done in p2.5.

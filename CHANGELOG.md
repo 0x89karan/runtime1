@@ -3,6 +3,45 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.6] - 2026-06-18 (v0.32.0)
+
+Spawn view for `agentctl watch`. The new `[n]ew` view is the first interactive/write
+form in the TUI — it lets the operator pick a template, fill in a task, toggle
+capability grants (pre-checked from the template's `suggested_caps`, deny-by-default),
+preview the generated `agent.toml`, then spawn agentd (mode a: generate-and-exec).
+
+- **`agentctl/src/watch/spawn.rs`** — new module: `SpawnTemplate` (name, source,
+  description, showcases, suggested_caps); `load_spawn_templates()` (lazy via
+  `TemplateResolver`); `display_cap()` struct-form formatter ("FsRead {/workspace}").
+- **`View::Spawn`** in `agentctl watch`; `[n]` from Dashboard; `[Tab]` cycles through
+  `TemplatePicker → TaskField → CapToggles → ActionGenerate → ActionSpawn → wrap`.
+- **`SpawnViewState`** — lazy-loaded templates (once on first entry), cap toggles
+  `Vec<(Capability, String, bool)>` (all pre-checked), `task_input`, `preview`,
+  `result_msg`, `pending_exec: Option<PendingSpawn>`.
+- **Key bindings** — `[g]` generate preview; `[r]` spawn (sets `pending_exec`);
+  `Esc` in TaskField defocuses (does not exit view); `Esc`/`q` elsewhere back to Dashboard.
+- **`pending_exec` pattern** — `handle_spawn_key` sets `pending_exec`; `run_tui`
+  detects it after the event match, breaks the loop, drops `CleanupGuard` (restoring
+  the terminal), then calls `execute_pending_spawn` which resolves the template,
+  writes a `NamedTempFile`, and `exec`s agentd (Unix `execvp`, replacing the TUI process).
+- **`render_spawn()`** in `views.rs` — 5-row layout (header / picker / task / mid-split /
+  footer); focused section border highlighted in Yellow; action buttons in mid-split right
+  pane; preview shows first 20 lines of generated TOML.
+- **Plain mode** — `render_plain` appends a `spawn:` section listing the template catalogue
+  (loaded only if the Spawn view was entered; otherwise shows "none loaded").
+- **`agentctl/src/spawn.rs`** — `exec_agentd`, `resolve_agentd`, `format_cap` promoted
+  to `pub(crate)` for reuse from the watch module.
+- **Adversarial review fixes** (landed in the same increment):
+  - Cap toggles now revoke baseline caps — `PendingSpawn` gains `disabled_caps: Vec<Capability>`;
+    `do_generate` and `execute_pending_spawn` strip them via `caps.retain(|c| !disabled.contains(c))`
+    so unchecking a suggested cap that is also in the template `[capabilities]` section actually
+    removes it from the generated TOML.
+  - `flush()` added before `keep()` in `execute_pending_spawn` — matches CLI `spawn.rs:173`;
+    without it the OS could discard buffered TOML bytes when `execvp` replaces the process.
+- **793 tests** (+45 new: 8 watch/spawn.rs, 9 app.rs, 8 mod.rs, 0 views.rs — render
+  functions tested via render_plain and existing TUI infrastructure; +21 from adversarial
+  review coverage: disabled_caps, flush guard, r/g keystroke passthrough, API key guard).
+
 ## [p6.5] - 2026-06-18 (v0.31.0)
 
 Memory view for `agentctl watch`. The new `[m]emory` view lets operators browse

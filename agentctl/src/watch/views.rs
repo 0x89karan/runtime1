@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Paragraph, Row, Table},
 };
 
-use super::app::{App, MemoryAbsence, MemoryPane, View};
+use super::app::{App, MemoryAbsence, MemoryPane, SpawnFocus, View};
 use super::memory::{
     filter_entries, filter_short_term, read_agent_memory, read_kb_segments, MAX_DISPLAY_ENTRIES,
     MAX_SEARCH_ENTRIES,
@@ -30,6 +30,7 @@ pub fn render(f: &mut Frame, app: &App) {
         View::System      => render_system(f, app),
         View::Topology    => render_topology(f, app),
         View::Memory      => render_memory(f, app),
+        View::Spawn       => render_spawn(f, app),
     }
 }
 
@@ -117,7 +118,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     }
 
     // Footer
-    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  q quit ";
+    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  [n]ew  q quit ";
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_area,
@@ -484,6 +485,164 @@ fn render_memory_kb_pane(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+fn render_spawn(f: &mut Frame, app: &App) {
+    let area = f.area();
+    // Need at least 4 rows for a useful layout.
+    if area.height < 4 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),  // header
+            Constraint::Length(6),  // template picker
+            Constraint::Length(3),  // task input
+            Constraint::Min(4),     // cap toggles + preview split
+            Constraint::Length(1),  // footer
+        ])
+        .split(area);
+
+    let (header_area, picker_area, task_area, mid_area, footer_area) =
+        (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]);
+
+    // Header
+    f.render_widget(
+        Paragraph::new(" spawn agent ")
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        header_area,
+    );
+
+    // Template picker
+    let sv = &app.spawn_view;
+    let picker_title = if sv.load_error.is_some() {
+        " TEMPLATE (load error) ".to_string()
+    } else {
+        format!(" TEMPLATE ({}/{}) ", sv.template_idx + 1, sv.templates.len().max(1))
+    };
+    let picker_focus = sv.focus == SpawnFocus::TemplatePicker;
+    let picker_block = Block::default()
+        .borders(Borders::ALL)
+        .title(picker_title)
+        .border_style(if picker_focus {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+
+    let picker_lines: Vec<Line> = if let Some(err) = &sv.load_error {
+        vec![Line::from(format!("  error: {}", sanitize(err)))]
+    } else if sv.templates.is_empty() {
+        vec![Line::from("  (no templates — run `agentctl list-templates` to check)")]
+    } else {
+        sv.templates.iter().enumerate().flat_map(|(i, t)| {
+            use agentd::template::TemplateSource;
+            let marker = if i == sv.template_idx { "> " } else { "  " };
+            let source_badge = match t.source {
+                TemplateSource::User => " [user]",
+                TemplateSource::Repo => " [repo]",
+            };
+            let style = if i == sv.template_idx {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let mut lines = vec![Line::styled(
+                format!("{marker}{}{source_badge} — {}", t.name, sanitize(&t.description)),
+                style,
+            )];
+            // Show showcases as an indented sub-line for the selected template.
+            if i == sv.template_idx && !t.showcases.is_empty() {
+                lines.push(Line::from(format!("    {}", sanitize(&t.showcases))));
+            }
+            lines
+        }).collect()
+    };
+    f.render_widget(Paragraph::new(picker_lines).block(picker_block), picker_area);
+
+    // Task input
+    let task_focus = sv.focus == SpawnFocus::TaskField;
+    let task_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" TASK ")
+        .border_style(if task_focus {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        });
+    let task_text = if task_focus {
+        format!("{}_", sv.task_input)
+    } else if sv.task_input.is_empty() {
+        "(empty — Tab to focus, type task description)".to_string()
+    } else {
+        sv.task_input.clone()
+    };
+    f.render_widget(Paragraph::new(task_text).block(task_block), task_area);
+
+    // Split mid area: left = cap toggles, right = preview
+    let mid_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(mid_area);
+    let (cap_area, preview_area) = (mid_chunks[0], mid_chunks[1]);
+
+    // Cap toggles
+    let cap_focus = sv.focus == SpawnFocus::CapToggles;
+    let cap_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" CAPABILITIES ")
+        .border_style(if cap_focus { Style::default().fg(Color::Yellow) } else { Style::default() });
+    let cap_lines: Vec<Line> = if sv.cap_toggles.is_empty() {
+        vec![Line::from("  (no suggested caps)")]
+    } else {
+        sv.cap_toggles.iter().enumerate().map(|(i, (_, label, enabled))| {
+            let cursor = if cap_focus && i == sv.cap_idx { ">" } else { " " };
+            let check  = if *enabled { "[x]" } else { "[ ]" };
+            Line::from(format!(" {cursor} {check} {}", sanitize(label)))
+        }).collect()
+    };
+    f.render_widget(Paragraph::new(cap_lines).block(cap_block), cap_area);
+
+    // Preview pane — generated agent.toml or action buttons
+    let gen_focus   = sv.focus == SpawnFocus::ActionGenerate;
+    let spawn_focus = sv.focus == SpawnFocus::ActionSpawn;
+    let preview_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" PREVIEW / ACTIONS ");
+    let preview_lines: Vec<Line> = {
+        let mut lines: Vec<Line> = vec![];
+        // Action buttons row
+        let gen_style   = if gen_focus   { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default() };
+        let spawn_style = if spawn_focus { Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)  } else { Style::default() };
+        lines.push(Line::from(vec![
+            Span::styled(" [g] Generate ", gen_style),
+            Span::raw("  "),
+            Span::styled(" [r] Spawn ", spawn_style),
+        ]));
+        lines.push(Line::from(""));
+        // Result / error message
+        if let Some(msg) = &sv.result_msg {
+            lines.push(Line::from(format!("  {}", sanitize(msg))));
+            lines.push(Line::from(""));
+        }
+        // Generated preview
+        if let Some(preview) = &sv.preview {
+            for l in preview.lines().take(20) {
+                lines.push(Line::from(format!("  {}", sanitize(l))));
+            }
+        }
+        lines
+    };
+    f.render_widget(Paragraph::new(preview_lines).block(preview_block), preview_area);
+
+    // Footer
+    let hints = " [Tab] focus  [g] generate  [r] spawn  Esc/q back ";
+    f.render_widget(
+        Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        footer_area,
+    );
+}
+
 /// Render a plain-text snapshot to a string (for --plain mode, no ANSI).
 pub fn render_plain(app: &App) -> String {
     let mut out = String::new();
@@ -563,6 +722,16 @@ pub fn render_plain(app: &App) -> String {
                 let preview = &e.content[..e.content.floor_char_boundary(80.min(e.content.len()))];
                 out.push_str(&format!("      {}: {}\n", sanitize(&e.key), sanitize(preview)));
             }
+        }
+    }
+    // Spawn section — template catalogue summary.
+    out.push_str("spawn:\n");
+    if app.spawn_view.templates.is_empty() {
+        out.push_str("  templates: (none loaded — enter Spawn view in TUI to load)\n");
+    } else {
+        out.push_str(&format!("  templates: {}\n", app.spawn_view.templates.len()));
+        for t in &app.spawn_view.templates {
+            out.push_str(&format!("    {} — {}\n", t.name, sanitize(&t.description)));
         }
     }
     out

@@ -688,7 +688,7 @@ available only via an attached Layer-2 MCP KB. **Acceptance:** the journaler's l
 entries and a shared `project:` segment are browsable with provenance; the tab degrades
 gracefully ("memory subsystem not present") when Phase 5 is absent.
 
-### ▢ p6.6 — Spawn view
+### ▣ p6.6 — Spawn view
 **Depends on:** p6.2, p6.3. Template picker → task field → capability toggles
 (pre-checked from the template, deny-by-default) → preview generated `agent.toml` →
 spawn. Mode (a) generate-and-exec ships here; mode (b) inject-into-running-scheduler

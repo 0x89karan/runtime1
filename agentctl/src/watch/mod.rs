@@ -15,10 +15,11 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 pub mod app;
 pub mod memory;
 pub mod reader;
+pub mod spawn;
 pub mod topology;
 pub mod views;
 
-use app::{App, MemoryPane, View};
+use app::{App, MemoryPane, PendingSpawn, SpawnFocus, View};
 use reader::load_snapshot;
 
 #[derive(clap::Args)]
@@ -169,8 +170,13 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
                             }
                         }
                         View::Memory => handle_memory_key(key.code, &mut app),
+                        View::Spawn  => handle_spawn_key(key.code, &mut app),
                     }
                     if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
+                        break;
+                    }
+                    // Pending exec: TUI loop exits; terminal is restored below.
+                    if app.spawn_view.pending_exec.is_some() {
                         break;
                     }
                 }
@@ -180,9 +186,14 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
         }
     }
 
-    // Restore the original panic hook — the terminal-restore hook is no longer
-    // needed once the event loop exits; CleanupGuard::drop handles cleanup.
+    // Force terminal restore before any pending exec replaces the process.
+    drop(_guard);
     let _ = std::panic::take_hook();
+
+    // Pending spawn: generate agent.toml, write to tempfile, exec agentd.
+    if let Some(pending) = app.spawn_view.pending_exec.take() {
+        execute_pending_spawn(pending)?;
+    }
 
     Ok(())
 }
@@ -249,8 +260,101 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App) {
             app.memory_view.search_query.clear();
             app.memory_view.search_active     = false;
         }
+        KeyCode::Char('n') => {
+            app.view = View::Spawn;
+            // Lazy-load templates on first entry.
+            app.spawn_view.load();
+        }
         _ => {}
     }
+}
+
+fn handle_spawn_key(code: KeyCode, app: &mut App) {
+    let focus = app.spawn_view.focus.clone();
+    match (&focus, code) {
+        // TaskField captures all char input; Esc defocuses, Enter tabs forward.
+        (SpawnFocus::TaskField, KeyCode::Char(c)) => {
+            app.spawn_view.task_input.push(c);
+        }
+        (SpawnFocus::TaskField, KeyCode::Backspace) => {
+            app.spawn_view.task_input.pop();
+        }
+        (SpawnFocus::TaskField, KeyCode::Esc) => {
+            app.spawn_view.focus = SpawnFocus::TemplatePicker;
+        }
+        (SpawnFocus::TaskField, KeyCode::Enter) => {
+            app.spawn_view.focus_next();
+        }
+        // Global: Tab cycles focus.
+        (_, KeyCode::Tab) => {
+            app.spawn_view.focus_next();
+        }
+        // Global: Esc/q back to Dashboard (only when TaskField is not focused —
+        // TaskField Esc is handled above).
+        (_, KeyCode::Esc) | (_, KeyCode::Char('q')) => {
+            app.view = View::Dashboard;
+        }
+        // Template picker navigation.
+        (SpawnFocus::TemplatePicker, KeyCode::Up | KeyCode::Char('k')) => {
+            app.spawn_view.select_template_prev();
+        }
+        (SpawnFocus::TemplatePicker, KeyCode::Down | KeyCode::Char('j')) => {
+            app.spawn_view.select_template_next();
+        }
+        // Cap toggle navigation and toggle.
+        (SpawnFocus::CapToggles, KeyCode::Up | KeyCode::Char('k')) => {
+            app.spawn_view.cap_prev();
+        }
+        (SpawnFocus::CapToggles, KeyCode::Down | KeyCode::Char('j')) => {
+            app.spawn_view.cap_next();
+        }
+        (SpawnFocus::CapToggles, KeyCode::Char(' ') | KeyCode::Enter) => {
+            let idx = app.spawn_view.cap_idx;
+            app.spawn_view.toggle_cap_at(idx);
+        }
+        // Generate action: [g] shortcut (outside TaskField) or Enter on button.
+        (_, KeyCode::Char('g')) => {
+            app.spawn_view.do_generate();
+        }
+        (SpawnFocus::ActionGenerate, KeyCode::Enter | KeyCode::Char(' ')) => {
+            app.spawn_view.do_generate();
+        }
+        // Spawn action: [r] shortcut (outside TaskField) or Enter on button.
+        (_, KeyCode::Char('r')) => {
+            app.spawn_view.do_spawn();
+        }
+        (SpawnFocus::ActionSpawn, KeyCode::Enter | KeyCode::Char(' ')) => {
+            app.spawn_view.do_spawn();
+        }
+        _ => {}
+    }
+}
+
+/// Called after the TUI loop exits when `pending_exec` is set.
+/// Resolves the template, writes a temp config, and execs agentd.
+fn execute_pending_spawn(pending: PendingSpawn) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let resolver = crate::build_resolver(None, None);
+    let (cfg, _) = resolver.resolve(&pending.template_name)?;
+    let task_str = if pending.task.is_empty() { None } else { Some(pending.task.as_str()) };
+    let mut config = cfg.to_agent_config(task_str, pending.extra_caps)?;
+    // Strip caps the user explicitly disabled so unchecking a baseline cap revokes it.
+    if let Some(agent) = config.agent.as_mut() {
+        if let Some(caps) = agent.capabilities.as_mut() {
+            caps.retain(|c| !pending.disabled_caps.contains(c));
+        }
+    }
+    let toml_str = toml::to_string_pretty(&config)
+        .map_err(|e| anyhow::anyhow!("config serialization failed: {e}"))?;
+    let mut tmpfile = tempfile::NamedTempFile::new()
+        .context("creating temp config file")?;
+    tmpfile.write_all(toml_str.as_bytes())
+        .context("writing temp config")?;
+    tmpfile.flush()
+        .context("flushing temp config")?;
+    let (_, path) = tmpfile.keep().context("keeping temp file")?;
+    let agentd = crate::spawn::resolve_agentd(&None)?;
+    crate::spawn::exec_agentd(&agentd, &path)
 }
 
 #[cfg(test)]
@@ -259,8 +363,8 @@ mod tests {
 
     use crossterm::event::KeyCode;
 
-    use super::{handle_dashboard_key, handle_memory_key, App, View};
-    use crate::watch::app::MemoryPane;
+    use super::{handle_dashboard_key, handle_memory_key, handle_spawn_key, App, View};
+    use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::reader::{AgentInfo, BudgetKind, Snapshot};
 
     fn make_snapshot(ids: &[&str]) -> Snapshot {
@@ -359,6 +463,16 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         handle_dashboard_key(KeyCode::Char('m'), &mut app);
         assert_eq!(app.view, View::Memory);
+    }
+
+    #[test]
+    fn dashboard_key_n_switches_to_spawn_view() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        handle_dashboard_key(KeyCode::Char('n'), &mut app);
+        assert_eq!(app.view, View::Spawn,
+            "[n] must switch to Spawn view");
+        assert!(app.spawn_view.loaded,
+            "spawn_view.load() must have been called on entry");
     }
 
     // ── handle_memory_key ────────────────────────────────────────────────────
@@ -467,5 +581,208 @@ mod tests {
         assert!(!app.memory_view.search_active,           "search_active must clear");
         assert_eq!(app.memory_view.pane, crate::watch::app::MemoryPane::ShortTerm,
             "pane must reset to ShortTerm");
+    }
+
+    // ── handle_spawn_key ────────────────────────────────────────────────────
+
+    #[test]
+    fn spawn_key_esc_returns_to_dashboard_when_not_in_task_field() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        app.spawn_view.focus = SpawnFocus::TemplatePicker;
+        handle_spawn_key(KeyCode::Esc, &mut app);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn spawn_key_q_returns_to_dashboard_when_not_in_task_field() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        app.spawn_view.focus = SpawnFocus::ActionGenerate;
+        handle_spawn_key(KeyCode::Char('q'), &mut app);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn spawn_key_q_appends_to_task_when_task_field_focused() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        app.spawn_view.focus = SpawnFocus::TaskField;
+        handle_spawn_key(KeyCode::Char('q'), &mut app);
+        assert_eq!(app.view, View::Spawn, "view must stay Spawn while in task field");
+        assert_eq!(app.spawn_view.task_input, "q", "char must append to task input");
+    }
+
+    #[test]
+    fn spawn_key_esc_defocuses_task_field() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        app.spawn_view.focus = SpawnFocus::TaskField;
+        handle_spawn_key(KeyCode::Esc, &mut app);
+        assert_eq!(app.view, View::Spawn, "Esc in task field must not exit spawn view");
+        assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker,
+            "Esc in task field must defocus to TemplatePicker");
+    }
+
+    #[test]
+    fn spawn_key_tab_cycles_focus() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        // inject a cap so CapToggles is reachable
+        app.spawn_view.cap_toggles = vec![(
+            agentd::capability::Capability::Spawn,
+            "Spawn".to_string(),
+            true,
+        )];
+        assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker);
+        handle_spawn_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.spawn_view.focus, SpawnFocus::TaskField);
+        handle_spawn_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.spawn_view.focus, SpawnFocus::CapToggles);
+        handle_spawn_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.spawn_view.focus, SpawnFocus::ActionGenerate);
+        handle_spawn_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.spawn_view.focus, SpawnFocus::ActionSpawn);
+        handle_spawn_key(KeyCode::Tab, &mut app);
+        assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker, "must wrap");
+    }
+
+    #[test]
+    fn spawn_key_backspace_removes_last_char_from_task() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TaskField;
+        app.spawn_view.task_input = "hello".to_string();
+        handle_spawn_key(KeyCode::Backspace, &mut app);
+        assert_eq!(app.spawn_view.task_input, "hell");
+    }
+
+    #[test]
+    fn spawn_key_space_toggles_cap_when_cap_toggles_focused() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::CapToggles;
+        app.spawn_view.cap_toggles = vec![(
+            agentd::capability::Capability::Spawn,
+            "Spawn".to_string(),
+            true,
+        )];
+        app.spawn_view.cap_idx = 0;
+        handle_spawn_key(KeyCode::Char(' '), &mut app);
+        assert!(!app.spawn_view.cap_toggles[0].2, "space must toggle cap off");
+    }
+
+    #[test]
+    fn spawn_key_enter_in_task_field_cycles_focus_forward() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TaskField;
+        // No cap_toggles — TaskField Enter skips to ActionGenerate.
+        handle_spawn_key(KeyCode::Enter, &mut app);
+        assert_eq!(app.spawn_view.focus, SpawnFocus::ActionGenerate,
+            "Enter in TaskField must advance focus (not exit view)");
+    }
+
+    #[test]
+    fn spawn_key_up_in_template_picker_calls_select_template_prev() {
+        use crate::watch::spawn::SpawnTemplate;
+        use agentd::template::TemplateSource;
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TemplatePicker;
+        app.spawn_view.templates = vec![
+            SpawnTemplate { name: "a".into(), source: TemplateSource::Repo,
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+            SpawnTemplate { name: "b".into(), source: TemplateSource::Repo,
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+        ];
+        app.spawn_view.template_idx = 1;
+        handle_spawn_key(KeyCode::Up, &mut app);
+        assert_eq!(app.spawn_view.template_idx, 0, "Up in TemplatePicker must decrement index");
+    }
+
+    #[test]
+    fn spawn_key_down_in_template_picker_calls_select_template_next() {
+        use crate::watch::spawn::SpawnTemplate;
+        use agentd::template::TemplateSource;
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TemplatePicker;
+        app.spawn_view.templates = vec![
+            SpawnTemplate { name: "a".into(), source: TemplateSource::Repo,
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+            SpawnTemplate { name: "b".into(), source: TemplateSource::Repo,
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+        ];
+        app.spawn_view.template_idx = 0;
+        handle_spawn_key(KeyCode::Down, &mut app);
+        assert_eq!(app.spawn_view.template_idx, 1, "Down in TemplatePicker must increment index");
+    }
+
+    #[test]
+    fn spawn_key_k_in_cap_toggles_calls_cap_prev() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::CapToggles;
+        app.spawn_view.cap_toggles = vec![
+            (agentd::capability::Capability::Spawn, "Spawn".to_string(), true),
+            (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
+        ];
+        app.spawn_view.cap_idx = 1;
+        handle_spawn_key(KeyCode::Char('k'), &mut app);
+        assert_eq!(app.spawn_view.cap_idx, 0, "'k' in CapToggles must call cap_prev");
+    }
+
+    #[test]
+    fn spawn_key_j_in_cap_toggles_calls_cap_next() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::CapToggles;
+        app.spawn_view.cap_toggles = vec![
+            (agentd::capability::Capability::Spawn, "Spawn".to_string(), true),
+            (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
+        ];
+        app.spawn_view.cap_idx = 0;
+        handle_spawn_key(KeyCode::Char('j'), &mut app);
+        assert_eq!(app.spawn_view.cap_idx, 1, "'j' in CapToggles must call cap_next");
+    }
+
+    #[test]
+    fn spawn_key_g_calls_do_generate_when_not_in_task_field() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TemplatePicker;
+        // No templates loaded — do_generate sets an error result_msg.
+        handle_spawn_key(KeyCode::Char('g'), &mut app);
+        assert!(app.spawn_view.result_msg.is_some(),
+            "'g' outside TaskField must invoke do_generate (result_msg set)");
+    }
+
+    #[test]
+    fn spawn_key_r_calls_do_spawn_when_not_in_task_field() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TemplatePicker;
+        // No templates loaded — do_spawn sets an error result_msg.
+        handle_spawn_key(KeyCode::Char('r'), &mut app);
+        assert!(app.spawn_view.result_msg.is_some(),
+            "'r' outside TaskField must invoke do_spawn (result_msg set)");
+    }
+
+    #[test]
+    fn spawn_key_r_appends_to_task_when_task_field_focused() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TaskField;
+        handle_spawn_key(KeyCode::Char('r'), &mut app);
+        assert_eq!(app.spawn_view.task_input, "r",
+            "Char('r') in TaskField must append to task input, not trigger do_spawn");
+        assert!(app.spawn_view.pending_exec.is_none(),
+            "Char('r') in TaskField must not set pending_exec");
+        assert!(app.spawn_view.result_msg.is_none(),
+            "Char('r') in TaskField must not set result_msg");
+    }
+
+    #[test]
+    fn spawn_key_g_appends_to_task_when_task_field_focused() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.spawn_view.focus = SpawnFocus::TaskField;
+        handle_spawn_key(KeyCode::Char('g'), &mut app);
+        assert_eq!(app.spawn_view.task_input, "g",
+            "Char('g') in TaskField must append to task input, not trigger do_generate");
+        assert!(app.spawn_view.preview.is_none(),
+            "Char('g') in TaskField must not trigger do_generate");
+        assert!(app.spawn_view.result_msg.is_none(),
+            "Char('g') in TaskField must not set result_msg");
     }
 }

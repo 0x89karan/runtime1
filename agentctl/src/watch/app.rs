@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
+use agentd::capability::Capability;
+
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
 use super::reader::{AgentInfo, Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox};
+use super::spawn::{load_spawn_templates, SpawnTemplate};
 use super::topology::{build_graph, TopologyGraph};
 
 /// Which view is currently displayed.
@@ -17,6 +20,260 @@ pub enum View {
     Topology,
     /// Browse per-agent and shared KB memory stores.
     Memory,
+    /// Form to pick a template, fill a task, toggle capabilities, and spawn an agent.
+    Spawn,
+}
+
+// ── Spawn view ───────────────────────────────────────────────────────────────
+
+/// Which form field has keyboard focus in the Spawn view.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum SpawnFocus {
+    #[default]
+    TemplatePicker,
+    TaskField,
+    CapToggles,
+    ActionGenerate,
+    ActionSpawn,
+}
+
+/// Pending exec action: set by `handle_spawn_key`, consumed by `run_tui`.
+///
+/// `run_tui` restores the terminal and then executes agentd when it finds this.
+#[derive(Debug, Clone)]
+pub struct PendingSpawn {
+    /// Name of the resolved template (used to construct the output filename).
+    pub template_name:  String,
+    /// Task string to inject.
+    pub task:           String,
+    /// Capabilities to add beyond the template baseline.
+    pub extra_caps:     Vec<Capability>,
+    /// Suggested caps the user explicitly unchecked — stripped from the template
+    /// baseline so the toggle semantics are "grant / revoke", not just "add".
+    pub disabled_caps:  Vec<Capability>,
+}
+
+/// UI state for the Spawn view.
+#[derive(Debug, Default)]
+pub struct SpawnViewState {
+    /// Loaded templates; empty until the view is first entered.
+    pub templates:      Vec<SpawnTemplate>,
+    /// `true` once `load_spawn_templates()` has been called at least once.
+    pub loaded:         bool,
+    /// Load error message, if any.
+    pub load_error:     Option<String>,
+    /// Index of the currently selected template.
+    pub template_idx:   usize,
+    /// Which form section has keyboard focus.
+    pub focus:          SpawnFocus,
+    /// Index of the highlighted capability toggle (when focus = CapToggles).
+    pub cap_idx:        usize,
+    /// Task text entered by the operator.
+    pub task_input:     String,
+    /// Per-capability toggle state: (cap, display_string, enabled).
+    pub cap_toggles:    Vec<(Capability, String, bool)>,
+    /// Generated `agent.toml` preview text (set by Generate action).
+    pub preview:        Option<String>,
+    /// Feedback message shown in the footer (error or success).
+    pub result_msg:     Option<String>,
+    /// Pending exec action.  When set, `run_tui` cleans up the terminal and
+    /// execs agentd.
+    pub pending_exec:   Option<PendingSpawn>,
+}
+
+impl SpawnViewState {
+    /// Load templates and build the initial cap-toggle list for the first template.
+    pub fn load(&mut self) {
+        if self.loaded { return; }
+        self.loaded = true;
+        let (templates, err) = load_spawn_templates();
+        self.load_error = err;
+        self.templates  = templates;
+        self.template_idx = 0;
+        self.rebuild_cap_toggles();
+    }
+
+    /// Rebuild `cap_toggles` from the currently selected template's `suggested_caps`.
+    pub fn rebuild_cap_toggles(&mut self) {
+        let caps = self
+            .templates
+            .get(self.template_idx)
+            .map(|t| t.suggested_caps.clone())
+            .unwrap_or_default();
+        self.cap_toggles = caps
+            .into_iter()
+            .map(|cap| {
+                let label = super::spawn::display_cap(&cap);
+                (cap, label, true) // all pre-checked
+            })
+            .collect();
+        self.cap_idx = 0;
+    }
+
+    /// The currently selected template, if any.
+    pub fn selected_template(&self) -> Option<&SpawnTemplate> {
+        self.templates.get(self.template_idx)
+    }
+
+    /// Move template selection up (saturating).
+    pub fn select_template_prev(&mut self) {
+        if self.template_idx > 0 {
+            self.template_idx -= 1;
+            self.rebuild_cap_toggles();
+            self.preview    = None;
+            self.result_msg = None;
+        }
+    }
+
+    /// Move template selection down (saturating).
+    pub fn select_template_next(&mut self) {
+        if !self.templates.is_empty()
+            && self.template_idx < self.templates.len() - 1
+        {
+            self.template_idx += 1;
+            self.rebuild_cap_toggles();
+            self.preview    = None;
+            self.result_msg = None;
+        }
+    }
+
+    /// Toggle the cap at `cap_idx` (or at a specific index).
+    pub fn toggle_cap_at(&mut self, idx: usize) {
+        if let Some((_, _, enabled)) = self.cap_toggles.get_mut(idx) {
+            *enabled = !*enabled;
+        }
+    }
+
+    /// Move cap selection up.
+    pub fn cap_prev(&mut self) {
+        if self.cap_idx > 0 { self.cap_idx -= 1; }
+    }
+
+    /// Move cap selection down.
+    pub fn cap_next(&mut self) {
+        if !self.cap_toggles.is_empty()
+            && self.cap_idx < self.cap_toggles.len() - 1
+        {
+            self.cap_idx += 1;
+        }
+    }
+
+    /// Collect the caps that are currently enabled.
+    pub fn enabled_caps(&self) -> Vec<Capability> {
+        self.cap_toggles
+            .iter()
+            .filter(|(_, _, on)| *on)
+            .map(|(cap, _, _)| cap.clone())
+            .collect()
+    }
+
+    /// Collect the suggested caps that the user explicitly unchecked.
+    pub fn disabled_caps(&self) -> Vec<Capability> {
+        self.cap_toggles
+            .iter()
+            .filter(|(_, _, on)| !*on)
+            .map(|(cap, _, _)| cap.clone())
+            .collect()
+    }
+
+    /// Cycle focus forward through the form sections.
+    pub fn focus_next(&mut self) {
+        self.focus = match self.focus {
+            SpawnFocus::TemplatePicker => SpawnFocus::TaskField,
+            SpawnFocus::TaskField      => {
+                if self.cap_toggles.is_empty() {
+                    SpawnFocus::ActionGenerate
+                } else {
+                    SpawnFocus::CapToggles
+                }
+            }
+            SpawnFocus::CapToggles     => SpawnFocus::ActionGenerate,
+            SpawnFocus::ActionGenerate => SpawnFocus::ActionSpawn,
+            SpawnFocus::ActionSpawn    => SpawnFocus::TemplatePicker,
+        };
+    }
+
+    /// Generate the `agent.toml` preview from the current form state.
+    pub fn do_generate(&mut self) {
+        let Some(template) = self.selected_template() else {
+            self.result_msg = Some("No template selected.".to_string());
+            return;
+        };
+        let task = if self.task_input.is_empty() {
+            None
+        } else {
+            Some(self.task_input.as_str())
+        };
+        // Re-resolve the full template config to call `to_agent_config`.
+        let resolver = crate::build_resolver(None, None);
+        match resolver.resolve(&template.name) {
+            Err(e) => {
+                self.result_msg = Some(format!("resolve error: {e:#}"));
+            }
+            Ok((cfg, _)) => {
+                let extra    = self.enabled_caps();
+                let disabled = self.disabled_caps();
+                match cfg.to_agent_config(task, extra) {
+                    Err(e) => {
+                        self.result_msg = Some(format!("config error: {e:#}"));
+                    }
+                    Ok(mut config) => {
+                        // Strip caps the user explicitly disabled from the template
+                        // baseline so the preview matches what execute_pending_spawn
+                        // will actually exec.
+                        if let Some(agent) = config.agent.as_mut() {
+                            if let Some(caps) = agent.capabilities.as_mut() {
+                                caps.retain(|c| !disabled.contains(c));
+                            }
+                        }
+                        match toml::to_string_pretty(&config) {
+                            Err(e) => {
+                                self.result_msg = Some(format!("toml error: {e:#}"));
+                            }
+                            Ok(toml_str) => {
+                                self.preview    = Some(toml_str);
+                                self.result_msg = Some("Preview generated. Press [r] to spawn.".to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Queue a spawn action for `run_tui` to execute (mode a: generate + exec).
+    pub fn do_spawn(&mut self) {
+        let template_name = match self.selected_template() {
+            Some(t) => t.name.clone(),
+            None    => { self.result_msg = Some("No template selected.".to_string()); return; }
+        };
+        if self.task_input.is_empty() {
+            // Check if template has a default task; if not, force Generate first.
+            let resolver = crate::build_resolver(None, None);
+            let has_default = resolver
+                .resolve(&template_name)
+                .ok()
+                .and_then(|(cfg, _)| cfg.agent.map(|a| !a.task.is_empty()))
+                .unwrap_or(false);
+            if !has_default {
+                self.result_msg = Some("Task required — fill in the task field and press [g] to generate first.".to_string());
+                return;
+            }
+        }
+        if std::env::var("ANTHROPIC_API_KEY").is_err() {
+            self.result_msg = Some("ANTHROPIC_API_KEY is not set — required by agentd.".to_string());
+            return;
+        }
+        let extra    = self.enabled_caps();
+        let disabled = self.disabled_caps();
+        self.result_msg  = Some("Spawning agentd — TUI will exit...".to_string());
+        self.pending_exec = Some(PendingSpawn {
+            template_name,
+            task:          self.task_input.clone(),
+            extra_caps:    extra,
+            disabled_caps: disabled,
+        });
+    }
 }
 
 /// Which pane is active in the Memory view (true-tab model).
@@ -91,6 +348,8 @@ pub struct App {
     pub agents_dir:      PathBuf,
     /// UI state for the Memory view.
     pub memory_view:     MemoryPaneState,
+    /// UI state for the Spawn view.
+    pub spawn_view:      SpawnViewState,
 }
 
 impl App {
@@ -109,6 +368,7 @@ impl App {
             log_path:        None,
             agents_dir,
             memory_view:     MemoryPaneState::default(),
+            spawn_view:      SpawnViewState::default(),
         }
     }
 
@@ -140,6 +400,11 @@ impl App {
         // active — reading up to 512 KB on every tick in other views causes stutter.
         let log = if self.view == View::Topology { self.log_path.as_deref() } else { None };
         self.topology = build_graph(&self.agents, log);
+
+        // Load templates once when the Spawn view is first entered.
+        if self.view == View::Spawn {
+            self.spawn_view.load();
+        }
 
         // Read memory only while the Memory view is active to avoid FUSE I/O on
         // every tick when the user is not looking at memory data.
@@ -531,5 +796,327 @@ mod tests {
             "Memory view must stay active when selected agent disappears — KB still browsable");
         assert!(!app.memory_view.kb_segments.is_empty(),
             "KB segments must remain loaded even with no selected agent");
+    }
+
+    // ── Spawn view unit tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn spawn_view_initial_state_has_no_preview() {
+        let state = SpawnViewState::default();
+        assert!(state.preview.is_none(), "preview must start as None");
+        assert!(!state.loaded, "loaded must start false");
+        assert!(state.templates.is_empty());
+        assert!(state.pending_exec.is_none());
+    }
+
+    #[test]
+    fn spawn_view_focus_cycles_through_all_states_with_caps() {
+        // Inject a cap so CapToggles is reachable.
+        let mut state = SpawnViewState {
+            cap_toggles: vec![(
+                agentd::capability::Capability::Spawn,
+                "Spawn".to_string(),
+                true,
+            )],
+            ..Default::default()
+        };
+        assert_eq!(state.focus, SpawnFocus::TemplatePicker);
+        state.focus_next();
+        assert_eq!(state.focus, SpawnFocus::TaskField);
+        state.focus_next();
+        assert_eq!(state.focus, SpawnFocus::CapToggles);
+        state.focus_next();
+        assert_eq!(state.focus, SpawnFocus::ActionGenerate);
+        state.focus_next();
+        assert_eq!(state.focus, SpawnFocus::ActionSpawn);
+        state.focus_next();
+        assert_eq!(state.focus, SpawnFocus::TemplatePicker, "must wrap back");
+    }
+
+    #[test]
+    fn spawn_view_focus_skips_cap_toggles_when_empty() {
+        // No cap_toggles — CapToggles must be skipped.
+        let mut state = SpawnViewState {
+            focus: SpawnFocus::TaskField,
+            ..Default::default()
+        };
+        state.focus_next();
+        assert_eq!(state.focus, SpawnFocus::ActionGenerate,
+            "CapToggles must be skipped when cap_toggles is empty");
+    }
+
+    #[test]
+    fn spawn_view_select_template_prev_does_not_underflow() {
+        let mut state = SpawnViewState {
+            template_idx: 0,
+            ..Default::default()
+        };
+        state.select_template_prev();
+        assert_eq!(state.template_idx, 0, "must saturate at 0");
+    }
+
+    #[test]
+    fn spawn_view_select_template_next_saturates_at_end() {
+        let mut state = SpawnViewState::default();
+        // No templates loaded — next must be a no-op.
+        state.select_template_next();
+        assert_eq!(state.template_idx, 0, "must not advance past end");
+    }
+
+    #[test]
+    fn spawn_view_toggle_cap_flips_enabled_state() {
+        let mut state = SpawnViewState {
+            cap_toggles: vec![(
+                agentd::capability::Capability::Spawn,
+                "Spawn".to_string(),
+                true,
+            )],
+            ..Default::default()
+        };
+        state.toggle_cap_at(0);
+        assert!(!state.cap_toggles[0].2, "must be disabled after toggle");
+        state.toggle_cap_at(0);
+        assert!(state.cap_toggles[0].2, "must be re-enabled after second toggle");
+    }
+
+    #[test]
+    fn spawn_view_enabled_caps_returns_only_enabled() {
+        let state = SpawnViewState {
+            cap_toggles: vec![
+                (agentd::capability::Capability::Spawn, "Spawn".to_string(), true),
+                (agentd::capability::Capability::FsRead { prefix: "/".into() },
+                 "FsRead {/}".to_string(), false),
+            ],
+            ..Default::default()
+        };
+        let enabled = state.enabled_caps();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0], agentd::capability::Capability::Spawn);
+    }
+
+    #[test]
+    fn spawn_view_cap_idx_clamps_within_toggles() {
+        let mut state = SpawnViewState {
+            cap_toggles: vec![
+                (agentd::capability::Capability::Spawn, "Spawn".to_string(), true),
+            ],
+            ..Default::default()
+        };
+        // prev at 0 must not underflow
+        state.cap_prev();
+        assert_eq!(state.cap_idx, 0);
+        // next at last must not overflow
+        state.cap_next();
+        assert_eq!(state.cap_idx, 0, "must saturate at last index");
+    }
+
+    #[test]
+    fn app_new_has_spawn_view_default_state() {
+        let d = tempfile::tempdir().unwrap();
+        let app = App::new(d.path().to_path_buf());
+        assert!(!app.spawn_view.loaded);
+        assert!(app.spawn_view.preview.is_none());
+        assert!(app.spawn_view.templates.is_empty());
+        assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker);
+    }
+
+    fn make_spawn_template(name: &str) -> super::SpawnTemplate {
+        use agentd::template::TemplateSource;
+        super::SpawnTemplate {
+            name:           name.to_string(),
+            source:         TemplateSource::Repo,
+            description:    String::new(),
+            showcases:      String::new(),
+            suggested_caps: vec![],
+        }
+    }
+
+    #[test]
+    fn spawn_view_select_template_prev_decrements_when_idx_greater_than_zero() {
+        let mut state = SpawnViewState {
+            templates: vec![make_spawn_template("a"), make_spawn_template("b")],
+            template_idx: 1,
+            ..Default::default()
+        };
+        state.select_template_prev();
+        assert_eq!(state.template_idx, 0, "prev must decrement when idx > 0");
+    }
+
+    #[test]
+    fn spawn_view_select_template_next_increments_when_not_at_end() {
+        let mut state = SpawnViewState {
+            templates: vec![make_spawn_template("a"), make_spawn_template("b")],
+            template_idx: 0,
+            ..Default::default()
+        };
+        state.select_template_next();
+        assert_eq!(state.template_idx, 1, "next must increment when idx < len-1");
+    }
+
+    #[test]
+    fn spawn_view_toggle_cap_at_out_of_bounds_is_noop() {
+        let mut state = SpawnViewState {
+            cap_toggles: vec![(
+                agentd::capability::Capability::Spawn,
+                "Spawn".to_string(),
+                true,
+            )],
+            ..Default::default()
+        };
+        state.toggle_cap_at(99); // way out of bounds
+        assert!(state.cap_toggles[0].2, "out-of-bounds toggle must not change any cap");
+    }
+
+    #[test]
+    fn spawn_view_cap_prev_decrements_when_idx_greater_than_zero() {
+        let mut state = SpawnViewState {
+            cap_toggles: vec![
+                (agentd::capability::Capability::Spawn, "Spawn".to_string(), true),
+                (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
+            ],
+            cap_idx: 1,
+            ..Default::default()
+        };
+        state.cap_prev();
+        assert_eq!(state.cap_idx, 0, "cap_prev must decrement when idx > 0");
+    }
+
+    #[test]
+    fn spawn_view_cap_next_increments_when_not_at_last() {
+        let mut state = SpawnViewState {
+            cap_toggles: vec![
+                (agentd::capability::Capability::Spawn, "Spawn".to_string(), true),
+                (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
+            ],
+            cap_idx: 0,
+            ..Default::default()
+        };
+        state.cap_next();
+        assert_eq!(state.cap_idx, 1, "cap_next must increment when idx < len-1");
+    }
+
+    #[test]
+    fn spawn_view_enabled_caps_returns_empty_when_all_disabled() {
+        let state = SpawnViewState {
+            cap_toggles: vec![
+                (agentd::capability::Capability::Spawn, "Spawn".to_string(), false),
+                (agentd::capability::Capability::FsRead { prefix: "/".into() }, "FsRead".to_string(), false),
+            ],
+            ..Default::default()
+        };
+        assert!(state.enabled_caps().is_empty(), "must return empty when all caps disabled");
+    }
+
+    #[test]
+    fn spawn_view_disabled_caps_returns_unchecked() {
+        let state = SpawnViewState {
+            cap_toggles: vec![
+                (agentd::capability::Capability::Spawn,
+                 "Spawn".to_string(), true),
+                (agentd::capability::Capability::FsRead { prefix: "/workspace".into() },
+                 "FsRead /workspace".to_string(), false),
+            ],
+            ..Default::default()
+        };
+        let disabled = state.disabled_caps();
+        assert_eq!(disabled.len(), 1);
+        assert_eq!(
+            disabled[0],
+            agentd::capability::Capability::FsRead { prefix: "/workspace".into() },
+            "disabled_caps must return only the unchecked toggle"
+        );
+    }
+
+    #[test]
+    fn spawn_view_disabled_caps_empty_when_all_enabled() {
+        let state = SpawnViewState {
+            cap_toggles: vec![
+                (agentd::capability::Capability::Spawn, "Spawn".to_string(), true),
+            ],
+            ..Default::default()
+        };
+        assert!(state.disabled_caps().is_empty(),
+            "disabled_caps must be empty when all toggles are on");
+    }
+
+    #[test]
+    fn spawn_view_do_spawn_passes_disabled_caps_to_pending_exec() {
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        // Safety: test-only env mutation; only the API-key guard path is exercised.
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-test-fake"); }
+
+        let mut state = SpawnViewState {
+            templates:  vec![make_spawn_template("scout")],
+            task_input: "test task".to_string(),
+            cap_toggles: vec![(
+                agentd::capability::Capability::FsRead { prefix: "/workspace".into() },
+                "FsRead /workspace".to_string(),
+                false, // disabled
+            )],
+            ..Default::default()
+        };
+        state.do_spawn();
+
+        unsafe {
+            match saved {
+                Some(k) => std::env::set_var("ANTHROPIC_API_KEY", &k),
+                None    => std::env::remove_var("ANTHROPIC_API_KEY"),
+            }
+        }
+
+        let exec = state.pending_exec.as_ref()
+            .expect("pending_exec must be set when guards pass");
+        assert_eq!(exec.disabled_caps.len(), 1,
+            "PendingSpawn.disabled_caps must contain the one unchecked toggle");
+        assert_eq!(
+            exec.disabled_caps[0],
+            agentd::capability::Capability::FsRead { prefix: "/workspace".into() },
+        );
+    }
+
+    #[test]
+    fn spawn_view_do_generate_sets_error_when_no_templates_loaded() {
+        let mut state = SpawnViewState::default();
+        // No templates — do_generate must set an error result_msg.
+        state.do_generate();
+        assert_eq!(state.result_msg.as_deref(), Some("No template selected."),
+            "do_generate with no templates must set error result_msg");
+        assert!(state.preview.is_none(), "preview must stay None on error");
+    }
+
+    #[test]
+    fn spawn_view_do_spawn_sets_error_when_no_templates_loaded() {
+        let mut state = SpawnViewState::default();
+        // No templates — do_spawn must set an error result_msg.
+        state.do_spawn();
+        assert_eq!(state.result_msg.as_deref(), Some("No template selected."),
+            "do_spawn with no templates must set error result_msg");
+        assert!(state.pending_exec.is_none(), "pending_exec must stay None on error");
+    }
+
+    #[test]
+    fn spawn_view_do_spawn_api_key_missing_sets_error() {
+        // Temporarily remove ANTHROPIC_API_KEY to exercise the env-var guard in do_spawn.
+        let saved = std::env::var("ANTHROPIC_API_KEY").ok();
+        // Safety: test-only; no other test in this module reads ANTHROPIC_API_KEY.
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY"); }
+
+        let mut state = SpawnViewState {
+            templates:  vec![make_spawn_template("scout")],
+            task_input: "test task".to_string(),
+            ..Default::default()
+        };
+        state.do_spawn();
+
+        if let Some(k) = saved {
+            unsafe { std::env::set_var("ANTHROPIC_API_KEY", &k); }
+        }
+
+        assert!(
+            state.result_msg.as_deref().map(|m| m.contains("ANTHROPIC_API_KEY")).unwrap_or(false),
+            "missing API key must set result_msg containing 'ANTHROPIC_API_KEY'"
+        );
+        assert!(state.pending_exec.is_none(),
+            "pending_exec must stay None when ANTHROPIC_API_KEY is absent");
     }
 }
