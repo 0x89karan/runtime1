@@ -1,0 +1,48 @@
+sample_tasks = [
+    "Index all Markdown files in /workspace/library and write a table of contents to /workspace/library/INDEX.md.",
+    "Search /workspace/library for documents mentioning 'neural networks' and summarize the top 5 results.",
+]
+
+[template]
+name        = "librarian"
+description = "Filesystem librarian: reads and writes a sandboxed directory using an MCP server."
+showcases   = "per-tool Landlock FS confinement on an MCP subprocess (p3.3) + capability scoping (p4.x)"
+
+[capabilities]
+fs_read  = ["/workspace/library"]
+fs_write = ["/workspace/library"]
+# Mcp grant required for the model to see tools served by the "fs" MCP server.
+mcp      = [{ server = "fs", tools = [] }]
+
+[card]
+name        = "Librarian"
+description = "Reads and writes a file collection inside /workspace/library using the MCP filesystem server."
+skills      = ["research", "file-management"]
+suggested_caps = [
+    { FsRead  = { prefix = "/workspace/library" } },
+    { FsWrite = { prefix = "/workspace/library" } },
+    { Mcp     = { server = "fs", tools = [] } },
+]
+
+# MCP server subprocess sandbox: capabilities below apply to the subprocess,
+# NOT to this agent's [capabilities] section which governs the agent process itself.
+[[tools.mcp_servers]]
+name = "fs"
+command = "npx"
+args    = ["@modelcontextprotocol/server-filesystem", "/workspace/library"]
+capabilities = [
+    { FsRead  = { prefix = "/workspace/library" } },
+    { FsWrite = { prefix = "/workspace/library" } },
+]
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[agent]
+# Note: static ID — rename before spawning a second copy in the same session.
+id           = "librarian"
+task         = ""
+max_turns    = 20
+token_budget = 100000

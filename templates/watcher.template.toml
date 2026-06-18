@@ -1,0 +1,35 @@
+sample_tasks = [
+    "List /workspace/src recursively and report all .rs files, grouped by subdirectory.",
+]
+
+[template]
+name           = "watcher"
+description    = "Filesystem observer: scans a directory and reports changes on demand."
+showcases      = "closest thing to a daemon in AgentOS — REQUIRES event-trigger surface (not yet implemented; see post-Phase-6 roadmap)"
+gated_requires = "event-trigger surface (not yet implemented — spawning this template starts a one-shot scan agent, not a persistent daemon)"
+
+[capabilities]
+fs_read = ["/workspace"]
+
+[card]
+name        = "Watcher"
+description = "Scans /workspace for changes and reports them. Runs as a one-shot scan until event-trigger support lands."
+skills      = ["monitoring", "filesystem"]
+suggested_caps = [
+    { FsRead = { prefix = "/workspace" } },
+]
+
+[tools]
+native = ["read_file", "list_dir"]
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 2048
+
+[agent]
+# Note: static ID — rename before spawning a second copy in the same session.
+id           = "watcher"
+task         = ""
+max_turns    = 10
+token_budget = 50000

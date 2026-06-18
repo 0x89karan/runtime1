@@ -18,16 +18,29 @@ pub struct TemplateMeta {
     pub description: String,
     /// What AgentOS-specific feature this template showcases.
     pub showcases: String,
+    /// Human-readable prerequisite for gated templates.
+    ///
+    /// When set, `agentctl spawn` prints a warning before exec so the operator
+    /// knows the template requires a specific runtime dependency (e.g. Phase-5
+    /// memory, gVisor, event-trigger surface). `None` = unconditionally runnable.
+    #[serde(default)]
+    pub gated_requires: Option<String>,
+}
+
+/// One entry in `[capabilities].mcp`. Each becomes `Capability::Mcp { server, tools }`.
+///
+/// `tools = []` grants access to all tools on the named server.
+#[derive(Debug, Deserialize, Default)]
+pub struct McpCapEntry {
+    pub server: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 /// `[capabilities]` section — flat sugar format, deny-by-default.
 ///
 /// Maps to `Capability` variants via `to_capability_vec()`. Missing `[capabilities]`
 /// in a template becomes `Some([])` (deny-all) in the lowered `AgentConfig`, never `None`.
-///
-/// `Capability::Mcp` is **not expressible** here. If a template needs to suggest MCP
-/// capability grants, add them directly to `[agent].capabilities` using the native
-/// struct-of-arrays form: `capabilities = [{ Mcp = { server = "fs", tools = [] } }]`.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateCapabilities {
@@ -55,6 +68,9 @@ pub struct TemplateCapabilities {
     /// When `true`, adds `Capability::Spawn`.
     #[serde(default)]
     pub spawn: bool,
+    /// MCP servers the agent may use. Each becomes `Capability::Mcp { server, tools }`.
+    #[serde(default)]
+    pub mcp: Vec<McpCapEntry>,
 }
 
 impl TemplateCapabilities {
@@ -81,6 +97,9 @@ impl TemplateCapabilities {
         }
         if self.spawn {
             caps.push(Capability::Spawn);
+        }
+        for e in &self.mcp {
+            caps.push(Capability::Mcp { server: e.server.clone(), tools: e.tools.clone() });
         }
         caps
     }
@@ -230,6 +249,8 @@ pub struct TemplateEntry {
     pub description: String,
     pub source: TemplateSource,
     pub showcases: String,
+    /// Example task strings from `sample_tasks` in the template file.
+    pub sample_tasks: Vec<String>,
 }
 
 /// Resolves `*.template.toml` files from user and repo directories.
@@ -344,6 +365,7 @@ impl TemplateResolver {
                     description: cfg.template.description.clone(),
                     source: source.clone(),
                     showcases: cfg.template.showcases.clone(),
+                    sample_tasks: cfg.sample_tasks.clone(),
                 });
             }
         }
@@ -862,5 +884,145 @@ task = "t"
         assert_eq!(cfg.sample_tasks.len(), 2, "scout must have 2 sample tasks");
         assert!(cfg.capabilities.is_some(), "scout must declare [capabilities]");
         assert!(cfg.agent.is_some(), "scout must have [agent] section");
+    }
+
+    // ── catalogue tests (p6.7) ────────────────────────────────────────────────────
+
+    fn catalogue_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("agentd/ must have a parent dir (repo root)")
+            .join("templates")
+    }
+
+    fn catalogue_resolver() -> TemplateResolver {
+        TemplateResolver::new(
+            catalogue_dir(),
+            std::path::PathBuf::from("/nonexistent-user-dir"),
+        )
+    }
+
+    #[test]
+    fn catalogue_all_seven_templates_present() {
+        let resolver = catalogue_resolver();
+        let entries = resolver.list().unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian"] {
+            assert!(
+                names.contains(expected),
+                "catalogue must contain template '{expected}'; found: {names:?}"
+            );
+        }
+        assert_eq!(entries.len(), 7, "catalogue must have exactly 7 templates; found: {names:?}");
+    }
+
+    #[test]
+    fn catalogue_non_gated_templates_lower_to_valid_config() {
+        let resolver = catalogue_resolver();
+
+        let (lib_cfg, _) = resolver.resolve("librarian").unwrap();
+        let lib_config = lib_cfg.to_agent_config(Some("index /workspace/library"), vec![]).unwrap();
+        assert!(lib_config.agent.is_some(), "librarian must lower to a valid Config");
+
+        let (coord_cfg, _) = resolver.resolve("coordinator").unwrap();
+        let coord_config = coord_cfg.to_agent_config(Some("spawn two scouts"), vec![]).unwrap();
+        assert!(coord_config.agent.is_some(), "coordinator must lower to a valid Config");
+        assert!(
+            !coord_config.memory.enabled,
+            "coordinator must have memory.enabled = false (no phantom memory.redb)"
+        );
+        let native = &coord_config.tools.native;
+        assert!(native.contains(&"spawn_agent".to_string()), "coordinator must list spawn_agent in tools.native");
+        assert!(native.contains(&"send_message".to_string()), "coordinator must list send_message in tools.native");
+        assert!(native.contains(&"list_agents".to_string()), "coordinator must list list_agents in tools.native");
+    }
+
+    #[test]
+    fn catalogue_gated_templates_lower_to_valid_config() {
+        let resolver = catalogue_resolver();
+        for name in &["journaler", "memory-custodian", "watcher"] {
+            let (cfg, _) = resolver.resolve(name).unwrap();
+            let config = cfg
+                .to_agent_config(Some("test task"), vec![])
+                .unwrap_or_else(|e| panic!("template '{name}' must lower without error: {e:#}"));
+            assert!(config.agent.is_some(), "template '{name}' must produce a Config with [agent]");
+            assert!(
+                cfg.template.gated_requires.is_some(),
+                "gated template '{name}' must have gated_requires set"
+            );
+            let req = cfg.template.gated_requires.as_deref().unwrap();
+            assert!(!req.is_empty(), "gated_requires for '{name}' must not be empty");
+        }
+    }
+
+    #[test]
+    fn catalogue_gvisor_template_config() {
+        let resolver = catalogue_resolver();
+        let (cfg, _) = resolver.resolve("code-aware").unwrap();
+        let config = cfg.to_agent_config(Some("analyze /workspace/repo"), vec![]).unwrap();
+        assert!(config.agent.is_some());
+        assert!(
+            cfg.template.gated_requires.is_some(),
+            "code-aware must have gated_requires (requires runsc)"
+        );
+        for server in &config.tools.mcp_servers {
+            assert_eq!(
+                server.isolation,
+                crate::config::IsolationMode::Gvisor,
+                "code-aware MCP server '{}' must use Gvisor isolation",
+                server.name
+            );
+        }
+    }
+
+    #[test]
+    fn catalogue_coordinator_has_spawn_cap() {
+        let resolver = catalogue_resolver();
+        let (cfg, _) = resolver.resolve("coordinator").unwrap();
+        let card = cfg.card.as_ref().expect("coordinator must have [card] section");
+        assert!(
+            card.suggested_caps.contains(&Capability::Spawn),
+            "coordinator suggested_caps must include Spawn"
+        );
+        let config = cfg.to_agent_config(Some("spawn scouts"), vec![]).unwrap();
+        assert!(
+            config.tools.native.contains(&"spawn_agent".to_string()),
+            "coordinator tools.native must include spawn_agent"
+        );
+    }
+
+    #[test]
+    fn catalogue_gated_templates_have_sample_tasks() {
+        let resolver = catalogue_resolver();
+        let entries = resolver.list().unwrap();
+        for entry in &entries {
+            if ["journaler", "watcher", "memory-custodian"].contains(&entry.name.as_str()) {
+                assert!(
+                    !entry.sample_tasks.is_empty(),
+                    "gated template '{}' must have at least one sample_task",
+                    entry.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalogue_journaler_memory_segment_set() {
+        let resolver = catalogue_resolver();
+        let (cfg, _) = resolver.resolve("journaler").unwrap();
+        let config = cfg.to_agent_config(Some("record findings"), vec![]).unwrap();
+        assert!(!config.memory.segments.is_empty(), "journaler must have [[memory.segments]]");
+        let seg = &config.memory.segments[0];
+        assert_eq!(seg.name, "agent/journaler", "segment name must be 'agent/journaler'");
+        assert_eq!(
+            seg.class,
+            crate::config::SegmentClass::Log,
+            "segment class must be Log"
+        );
+        assert_eq!(
+            config.memory.store_path,
+            "/run/memory/memory.redb",
+            "journaler must use /run/memory/memory.redb store path"
+        );
     }
 }

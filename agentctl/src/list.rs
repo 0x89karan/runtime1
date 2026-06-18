@@ -30,15 +30,26 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+const SHOWCASES_MAX_CHARS: usize = 72;
+
 fn print_table(entries: &[TemplateEntry]) {
     let name_w = entries.iter().map(|e| e.name.len()).max().unwrap_or(4).max(4);
-    println!("{:<width$}  {:<6}  SHOWCASES", "NAME", "SOURCE", width = name_w);
+    let indent  = " ".repeat(name_w + 10); // align sub-line under DESCRIPTION
+    println!("{:<width$}  {:<6}  DESCRIPTION", "NAME", "SOURCE", width = name_w);
     for e in entries {
         let src = match e.source {
             TemplateSource::Repo => "Repo",
             TemplateSource::User => "User",
         };
-        println!("{:<width$}  {:<6}  {}", e.name, src, e.showcases, width = name_w);
+        println!("{:<width$}  {:<6}  {}", e.name, src, e.description, width = name_w);
+        // Showcases on a sub-line so the table stays scannable.
+        // Use chars().count() to avoid panicking on multi-byte UTF-8 boundaries.
+        let showcases = if e.showcases.chars().count() > SHOWCASES_MAX_CHARS {
+            format!("{}...", e.showcases.chars().take(SHOWCASES_MAX_CHARS).collect::<String>())
+        } else {
+            e.showcases.clone()
+        };
+        println!("{indent}Showcases: {showcases}");
     }
 }
 
@@ -47,15 +58,54 @@ mod tests {
     use super::*;
     use agentd::template::TemplateSource;
 
+    fn make_entry(showcases: &str) -> TemplateEntry {
+        TemplateEntry {
+            name:         "scout".to_string(),
+            description:  "Read-only researcher.".to_string(),
+            source:       TemplateSource::Repo,
+            showcases:    showcases.to_string(),
+            sample_tasks: vec![],
+        }
+    }
+
     #[test]
     fn list_formats_entry_correctly() {
-        let entries = vec![TemplateEntry {
-            name: "scout".to_string(),
-            description: "Read-only researcher.".to_string(),
-            source: TemplateSource::Repo,
-            showcases: "read_file, list_dir".to_string(),
-        }];
         // Smoke-test: ensure print_table doesn't panic with one entry.
-        print_table(&entries);
+        print_table(&[make_entry("read_file, list_dir")]);
+    }
+
+    #[test]
+    fn list_truncates_showcases_longer_than_max() {
+        // Build a showcases string that is clearly longer than SHOWCASES_MAX_CHARS.
+        let long = "a".repeat(SHOWCASES_MAX_CHARS + 10);
+        let entry = make_entry(&long);
+        // print_table must not panic; verify the truncation path fires.
+        assert!(entry.showcases.chars().count() > SHOWCASES_MAX_CHARS);
+        let truncated = if entry.showcases.chars().count() > SHOWCASES_MAX_CHARS {
+            format!(
+                "{}...",
+                entry.showcases.chars().take(SHOWCASES_MAX_CHARS).collect::<String>()
+            )
+        } else {
+            entry.showcases.clone()
+        };
+        assert!(truncated.ends_with("..."), "truncated string must end with ...");
+        assert_eq!(
+            truncated.chars().count(),
+            SHOWCASES_MAX_CHARS + 3,
+            "truncated length must be SHOWCASES_MAX_CHARS + len('...')"
+        );
+        print_table(&[entry]); // must not panic
+    }
+
+    #[test]
+    fn list_showcases_truncation_is_char_safe_for_multibyte_utf8() {
+        // Build a showcases string from multi-byte UTF-8 chars (Japanese kana, 3 bytes each).
+        // Byte length >> char count — using &str[..N] would panic at a non-boundary.
+        let kana = "あ".repeat(SHOWCASES_MAX_CHARS + 5);
+        assert!(kana.len() > SHOWCASES_MAX_CHARS, "byte len must exceed char limit");
+        let entry = make_entry(&kana);
+        // Must not panic — this is the regression test for the original byte-slice panic.
+        print_table(&[entry]);
     }
 }

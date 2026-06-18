@@ -1,0 +1,48 @@
+sample_tasks = [
+    "Read /workspace/research and store key findings to the shared project: KB segment for other agents to reference.",
+    "Search the project: KB segment for entries about 'performance' and produce a structured summary.",
+]
+
+[template]
+name           = "memory-custodian"
+description    = "Shared-KB curator: reads research output and writes structured findings to the shared project KB."
+showcases      = "Phase-5 shared KB + segment classes (p5.4) + BM25-lite search (p5.5) + provenance stamping"
+gated_requires = "Phase-5 memory (memory.store_path must point to a running redb volume, e.g. /run/memory/memory.redb)"
+
+[capabilities]
+fs_read  = ["/workspace"]
+kb_read  = ["project:findings"]
+kb_write = ["project:findings"]
+
+[card]
+name        = "Memory Custodian"
+description = "Curates the shared project:findings KB segment — stores, searches, and organizes findings for multi-agent recall."
+skills      = ["memory", "research", "knowledge-base"]
+suggested_caps = [
+    { FsRead   = { prefix  = "/workspace" } },
+    { KbRead   = { segment = "project:findings" } },
+    { KbWrite  = { segment = "project:findings" } },
+]
+
+[tools]
+native = ["read_file", "list_dir", "kb_get", "kb_put", "kb_search"]
+
+[memory]
+enabled    = true
+store_path = "/run/memory/memory.redb"
+
+[[memory.segments]]
+name  = "project:findings"
+class = "scratch"
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[agent]
+# Note: static ID — rename before spawning a second copy in the same session.
+id           = "memory-custodian"
+task         = ""
+max_turns    = 30
+token_budget = 200000

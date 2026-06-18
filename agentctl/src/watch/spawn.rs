@@ -10,12 +10,15 @@ pub struct SpawnTemplate {
     pub showcases:      String,
     /// Pre-loaded from `[card].suggested_caps`.  Empty for templates without a `[card]`.
     pub suggested_caps: Vec<Capability>,
+    /// Example task strings from `sample_tasks`. Used to pre-fill the task field.
+    pub sample_tasks:   Vec<String>,
 }
 
 /// Load all templates from the default resolver, returning them sorted by name.
 ///
 /// Calls `resolver.resolve()` for each entry to capture `suggested_caps` from
-/// `[card]`.  On failure, returns an empty list and stores an error message.
+/// `[card]`.  Entries that fail to resolve are skipped (not emitted as ghost
+/// entries with empty caps); errors are accumulated and returned as `load_error`.
 pub fn load_spawn_templates() -> (Vec<SpawnTemplate>, Option<String>) {
     let resolver = crate::build_resolver(None, None);
     let entries = match resolver.list() {
@@ -23,15 +26,26 @@ pub fn load_spawn_templates() -> (Vec<SpawnTemplate>, Option<String>) {
         Err(e) => return (vec![], Some(format!("failed to list templates: {e:#}"))),
     };
     let mut out = Vec::with_capacity(entries.len());
-    for TemplateEntry { name, source, description, showcases } in entries {
-        let suggested_caps = resolver
-            .resolve(&name)
-            .ok()
-            .and_then(|(cfg, _)| cfg.card.map(|c| c.suggested_caps))
-            .unwrap_or_default();
-        out.push(SpawnTemplate { name, source, description, showcases, suggested_caps });
+    let mut resolve_errors: Vec<String> = Vec::new();
+    for TemplateEntry { name, source, description, showcases, sample_tasks: _ } in entries {
+        let (suggested_caps, full_sample_tasks) = match resolver.resolve(&name) {
+            Ok((cfg, _)) => {
+                let caps = cfg.card.map(|c| c.suggested_caps).unwrap_or_default();
+                (caps, cfg.sample_tasks)
+            }
+            Err(e) => {
+                resolve_errors.push(format!("{name}: {e:#}"));
+                continue;
+            }
+        };
+        out.push(SpawnTemplate { name, source, description, showcases, suggested_caps, sample_tasks: full_sample_tasks });
     }
-    (out, None)
+    let load_error = if resolve_errors.is_empty() {
+        None
+    } else {
+        Some(format!("failed to resolve: {}", resolve_errors.join(", ")))
+    };
+    (out, load_error)
 }
 
 /// Format a `Capability` for display in the Spawn view cap-toggle list.

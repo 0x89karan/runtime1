@@ -336,6 +336,9 @@ fn execute_pending_spawn(pending: PendingSpawn) -> anyhow::Result<()> {
     use std::io::Write as _;
     let resolver = crate::build_resolver(None, None);
     let (cfg, _) = resolver.resolve(&pending.template_name)?;
+    if let Some(requires) = &cfg.template.gated_requires {
+        crate::spawn::warn_gated_requires(requires);
+    }
     let task_str = if pending.task.is_empty() { None } else { Some(pending.task.as_str()) };
     let mut config = cfg.to_agent_config(task_str, pending.extra_caps)?;
     // Strip caps the user explicitly disabled so unchecking a baseline cap revokes it.
@@ -688,9 +691,9 @@ mod tests {
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
         app.spawn_view.templates = vec![
             SpawnTemplate { name: "a".into(), source: TemplateSource::Repo,
-                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
             SpawnTemplate { name: "b".into(), source: TemplateSource::Repo,
-                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
         ];
         app.spawn_view.template_idx = 1;
         handle_spawn_key(KeyCode::Up, &mut app);
@@ -705,9 +708,9 @@ mod tests {
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
         app.spawn_view.templates = vec![
             SpawnTemplate { name: "a".into(), source: TemplateSource::Repo,
-                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
             SpawnTemplate { name: "b".into(), source: TemplateSource::Repo,
-                            description: String::new(), showcases: String::new(), suggested_caps: vec![] },
+                            description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
         ];
         app.spawn_view.template_idx = 0;
         handle_spawn_key(KeyCode::Down, &mut app);

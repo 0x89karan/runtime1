@@ -1,0 +1,37 @@
+sample_tasks = [
+    "Spawn two child agents: one to outline an essay on 'Rust async runtimes' and one to outline 'Go concurrency models'. Collect their responses via list_agents and synthesize a comparison.",
+    "Spawn three child agents each tasked with drafting a different section of a design doc, then combine their outputs into a single structured document.",
+]
+
+[template]
+name        = "coordinator"
+description = "Multi-agent coordinator: spawns child agents via the bus and synthesizes their results."
+showcases   = "p1.5 message bus + p1.6 Agent Cards + spawn tree — the multi-agent runtime primitive"
+
+[capabilities]
+spawn = true
+
+[card]
+name        = "Coordinator"
+description = "Orchestrates child agents using spawn_agent, send_message, and list_agents."
+skills      = ["orchestration", "multi-agent"]
+suggested_caps = [{ Spawn = {} }]
+
+[tools]
+native = ["spawn_agent", "send_message", "list_agents"]
+
+# Coordinator does not use the memory store; disable to avoid phantom memory.redb creation.
+[memory]
+enabled = false
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 8192
+
+[agent]
+# Note: static ID — rename before spawning a second copy in the same session.
+id           = "coordinator"
+task         = ""
+max_turns    = 20
+token_budget = 500000

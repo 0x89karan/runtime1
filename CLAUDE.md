@@ -145,7 +145,17 @@ readers; `filter_entries()`/`filter_short_term()` client-side substring filters;
 (Short-term/Long-term/KB) with per-pane scroll; `[/]` search; KB always accessible without live agent;
 `MemoryAbsence::Subsystem`/`Empty` graceful degradation; ns u64 → RFC3339 provenance via chrono;
 `[log]`/`[scratch]`/`[canon]` class badges; plain-mode memory dump; 727 tests.
-**Next: p6.6 — see `docs/ROADMAP.md`.**
+**p6.6 complete (v0.32.0).** Spawn view in `agentctl watch`: `View::Spawn` with template picker,
+task field, capability toggles (deny-by-default, pre-checked from `suggested_caps`), generate
+preview, and exec agentd; `PendingSpawn`/`SpawnViewState`/`SpawnFocus` structs; `execute_pending_spawn`
+in `watch/mod.rs`; `agentctl/src/watch/spawn.rs`; cap revoke fix (disabled caps stripped from
+lowered config); flush guard before rename (Linux SIGTERM checkpoint stability); 793 tests.
+**p6.7 complete (v0.33.0).** Starter catalogue — 6 new templates (librarian, journaler, coordinator,
+code-aware, watcher, memory-custodian) plus the existing scout (7 total); `gated_requires: Option<String>`
+on `TemplateMeta` with pre-spawn warning in both CLI and TUI paths; `sample_tasks: Vec<String>` on
+`TemplateEntry` with TUI pre-fill of `task_input`; 14 new catalogue tests; UTF-8-safe `showcases`
+truncation in `agentctl list-templates`; 808 workspace tests.
+**Next: p6.8 — see `docs/ROADMAP.md`.**
 
 ## How to work here
 

@@ -91,6 +91,21 @@ impl SpawnViewState {
         self.templates  = templates;
         self.template_idx = 0;
         self.rebuild_cap_toggles();
+        self.prefill_task_if_empty();
+    }
+
+    /// Pre-fill `task_input` with the first `sample_tasks` entry of the selected template,
+    /// but only when the field is currently empty (never overwrites user-typed text).
+    pub fn prefill_task_if_empty(&mut self) {
+        if self.task_input.is_empty() {
+            if let Some(sample) = self
+                .templates
+                .get(self.template_idx)
+                .and_then(|t| t.sample_tasks.first())
+            {
+                self.task_input = sample.clone();
+            }
+        }
     }
 
     /// Rebuild `cap_toggles` from the currently selected template's `suggested_caps`.
@@ -115,13 +130,30 @@ impl SpawnViewState {
         self.templates.get(self.template_idx)
     }
 
+    /// Reset all mutable form state after a template selection change.
+    ///
+    /// Only replaces `task_input` if it is empty or still holds `prev_sample`
+    /// (the previous template's prefill). User-typed text is never discarded.
+    fn reset_after_template_change(&mut self, prev_sample: Option<&str>) {
+        self.rebuild_cap_toggles();
+        self.preview    = None;
+        self.result_msg = None;
+        let is_unchanged = self.task_input.is_empty()
+            || prev_sample.is_some_and(|s| self.task_input == s);
+        if is_unchanged {
+            self.task_input.clear();
+            self.prefill_task_if_empty();
+        }
+    }
+
     /// Move template selection up (saturating).
     pub fn select_template_prev(&mut self) {
         if self.template_idx > 0 {
+            let prev_sample = self.templates.get(self.template_idx)
+                .and_then(|t| t.sample_tasks.first())
+                .cloned();
             self.template_idx -= 1;
-            self.rebuild_cap_toggles();
-            self.preview    = None;
-            self.result_msg = None;
+            self.reset_after_template_change(prev_sample.as_deref());
         }
     }
 
@@ -130,10 +162,11 @@ impl SpawnViewState {
         if !self.templates.is_empty()
             && self.template_idx < self.templates.len() - 1
         {
+            let prev_sample = self.templates.get(self.template_idx)
+                .and_then(|t| t.sample_tasks.first())
+                .cloned();
             self.template_idx += 1;
-            self.rebuild_cap_toggles();
-            self.preview    = None;
-            self.result_msg = None;
+            self.reset_after_template_change(prev_sample.as_deref());
         }
     }
 
@@ -463,6 +496,8 @@ impl App {
 mod tests {
     use super::*;
     use crate::watch::reader::{AgentInfo, BudgetKind, Snapshot};
+
+    use crate::ENV_MUTEX;
 
     fn make_agent(id: &str) -> AgentInfo {
         AgentInfo {
@@ -928,6 +963,7 @@ mod tests {
             description:    String::new(),
             showcases:      String::new(),
             suggested_caps: vec![],
+            sample_tasks:   vec![],
         }
     }
 
@@ -951,6 +987,102 @@ mod tests {
         };
         state.select_template_next();
         assert_eq!(state.template_idx, 1, "next must increment when idx < len-1");
+    }
+
+    fn make_spawn_template_with_tasks(name: &str, tasks: Vec<String>) -> super::SpawnTemplate {
+        use agentd::template::TemplateSource;
+        super::SpawnTemplate {
+            name:           name.to_string(),
+            source:         TemplateSource::Repo,
+            description:    String::new(),
+            showcases:      String::new(),
+            suggested_caps: vec![],
+            sample_tasks:   tasks,
+        }
+    }
+
+    #[test]
+    fn spawn_view_prefill_fills_empty_task_on_template_select() {
+        let mut state = SpawnViewState {
+            templates: vec![
+                make_spawn_template("scout"),
+                make_spawn_template_with_tasks("journaler", vec!["Record today's findings.".into()]),
+            ],
+            template_idx: 0,
+            ..Default::default()
+        };
+        state.select_template_next(); // navigate to journaler
+        assert_eq!(state.template_idx, 1, "must be on journaler");
+        assert_eq!(
+            state.task_input,
+            "Record today's findings.",
+            "task_input must be pre-filled from sample_tasks[0]"
+        );
+    }
+
+    #[test]
+    fn spawn_view_prefill_noop_when_no_sample_tasks() {
+        let mut state = SpawnViewState {
+            templates: vec![
+                make_spawn_template("scout"),   // no sample_tasks
+                make_spawn_template("scout2"),  // no sample_tasks
+            ],
+            template_idx: 0,
+            ..Default::default()
+        };
+        state.select_template_next();
+        assert_eq!(state.template_idx, 1);
+        assert!(state.task_input.is_empty(), "task_input must stay empty when no sample_tasks");
+    }
+
+    #[test]
+    fn spawn_view_prefill_skips_when_task_already_filled() {
+        let mut state = SpawnViewState {
+            templates: vec![
+                make_spawn_template_with_tasks("journaler", vec!["default sample".into()]),
+            ],
+            template_idx: 0,
+            task_input: "user typed this".to_string(),
+            ..Default::default()
+        };
+        state.prefill_task_if_empty();
+        assert_eq!(
+            state.task_input, "user typed this",
+            "prefill_task_if_empty must not overwrite non-empty task_input"
+        );
+    }
+
+    #[test]
+    fn spawn_view_select_template_prev_prefills_sample_task() {
+        let mut state = SpawnViewState {
+            templates: vec![
+                make_spawn_template_with_tasks("journaler", vec!["Record today's findings.".into()]),
+                make_spawn_template("scout"),
+            ],
+            template_idx: 1,
+            ..Default::default()
+        };
+        state.select_template_prev();
+        assert_eq!(state.template_idx, 0, "must be on journaler after prev");
+        assert_eq!(
+            state.task_input,
+            "Record today's findings.",
+            "task_input must be pre-filled from sample_tasks[0] after select_template_prev"
+        );
+    }
+
+    #[test]
+    fn spawn_view_reset_after_template_change_clears_preview_and_result_msg() {
+        let mut state = SpawnViewState {
+            templates:    vec![make_spawn_template("a"), make_spawn_template("b")],
+            template_idx: 0,
+            preview:      Some("previous preview text".to_string()),
+            result_msg:   Some("previous result".to_string()),
+            ..Default::default()
+        };
+        state.select_template_next();
+        assert!(state.preview.is_none(), "preview must be cleared after template navigation");
+        assert!(state.result_msg.is_none(), "result_msg must be cleared after template navigation");
     }
 
     #[test]
@@ -1041,8 +1173,9 @@ mod tests {
 
     #[test]
     fn spawn_view_do_spawn_passes_disabled_caps_to_pending_exec() {
+        let _env_guard = ENV_MUTEX.lock().unwrap();
         let saved = std::env::var("ANTHROPIC_API_KEY").ok();
-        // Safety: test-only env mutation; only the API-key guard path is exercised.
+        // Safety: test-only env mutation; ENV_MUTEX serializes all env-var-touching tests.
         unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-test-fake"); }
 
         let mut state = SpawnViewState {
@@ -1096,9 +1229,10 @@ mod tests {
 
     #[test]
     fn spawn_view_do_spawn_api_key_missing_sets_error() {
+        let _env_guard = ENV_MUTEX.lock().unwrap();
         // Temporarily remove ANTHROPIC_API_KEY to exercise the env-var guard in do_spawn.
         let saved = std::env::var("ANTHROPIC_API_KEY").ok();
-        // Safety: test-only; no other test in this module reads ANTHROPIC_API_KEY.
+        // Safety: test-only env mutation; ENV_MUTEX serializes all env-var-touching tests.
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY"); }
 
         let mut state = SpawnViewState {

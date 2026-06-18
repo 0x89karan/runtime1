@@ -41,7 +41,7 @@ pub enum Capability {
         ports: Vec<u16>,
     },
     Mcp { server: String, tools: Vec<String> },
-    /// Reserved — no tool declares Spawn yet; always denied.
+    /// Grants permission to spawn child agents via `spawn_agent`. Enforced by the scheduler.
     Spawn,
     /// Read access to a memory namespace segment (prefix-match on namespace).
     /// `KbRead { segment: "agent:scratch" }` grants read access to all keys
@@ -109,7 +109,7 @@ pub fn satisfies_type(granted: &[Capability], required: &Capability) -> bool {
 ///   that server (wildcard).
 /// - `Net`: advisory at this layer — always `true`. Kernel-level TCP port
 ///   enforcement is handled by `caps_to_rules()` → `AllowNetConnect` (p4.6+).
-/// - `Spawn`: always `false` — no tool declares this capability yet.
+/// - `Spawn`: `true` if any granted cap is `Capability::Spawn`; required by `spawn_agent`.
 pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
     match required {
         Capability::FsRead { prefix: req_path } => {

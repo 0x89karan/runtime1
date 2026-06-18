@@ -36,6 +36,11 @@ pub struct Args {
     pub dry_run: bool,
 }
 
+pub(crate) fn warn_gated_requires(requires: &str) {
+    eprintln!("warning: this template requires: {requires}");
+    eprintln!("         proceeding — if agentd fails, ensure the requirement is met.");
+}
+
 pub fn run(args: Args) -> anyhow::Result<()> {
     let resolver =
         crate::build_resolver(args.user_templates_dir.as_deref(), args.repo_dir.as_deref());
@@ -142,7 +147,15 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             "dry-run: template resolved from {}",
             template_file.display()
         );
+        if let Some(requires) = &template.template.gated_requires {
+            eprintln!("note: this template requires: {requires}");
+        }
         return Ok(());
+    }
+
+    // Warn about gated requirements before exec so the operator can abort if needed.
+    if let Some(requires) = &template.template.gated_requires {
+        warn_gated_requires(requires);
     }
 
     // For live exec, agentd must be present.
@@ -738,6 +751,30 @@ task = ""
         assert!(msg.contains("/nonexistent/agentd"), "error must include the path");
     }
 
+    #[test]
+    fn gated_requires_parses_correctly() {
+        // Verify that gated_requires is correctly deserialized from TOML.
+        let raw = r#"
+sample_tasks = ["Journal today's findings."]
+
+[template]
+name           = "gated-test"
+description    = "A gated test template."
+showcases      = "gated_requires demo"
+gated_requires = "Phase-5 memory"
+
+[agent]
+id   = "gated-test"
+task = ""
+"#;
+        let cfg: agentd::template::TemplateConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            cfg.template.gated_requires.as_deref(),
+            Some("Phase-5 memory"),
+            "gated_requires must parse correctly"
+        );
+    }
+
     /// Exercises the dry-run branch in `run()` end-to-end. This path must succeed
     /// even when agentd is not on PATH — dry-run never execs.
     #[test]
@@ -780,8 +817,9 @@ task = ""
         }
 
         // Capture any existing key so we can restore it afterward.
+        let _env_guard = crate::ENV_MUTEX.lock().unwrap();
         let saved = std::env::var("ANTHROPIC_API_KEY").ok();
-        // Safety: test-scoped removal is safe for this single-threaded check.
+        // Safety: test-only env mutation; ENV_MUTEX serializes all env-var-touching tests.
         std::env::remove_var("ANTHROPIC_API_KEY");
 
         let args = Args {

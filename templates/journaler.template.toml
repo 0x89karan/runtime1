@@ -1,0 +1,48 @@
+sample_tasks = [
+    "Summarize what I worked on today by reading /workspace/notes/today.md and store the summary in long-term memory.",
+    "Recall my last 5 journal entries from memory and produce a weekly summary.",
+]
+
+[template]
+name           = "journaler"
+description    = "Persistent note-taking agent that remembers across runs using the Phase-5 memory store."
+showcases      = "Phase-5 durable per-agent memory (p5.2–p5.3) + checkpoint/restore (p3.2)"
+gated_requires = "Phase-5 memory (memory.store_path must point to a running redb volume, e.g. /run/memory/memory.redb)"
+
+[capabilities]
+fs_read  = ["/workspace"]
+kb_read  = ["agent/journaler"]
+kb_write = ["agent/journaler"]
+
+[card]
+name        = "Journaler"
+description = "Reads workspace files and writes durable journal entries to the Phase-5 KB store."
+skills      = ["journaling", "memory"]
+suggested_caps = [
+    { FsRead   = { prefix   = "/workspace"      } },
+    { KbRead   = { segment  = "agent/journaler" } },
+    { KbWrite  = { segment  = "agent/journaler" } },
+]
+
+[tools]
+native = ["read_file", "list_dir", "mem_remember", "mem_recall", "kb_get", "kb_put", "kb_search"]
+
+[memory]
+enabled    = true
+store_path = "/run/memory/memory.redb"
+
+[[memory.segments]]
+name  = "agent/journaler"
+class = "log"
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[agent]
+# Note: static ID — rename before spawning a second copy in the same session.
+id           = "journaler"
+task         = ""
+max_turns    = 30
+token_budget = 200000

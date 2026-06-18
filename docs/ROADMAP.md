@@ -688,7 +688,7 @@ available only via an attached Layer-2 MCP KB. **Acceptance:** the journaler's l
 entries and a shared `project:` segment are browsable with provenance; the tab degrades
 gracefully ("memory subsystem not present") when Phase 5 is absent.
 
-### ▣ p6.6 — Spawn view
+### ✅ p6.6 — Spawn view
 **Depends on:** p6.2, p6.3. Template picker → task field → capability toggles
 (pre-checked from the template, deny-by-default) → preview generated `agent.toml` →
 spawn. Mode (a) generate-and-exec ships here; mode (b) inject-into-running-scheduler
@@ -696,7 +696,7 @@ depends on the writable **`/agents/control`** surface (its own sub-task). **Acce
 spawning from the form produces the same `agent.toml` the CLI would and starts the agent;
 no capability is granted beyond the template without an explicit toggle.
 
-### ▢ p6.7 — Starter catalogue (the committed templates)
+### ✅ p6.7 — Starter catalogue (the committed templates)
 **Depends on:** p6.1 (+ p5.x for memory-dependent templates). Ship the 7 templates:
 scout, librarian, journaler, code-aware, watcher, coordinator, memory-custodian — each
 with its showcase rationale. journaler/memory-custodian are Phase-5-gated; watcher is

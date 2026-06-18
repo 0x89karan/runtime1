@@ -530,10 +530,13 @@ fn render_spawn(f: &mut Frame, app: &App) {
             Style::default()
         });
 
-    let picker_lines: Vec<Line> = if let Some(err) = &sv.load_error {
-        vec![Line::from(format!("  error: {}", sanitize(err)))]
-    } else if sv.templates.is_empty() {
-        vec![Line::from("  (no templates — run `agentctl list-templates` to check)")]
+    let picker_lines: Vec<Line> = if sv.templates.is_empty() {
+        // Only show the error alone when no templates loaded at all.
+        if let Some(err) = &sv.load_error {
+            vec![Line::from(format!("  error: {}", sanitize(err)))]
+        } else {
+            vec![Line::from("  (no templates — run `agentctl list-templates` to check)")]
+        }
     } else {
         sv.templates.iter().enumerate().flat_map(|(i, t)| {
             use agentd::template::TemplateSource;

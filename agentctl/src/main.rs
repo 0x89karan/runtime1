@@ -63,6 +63,11 @@ fn default_user_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/run/user/templates"))
 }
 
+/// Crate-level mutex that serializes tests mutating process env vars.
+/// Using a process-wide lock prevents parallel test races on ANTHROPIC_API_KEY.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn default_repo_dir() -> PathBuf {
     // Walk up from the binary location to find a `templates/` directory.
     // This lets `./target/debug/agentctl` find `templates/` at the repo root in dev,

@@ -3,6 +3,28 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.7] - 2026-06-18 (v0.33.0)
+
+Starter catalogue — 7 committed templates covering every AgentOS primitive layer.
+
+- **6 new templates** (`templates/`) — `librarian` (Landlock MCP sandbox), `journaler`
+  (Phase-5 durable memory), `coordinator` (spawn + bus), `code-aware` (gVisor isolation),
+  `watcher` (trigger-gated, ships as honest one-shot scanner), `memory-custodian`
+  (shared KB curation). Each has `sample_tasks`, `showcases`, and `gated_requires` where
+  applicable.
+- **`TemplateMeta.gated_requires: Option<String>`** — new field in `agentd/src/template.rs`.
+  When set, `agentctl spawn` prints a pre-flight warning before exec so operators know
+  about Phase-5 memory, gVisor, or event-trigger dependencies.
+- **`TemplateEntry.sample_tasks: Vec<String>`** — catalogue listing now carries sample
+  tasks; `agentctl list-templates` shows DESCRIPTION (not SHOWCASES) as the primary column
+  with showcases on a sub-line for scannability.
+- **TUI Spawn view pre-fill** — `SpawnViewState` pre-fills `task_input` with
+  `sample_tasks[0]` when navigating to a template with an empty task field.
+- **22 new tests** (14 catalogue in `agentd/src/template.rs`, 1 gated_requires parse in
+  `agentctl/src/spawn.rs`, 3 prefill/reset in `agentctl/src/watch/app.rs`, 2 truncation
+  safety in `agentctl/src/list.rs`, 2 coverage for `load_spawn_templates` + boundary paths).
+- Total test count: 808 workspace (agentd lib 396 + agentctl 259 + surfaces 32 + sandbox + integration).
+
 ## [p6.6] - 2026-06-18 (v0.32.0)
 
 Spawn view for `agentctl watch`. The new `[n]ew` view is the first interactive/write

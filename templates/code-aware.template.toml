@@ -1,0 +1,65 @@
+sample_tasks = [
+    "Review the git history in /workspace/repo for the last 10 commits and summarize what changed.",
+    "Find all TODO comments in /workspace/repo/src and create a prioritized task list.",
+]
+
+[template]
+name           = "code-aware"
+description    = "Multi-tool code agent sandboxed inside a gVisor container with network isolation."
+showcases      = "gVisor runsc process isolation (p4.2) + network namespace isolation per MCP subprocess"
+gated_requires = "gVisor (runsc must be on PATH; without it the MCP server subprocess will fail to start)"
+
+[capabilities]
+fs_read   = ["/workspace/repo"]
+fs_write  = ["/workspace/repo"]
+net_ports = [443]
+# Mcp grants required for the model to see tools served by the "fs" and "git" MCP servers.
+mcp       = [
+    { server = "fs",  tools = [] },
+    { server = "git", tools = [] },
+]
+
+[card]
+name        = "Code-Aware"
+description = "Reads and writes /workspace/repo using filesystem + git MCP servers, both isolated inside gVisor."
+skills      = ["code-review", "git", "analysis"]
+suggested_caps = [
+    { FsRead  = { prefix = "/workspace/repo" } },
+    { FsWrite = { prefix = "/workspace/repo" } },
+    { Net  = { hosts = [], ports = [443] } },
+    { Mcp  = { server = "fs",  tools = [] } },
+    { Mcp  = { server = "git", tools = [] } },
+]
+
+# MCP server subprocess sandbox: capabilities below apply to the MCP subprocess, NOT the agent.
+# Under gVisor, Landlock rules are replaced by gVisor's own kernel + network namespace isolation.
+[[tools.mcp_servers]]
+name      = "fs"
+command   = "npx"
+args      = ["@modelcontextprotocol/server-filesystem", "/workspace/repo"]
+isolation = "gvisor"
+capabilities = [
+    { FsRead  = { prefix = "/workspace/repo" } },
+    { FsWrite = { prefix = "/workspace/repo" } },
+]
+
+[[tools.mcp_servers]]
+name      = "git"
+command   = "uvx"
+args      = ["mcp-server-git", "--repository", "/workspace/repo"]
+isolation = "gvisor"
+capabilities = [
+    { FsRead = { prefix = "/workspace/repo" } },
+]
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 8192
+
+[agent]
+# Note: static ID — rename before spawning a second copy in the same session.
+id           = "code-aware"
+task         = ""
+max_turns    = 40
+token_budget = 300000

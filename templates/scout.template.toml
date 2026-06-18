@@ -30,6 +30,7 @@ skills         = ["research", "summarization"]
 suggested_caps = [{ FsRead = { prefix = "/workspace" } }]
 
 [agent]
+# Note: static ID — rename before spawning a second copy in the same session.
 id           = "scout"
 task         = ""
 max_turns    = 10
