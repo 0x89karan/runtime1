@@ -13,6 +13,7 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 pub mod app;
+pub mod inspector;
 pub mod memory;
 pub mod reader;
 pub mod spawn;
@@ -169,8 +170,9 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
                                 _ => {}
                             }
                         }
-                        View::Memory => handle_memory_key(key.code, &mut app),
-                        View::Spawn  => handle_spawn_key(key.code, &mut app),
+                        View::Memory    => handle_memory_key(key.code, &mut app),
+                        View::Spawn     => handle_spawn_key(key.code, &mut app),
+                        View::Inspector => handle_inspector_key(key.code, &mut app),
                     }
                     if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
                         break;
@@ -265,6 +267,10 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App) {
             // Lazy-load templates on first entry.
             app.spawn_view.load();
         }
+        KeyCode::Char('i') => {
+            app.view = View::Inspector;
+            // Load-once: first entry triggers load via apply_snapshot; [r] reloads.
+        }
         _ => {}
     }
 }
@@ -330,6 +336,65 @@ fn handle_spawn_key(code: KeyCode, app: &mut App) {
     }
 }
 
+fn handle_inspector_key(code: KeyCode, app: &mut App) {
+    match code {
+        // Search mode: [/] enters, Esc exits + clears query.
+        KeyCode::Char('/') if !app.inspector_view.search_active => {
+            app.inspector_view.search_active = true;
+        }
+        KeyCode::Esc if app.inspector_view.search_active => {
+            app.inspector_view.search_active = false;
+            app.inspector_view.search_query.clear();
+            app.inspector_view.rebuild_view();
+        }
+        KeyCode::Char(c) if app.inspector_view.search_active => {
+            app.inspector_view.search_query.push(c);
+            app.inspector_view.rebuild_view();
+        }
+        KeyCode::Backspace if app.inspector_view.search_active => {
+            app.inspector_view.search_query.pop();
+            app.inspector_view.rebuild_view();
+        }
+        // [Tab] cycles the filter.
+        KeyCode::Tab if !app.inspector_view.search_active => {
+            app.inspector_view.filter = app.inspector_view.filter.next();
+            app.inspector_view.rebuild_view();
+        }
+        // [r] reloads the flight log.
+        KeyCode::Char('r') if !app.inspector_view.search_active => {
+            let log = app.log_path.clone();
+            app.inspector_view.loaded = false;
+            app.inspector_view.load(log.as_deref());
+        }
+        // Scroll.
+        KeyCode::Up | KeyCode::Char('k') if !app.inspector_view.search_active => {
+            app.inspector_view.scroll = app.inspector_view.scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if !app.inspector_view.search_active => {
+            let max = app.inspector_view.lines.len().saturating_sub(1);
+            app.inspector_view.scroll = (app.inspector_view.scroll + 1).min(max);
+        }
+        KeyCode::PageUp if !app.inspector_view.search_active => {
+            app.inspector_view.scroll = app.inspector_view.scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown if !app.inspector_view.search_active => {
+            let max = app.inspector_view.lines.len().saturating_sub(1);
+            app.inspector_view.scroll = (app.inspector_view.scroll + 10).min(max);
+        }
+        KeyCode::Home if !app.inspector_view.search_active => {
+            app.inspector_view.scroll = 0;
+        }
+        KeyCode::End if !app.inspector_view.search_active => {
+            app.inspector_view.scroll = app.inspector_view.lines.len().saturating_sub(1);
+        }
+        // Back to dashboard.
+        KeyCode::Esc | KeyCode::Char('q') if !app.inspector_view.search_active => {
+            app.view = View::Dashboard;
+        }
+        _ => {}
+    }
+}
+
 /// Called after the TUI loop exits when `pending_exec` is set.
 /// Resolves the template, writes a temp config, and execs agentd.
 fn execute_pending_spawn(pending: PendingSpawn) -> anyhow::Result<()> {
@@ -379,6 +444,7 @@ mod tests {
                 budget:         BudgetKind::Unlimited,
                 tools:          vec![],
                 parent_id:      None,
+                sandbox:        None,
             }).collect(),
             budget: None, queue: None, sandbox: None, provider: None, error: None,
         }

@@ -704,7 +704,7 @@ marked trigger-gated (no event-trigger mechanism exists yet). **Acceptance:** ev
 non-gated template spawns and runs its sample task; the demo set exercises sandbox +
 capabilities + bus + (when present) memory.
 
-### ▢ p6.8 — Sandbox-enforcement surface + edge-case polish
+### ✅ p6.8 — Sandbox-enforcement surface + edge-case polish (v0.34.0)
 **Depends on:** p6.3, p4.1–p4.6. `EnforcementStatus` surfaced in System + Agent-detail
 from `/agents/system/sandbox` + `/agents/<id>/sandbox`; **prominent degradation warnings**
 (Landlock ABI < V4 → net not enforced — the F-002 silent-degradation case made visible;

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use agentd::capability::Capability;
 
+use super::inspector::InspectorState;
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
 use super::reader::{AgentInfo, Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox};
 use super::spawn::{load_spawn_templates, SpawnTemplate};
@@ -22,6 +23,8 @@ pub enum View {
     Memory,
     /// Form to pick a template, fill a task, toggle capabilities, and spawn an agent.
     Spawn,
+    /// Read-only flight-log inspector with filter cycling and search.
+    Inspector,
 }
 
 // ── Spawn view ───────────────────────────────────────────────────────────────
@@ -383,6 +386,8 @@ pub struct App {
     pub memory_view:     MemoryPaneState,
     /// UI state for the Spawn view.
     pub spawn_view:      SpawnViewState,
+    /// UI state for the Inspector view.
+    pub inspector_view:  InspectorState,
 }
 
 impl App {
@@ -402,6 +407,7 @@ impl App {
             agents_dir,
             memory_view:     MemoryPaneState::default(),
             spawn_view:      SpawnViewState::default(),
+            inspector_view:  InspectorState::default(),
         }
     }
 
@@ -437,6 +443,11 @@ impl App {
         // Load templates once when the Spawn view is first entered.
         if self.view == View::Spawn {
             self.spawn_view.load();
+        }
+
+        // Load inspector lines once on first entry to this view; [r] triggers reload.
+        if self.view == View::Inspector && !self.inspector_view.loaded {
+            self.inspector_view.load(self.log_path.as_deref());
         }
 
         // Read memory only while the Memory view is active to avoid FUSE I/O on
@@ -507,6 +518,7 @@ mod tests {
             budget:         BudgetKind::Unlimited,
             tools:          vec![],
             parent_id:      None,
+            sandbox:        None,
         }
     }
 

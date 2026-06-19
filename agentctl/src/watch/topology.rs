@@ -253,6 +253,7 @@ mod tests {
             budget:         BudgetKind::Unlimited,
             tools:          vec![],
             parent_id:      parent.map(str::to_string),
+            sandbox:        None,
         }
     }
 

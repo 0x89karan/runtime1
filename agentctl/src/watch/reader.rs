@@ -23,10 +23,45 @@ pub struct SysQueue {
     pub depth: usize,
 }
 
-/// Parsed content of /agents/system/sandbox
+/// Per-server enforcement record deserialized from /agents/system/sandbox or
+/// /agents/<id>/sandbox.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ServerEnforcement {
+    pub name:              String,
+    #[serde(default)]
+    pub isolation:         String,
+    #[serde(default)]
+    pub landlock:          bool,
+    #[serde(default)]
+    pub seccomp:           bool,
+    #[serde(default)]
+    pub spawn_enforcement: String,
+    #[serde(default)]
+    pub namespace_net:     bool,
+    #[serde(default)]
+    pub namespace_mount:   bool,
+    #[serde(default)]
+    pub landlock_net:      bool,
+}
+
+/// Parsed content of /agents/system/sandbox.
+/// The `any_sandboxed` key was previously "applied" — accept both via alias.
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct SysSandbox {
-    pub applied: bool,
+    /// `any_sandboxed` is the current key; `applied` is the pre-p6.8 alias.
+    #[serde(alias = "applied")]
+    pub any_sandboxed:  bool,
+    #[serde(default)]
+    pub servers:        Vec<ServerEnforcement>,
+    #[serde(default)]
+    pub degradations:   Vec<String>,
+}
+
+/// Parsed content of /agents/<id>/sandbox — per-agent view.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct AgentSandbox {
+    #[serde(default)]
+    pub servers: Vec<ServerEnforcement>,
 }
 
 /// Parsed content of /agents/system/provider
@@ -45,6 +80,7 @@ pub struct AgentInfo {
     pub budget:         BudgetKind,
     pub tools:          Vec<String>,
     pub parent_id:      Option<String>,
+    pub sandbox:        Option<AgentSandbox>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,7 +144,13 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
         Some("(none)") | None => None,
         Some(s)               => Some(s.to_string()),
     };
-    AgentInfo { id: id.to_string(), status, context_tokens, budget, tools, parent_id }
+    let sandbox = read_agent_sandbox(agents_dir, id);
+    AgentInfo { id: id.to_string(), status, context_tokens, budget, tools, parent_id, sandbox }
+}
+
+/// Read /agents/<id>/sandbox
+pub fn read_agent_sandbox(agents_dir: &Path, id: &str) -> Option<AgentSandbox> {
+    read_json(&agents_dir.join(id).join("sandbox"))
 }
 
 /// Read /agents/system/budget
@@ -178,14 +220,92 @@ mod tests {
 
     #[test]
     fn sys_sandbox_false_parses() {
-        let s: SysSandbox = serde_json::from_str(r#"{"applied":false}"#).unwrap();
-        assert!(!s.applied);
+        let s: SysSandbox = serde_json::from_str(
+            r#"{"any_sandboxed":false,"servers":[],"degradations":[]}"#
+        ).unwrap();
+        assert!(!s.any_sandboxed);
     }
 
     #[test]
     fn sys_sandbox_true_parses() {
+        let s: SysSandbox = serde_json::from_str(
+            r#"{"any_sandboxed":true,"servers":[],"degradations":[]}"#
+        ).unwrap();
+        assert!(s.any_sandboxed);
+    }
+
+    #[test]
+    fn sys_sandbox_applied_alias_accepted() {
+        // Pre-p6.8 "applied" key must still deserialize correctly.
         let s: SysSandbox = serde_json::from_str(r#"{"applied":true}"#).unwrap();
-        assert!(s.applied);
+        assert!(s.any_sandboxed, "alias 'applied' must map to any_sandboxed");
+    }
+
+    #[test]
+    fn sys_sandbox_servers_and_degradations_parse() {
+        let json = r#"{
+            "any_sandboxed": true,
+            "servers": [
+                {"name":"search","isolation":"none","landlock":true,"seccomp":true,
+                 "spawn_enforcement":"fork_vfork_only","namespace_net":false,
+                 "namespace_mount":false,"landlock_net":false}
+            ],
+            "degradations": ["landlock_net_unavailable"]
+        }"#;
+        let s: SysSandbox = serde_json::from_str(json).unwrap();
+        assert!(s.any_sandboxed);
+        assert_eq!(s.servers.len(), 1);
+        assert_eq!(s.servers[0].name, "search");
+        assert!(s.servers[0].landlock);
+        assert_eq!(s.degradations, vec!["landlock_net_unavailable"]);
+    }
+
+    #[test]
+    fn agent_sandbox_no_servers_parses() {
+        let s: AgentSandbox = serde_json::from_str(r#"{"servers":[]}"#).unwrap();
+        assert!(s.servers.is_empty());
+    }
+
+    #[test]
+    fn agent_sandbox_with_server_parses() {
+        let json = r#"{"servers":[
+            {"name":"fs","isolation":"none","landlock":true,"seccomp":false,
+             "spawn_enforcement":"none","namespace_net":false,
+             "namespace_mount":false,"landlock_net":false}
+        ]}"#;
+        let s: AgentSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(s.servers.len(), 1);
+        assert_eq!(s.servers[0].name, "fs");
+        assert!(s.servers[0].landlock);
+        assert!(!s.servers[0].seccomp);
+    }
+
+    #[test]
+    fn read_agent_sandbox_returns_none_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        let result = read_agent_sandbox(tmp.path(), "a");
+        assert!(result.is_none(), "missing sandbox file must return None");
+    }
+
+    #[test]
+    fn read_agent_sandbox_parses_empty_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("sandbox", r#"{"servers":[]}"#)]);
+        let result = read_agent_sandbox(tmp.path(), "a");
+        assert!(result.is_some());
+        assert!(result.unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn read_agent_info_populates_sandbox_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[
+            ("status", "running\n"),
+            ("sandbox", r#"{"servers":[]}"#),
+        ]);
+        let info = read_agent_info(tmp.path(), "a");
+        assert!(info.sandbox.is_some(), "sandbox field must be populated from file");
     }
 
     #[test]

@@ -3,6 +3,43 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p6.8] - 2026-06-19 (v0.34.0)
+
+Sandbox-enforcement surface + flight-log inspector for `agentctl watch`.
+
+- **`SandboxSummary` + `ServerEnforcement`** (`surfaces/src/snapshot.rs`) — replaces
+  `sandbox_applied: bool` on `SchedulerSnapshot` with a full `SandboxSummary { any_sandboxed,
+  servers: Vec<ServerEnforcement>, degradations: Vec<String> }`. `ServerEnforcement` carries
+  per-MCP-server fields: `name`, `isolation`, `landlock`, `seccomp`, `spawn_enforcement`,
+  `namespace_net`, `namespace_mount`, `landlock_net`.
+- **`/agents/<id>/sandbox` FUSE virtual file** (`surfaces/src/agents_fs.rs`) — `OFF_SANDBOX=10`,
+  11th per-agent inode slot, emits JSON with the per-agent server enforcement list. Updated
+  `alloc_dir`, `prune_dead_agent`, readdir, lookup, getattr, `file_content_for_ino`.
+- **`/agents/system/sandbox` expanded** — now emits full `SandboxSummary` JSON including
+  `servers[]` and `degradations[]` arrays (was boolean `applied` only).
+- **`accessible_server_names: Vec<String>`** on `AgentSnapshot` — names of MCP servers the
+  agent has `Mcp`-capability access to; populated from `AgentTask` in `scheduler.rs`.
+- **`main.rs` sandbox builder** — builds `ServerEnforcement` per MCP server
+  (`#[cfg(target_os = "linux")]`), detects `landlock_net_unavailable` and
+  `spawn_enforcement_unavailable_arch` degradations.
+- **`agentctl` reader expansion** (`agentctl/src/watch/reader.rs`) — `SysSandbox` gains
+  `servers` + `degradations` fields (`#[serde(alias = "applied")]` for backward compat);
+  `AgentSandbox` struct; `read_agent_sandbox()` helper; `AgentInfo.sandbox` field.
+- **Agent-detail sandbox row** (`views.rs`) — shows per-server flags
+  (`landlock`, `seccomp`, `net_ns`, `mount_ns`) inline in the detail pane.
+- **System-view degradation warnings** — yellow warning rows appear for each entry in
+  `SysSandbox.degradations` (e.g. "landlock_net_unavailable").
+- **`View::Inspector`** (`[i]` key in `agentctl watch`) — new `agentctl/src/watch/inspector.rs`
+  module with `InspectorState`: loads last 512 KB of `flight.jsonl` (load-once model,
+  `[r]` to reload); `[Tab]` cycles filter (All → Errors → Sandbox → CapDenied); `[/]`
+  substring search; color-coded body (red=errors, cyan=sandbox, yellow=cap_denied); scroll
+  with ↑/↓/j/k/PgUp/PgDn/Home/End.
+- **`MAX_INSPECTOR_LINES=500`** cap on loaded flight-log lines.
+- **Tests**: 14 new inspector tests, 11 new FUSE tests (incl. unrestricted-caps path, restricted-empty
+  path, named-accessible-server intersection, sys sandbox with servers+degradations), 10 new reader
+  tests (incl. render_plain sandbox blocks), 1 new checkpoint test (parent_map serde default) —
+  total workspace test count: 841.
+
 ## [p6.7] - 2026-06-18 (v0.33.0)
 
 Starter catalogue — 7 committed templates covering every AgentOS primitive layer.

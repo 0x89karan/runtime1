@@ -284,6 +284,24 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_checkpoint_parent_map_serde_default() {
+        // Pre-p6.4 checkpoints have no "parent_map" field. Deserializing them must
+        // succeed with an empty map, not fail. This guards the `#[serde(default)]`.
+        let json = serde_json::json!({
+            "format_version": FORMAT_VERSION,
+            "agents": [],
+            "awaiting": [],
+            "mailboxes": {},
+            "tokens_spent": 0,
+            "child_seq": 0,
+            "spawn_depths": {}
+            // "parent_map" is intentionally absent
+        });
+        let cp: SchedulerCheckpoint = serde_json::from_str(&serde_json::to_string(&json).unwrap()).unwrap();
+        assert!(cp.parent_map.is_empty(), "missing parent_map field must deserialize to empty map");
+    }
+
+    #[test]
     fn load_corrupt_json_returns_err() {
         let dir = TempDir::new().unwrap();
         let store = CheckpointStore::new(dir.path());

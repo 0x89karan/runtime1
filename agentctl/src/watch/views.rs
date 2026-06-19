@@ -31,6 +31,7 @@ pub fn render(f: &mut Frame, app: &App) {
         View::Topology    => render_topology(f, app),
         View::Memory      => render_memory(f, app),
         View::Spawn       => render_spawn(f, app),
+        View::Inspector   => render_inspector(f, app),
     }
 }
 
@@ -144,6 +145,33 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
     } else {
         agent.tools.join(", ")
     };
+    let sandbox_str = match &agent.sandbox {
+        None => "(unavailable)".to_string(),
+        Some(sb) if sb.servers.is_empty() => "(none)".to_string(),
+        Some(sb) => {
+            sb.servers.iter()
+                .map(|s| {
+                    let flags: Vec<&str> = [
+                        s.landlock.then_some("landlock"),
+                        s.seccomp.then_some("seccomp"),
+                        s.landlock_net.then_some("landlock_net"),
+                        s.namespace_net.then_some("net_ns"),
+                        s.namespace_mount.then_some("mount_ns"),
+                        (!s.isolation.is_empty() && s.isolation != "none")
+                            .then_some(s.isolation.as_str()),
+                    ].iter().filter_map(|x| *x).collect();
+                    if flags.is_empty() {
+                        format!("{}:none", s.name)
+                    } else {
+                        // Truncate safely at char boundary
+                        let flags_str = flags.join(",");
+                        format!("{}:{}", s.name, flags_str)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+        }
+    };
     let lines: Vec<Line> = vec![
         Line::from(vec![
             Span::styled("  Status:   ", Style::default().add_modifier(Modifier::BOLD)),
@@ -156,8 +184,11 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
             Span::styled("  Tools:    ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(tools_str),
         ]),
+        Line::from(vec![
+            Span::styled("  Sandbox:  ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(sandbox_str),
+        ]),
     ];
-
     f.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(" detail ")),
@@ -182,11 +213,13 @@ fn render_system(f: &mut Frame, app: &App) {
 
     let spent   = app.budget.as_ref().map(|b| b.spent).unwrap_or(0);
     let depth   = app.queue.as_ref().map(|q| q.depth).unwrap_or(0);
-    let sandbox = app.sandbox.as_ref().map(|s| s.applied).unwrap_or(false);
+    let sandbox_ref = app.sandbox.as_ref();
+    let sandbox     = sandbox_ref.map(|s| s.any_sandboxed).unwrap_or(false);
+    let degs        = sandbox_ref.map(|s| s.degradations.as_slice()).unwrap_or_default();
     let model   = app.provider.as_ref().map(|p| p.model.as_str()).unwrap_or("unknown");
     let backend = app.provider.as_ref().map(|p| p.backend.as_str()).unwrap_or("unknown");
 
-    let lines: Vec<Line> = vec![
+    let mut lines: Vec<Line> = vec![
         Line::from(""),
         Line::from(vec![
             Span::styled("  Provider:  ", Style::default().add_modifier(Modifier::BOLD)),
@@ -205,6 +238,12 @@ fn render_system(f: &mut Frame, app: &App) {
             Span::raw(if sandbox { "applied" } else { "none" }),
         ]),
     ];
+    for deg in degs {
+        lines.push(Line::from(vec![
+            Span::styled("  ! Degraded:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {deg}"), Style::default().fg(Color::Yellow)),
+        ]));
+    }
 
     f.render_widget(
         Paragraph::new(lines)
@@ -646,6 +685,86 @@ fn render_spawn(f: &mut Frame, app: &App) {
     );
 }
 
+fn render_inspector(f: &mut Frame, app: &App) {
+    use super::inspector::InspectorFilter;
+
+    let (header_area, content_area, footer_area) = header_footer_layout(f.area());
+
+    let filter_label = app.inspector_view.filter.label();
+    let search_hint  = if app.inspector_view.search_active {
+        format!(" › search: {}_", app.inspector_view.search_query)
+    } else {
+        String::new()
+    };
+    f.render_widget(
+        Paragraph::new(format!(
+            " agentctl watch › inspector [{}]{} — loaded {}",
+            filter_label, search_hint, app.inspector_view.load_time
+        )).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        header_area,
+    );
+
+    let height = content_area.height as usize;
+    let lines  = &app.inspector_view.lines;
+    let scroll = app.inspector_view.scroll.min(lines.len().saturating_sub(1));
+
+    let visible: Vec<Line> = lines
+        .iter()
+        .skip(scroll)
+        .take(height)
+        .map(|l| {
+            let s = l.as_str();
+            // Colour-code by event kind.
+            let style = if s.contains("\"kind\":\"tool_error\"")
+                || s.contains("\"kind\":\"inference_error\"")
+                || s.contains("\"kind\":\"agent_failed\"")
+            {
+                Style::default().fg(Color::Red)
+            } else if s.contains("\"kind\":\"sandbox_applied\"")
+                || s.contains("\"kind\":\"sandbox_skipped\"")
+            {
+                Style::default().fg(Color::Cyan)
+            } else if s.contains("\"kind\":\"capability_denied\"") {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            let n = 200.min(s.len());
+            let end = s.floor_char_boundary(n);
+            Line::from(Span::styled(s[..end].to_string(), style))
+        })
+        .collect();
+
+    f.render_widget(
+        Paragraph::new(visible)
+            .block(Block::default().borders(Borders::ALL).title(" flight log ")),
+        content_area,
+    );
+
+    let filter_cycle: String = [
+        InspectorFilter::All,
+        InspectorFilter::Errors,
+        InspectorFilter::Sandbox,
+        InspectorFilter::CapDenied,
+    ]
+    .iter()
+    .map(|f| {
+        if f == &app.inspector_view.filter {
+            format!("[{}]", f.label())
+        } else {
+            f.label().to_string()
+        }
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+
+    let hints = format!(" Tab:filter({filter_cycle})  [/]search  [r]refresh  Esc/q back ");
+    f.render_widget(
+        Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        footer_area,
+    );
+}
+
 /// Render a plain-text snapshot to a string (for --plain mode, no ANSI).
 pub fn render_plain(app: &App) -> String {
     let mut out = String::new();
@@ -660,6 +779,21 @@ pub fn render_plain(app: &App) -> String {
     }
     if let Some(q) = app.queue.as_ref() {
         out.push_str(&format!("queue_depth: {}\n", q.depth));
+    }
+    if let Some(sb) = app.sandbox.as_ref() {
+        out.push_str(&format!("sandbox: any_sandboxed={}\n", sb.any_sandboxed));
+        for s in &sb.servers {
+            out.push_str(&format!(
+                "  server {}: isolation={} landlock={} seccomp={} \
+                spawn_enforcement={} namespace_net={} namespace_mount={} landlock_net={}\n",
+                sanitize(&s.name), sanitize(&s.isolation),
+                s.landlock, s.seccomp, sanitize(&s.spawn_enforcement),
+                s.namespace_net, s.namespace_mount, s.landlock_net,
+            ));
+        }
+        for d in &sb.degradations {
+            out.push_str(&format!("  degradation: {}\n", sanitize(d)));
+        }
     }
     if app.agents.is_empty() {
         out.push_str("agents: (none)\n");
@@ -756,6 +890,7 @@ mod tests {
             budget:         BudgetKind::Unlimited,
             tools,
             parent_id:      None,
+            sandbox:        None,
         }
     }
 
@@ -910,6 +1045,60 @@ mod tests {
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("parent=coordinator"), "child agent must show parent id");
+    }
+
+    // ── render_plain: sandbox block ──────────────────────────────────────────
+
+    #[test]
+    fn render_plain_sandbox_with_server_and_degradation() {
+        use crate::watch::reader::{ServerEnforcement, SysSandbox};
+        let sb = SysSandbox {
+            any_sandboxed: true,
+            servers: vec![ServerEnforcement {
+                name:              "search".to_string(),
+                isolation:         "none".to_string(),
+                landlock:          true,
+                seccomp:           true,
+                spawn_enforcement: "fork_vfork_only".to_string(),
+                namespace_net:     false,
+                namespace_mount:   false,
+                landlock_net:      false,
+            }],
+            degradations: vec!["landlock_net_unavailable".to_string()],
+        };
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None,
+            sandbox: Some(sb), provider: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("sandbox: any_sandboxed=true"), "any_sandboxed must appear");
+        assert!(out.contains("server search:"), "server name must appear");
+        assert!(out.contains("landlock=true"), "landlock flag must appear");
+        assert!(out.contains("seccomp=true"), "seccomp flag must appear");
+        assert!(out.contains("spawn_enforcement=fork_vfork_only"), "spawn_enforcement must appear");
+        assert!(out.contains("degradation: landlock_net_unavailable"), "degradation must appear");
+    }
+
+    #[test]
+    fn render_plain_sandbox_gvisor_shows_isolation() {
+        use crate::watch::reader::{ServerEnforcement, SysSandbox};
+        let sb = SysSandbox {
+            any_sandboxed: true,
+            servers: vec![ServerEnforcement {
+                name:      "sandbox-server".to_string(),
+                isolation: "gvisor".to_string(),
+                landlock:  false, seccomp: false,
+                spawn_enforcement: "none".to_string(),
+                namespace_net: false, namespace_mount: false, landlock_net: false,
+            }],
+            degradations: vec![],
+        };
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None,
+            sandbox: Some(sb), provider: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("isolation=gvisor"), "gvisor isolation must appear in render_plain output");
     }
 
     // ── status_style: coverage via plain-text content (not TUI) ─────────────

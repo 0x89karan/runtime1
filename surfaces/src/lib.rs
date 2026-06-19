@@ -1,7 +1,7 @@
 pub mod agents_fs;
 pub mod snapshot;
 
-pub use snapshot::{AgentSnapshot, AgentStatus, SchedulerSnapshot};
+pub use snapshot::{AgentSnapshot, AgentStatus, SchedulerSnapshot, SandboxSummary, ServerEnforcement};
 
 /// Minimal read-only view of the memory store, used by the FUSE filesystem.
 ///

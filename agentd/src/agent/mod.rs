@@ -120,6 +120,30 @@ impl AgentTask {
         &self.tool_names
     }
 
+    /// Names of MCP servers this agent has Mcp-capability access to.
+    /// Used by the snapshot surface to build the per-agent sandbox view.
+    pub fn accessible_server_names(&self) -> Vec<String> {
+        match &self.cfg.capabilities {
+            None => vec![],
+            Some(caps) => caps
+                .iter()
+                .filter_map(|cap| {
+                    if let crate::capability::Capability::Mcp { server, .. } = cap {
+                        Some(server.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// True when the agent has no capability constraints (capabilities = None in config),
+    /// meaning it has unrestricted access to all registered MCP servers.
+    pub fn is_capabilities_unrestricted(&self) -> bool {
+        self.cfg.capabilities.is_none()
+    }
+
     /// Scheduling priority from config. Higher value = runs before lower.
     pub fn priority(&self) -> u32 {
         self.cfg.priority

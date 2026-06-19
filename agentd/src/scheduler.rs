@@ -1219,6 +1219,8 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     })
                     .collect(),
                 parent_id: state.parent_map.get(id).cloned(),
+                accessible_server_names:   task.accessible_server_names(),
+                capabilities_unrestricted: task.is_capabilities_unrestricted(),
             }
         })
         .collect();

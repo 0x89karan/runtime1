@@ -155,7 +155,14 @@ code-aware, watcher, memory-custodian) plus the existing scout (7 total); `gated
 on `TemplateMeta` with pre-spawn warning in both CLI and TUI paths; `sample_tasks: Vec<String>` on
 `TemplateEntry` with TUI pre-fill of `task_input`; 14 new catalogue tests; UTF-8-safe `showcases`
 truncation in `agentctl list-templates`; 808 workspace tests.
-**Next: p6.8 — see `docs/ROADMAP.md`.**
+**p6.8 complete (v0.34.0).** Sandbox-enforcement surface + flight-log inspector: `SandboxSummary` +
+`ServerEnforcement` replacing `sandbox_applied: bool`; `/agents/<id>/sandbox` FUSE virtual file
+(`OFF_SANDBOX=10`, 11th per-agent inode); `/agents/system/sandbox` expanded with full `servers[]` +
+`degradations[]`; `accessible_server_names` on `AgentSnapshot`; `main.rs` builds `ServerEnforcement`
+per MCP server + detects degradations; `agentctl` reader/views show per-server sandbox flags +
+degradation warnings; `View::Inspector` (`[i]` key) with load-once flight-log tail, filter
+(All/Errors/Sandbox/CapDenied), substring search, color-coded body; 840+ workspace tests.
+**Phase 6 complete. Next: see `docs/ROADMAP.md` §Beyond.**
 
 ## How to work here
 

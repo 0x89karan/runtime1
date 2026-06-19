@@ -312,6 +312,14 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // calling exit() while mcp_clients is still in scope.
     let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
     let mut any_sandbox_applied = false;
+    // Per-server enforcement records collected during spawn; used to populate
+    // SandboxSummary on the snapshot after all servers are started.
+    // degradations computed once at server spawn; reflect startup-time policy, not runtime state.
+    let mut server_enforcements: Vec<surfaces::ServerEnforcement> = Vec::new();
+    // On non-Linux, degradation_set is never mutated (linux-gated code only).
+    // BTreeSet gives deterministic ordering so the JSON array is stable across runs.
+    #[allow(unused_mut)]
+    let mut degradation_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for server in &cfg.tools.mcp_servers {
         // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn},{Net}])
         // when only spawn/net caps are present with no FS rules.
@@ -467,6 +475,66 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         }
         tracing::info!(name = %server.name, tools = n, "MCP server connected");
         mcp_clients.push(client);
+
+        // Build per-server enforcement record for the snapshot surface.
+        let isolation_str = if is_gvisor { "gvisor" } else { "none" }.to_string();
+        #[cfg(target_os = "linux")]
+        let se = {
+            if is_gvisor {
+                // gVisor: native kernel mechanisms not applied; isolation handled by Sentry.
+                surfaces::ServerEnforcement {
+                    name:              server.name.clone(),
+                    isolation:         isolation_str,
+                    landlock:          false,
+                    seccomp:           false,
+                    spawn_enforcement: "none".to_string(),
+                    namespace_net:     false,
+                    namespace_mount:   false,
+                    landlock_net:      false,
+                }
+            } else if let Some(ref enf) = enforcement {
+                // Check degradations from enforcement status.
+                // Pre-V4 net-cap: deny-all fallback is active (safer than unrestricted).
+                let has_net_ports = server.capabilities.as_deref()
+                    .map(|c| c.iter().any(|cap| {
+                        if let agentd::capability::Capability::Net { ports, .. } = cap {
+                            !ports.is_empty()
+                        } else { false }
+                    }))
+                    .unwrap_or(false);
+                if has_net_ports && !enf.landlock_net {
+                    degradation_set.insert("landlock_net_unavailable".to_string());
+                }
+                let has_deny_spawn = sandbox_rules.as_deref()
+                    .is_some_and(|r| r.iter().any(|rule| matches!(rule, SandboxRule::DenySpawn)));
+                if has_deny_spawn && enf.spawn_enforcement == "none" {
+                    degradation_set.insert("spawn_enforcement_unavailable_arch".to_string());
+                }
+                surfaces::ServerEnforcement {
+                    name:              server.name.clone(),
+                    isolation:         isolation_str,
+                    landlock:          enf.landlock,
+                    seccomp:           enf.seccomp,
+                    spawn_enforcement: enf.spawn_enforcement.to_string(),
+                    namespace_net:     enf.namespace_net,
+                    namespace_mount:   enf.namespace_mount,
+                    landlock_net:      enf.landlock_net,
+                }
+            } else {
+                surfaces::ServerEnforcement {
+                    name:      server.name.clone(),
+                    isolation: isolation_str,
+                    ..Default::default()
+                }
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let se = surfaces::ServerEnforcement {
+            name:      server.name.clone(),
+            isolation: isolation_str,
+            ..Default::default()
+        };
+        server_enforcements.push(se);
     }
 
     let tool_names = registry.tool_names();
@@ -505,8 +573,12 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // Set static snapshot fields (provider model + sandbox status) once at startup,
     // before the FUSE mount, so the /agents/system/ files are accurate from first access.
     if let Ok(mut snap) = snapshot.write() {
-        snap.provider_model  = cfg.model.model.clone();
-        snap.sandbox_applied = any_sandbox_applied;
+        snap.provider_model = cfg.model.model.clone();
+        snap.sandbox = surfaces::SandboxSummary {
+            any_sandboxed:  any_sandbox_applied,
+            servers:        server_enforcements,
+            degradations:   degradation_set.into_iter().collect(),
+        };
     }
 
     #[cfg(target_os = "linux")]

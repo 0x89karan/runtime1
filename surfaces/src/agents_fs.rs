@@ -47,6 +47,8 @@ pub(crate) const OFF_LONG_TERM_DIR: u64 = 7;
 pub(crate) const OFF_TOOLS:         u64 = 8;
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const OFF_PARENT:        u64 = 9;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const OFF_SANDBOX:       u64 = 10;
 
 /// System directory and file inodes (not in inode_to_id; handled explicitly).
 #[cfg(any(test, target_os = "linux"))]
@@ -62,9 +64,11 @@ const INO_SYS_PROVIDER: u64 = 14;
 
 // Invariant: all per-agent file offsets must fit within DIR_STEP - 1 slots.
 #[cfg(any(test, target_os = "linux"))]
-const _: () = assert!(OFF_TOOLS  < DIR_STEP - 1, "OFF_TOOLS must be < DIR_STEP - 1");
+const _: () = assert!(OFF_TOOLS   < DIR_STEP - 1, "OFF_TOOLS must be < DIR_STEP - 1");
 #[cfg(any(test, target_os = "linux"))]
-const _: () = assert!(OFF_PARENT < DIR_STEP - 1, "OFF_PARENT must be < DIR_STEP - 1");
+const _: () = assert!(OFF_PARENT  < DIR_STEP - 1, "OFF_PARENT must be < DIR_STEP - 1");
+#[cfg(any(test, target_os = "linux"))]
+const _: () = assert!(OFF_SANDBOX < DIR_STEP - 1, "OFF_SANDBOX must be < DIR_STEP - 1");
 
 /// Last 64 KB of flight.jsonl to scan for per-agent events.
 #[cfg(any(test, target_os = "linux"))]
@@ -204,10 +208,11 @@ impl AgentsFs {
         let ino = self.next_dir_inode;
         self.next_dir_inode += DIR_STEP;
         self.dir_inodes.insert(agent_id.to_string(), ino);
-        // Register all 10 fixed inodes so inode_to_id lookups work.
+        // Register all 11 fixed inodes so inode_to_id lookups work.
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
             OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
+            OFF_SANDBOX,
         ] {
             self.inode_to_id.insert(ino + offset, agent_id.to_string());
         }
@@ -335,6 +340,42 @@ impl AgentsFs {
                     None      => b"(none)\n".to_vec(),
                 }
             }
+            OFF_SANDBOX => {
+                // When capabilities == None (unrestricted) show all registered servers;
+                // otherwise show only the servers the agent has Mcp-capability access to.
+                let server_names: Vec<&str> = if agent.capabilities_unrestricted {
+                    snap.sandbox.servers.iter().map(|s| s.name.as_str()).collect()
+                } else {
+                    agent.accessible_server_names.iter().map(|s| s.as_str()).collect()
+                };
+                let servers: String = server_names.iter().map(|name| {
+                    let enf = snap.sandbox.servers.iter().find(|s| s.name.as_str() == *name);
+                    match enf {
+                        Some(s) => format!(
+                            "{{\"name\":\"{}\",\"isolation\":\"{}\",\
+                            \"landlock\":{},\"seccomp\":{},\
+                            \"spawn_enforcement\":\"{}\",\
+                            \"namespace_net\":{},\"namespace_mount\":{},\
+                            \"landlock_net\":{}}}",
+                            json_escape_str(&s.name),
+                            json_escape_str(&s.isolation),
+                            s.landlock, s.seccomp,
+                            json_escape_str(&s.spawn_enforcement),
+                            s.namespace_net, s.namespace_mount,
+                            s.landlock_net,
+                        ),
+                        None => format!(
+                            "{{\"name\":\"{}\",\"isolation\":\"none\",\
+                            \"landlock\":false,\"seccomp\":false,\
+                            \"spawn_enforcement\":\"none\",\
+                            \"namespace_net\":false,\"namespace_mount\":false,\
+                            \"landlock_net\":false}}",
+                            json_escape_str(name),
+                        ),
+                    }
+                }).collect::<Vec<_>>().join(",");
+                format!("{{\"servers\":[{servers}]}}\n").into_bytes()
+            }
             // OFF_MEMORY_DIR and OFF_LONG_TERM_DIR are directories — not served here.
             _ => return None,
         };
@@ -353,10 +394,29 @@ impl AgentsFs {
                 "{{\"depth\":{}}}\n",
                 snap.queue_depth
             ),
-            INO_SYS_SANDBOX => format!(
-                "{{\"applied\":{}}}\n",
-                snap.sandbox_applied
-            ),
+            INO_SYS_SANDBOX => {
+                let sb = &snap.sandbox;
+                let any = sb.any_sandboxed;
+                let degs: String = sb.degradations.iter().map(|d| {
+                    format!("\"{}\"", json_escape_str(d))
+                }).collect::<Vec<_>>().join(",");
+                let servers: String = sb.servers.iter().map(|s| {
+                    format!(
+                        "{{\"name\":\"{}\",\"isolation\":\"{}\",\
+                        \"landlock\":{},\"seccomp\":{},\
+                        \"spawn_enforcement\":\"{}\",\
+                        \"namespace_net\":{},\"namespace_mount\":{},\
+                        \"landlock_net\":{}}}",
+                        json_escape_str(&s.name),
+                        json_escape_str(&s.isolation),
+                        s.landlock, s.seccomp,
+                        json_escape_str(&s.spawn_enforcement),
+                        s.namespace_net, s.namespace_mount,
+                        s.landlock_net,
+                    )
+                }).collect::<Vec<_>>().join(",");
+                format!("{{\"any_sandboxed\":{any},\"servers\":[{servers}],\"degradations\":[{degs}]}}\n")
+            }
             INO_SYS_PROVIDER => {
                 let escaped = json_escape_str(&snap.provider_model);
                 format!("{{\"model\":\"{escaped}\",\"backend\":\"anthropic\"}}\n")
@@ -392,10 +452,11 @@ impl AgentsFs {
     /// into a `Vec<String>` before calling this (Rust borrow checker requires it).
     fn prune_dead_agent(&mut self, agent_id: &str) {
         if let Some(base) = self.dir_inodes.remove(agent_id) {
-            // Remove all 10 fixed per-agent inodes (dir + offsets 1–9).
+            // Remove all 11 fixed per-agent inodes (dir + offsets 1–10).
             for offset in [
                 0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
                 OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
+                OFF_SANDBOX,
             ] {
                 self.inode_to_id.remove(&(base + offset));
             }
@@ -493,6 +554,7 @@ fn file_name_for_offset(offset: u64) -> Option<&'static str> {
         OFF_LONG_TERM_DIR => Some("long_term"),
         OFF_TOOLS         => Some("tools"),
         OFF_PARENT        => Some("parent"),
+        OFF_SANDBOX       => Some("sandbox"),
         _ => None,
     }
 }
@@ -670,6 +732,11 @@ impl fuser::Filesystem for AgentsFs {
                     }
                     "parent" => {
                         let ino = dir_ino + OFF_PARENT;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    "sandbox" => {
+                        let ino = dir_ino + OFF_SANDBOX;
                         let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
                         reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
                     }
@@ -901,6 +968,7 @@ impl fuser::Filesystem for AgentsFs {
                     (dir_ino + OFF_FLIGHT,  fuser::FileType::RegularFile, "flight".to_string()),
                     (dir_ino + OFF_TOOLS,   fuser::FileType::RegularFile, "tools".to_string()),
                     (dir_ino + OFF_PARENT,  fuser::FileType::RegularFile, "parent".to_string()),
+                    (dir_ino + OFF_SANDBOX, fuser::FileType::RegularFile, "sandbox".to_string()),
                 ];
                 if self.memory.is_some() {
                     v.push((dir_ino + OFF_MEMORY_DIR, fuser::FileType::Directory, "memory".to_string()));
@@ -1045,7 +1113,7 @@ mod tests {
             in_flight:           0,
             queue_depth:         0,
             provider_model:      String::new(),
-            sandbox_applied:     false,
+            sandbox:             Default::default(),
         }))
     }
 
@@ -1053,30 +1121,33 @@ mod tests {
         agents:          Vec<AgentSnapshot>,
         global_spent:    u64,
         queue_depth:     usize,
-        sandbox_applied: bool,
+        any_sandboxed:   bool,
         provider_model:  &str,
     ) -> Arc<RwLock<SchedulerSnapshot>> {
+        use crate::snapshot::SandboxSummary;
         Arc::new(RwLock::new(SchedulerSnapshot {
             agents,
             global_tokens_spent: global_spent,
             in_flight:           0,
             queue_depth,
             provider_model:      provider_model.to_string(),
-            sandbox_applied,
+            sandbox:             SandboxSummary { any_sandboxed, ..Default::default() },
         }))
     }
 
     fn agent_snap(id: &str, status: AgentStatus) -> AgentSnapshot {
         AgentSnapshot {
-            id:                  id.to_string(),
+            id:                      id.to_string(),
             status,
-            turn:                0,
-            context_tokens:      100,
-            token_budget:        50_000,
-            task_preview:        "do something".to_string(),
-            tools:               vec![],
-            short_term_previews: vec![],
-            parent_id:           None,
+            turn:                    0,
+            context_tokens:          100,
+            token_budget:            50_000,
+            task_preview:            "do something".to_string(),
+            tools:                   vec![],
+            short_term_previews:     vec![],
+            parent_id:               None,
+            accessible_server_names:   vec![],
+            capabilities_unrestricted: false,
         }
     }
 
@@ -1977,7 +2048,7 @@ mod tests {
         let fs = AgentsFs::new(snap, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
-        assert_eq!(s, "{\"applied\":false}\n");
+        assert_eq!(s, "{\"any_sandboxed\":false,\"servers\":[],\"degradations\":[]}\n");
     }
 
     #[test]
@@ -1986,7 +2057,179 @@ mod tests {
         let fs = AgentsFs::new(snap, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
-        assert_eq!(s, "{\"applied\":true}\n");
+        assert_eq!(s, "{\"any_sandboxed\":true,\"servers\":[],\"degradations\":[]}\n");
+    }
+
+    #[test]
+    fn sys_sandbox_renders_servers_and_degradations() {
+        use crate::snapshot::{SandboxSummary, ServerEnforcement};
+        let enf = ServerEnforcement {
+            name:              "search".to_string(),
+            isolation:         "none".to_string(),
+            landlock:          true,
+            seccomp:           true,
+            spawn_enforcement: "fork_vfork_only".to_string(),
+            namespace_net:     false,
+            namespace_mount:   false,
+            landlock_net:      false,
+        };
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot {
+            agents:              vec![],
+            global_tokens_spent: 0,
+            in_flight:           0,
+            queue_depth:         0,
+            provider_model:      String::new(),
+            sandbox:             SandboxSummary {
+                any_sandboxed: true,
+                servers:        vec![enf],
+                degradations:   vec!["landlock_net_unavailable".to_string()],
+            },
+        }));
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains("\"any_sandboxed\":true"), "any_sandboxed must be true");
+        assert!(s.contains("\"search\""), "server name must appear");
+        assert!(s.contains("\"landlock\":true"), "landlock flag must appear");
+        assert!(s.contains("\"landlock_net_unavailable\""), "degradation must appear in JSON");
+    }
+
+    #[test]
+    fn sys_sandbox_json_key_is_any_sandboxed() {
+        // Acceptance: the JSON key must be "any_sandboxed", not the old "applied".
+        let snap = make_snap_with_sys(vec![], 0, 0, true, "");
+        let fs = AgentsFs::new(snap, None);
+        let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains("\"any_sandboxed\""), "key must be any_sandboxed");
+        assert!(!s.contains("\"applied\""), "old key must not appear");
+    }
+
+    #[test]
+    fn alloc_dir_registers_sandbox_offset() {
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None);
+        let base = fs.alloc_dir("agent-x");
+        assert!(
+            fs.inode_to_id.contains_key(&(base + OFF_SANDBOX)),
+            "inode_to_id must contain OFF_SANDBOX inode after alloc_dir"
+        );
+    }
+
+    #[test]
+    fn prune_dead_agent_removes_sandbox_inode() {
+        let snap = make_snap(vec![agent_snap("dead", AgentStatus::Done)]);
+        let mut fs = AgentsFs::new(snap, None);
+        let base = fs.alloc_dir("dead");
+        let sandbox_ino = base + OFF_SANDBOX;
+        assert!(fs.inode_to_id.contains_key(&sandbox_ino));
+        fs.prune_dead_agent("dead");
+        assert!(
+            !fs.inode_to_id.contains_key(&sandbox_ino),
+            "sandbox inode must be removed after prune_dead_agent"
+        );
+    }
+
+    #[test]
+    fn agent_sandbox_no_accessible_servers() {
+        // Agent with no accessible servers → servers array is empty.
+        let a = agent_snap("a1", AgentStatus::Running);
+        let snap = make_snap(vec![a]);
+        let mut fs = AgentsFs::new(snap, None);
+        let base = fs.alloc_dir("a1");
+        let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"servers\":[]}\n");
+    }
+
+    #[test]
+    fn agent_sandbox_unrestricted_shows_all_system_servers() {
+        // capabilities_unrestricted=true → sandbox file lists all registered servers
+        // even though accessible_server_names is empty (the unrestricted-access path).
+        use crate::snapshot::{SandboxSummary, ServerEnforcement};
+        let mut a = agent_snap("a1", AgentStatus::Running);
+        a.capabilities_unrestricted = true;
+        // accessible_server_names stays empty — unrestricted means "all"
+        let enf = ServerEnforcement {
+            name:               "files".to_string(),
+            isolation:          "none".to_string(),
+            landlock:           true,
+            seccomp:            false,
+            spawn_enforcement:  "fork_vfork_only".to_string(),
+            namespace_net:      false,
+            namespace_mount:    false,
+            landlock_net:       false,
+        };
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot {
+            agents:              vec![a],
+            global_tokens_spent: 0,
+            in_flight:           0,
+            queue_depth:         0,
+            provider_model:      String::new(),
+            sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
+        }));
+        let mut fs = AgentsFs::new(snap, None);
+        let base = fs.alloc_dir("a1");
+        let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains("\"files\""), "unrestricted agent must show all system servers");
+        assert!(s.contains("\"landlock\":true"), "server enforcement fields must be present");
+    }
+
+    #[test]
+    fn agent_sandbox_restricted_empty_accessible_shows_no_servers() {
+        // capabilities_unrestricted=false + empty accessible_server_names → empty servers array.
+        // Confirms we don't accidentally fall through to the unrestricted path.
+        use crate::snapshot::{SandboxSummary, ServerEnforcement};
+        let enf = ServerEnforcement { name: "files".to_string(), ..Default::default() };
+        let a = agent_snap("a2", AgentStatus::Running); // capabilities_unrestricted=false, accessible=[]
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot {
+            agents:              vec![a],
+            global_tokens_spent: 0,
+            in_flight:           0,
+            queue_depth:         0,
+            provider_model:      String::new(),
+            sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
+        }));
+        let mut fs = AgentsFs::new(snap, None);
+        let base = fs.alloc_dir("a2");
+        let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "{\"servers\":[]}\n", "restricted agent with empty accessible list must show no servers");
+    }
+
+    #[test]
+    fn agent_sandbox_restricted_with_named_accessible_server() {
+        // capabilities_unrestricted=false + accessible_server_names=["files"] →
+        // the sandbox output must include the "files" server from system enforcement.
+        use crate::snapshot::{SandboxSummary, ServerEnforcement};
+        let enf = ServerEnforcement {
+            name:              "files".to_string(),
+            isolation:         "none".to_string(),
+            landlock:          true,
+            seccomp:           false,
+            spawn_enforcement: "fork_vfork_only".to_string(),
+            namespace_net:     false,
+            namespace_mount:   false,
+            landlock_net:      false,
+        };
+        let mut a = agent_snap("a3", AgentStatus::Running);
+        a.accessible_server_names = vec!["files".to_string()];
+        // capabilities_unrestricted stays false — this agent is scoped to just "files"
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot {
+            agents:              vec![a],
+            global_tokens_spent: 0,
+            in_flight:           0,
+            queue_depth:         0,
+            provider_model:      String::new(),
+            sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
+        }));
+        let mut fs = AgentsFs::new(snap, None);
+        let base = fs.alloc_dir("a3");
+        let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains("\"files\""), "accessible server must appear in sandbox output");
+        assert!(s.contains("\"landlock\":true"), "server enforcement details must be present");
     }
 
     #[test]
@@ -2044,7 +2287,7 @@ mod tests {
         let s = crate::snapshot::SchedulerSnapshot::default();
         assert_eq!(s.queue_depth, 0);
         assert_eq!(s.provider_model, "");
-        assert!(!s.sandbox_applied);
+        assert!(!s.sandbox.any_sandboxed);
     }
 
     #[test]
