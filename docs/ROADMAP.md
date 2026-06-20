@@ -722,38 +722,124 @@ with `agentd` still ≤ 4 MB.
 
 ---
 
-## Beyond
+## Core vs. Harness
 
-Re-homed into Phase 5 (above): the memory substrate (Layer 1 — embedded, lexical).
-Remaining:
-- **Layer 2 — external hybrid (semantic + keyword) KB over MCP.** Attach a real search
-  engine (**HelixDB** — Rust graph+vector, best ethos fit and adds a provenance/link
-  graph; or Postgres+pgvector+FTS; or Qdrant/Meilisearch) as a sandboxed MCP server
-  (`gbrain` is a working reference of the pattern);
-  embeddings come from a **remote embedding API** (Voyage AI canonical; Cohere/OpenAI
-  viable), preserving the remote-cognition lock — no embedding weights on the `agentd`
-  host. Stdio-sidecar is reachable within Phase 5; a networked KB uses the HTTP/SSE
-  MCP transport shipped in p7.1, with the p4.6 Landlock V4 TCP-port rules as the
-  enforcement layer. Design: `docs/DESIGN-memory.md` §4 (two storage layers) + §9 Q1
-  (decided).
-- Additional inference backends (incl. a local `impl InferenceGateway`, and a remote
-  `embed()` method on the gateway if embeddings are ever pulled in-process rather than
-  into the KB sidecar), richer A2A/ACP interop, and multi-device agent migration.
+After Phase 6 the agentOS **core** (`agentd` + `agentctl`) is complete. It can run
+capability-scoped agents with memory, observation, sandbox enforcement, and a full
+operator interface. The test for whether something belongs in the core: *does every
+agent need it, regardless of what it does?*
 
-Re-homed into Phase 6 (above): the human interface layer (operator TUI + agent
-catalogue). Beyond Phase 6: an event-trigger surface (unlocks the Watcher template —
-the daemon-shaped agent), and write-capable memory/control surfaces.
+From here two tracks diverge:
 
-### Phase 7 — Connectivity
+- **Core** — small, additive changes that belong inside `agentd`/`agentctl` because
+  they are protocol-level or infrastructure-level, not capability-level. These keep
+  the binary at the existing size budget (≤ 6 MB CI guard).
+- **Harness** (`agentos-std`, shipped as `agentos:full`) — the standard library of MCP
+  servers, sidecars, and configurations that operators compose from. Written in any
+  language. Versioned independently of the runtime. Never compiled into `agentd`.
+  Delivered as a Docker image layer on top of `agentos:core`.
 
-**p7.1 — HTTP/SSE MCP transport** ✅ (v0.35.0)
+The boundary is enforced mechanically: anything that would grow the `agentd` binary
+beyond 6 MB belongs in the harness.
+
+**p7.1 — HTTP/SSE MCP transport** ✅ (v0.35.0) [CORE]
 Client-side Streamable HTTP transport (MCP spec 2025-03-26). `McpBackend` trait unifies
 stdio and HTTP; `McpHttpClient` with SSE state machine, session-ID capture, bounded-body
 streaming, 30 s timeout; `url` + `headers_env` config fields; `https://` enforcement;
 `mcp_http_connected` / `mcp_http_error` flight events; `transport` field on
-`ServerEnforcement`; `docs/MCP_SERVERS.md` directory. Plan: `docs/plans/p7.1-http-sse-mcp-transport.md`.
+`ServerEnforcement`; `docs/MCP_SERVERS.md` directory. Core rationale: MCP is the tool
+ABI; the client (both transports) belongs in the runtime alongside `infer()`. `reqwest`
+was already a dependency since p0.2; the `stream` feature added negligible binary delta.
 
-**p7.2 — OAuth MCP auth** (planned)
-`auth_provider` field on `[[tools.mcp_servers]]`; OAuth2 authorization-code flow with
-local callback server; token refresh; keychain storage. Unlocks Gmail, Google Drive,
-and other OAuth-gated MCP servers.
+---
+
+## Phase 7 — Core additions
+
+Two small, additive changes to the runtime. Both are protocol or infrastructure concerns
+that cannot live in a sidecar without losing the security or abstraction properties that
+make them meaningful.
+
+**p7.2 — Streaming inference** [CORE]
+Add `stream()` alongside `infer()` on `InferenceGateway`; wire Anthropic SSE streaming
+through `AnthropicGateway`; propagate chunks through the scheduler to stdout
+progressively. The existing run-to-completion path stays the default and unchanged;
+streaming is opt-in (`streaming = true` in `[model]`). Core rationale: this is a
+protocol-level extension to the inference gateway — the same layer as `infer()`. The
+display path (piping chunks through the scheduler) is infrastructure, not a capability.
+**Acceptance:** a streaming-enabled agent prints tokens as they arrive; the flight log
+still records complete `inference_response` events at turn end; non-streaming agents are
+unaffected.
+
+**p7.3 — Write-capable FUSE control surface** [CORE]
+`/agents/control` as a writable pseudo-file; writing a JSON command (`spawn`, `signal`)
+injects it into the running scheduler without restart. Completes p6.6 mode (b): `agentctl
+watch` can spawn agents into the live runtime. Core rationale: same as the read-only
+FUSE surface already in the core — it is operator infrastructure over the scheduler, not
+a tool an agent calls. **Acceptance:** `echo '{"spawn":...}' > /agents/control` starts a
+new agent in the running scheduler; `agentctl watch` spawn view uses it instead of
+exec'ing a new `agentd` process.
+
+---
+
+## Phase 7 — Standard library (harness)
+
+These ship as MCP server implementations in `agentos-std`, packaged in the `agentos:full`
+Docker image. None of them touch `agentd`. Operators attach them via
+`[[tools.mcp_servers]]` with explicit capability grants. Each is a small, independently-
+versioned process in any language.
+
+**h7.1 — Standard MCP servers** [HARNESS]
+Three first-party MCP servers that make the existing template catalogue useful without
+operator setup:
+- `shell_exec` — runs shell commands, returns stdout/stderr/exit code; requires a new
+  `ShellExec` capability (deny-by-default); sandbox applies `DenySpawn` + file grants
+  derived from the agent's `FsRead`/`FsWrite` caps.
+- `http_fetch` — fetches any HTTPS URL, returns a bounded body; requires `Net`; Landlock
+  V4 port rules from p4.6 apply.
+- `web_search` — thin wrapper over a search API (Brave Search or a local SearXNG
+  sidecar); `Net`-gated.
+These servers follow the pattern established by `docker/weather_mcp.py`: small, stdlib-
+only implementations of the MCP JSON-RPC protocol over stdio.
+
+**h7.2 — OAuth MCP sidecar** [HARNESS]
+Handles OAuth2 authorization-code flow with a local callback server; stores tokens in
+the system keychain (read from env at agent startup, preserving the secrets-from-env
+invariant); presents authenticated HTTP calls as MCP tools. Unlocks Gmail, Google Drive,
+Calendar, and other OAuth-gated services. `agentd` sees it as any other MCP server — no
+core changes.
+
+**h7.3 — Event trigger MCP servers** [HARNESS]
+Makes the `watcher` template (currently `gated_requires = "event-triggers"`) fully
+operational. Trigger sources (cron expression, filesystem watch, HTTP webhook) are MCP
+servers that expose a single blocking tool: `wait_for_trigger()`. The agent calls it as
+its first action; the server does not return until the condition fires. `agentd`'s
+existing "agent waiting for a tool result" mechanism handles the rest — no scheduler
+changes needed. The agent wakes from a checkpoint, runs its loop to completion, and is
+re-checkpointed by the scheduler to sleep again. The agent itself is never aware it is
+being triggered; it wakes as if from a fresh prompt.
+
+---
+
+## Phase 8 — Harness extensions
+
+**h8.1 — Layer 2 semantic memory** [HARNESS]
+Attach a HelixDB instance (Rust, graph + vector, provenance links — best ethos fit) as
+an MCP sidecar, reachable via the HTTP/SSE transport shipped in p7.1. Embeddings from a
+remote API (Voyage AI canonical; Cohere/OpenAI viable), preserving the cognition-is-
+remote lock — no embedding weights on the `agentd` host. The Layer-1 BM25 store (p5.5)
+stays as-is; agents use either or both. Design: `docs/DESIGN-memory.md` §4 (two storage
+layers) + §9 Q1 (decided).
+
+**h8.2 — `agentos:full` Docker distribution** [HARNESS]
+Formally packages the harness into a versioned Docker image pair. `agentos:core` contains
+only `agentd` + `agentctl` (the existing `Dockerfile`). `agentos:full` extends it with
+all standard MCP servers (h7.1), the OAuth sidecar (h7.2), event trigger servers (h7.3),
+HelixDB (h8.1), and the full template catalogue. Operators choose the image tier for
+their use case; the core runtime is identical in both.
+
+**h8.3 — Multi-device agent migration** [HARNESS, horizon]
+Serialize a running agent's full state (checkpoint + memory volume + config) into a
+portable artifact and restore it on another device. The checkpoint format (p3.2) and
+detachable memory volume (p5.3.5) provide the groundwork; the remaining work is a
+transfer protocol and identity continuity. Delivered as a command in `agentctl` — not a
+core runtime change. No plan doc yet; revisit when a concrete use case demands it.
