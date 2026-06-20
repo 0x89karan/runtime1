@@ -352,12 +352,13 @@ impl AgentsFs {
                     let enf = snap.sandbox.servers.iter().find(|s| s.name.as_str() == *name);
                     match enf {
                         Some(s) => format!(
-                            "{{\"name\":\"{}\",\"isolation\":\"{}\",\
+                            "{{\"name\":\"{}\",\"transport\":\"{}\",\"isolation\":\"{}\",\
                             \"landlock\":{},\"seccomp\":{},\
                             \"spawn_enforcement\":\"{}\",\
                             \"namespace_net\":{},\"namespace_mount\":{},\
                             \"landlock_net\":{}}}",
                             json_escape_str(&s.name),
+                            json_escape_str(&s.transport),
                             json_escape_str(&s.isolation),
                             s.landlock, s.seccomp,
                             json_escape_str(&s.spawn_enforcement),
@@ -365,7 +366,7 @@ impl AgentsFs {
                             s.landlock_net,
                         ),
                         None => format!(
-                            "{{\"name\":\"{}\",\"isolation\":\"none\",\
+                            "{{\"name\":\"{}\",\"transport\":\"\",\"isolation\":\"none\",\
                             \"landlock\":false,\"seccomp\":false,\
                             \"spawn_enforcement\":\"none\",\
                             \"namespace_net\":false,\"namespace_mount\":false,\
@@ -402,12 +403,13 @@ impl AgentsFs {
                 }).collect::<Vec<_>>().join(",");
                 let servers: String = sb.servers.iter().map(|s| {
                     format!(
-                        "{{\"name\":\"{}\",\"isolation\":\"{}\",\
+                        "{{\"name\":\"{}\",\"transport\":\"{}\",\"isolation\":\"{}\",\
                         \"landlock\":{},\"seccomp\":{},\
                         \"spawn_enforcement\":\"{}\",\
                         \"namespace_net\":{},\"namespace_mount\":{},\
                         \"landlock_net\":{}}}",
                         json_escape_str(&s.name),
+                        json_escape_str(&s.transport),
                         json_escape_str(&s.isolation),
                         s.landlock, s.seccomp,
                         json_escape_str(&s.spawn_enforcement),
@@ -2065,6 +2067,7 @@ mod tests {
         use crate::snapshot::{SandboxSummary, ServerEnforcement};
         let enf = ServerEnforcement {
             name:              "search".to_string(),
+            transport:         "stdio".to_string(),
             isolation:         "none".to_string(),
             landlock:          true,
             seccomp:           true,
@@ -2152,6 +2155,7 @@ mod tests {
         // accessible_server_names stays empty — unrestricted means "all"
         let enf = ServerEnforcement {
             name:               "files".to_string(),
+            transport:          "stdio".to_string(),
             isolation:          "none".to_string(),
             landlock:           true,
             seccomp:            false,
@@ -2205,6 +2209,7 @@ mod tests {
         use crate::snapshot::{SandboxSummary, ServerEnforcement};
         let enf = ServerEnforcement {
             name:              "files".to_string(),
+            transport:         "stdio".to_string(),
             isolation:         "none".to_string(),
             landlock:          true,
             seccomp:           false,

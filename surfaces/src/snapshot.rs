@@ -9,6 +9,8 @@ pub type SharedSnapshot = Arc<RwLock<SchedulerSnapshot>>;
 #[derive(Clone, Default)]
 pub struct ServerEnforcement {
     pub name:             String,
+    /// "stdio" | "http" — populated from McpBackend::transport_kind().
+    pub transport:        String,
     /// "none" | "gvisor"
     pub isolation:        String,
     pub landlock:         bool,

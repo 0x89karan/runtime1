@@ -732,10 +732,10 @@ Remaining:
   (`gbrain` is a working reference of the pattern);
   embeddings come from a **remote embedding API** (Voyage AI canonical; Cohere/OpenAI
   viable), preserving the remote-cognition lock — no embedding weights on the `agentd`
-  host. Stdio-sidecar is reachable within Phase 5; a **networked KB needs an HTTP/SSE
-  MCP transport** added to the MCP client (its own increment), with the p4.6 Landlock
-  V4 TCP-port rules as the enforcement layer. Design: `docs/DESIGN-memory.md` §4
-  (two storage layers) + §9 Q1 (decided).
+  host. Stdio-sidecar is reachable within Phase 5; a networked KB uses the HTTP/SSE
+  MCP transport shipped in p7.1, with the p4.6 Landlock V4 TCP-port rules as the
+  enforcement layer. Design: `docs/DESIGN-memory.md` §4 (two storage layers) + §9 Q1
+  (decided).
 - Additional inference backends (incl. a local `impl InferenceGateway`, and a remote
   `embed()` method on the gateway if embeddings are ever pulled in-process rather than
   into the KB sidecar), richer A2A/ACP interop, and multi-device agent migration.
@@ -743,3 +743,17 @@ Remaining:
 Re-homed into Phase 6 (above): the human interface layer (operator TUI + agent
 catalogue). Beyond Phase 6: an event-trigger surface (unlocks the Watcher template —
 the daemon-shaped agent), and write-capable memory/control surfaces.
+
+### Phase 7 — Connectivity
+
+**p7.1 — HTTP/SSE MCP transport** ✅ (v0.35.0)
+Client-side Streamable HTTP transport (MCP spec 2025-03-26). `McpBackend` trait unifies
+stdio and HTTP; `McpHttpClient` with SSE state machine, session-ID capture, bounded-body
+streaming, 30 s timeout; `url` + `headers_env` config fields; `https://` enforcement;
+`mcp_http_connected` / `mcp_http_error` flight events; `transport` field on
+`ServerEnforcement`; `docs/MCP_SERVERS.md` directory. Plan: `docs/plans/p7.1-http-sse-mcp-transport.md`.
+
+**p7.2 — OAuth MCP auth** (planned)
+`auth_provider` field on `[[tools.mcp_servers]]`; OAuth2 authorization-code flow with
+local callback server; token refresh; keychain storage. Unlocks Gmail, Google Drive,
+and other OAuth-gated MCP servers.

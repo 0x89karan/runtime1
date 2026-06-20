@@ -51,6 +51,31 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   or increase `MAX_DIR_KEYS` and add a per-call budget. Document the limit prominently in RUNBOOK.md.
   (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p6+.
 
+## Phase 7 — Open (deferred from p7.1 review)
+
+**p7.1-ar-01 (P2) — `McpHttpError` event defined but never emitted**
+- `events.rs` defines `EventKind::McpHttpError` and CONVENTIONS.md lists it in the taxonomy,
+  but `McpHttpClient::request()` and `McpTool::invoke()` never emit it.
+- Threading a `FlightRecorder` into `McpHttpClient` at connect time (similar to how native
+  tools access the scheduler) is the right fix path.
+- Impact: HTTP tool failures are not flight-logged with the `http_status`/`method` fields
+  defined in the taxonomy; they surface only as generic tool errors from the agent loop.
+- Fix: pass `Arc<FlightRecorder>` + `agent_id` into `McpHttpClient::connect()`, store on
+  the struct, emit `McpHttpError` in `request()` before returning `Err`. Defer to p7.2.
+
+**p7.1-ar-03 (P3) — `agentd/tests/mcp_http.rs` integration test file not written**
+- The p7.1 plan specified a live-HTTP-listener integration test suite (tokio listener,
+  session-ID continuity, 4 MB guard, pagination, HTTP error status codes).
+- Unit tests cover the SSE parser and config validation well; the network-path tests
+  require `httpmock` or `wiremock` infrastructure that wasn't added in p7.1.
+- Deferred from plan: `docs/plans/p7.1-http-sse-mcp-transport.md`. Fix in p7.2.
+
+**p7.1-ar-02 (P3) — SSRF to RFC-1918 / link-local addresses not blocked**
+- `validate()` checks `starts_with("https://")` only. `https://169.254.169.254/...` passes.
+- Single-tenant threat model: the operator controls config, so risk is low.
+- Fix: document the absence of RFC-1918 blocking in `THREAT_MODEL.md §p7.1` and add a note
+  in `docs/MCP_SERVERS.md`. Structural blocking is a p7.2+ hardening item.
+
 ## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
 
 **p5.5-ar-01 (P3) — Posting list loading is O(n) RAM at query time**

@@ -164,6 +164,19 @@ degradation warnings; `View::Inspector` (`[i]` key) with load-once flight-log ta
 (All/Errors/Sandbox/CapDenied), substring search, color-coded body; 840+ workspace tests.
 **Phase 6 complete. Next: see `docs/ROADMAP.md` §Beyond.**
 
+**p7.1 complete (v0.35.0).** Streamable HTTP MCP transport (MCP spec 2025-03-26):
+`McpBackend` trait unifies stdio (`McpClient`) and HTTP (`McpHttpClient`); `McpTool.client`
+changed from `Arc<McpClient>` to `Arc<dyn McpBackend>`; `McpHttpClient` — single-POST JSON-RPC
+with SSE state machine, `Mcp-Session-Id` header capture, `read_bounded_http_body()` (4 MB guard),
+`parse_sse_stream()`, 30 s `MCP_TIMEOUT`, 100-page `tools/list` guard; `McpServerConfig` gains
+`url: Option<String>` + `headers_env: HashMap<String,String>` with `is_http()` + `validate()`
+(mutual-exclusion guard, `https://` required, embedded credentials rejected); header secrets
+read from env at startup, never logged; transport dispatch in `main.rs`; HTTP servers skip sandbox
+(externally isolated); `ServerEnforcement.transport` field exposed in FUSE + `agentctl watch`;
+`mcp_http_connected` + `mcp_http_error` flight events; `docs/MCP_SERVERS.md` new file (Linear,
+GitHub); `reqwest` `stream` feature + `tokio` `net` feature; security: notify() body drain bounded,
+10 s connect_timeout, redirect following disabled; 862 workspace tests (up from 841).
+
 ## How to work here
 
 - **Work the roadmap in order.** Each increment in `docs/ROADMAP.md` is a small,

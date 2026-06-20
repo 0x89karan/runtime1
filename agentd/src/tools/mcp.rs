@@ -1,13 +1,14 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
     time::Duration,
 };
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures::StreamExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use serde_json::{json, Value};
@@ -37,6 +38,22 @@ const MCP_MAX_TOOL_PAGES: usize = 100;
 use super::{Tool, ToolContext};
 use crate::capability::Capability;
 use crate::inference::ToolSpec;
+
+/// Unified interface over stdio and HTTP MCP server connections.
+///
+/// Both `McpClient` (stdio) and `McpHttpClient` (HTTP/SSE) implement this trait.
+/// `McpTool` holds `Arc<dyn McpBackend>` so tool registration is transport-agnostic.
+#[async_trait]
+pub trait McpBackend: Send + Sync {
+    /// Send a JSON-RPC request and return the `result` field.
+    async fn request(&self, method: &str, params: Value) -> Result<Value>;
+    /// Send a JSON-RPC notification (no id, no response expected). Best-effort.
+    async fn notify(&self, method: &str) -> Result<()>;
+    /// Gracefully shut down this backend.
+    async fn shutdown(&self);
+    /// Returns `"stdio"` or `"http"` — used for FUSE surface display.
+    fn transport_kind(&self) -> &'static str;
+}
 
 struct Transport {
     stdin: ChildStdin,
@@ -341,7 +358,7 @@ impl McpClient {
         }
     }
 
-    async fn notify(&self, method: &str) -> Result<()> {
+    pub async fn notify(&self, method: &str) -> Result<()> {
         if self.broken.load(Ordering::Relaxed) {
             return Err(anyhow::anyhow!(
                 "MCP client is broken — a previous request timed out"
@@ -496,15 +513,416 @@ fn parse_tool_list(result: &Value) -> Result<Vec<ToolSpec>> {
         .collect()
 }
 
+// ── McpBackend impl for McpClient (stdio) ─────────────────────────────────────
+
+#[async_trait]
+impl McpBackend for McpClient {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        McpClient::request(self, method, params).await
+    }
+    async fn notify(&self, method: &str) -> Result<()> {
+        McpClient::notify(self, method).await
+    }
+    async fn shutdown(&self) {
+        McpClient::shutdown(self).await
+    }
+    fn transport_kind(&self) -> &'static str {
+        "stdio"
+    }
+}
+
+// ── McpHttpClient (Streamable HTTP, MCP spec 2025-03-26) ──────────────────────
+
+/// HTTP/SSE MCP client for Streamable HTTP transport.
+///
+/// Connects to a remote MCP server over HTTPS. Each JSON-RPC call is a POST
+/// to the server's URL; the response is either `application/json` (single result)
+/// or `text/event-stream` (SSE stream — the client finds the matching event).
+///
+/// Auth headers are injected from the host environment at connect time per the
+/// secrets-from-env invariant (header values are never logged or written to disk).
+pub struct McpHttpClient {
+    /// reqwest client with auth headers baked into default_headers.
+    client: reqwest::Client,
+    url: String,
+    server_name: String,
+    /// Just the header names (not values) for use in error messages.
+    auth_header_names: Vec<String>,
+    next_id: AtomicU64,
+    /// `Mcp-Session-Id` returned by the server after initialize. Sent on all subsequent requests.
+    session_id: StdMutex<Option<String>>,
+}
+
+impl McpHttpClient {
+    /// Connect to the HTTP MCP server: resolve auth headers from env, run the
+    /// initialize handshake, and list available tools.
+    ///
+    /// Returns `(backend, tool_specs, session_id_present)` — the bool indicates
+    /// whether the server returned an `Mcp-Session-Id` header during initialize.
+    pub async fn connect(
+        server_name: &str,
+        url: &str,
+        headers_env: &std::collections::HashMap<String, String>,
+    ) -> Result<(Arc<dyn McpBackend>, Vec<ToolSpec>, bool)> {
+        // Resolve auth headers from env (fail-fast on missing vars).
+        let mut header_map = reqwest::header::HeaderMap::new();
+        let mut auth_header_names: Vec<String> = Vec::new();
+        for (header_name, env_var_name) in headers_env {
+            let value = std::env::var(env_var_name).with_context(|| {
+                format!(
+                    "MCP server {server_name:?}: headers_env references env var {env_var_name:?} \
+                     which is not set — export {env_var_name}=<value> before starting agentd"
+                )
+            })?;
+            let hname = reqwest::header::HeaderName::from_bytes(header_name.as_bytes())
+                .with_context(|| format!("MCP server {server_name:?}: invalid header name {header_name:?}"))?;
+            let hval = reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| anyhow::anyhow!(
+                    "MCP server {server_name:?}: header {header_name:?} value contains non-ASCII bytes"
+                ))?;
+            header_map.insert(hname, hval);
+            auth_header_names.push(header_name.clone());
+        }
+
+        let client = reqwest::Client::builder()
+            .default_headers(header_map)
+            .connect_timeout(Duration::from_secs(10)) // fail fast on unreachable servers
+            .timeout(MCP_TIMEOUT) // covers full request lifecycle including body streaming
+            .redirect(reqwest::redirect::Policy::none()) // no auth header leakage on redirects
+            .build()
+            .context("building reqwest client for HTTP MCP server")?;
+
+        let http_client = Arc::new(Self {
+            client,
+            url: url.to_string(),
+            server_name: server_name.to_string(),
+            auth_header_names,
+            next_id: AtomicU64::new(1),
+            session_id: StdMutex::new(None),
+        });
+
+        // Initialize handshake.
+        http_client
+            .request(
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "agentd", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            )
+            .await
+            .context("MCP HTTP initialize")?;
+
+        // notifications/initialized — non-fatal if server returns 404/405.
+        let _ = http_client.notify("notifications/initialized").await;
+
+        // List tools with pagination guard.
+        let mut all_specs = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MCP_MAX_TOOL_PAGES {
+            let params = match &cursor {
+                Some(c) => json!({ "cursor": c }),
+                None => json!({}),
+            };
+            let list = http_client
+                .request("tools/list", params)
+                .await
+                .context("MCP HTTP tools/list")?;
+            all_specs.extend(parse_tool_list(&list)?);
+            cursor = list
+                .get("nextCursor")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        if cursor.is_some() {
+            tracing::warn!(
+                server = server_name,
+                "tools/list hit the {MCP_MAX_TOOL_PAGES}-page limit; \
+                 remaining tools were not loaded — contact the server operator"
+            );
+        }
+
+        let session_id_present = http_client.session_id.lock()
+            .ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+
+        Ok((http_client as Arc<dyn McpBackend>, all_specs, session_id_present))
+    }
+
+    /// Build and send one POST request, handle session ID capture, return the raw response.
+    async fn send_post(&self, body: &Value) -> Result<reqwest::Response> {
+        let mut builder = self.client
+            .post(&self.url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+            .json(body);
+
+        if let Ok(guard) = self.session_id.lock() {
+            if let Some(ref sid) = *guard {
+                builder = builder.header("mcp-session-id", sid.as_str());
+            }
+        }
+
+        let response = builder
+            .send()
+            .await
+            .with_context(|| format!("HTTP POST to MCP server '{}' ({})", self.server_name, self.url))?;
+
+        // Capture session ID from response headers (Streamable HTTP spec, write-once).
+        // Only accept the first session ID the server sends; ignore updates from subsequent
+        // responses (e.g. notifications/initialized) to prevent server-controlled override.
+        // Cap at 512 bytes — reject oversized or non-visible-ASCII values to prevent
+        // downstream reqwest header-builder poisoning.
+        if let Some(raw) = response.headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            if raw.len() <= 512 {
+                if let Ok(mut guard) = self.session_id.lock() {
+                    if guard.is_none() {
+                        *guard = Some(raw.to_string());
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    server = %self.server_name,
+                    "ignoring oversized Mcp-Session-Id ({} bytes > 512 byte limit)",
+                    raw.len()
+                );
+            }
+        }
+
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl McpBackend for McpHttpClient {
+    async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+
+        let response = self.send_post(&msg).await?;
+        let status = response.status();
+
+        if !status.is_success() {
+            let headers_info = if self.auth_header_names.is_empty() {
+                String::new()
+            } else {
+                let names = self.auth_header_names.iter()
+                    .map(|n| format!("'{n}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    " — check that env var{} {} {} set and contain{} the correct value \
+                     (header{} {} sent)",
+                    if self.auth_header_names.len() == 1 { "" } else { "s" },
+                    names,
+                    if self.auth_header_names.len() == 1 { "is" } else { "are" },
+                    if self.auth_header_names.len() == 1 { "s" } else { "" },
+                    if self.auth_header_names.len() == 1 { "" } else { "s" },
+                    if self.auth_header_names.len() == 1 { "was" } else { "were" },
+                )
+            };
+            return Err(anyhow::anyhow!(
+                "MCP server '{}' returned HTTP {} for '{}'{}",
+                self.server_name, status.as_u16(), method, headers_info
+            ));
+        }
+
+        let content_type = response.headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let body = read_bounded_http_body(response)
+            .await
+            .with_context(|| format!("reading HTTP response from MCP server '{}'", self.server_name))?;
+
+        let v: Value = if content_type.contains("text/event-stream") {
+            parse_sse_stream(&body, id)
+                .with_context(|| format!("parsing SSE response from MCP server '{}'", self.server_name))?
+        } else {
+            let trimmed = body.trim();
+            serde_json::from_str(trimmed).with_context(|| {
+                // chars().take() avoids panic on multi-byte UTF-8 char boundaries.
+                let preview: String = trimmed.chars().take(256).collect();
+                format!("parsing JSON response from MCP server '{}': {preview}", self.server_name)
+            })?
+        };
+
+        if let Some(err) = v.get("error") {
+            return Err(anyhow::anyhow!(
+                "MCP server '{}' returned JSON-RPC error for '{}': {}",
+                self.server_name, method, err
+            ));
+        }
+
+        // Validate response ID matches (skip for servers that omit id in response).
+        let resp_id = v.get("id").and_then(|i| i.as_u64())
+            .or_else(|| v.get("id").and_then(|i| i.as_str()).and_then(|s| s.parse::<u64>().ok()));
+        if let Some(resp_id) = resp_id {
+            if resp_id != id {
+                return Err(anyhow::anyhow!(
+                    "MCP server '{}': response ID {resp_id} doesn't match request ID {id} for '{method}'",
+                    self.server_name
+                ));
+            }
+        }
+
+        v.get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!(
+                "MCP server '{}' did not respond to '{}' with a valid JSON-RPC result — \
+                 is '{}' an MCP server endpoint?",
+                self.server_name, method, self.url
+            ))
+    }
+
+    async fn notify(&self, method: &str) -> Result<()> {
+        let msg = json!({ "jsonrpc": "2.0", "method": method });
+        match self.send_post(&msg).await {
+            Ok(resp) => {
+                let status = resp.status();
+                // 404/405/501 = server doesn't handle this notification; silently ignore.
+                if !status.is_success()
+                    && status != reqwest::StatusCode::NOT_FOUND
+                    && status != reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    && status.as_u16() != 501
+                {
+                    tracing::warn!(
+                        server = %self.server_name, method,
+                        status = status.as_u16(),
+                        "HTTP MCP notification returned non-success status"
+                    );
+                }
+                // Drain body (bounded) so the TCP connection can be reused.
+                // Errors here just close the connection — that's acceptable for notifications.
+                let _ = read_bounded_http_body(resp).await;
+            }
+            Err(e) => {
+                tracing::warn!(server = %self.server_name, method, "HTTP MCP notification failed: {e:#}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        // Send cancellation if we have a session ID.
+        let has_session = self.session_id.lock().ok()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        if has_session {
+            let _ = self.notify("notifications/shutdown").await;
+        }
+        // reqwest client is connection-pooled; no explicit close needed.
+    }
+
+    fn transport_kind(&self) -> &'static str {
+        "http"
+    }
+}
+
+/// Read an HTTP response body with a byte-count guard to prevent OOM.
+/// Uses streaming (`bytes_stream()`) so large payloads are rejected before full allocation.
+async fn read_bounded_http_body(response: reqwest::Response) -> Result<String> {
+    // Fast path: Content-Length check before streaming.
+    if let Some(len) = response.content_length() {
+        if len > MAX_RESPONSE_BYTES as u64 {
+            return Err(anyhow::anyhow!(
+                "MCP server HTTP response Content-Length {len} exceeds limit of {MAX_RESPONSE_BYTES} bytes"
+            ));
+        }
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("reading HTTP response body chunk")?;
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(anyhow::anyhow!(
+                "MCP server HTTP response exceeded limit of {MAX_RESPONSE_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("MCP server HTTP response is not valid UTF-8")
+}
+
+/// Parse an SSE (text/event-stream) body and find the JSON-RPC response for `expected_id`.
+///
+/// Per the SSE spec (and MCP 2025-03-26):
+/// - Lines starting with `data:` contribute to the current event's data (concatenated with `\n`).
+/// - An empty line terminates the current event.
+/// - Lines starting with `:`, `event:`, `id:`, `retry:` are skipped.
+/// - The first event whose data parses as JSON-RPC with a matching `id` is returned.
+fn parse_sse_stream(body: &str, expected_id: u64) -> Result<Value> {
+    // Use a String accumulator instead of Vec<String>+join to avoid per-line allocations.
+    // clear() retains the heap buffer for the next event.
+    let mut current_data = String::new();
+
+    let try_event = |data: &str| -> Option<Value> {
+        if data.is_empty() { return None; }
+        serde_json::from_str(data).ok()
+    };
+
+    let id_matches = |v: &Value| -> bool {
+        v["id"].as_u64() == Some(expected_id)
+            || v["id"].as_str().and_then(|s| s.parse::<u64>().ok()) == Some(expected_id)
+    };
+
+    for line in body.lines() {
+        if line.is_empty() {
+            // Event boundary — emit current event if it has data.
+            if let Some(v) = try_event(&current_data) {
+                if id_matches(&v) && (v.get("result").is_some() || v.get("error").is_some()) {
+                    return Ok(v);
+                }
+            }
+            current_data.clear();
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            if !current_data.is_empty() { current_data.push('\n'); }
+            current_data.push_str(data);
+        } else if let Some(data) = line.strip_prefix("data:") {
+            if !current_data.is_empty() { current_data.push('\n'); }
+            current_data.push_str(data);
+        }
+        // Skip: ": comment", "event:", "id:", "retry:" lines per SSE spec.
+    }
+
+    // Handle trailing data without a final blank line.
+    if let Some(v) = try_event(&current_data) {
+        if id_matches(&v) && (v.get("result").is_some() || v.get("error").is_some()) {
+            return Ok(v);
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "no JSON-RPC result for request ID {expected_id} found in SSE stream"
+    ))
+}
+
 /// A single tool exposed by a remote MCP server.
 pub struct McpTool {
-    client: Arc<McpClient>,
+    client: Arc<dyn McpBackend>,
     spec: ToolSpec,
     server_name: String,
 }
 
 impl McpTool {
-    pub fn new(client: Arc<McpClient>, spec: ToolSpec, server_name: String) -> Self {
+    pub fn new(client: Arc<dyn McpBackend>, spec: ToolSpec, server_name: String) -> Self {
         Self { client, spec, server_name }
     }
 }
@@ -678,6 +1096,90 @@ mod tests {
             assert!(parse_tool_list(&result).is_ok(), "name={good:?} should be valid");
         }
     }
+
+    // ── parse_sse_stream tests ──────────────────────────────────────────────
+
+    #[test]
+    fn sse_single_event_json_response() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n";
+        let v = parse_sse_stream(body, 1).unwrap();
+        assert_eq!(v["result"]["tools"], json!([]));
+    }
+
+    #[test]
+    fn sse_comment_and_metadata_lines_ignored() {
+        let body = concat!(
+            ": ping\n",
+            "event: message\n",
+            "id: 42\n",
+            "retry: 3000\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"ok\":true}}\n\n",
+        );
+        let v = parse_sse_stream(body, 5).unwrap();
+        assert_eq!(v["result"]["ok"], true);
+    }
+
+    #[test]
+    fn sse_skips_unmatched_id() {
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"x\":1}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"x\":2}}\n\n",
+        );
+        let v = parse_sse_stream(body, 7).unwrap();
+        assert_eq!(v["result"]["x"], 2);
+    }
+
+    #[test]
+    fn sse_multiline_data_concatenated() {
+        // SSE spec: multiple data: lines join with \n before parsing.
+        let frag1 = "{\"jsonrpc\":\"2.0\",";
+        let frag2 = "\"id\":3,\"result\":{\"v\":9}}";
+        let body = format!("data: {frag1}\ndata: {frag2}\n\n");
+        let v = parse_sse_stream(&body, 3).unwrap();
+        assert_eq!(v["result"]["v"], 9);
+    }
+
+    #[test]
+    fn sse_trailing_data_no_final_blank_line() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}";
+        let v = parse_sse_stream(body, 2).unwrap();
+        assert!(v["result"].is_object());
+    }
+
+    #[test]
+    fn sse_no_matching_id_returns_error() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+        assert!(parse_sse_stream(body, 9).is_err());
+    }
+
+    #[test]
+    fn sse_error_response_returned() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32601,\"message\":\"not found\"}}\n\n";
+        let v = parse_sse_stream(body, 4).unwrap();
+        assert!(v.get("error").is_some());
+    }
+
+    #[test]
+    fn sse_data_without_space_after_colon() {
+        // "data:" with no space is valid SSE.
+        let body = "data:{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"bare\":true}}\n\n";
+        let v = parse_sse_stream(body, 6).unwrap();
+        assert_eq!(v["result"]["bare"], true);
+    }
+
+    #[test]
+    fn sse_string_id_matches_u64() {
+        // Some servers serialize `id` as a JSON string, not number.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":\"8\",\"result\":{}}\n\n";
+        let v = parse_sse_stream(body, 8).unwrap();
+        assert!(v["result"].is_object());
+    }
+
+    #[test]
+    fn sse_empty_body_returns_error() {
+        assert!(parse_sse_stream("", 1).is_err());
+    }
 }
+
 // McpClient handshake and tool-call tests live in tests/mcp.rs (integration
 // tests) because CARGO_BIN_EXE_echo-mcp is only available there.

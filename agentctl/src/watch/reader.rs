@@ -29,6 +29,8 @@ pub struct SysQueue {
 pub struct ServerEnforcement {
     pub name:              String,
     #[serde(default)]
+    pub transport:         String,
+    #[serde(default)]
     pub isolation:         String,
     #[serde(default)]
     pub landlock:          bool,

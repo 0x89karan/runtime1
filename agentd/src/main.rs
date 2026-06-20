@@ -7,7 +7,7 @@ use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
 use agentd::memory::store::RedbStore;
 use agentd::tools::{
-    mcp::{McpClient, McpTool},
+    mcp::{McpBackend, McpClient, McpHttpClient, McpTool},
     native::register_native,
     ToolRegistry,
 };
@@ -269,9 +269,15 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
 
     // Pass 1: validate capabilities and isolation settings before spawning any process.
 
+    // Validate each server's transport/command mutual exclusion upfront.
+    for server in &cfg.tools.mcp_servers {
+        server.validate()
+            .with_context(|| format!("validating MCP server '{}'", server.name))?;
+    }
+
     // Check gVisor availability upfront so the error is clear, not buried in spawn output.
     #[cfg(target_os = "linux")]
-    for server in &cfg.tools.mcp_servers {
+    for server in cfg.tools.mcp_servers.iter().filter(|s| !s.is_http()) {
         if server.isolation == config::IsolationMode::Gvisor {
             let runsc_found = std::env::var("PATH").ok()
                 .map(|p| std::env::split_paths(&p).any(|dir| dir.join("runsc").exists()))
@@ -285,12 +291,14 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         }
     }
 
-    // When mcp_require_capabilities is true, refuse to start if any server would
+    // When mcp_require_capabilities is true, refuse to start if any stdio server would
     // run unsandboxed — either because the field is missing OR because the caps
     // produce no effective rules (e.g. capabilities=[{Spawn}] yields empty rules).
+    // HTTP servers are excluded: they are externally isolated (no subprocess to sandbox).
     if cfg.tools.mcp_require_capabilities {
         let missing: Vec<&str> = cfg.tools.mcp_servers
             .iter()
+            .filter(|s| !s.is_http())
             .filter(|s| {
                 s.capabilities.is_none()
                     || s.capabilities.as_deref().map(|c| caps_to_rules(c).is_empty()).unwrap_or(false)
@@ -307,10 +315,10 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         }
     }
 
-    // Held for Drop: keeps MCP child processes alive until run_agent returns.
+    // Held for Drop: keeps MCP child processes (stdio) or connection objects (HTTP) alive.
     // std::process::exit() bypasses Drop, so we must return Err instead of
-    // calling exit() while mcp_clients is still in scope.
-    let mut mcp_clients: Vec<Arc<McpClient>> = Vec::new();
+    // calling exit() while mcp_backends is still in scope.
+    let mut mcp_backends: Vec<Arc<dyn McpBackend>> = Vec::new();
     let mut any_sandbox_applied = false;
     // Per-server enforcement records collected during spawn; used to populate
     // SandboxSummary on the snapshot after all servers are started.
@@ -321,6 +329,49 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     #[allow(unused_mut)]
     let mut degradation_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for server in &cfg.tools.mcp_servers {
+        if server.is_http() {
+            // ── HTTP / Streamable-HTTP transport path ─────────────────────────
+            let url = server.url.as_deref().expect("validated above");
+            // Strip query string before logging — query params may contain secrets.
+            let url_for_log = url.split('?').next().unwrap_or(url);
+            tracing::info!(name = %server.name, url = url_for_log, "connecting to HTTP MCP server");
+
+            let (backend, specs, session_id_present) =
+                McpHttpClient::connect(&server.name, url, &server.headers_env)
+                    .await
+                    .with_context(|| format!("connecting to HTTP MCP server '{}'", server.name))?;
+
+            recorder.record(
+                "agentd",
+                None,
+                EventKind::McpHttpConnected,
+                serde_json::json!({
+                    "server_name":        server.name,
+                    "url":                url_for_log,
+                    "session_id_present": session_id_present,
+                }),
+            );
+
+            let n = specs.len();
+            for spec in specs {
+                registry
+                    .register(Box::new(McpTool::new(Arc::clone(&backend), spec, server.name.clone())))
+                    .with_context(|| format!("registering tools from HTTP MCP server '{}'", server.name))?;
+            }
+            tracing::info!(name = %server.name, tools = n, "HTTP MCP server connected");
+            mcp_backends.push(backend);
+
+            // HTTP servers are externally isolated — no sandbox fields to populate.
+            server_enforcements.push(surfaces::ServerEnforcement {
+                name:      server.name.clone(),
+                transport: "http".to_string(),
+                ..Default::default()
+            });
+            continue;
+        }
+
+        // ── stdio transport path ───────────────────────────────────────────────
+
         // caps_to_rules() may return an empty vec (e.g. capabilities=[{Spawn},{Net}])
         // when only spawn/net caps are present with no FS rules.
         // Treat empty rules the same as None: no kernel mechanism is installed, so
@@ -467,6 +518,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                 serde_json::json!({ "server": server.name, "reason": "non-Linux platform" }),
             );
         }
+        let client: Arc<dyn McpBackend> = client;
         let n = specs.len();
         for spec in specs {
             registry
@@ -474,7 +526,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                 .with_context(|| format!("registering tools from MCP server '{}'", server.name))?;
         }
         tracing::info!(name = %server.name, tools = n, "MCP server connected");
-        mcp_clients.push(client);
+        mcp_backends.push(client);
 
         // Build per-server enforcement record for the snapshot surface.
         let isolation_str = if is_gvisor { "gvisor" } else { "none" }.to_string();
@@ -484,6 +536,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                 // gVisor: native kernel mechanisms not applied; isolation handled by Sentry.
                 surfaces::ServerEnforcement {
                     name:              server.name.clone(),
+                    transport:         "stdio".to_string(),
                     isolation:         isolation_str,
                     landlock:          false,
                     seccomp:           false,
@@ -512,6 +565,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                 }
                 surfaces::ServerEnforcement {
                     name:              server.name.clone(),
+                    transport:         "stdio".to_string(),
                     isolation:         isolation_str,
                     landlock:          enf.landlock,
                     seccomp:           enf.seccomp,
@@ -523,6 +577,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             } else {
                 surfaces::ServerEnforcement {
                     name:      server.name.clone(),
+                    transport: "stdio".to_string(),
                     isolation: isolation_str,
                     ..Default::default()
                 }
@@ -531,6 +586,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         #[cfg(not(target_os = "linux"))]
         let se = surfaces::ServerEnforcement {
             name:      server.name.clone(),
+            transport: "stdio".to_string(),
             isolation: isolation_str,
             ..Default::default()
         };
@@ -624,7 +680,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     {
         Ok(gw) => Arc::new(gw),
         Err(e) => {
-            for client in &mcp_clients {
+            for client in &mcp_backends {
                 client.shutdown().await;
             }
             return Err(e);
@@ -671,7 +727,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     ) {
         Ok(s) => s,
         Err(e) => {
-            for client in &mcp_clients {
+            for client in &mcp_backends {
                 client.shutdown().await;
             }
             return Err(e);
@@ -702,7 +758,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         );
     }
 
-    for client in &mcp_clients {
+    for client in &mcp_backends {
         client.shutdown().await;
     }
 
@@ -719,7 +775,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
 
     if any_failed {
         // Return Err so main() calls exit() after run_agent has returned and
-        // mcp_clients has been dropped — process::exit skips destructors.
+        // mcp_backends has been dropped — process::exit skips destructors.
         anyhow::bail!("one or more agents failed");
     }
     Ok(())
@@ -1306,7 +1362,7 @@ mod tests {
 
     #[test]
     fn event_taxonomy_completeness() {
-        // All 9 Phase-5 memory/KB event kind strings must appear in CONVENTIONS.md.
+        // All tracked event kind strings must appear in CONVENTIONS.md.
         // This fails if a new event is added to events.rs but the docs table is not updated.
         let conventions = include_str!("../../docs/CONVENTIONS.md");
         let required_kinds = [
@@ -1319,6 +1375,8 @@ mod tests {
             "memory_distilled",
             "kb_search",
             "memory_evicted",
+            "mcp_http_connected",
+            "mcp_http_error",
         ];
         for kind in &required_kinds {
             assert!(

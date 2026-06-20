@@ -317,24 +317,88 @@ pub enum IsolationMode {
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
+    /// Subprocess command for stdio transport. Required when `url` is absent.
+    /// Must be empty when `url` is set (the two are mutually exclusive).
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Capability-based sandbox rules applied to this MCP server subprocess.
+    /// HTTP endpoint for Streamable HTTP transport (MCP spec 2025-03-26).
+    /// When set, the server is contacted over HTTP/SSE instead of spawning a subprocess.
+    /// Must start with `https://`. Mutually exclusive with `command`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Maps HTTP header names to environment variable names whose values are the header values.
+    /// Example: `{ Authorization = "LINEAR_MCP_TOKEN" }` reads `$LINEAR_MCP_TOKEN` at startup
+    /// and sends it as the `Authorization` header on every request.
+    /// The env var value (e.g. `"Bearer sk-lin-..."`) is the full header value, sent as-is.
+    /// Note: OAuth-based servers require a future `auth_provider` field; only static tokens here.
+    #[serde(default)]
+    pub headers_env: std::collections::HashMap<String, String>,
+    /// Capability-based sandbox rules applied to this MCP server subprocess (stdio only).
     /// `None` (field absent) = no sandbox — server runs unrestricted.
     /// `Some([])` = deny-all spawn + network isolation; no filesystem grants.
     /// `Some([...])` = exact capability set converted to Landlock + seccomp + namespace rules.
+    /// Ignored for HTTP servers (externally isolated).
     #[serde(default)]
     pub capabilities: Option<Vec<Capability>>,
-    /// Stronger isolation mode. `"none"` (default): pre_exec sandbox.
+    /// Stronger isolation mode for stdio servers. `"none"` (default): pre_exec sandbox.
     /// `"gvisor"`: wrap command with `runsc do`; requires `runsc` on PATH.
+    /// Ignored for HTTP servers.
     #[serde(default)]
     pub isolation: IsolationMode,
-    /// Extra environment variables to pass to this MCP server subprocess.
+    /// Extra environment variables to pass to this MCP server subprocess (stdio only).
     /// Applied on top of the standard allowlist (PATH, HOME, USER, LANG, LC_ALL, TMPDIR).
     /// The parent process's full environment, including secrets, is NOT inherited.
+    /// Ignored for HTTP servers (use `headers_env` for HTTP auth headers).
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+}
+
+impl McpServerConfig {
+    /// Returns true if this server uses HTTP transport.
+    pub fn is_http(&self) -> bool {
+        self.url.is_some()
+    }
+
+    /// Validate transport config: exactly one of url/command must be set; url must be https.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match (&self.url, self.command.is_empty()) {
+            (Some(_), false) => anyhow::bail!(
+                "MCP server '{}': cannot set both 'url' and 'command' — \
+                 use 'url' for HTTP transport or 'command' for stdio transport",
+                self.name
+            ),
+            (None, true) => anyhow::bail!(
+                "MCP server '{}': transport is 'stdio' but no command is set — \
+                 add command = \"/path/to/server\" for stdio or url = \"https://...\" for HTTP",
+                self.name
+            ),
+            (Some(url), true) => {
+                if !url.starts_with("https://") {
+                    anyhow::bail!(
+                        "MCP server '{}': url must start with 'https://' (got {:?}) — \
+                         plaintext HTTP is not allowed (tokens would be sent in clear text)",
+                        self.name, url
+                    );
+                }
+                // Reject credentials embedded in the URL (e.g. https://user:token@host/mcp)
+                // which would persist secrets to disk, violating the secrets-from-env invariant.
+                // Use headers_env to inject auth headers from environment variables instead.
+                let after_scheme = &url["https://".len()..];
+                let slash = after_scheme.find('/').unwrap_or(after_scheme.len());
+                if after_scheme[..slash].contains('@') {
+                    anyhow::bail!(
+                        "MCP server '{}': embedding credentials in the URL is not allowed — \
+                         use 'headers_env' to inject auth headers from environment variables",
+                        self.name
+                    );
+                }
+                Ok(())
+            }
+            (None, false) => Ok(()), // stdio, command present
+        }
+    }
 }
 
 #[cfg(test)]
@@ -835,6 +899,168 @@ task = "t"
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.log_path.as_deref(), Some("/var/log/agentd/flight.jsonl"));
+    }
+
+    // ── p7.1: HTTP MCP server config tests ────────────────────────────────────
+
+    #[test]
+    fn http_server_config_round_trips() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "linear"
+url = "https://mcp.linear.app/mcp"
+headers_env = { Authorization = "LINEAR_MCP_TOKEN" }
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let srv = &cfg.tools.mcp_servers[0];
+        assert_eq!(srv.name, "linear");
+        assert_eq!(srv.url.as_deref(), Some("https://mcp.linear.app/mcp"));
+        assert_eq!(srv.headers_env.get("Authorization").map(|s| s.as_str()), Some("LINEAR_MCP_TOKEN"));
+        assert!(srv.command.is_empty(), "command defaults to empty for HTTP server");
+    }
+
+    #[test]
+    fn http_server_validate_ok() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "linear"
+url = "https://mcp.linear.app/mcp"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.tools.mcp_servers[0].validate().is_ok());
+    }
+
+    #[test]
+    fn http_server_validate_rejects_http_url() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "bad"
+url = "http://insecure.example.com/mcp"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.tools.mcp_servers[0].validate().unwrap_err();
+        assert!(err.to_string().contains("https://"), "got: {err}");
+    }
+
+    #[test]
+    fn both_url_and_command_is_validation_error() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "bad"
+url = "https://example.com/mcp"
+command = "/usr/bin/server"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.tools.mcp_servers[0].validate().unwrap_err();
+        assert!(err.to_string().contains("both"), "got: {err}");
+    }
+
+    #[test]
+    fn stdio_server_validate_rejects_missing_command() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "files"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.tools.mcp_servers[0].validate().unwrap_err();
+        assert!(err.to_string().contains("no command"), "got: {err}");
+    }
+
+    #[test]
+    fn is_http_returns_true_for_url_server() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "linear"
+url = "https://mcp.linear.app/mcp"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.tools.mcp_servers[0].is_http());
+    }
+
+    #[test]
+    fn is_http_returns_false_for_stdio_server() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.tools.mcp_servers[0].is_http());
+    }
+
+    #[test]
+    fn headers_env_defaults_to_empty() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "echo"
+command = "/usr/bin/echo"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.tools.mcp_servers[0].headers_env.is_empty());
+    }
+
+    #[test]
+    fn http_server_validate_rejects_url_with_embedded_credentials() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "bad"
+url = "https://user:secret@mcp.example.com/mcp"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.tools.mcp_servers[0].validate().unwrap_err();
+        assert!(err.to_string().contains("headers_env"), "got: {err}");
+    }
+
+    #[test]
+    fn http_server_validate_rejects_non_https_scheme() {
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "bad"
+url = "ftp://example.com/mcp"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.tools.mcp_servers[0].validate().unwrap_err();
+        assert!(err.to_string().contains("https://"), "got: {err}");
     }
 
     // ── p4.7: McpServerConfig.env field tests ────────────────────────────────

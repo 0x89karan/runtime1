@@ -3,6 +3,46 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.1] - 2026-06-20 (v0.35.0)
+
+You can now connect agentd to hosted MCP services (Linear, GitHub, and any
+Streamable-HTTP-capable server) without running a local subprocess — add a
+`url` + `headers_env` block to `[[tools.mcp_servers]]` and the agent gains
+those tools automatically. Implements the MCP spec 2025-03-26 HTTP transport.
+
+- **`McpBackend` trait** (`agentd/src/tools/mcp.rs`) — unified interface over
+  stdio (`McpClient`) and HTTP (`McpHttpClient`); `McpTool.client` changed from
+  `Arc<McpClient>` to `Arc<dyn McpBackend>`; `transport_kind()` returns `"stdio"`
+  or `"http"`.
+- **`McpHttpClient`** — single-POST JSON-RPC client with SSE state machine;
+  `Mcp-Session-Id` header capture; `read_bounded_http_body()` with streaming
+  byte-count guard (4 MB limit); `parse_sse_stream()` per SSE spec; 30 s
+  `MCP_TIMEOUT`; multi-page `tools/list` with 100-page guard (warns on truncation).
+- **Config** (`config.rs`) — `McpServerConfig` extended with `url: Option<String>`
+  and `headers_env: HashMap<String,String>`; `command` now `#[serde(default)]`;
+  `is_http()` + `validate()` (mutual-exclusion guard; `https://` required;
+  embedded credentials in URL rejected).
+- **Header-secret safety** — values read from env at startup; never logged;
+  only header names appear in error messages.
+- **`main.rs`** — transport dispatch (`is_http()` branch) before
+  `mcp_require_capabilities` / gVisor / sandbox compile; `McpHttpConnected`
+  event on connect; HTTP servers skip sandbox (externally isolated);
+  `ServerEnforcement.transport` field (`"stdio"` | `"http"`).
+- **FUSE + agentctl surfaces** — `ServerEnforcement.transport` exposed in
+  `/agents/system/sandbox`, `/agents/<id>/sandbox` JSON; `agentctl watch`
+  shows transport in sandbox rows; plain-mode output includes `transport=`.
+- **Flight events** — `mcp_http_connected` (server_name, url, session_id_present)
+  + `mcp_http_error` (server_name, http_status, method); CONVENTIONS.md updated.
+- **docs/MCP_SERVERS.md** — new file with known HTTP MCP server URLs (Linear, GitHub).
+- **`agent.toml`** — commented HTTP server example block added.
+- **reqwest** `stream` feature added; **tokio** `net` feature added.
+- **Security hardening**: `notify()` body drain bounded (OOM fix); 10 s
+  `connect_timeout` (fast-fail on unreachable hosts); redirect following disabled
+  (auth header leak prevention).
+- **Tests**: 21 new tests (SSE parser, McpServerConfig validation, transport
+  rendering, HTTP sandbox rows, taxonomy completeness); 862 total workspace tests
+  (up from 841).
+
 ## [p6.8] - 2026-06-19 (v0.34.0)
 
 Sandbox-enforcement surface + flight-log inspector for `agentctl watch`.

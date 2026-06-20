@@ -97,6 +97,8 @@ Phase 0 kinds (canonical — do not rename):
 | `memory_distilled` | `mem_remember` committed a long-term memory entry to Tier 3 (agent, key, bytes) (p5.3+) |
 | `kb_search` | `kb_search` tool invoked; inverted index queried (agent_id, segment, query_preview, hits: usize, terms_matched: usize) (p5.5+) |
 | `memory_evicted` | entry evicted from a KB segment by capacity or age floor (segment, key, reason: "capacity"\|"age") (p5.6+) |
+| `mcp_http_connected` | HTTP MCP server connected after initialize + tools/list (server_name, url, session_id_present: bool) (p7.1+) |
+| `mcp_http_error` | HTTP MCP server returned non-2xx or JSON-RPC error (server_name, http_status: u16, method) (p7.1+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

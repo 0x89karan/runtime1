@@ -23,6 +23,16 @@ native = ["all"]                      # built-in tools: "all" or a list like ["r
 # command = "npx"
 # args    = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 
+# Attach an MCP server over HTTP (Streamable HTTP, MCP spec 2025-03-26):
+# [[tools.mcp_servers]]
+# name        = "linear"
+# url         = "https://mcp.linear.app/mcp"   # find this in the service's MCP docs
+# headers_env = { Authorization = "LINEAR_MCP_TOKEN" }
+#               # ^ env var NAME (not the value):
+#               #   export LINEAR_MCP_TOKEN="Bearer sk-lin-..."
+# # Note: OAuth-based servers (e.g. Gmail) require a future auth_provider field.
+# # No command/args/isolation/capabilities — HTTP servers are externally isolated.
+
 # Durable key/value store (p5.1+). Defaults shown; uncomment to override.
 # [memory]
 # store_path = "memory.redb"   # path to the redb file (relative to CWD or absolute)

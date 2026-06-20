@@ -65,6 +65,12 @@ pub enum EventKind {
     /// Entry evicted from a KB segment (capacity or age floor).
     /// data: { segment, key, reason: "capacity"|"age" }
     MemoryEvicted,
+    /// HTTP MCP server connected successfully after initialize + tools/list.
+    /// data: { server_name, url, session_id_present: bool }
+    McpHttpConnected,
+    /// HTTP MCP server returned a non-2xx status or JSON-RPC error during a tool call.
+    /// data: { server_name, http_status: u16, method }
+    McpHttpError,
     Error,
 }
 
@@ -120,6 +126,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::MemoryDistilled), "memory_distilled");
         assert_eq!(kind_str(EventKind::KbSearch), "kb_search");
         assert_eq!(kind_str(EventKind::MemoryEvicted), "memory_evicted");
+        assert_eq!(kind_str(EventKind::McpHttpConnected), "mcp_http_connected");
+        assert_eq!(kind_str(EventKind::McpHttpError), "mcp_http_error");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

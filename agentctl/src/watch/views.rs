@@ -159,6 +159,8 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
                         s.namespace_mount.then_some("mount_ns"),
                         (!s.isolation.is_empty() && s.isolation != "none")
                             .then_some(s.isolation.as_str()),
+                        (!s.transport.is_empty() && s.transport != "stdio")
+                            .then_some(s.transport.as_str()),
                     ].iter().filter_map(|x| *x).collect();
                     if flags.is_empty() {
                         format!("{}:none", s.name)
@@ -784,9 +786,9 @@ pub fn render_plain(app: &App) -> String {
         out.push_str(&format!("sandbox: any_sandboxed={}\n", sb.any_sandboxed));
         for s in &sb.servers {
             out.push_str(&format!(
-                "  server {}: isolation={} landlock={} seccomp={} \
+                "  server {}: transport={} isolation={} landlock={} seccomp={} \
                 spawn_enforcement={} namespace_net={} namespace_mount={} landlock_net={}\n",
-                sanitize(&s.name), sanitize(&s.isolation),
+                sanitize(&s.name), sanitize(&s.transport), sanitize(&s.isolation),
                 s.landlock, s.seccomp, sanitize(&s.spawn_enforcement),
                 s.namespace_net, s.namespace_mount, s.landlock_net,
             ));
@@ -1056,6 +1058,7 @@ mod tests {
             any_sandboxed: true,
             servers: vec![ServerEnforcement {
                 name:              "search".to_string(),
+                transport:         "stdio".to_string(),
                 isolation:         "none".to_string(),
                 landlock:          true,
                 seccomp:           true,
@@ -1073,10 +1076,37 @@ mod tests {
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("sandbox: any_sandboxed=true"), "any_sandboxed must appear");
         assert!(out.contains("server search:"), "server name must appear");
+        assert!(out.contains("transport=stdio"), "transport must appear");
         assert!(out.contains("landlock=true"), "landlock flag must appear");
         assert!(out.contains("seccomp=true"), "seccomp flag must appear");
         assert!(out.contains("spawn_enforcement=fork_vfork_only"), "spawn_enforcement must appear");
         assert!(out.contains("degradation: landlock_net_unavailable"), "degradation must appear");
+    }
+
+    #[test]
+    fn render_plain_sandbox_http_transport_server() {
+        use crate::watch::reader::{ServerEnforcement, SysSandbox};
+        let sb = SysSandbox {
+            any_sandboxed: false,
+            servers: vec![ServerEnforcement {
+                name:              "linear".to_string(),
+                transport:         "http".to_string(),
+                isolation:         "none".to_string(),
+                landlock:          false,
+                seccomp:           false,
+                spawn_enforcement: "none".to_string(),
+                namespace_net:     false,
+                namespace_mount:   false,
+                landlock_net:      false,
+            }],
+            degradations: vec![],
+        };
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None,
+            sandbox: Some(sb), provider: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("transport=http"), "HTTP transport must appear in render_plain output");
     }
 
     #[test]
@@ -1086,6 +1116,7 @@ mod tests {
             any_sandboxed: true,
             servers: vec![ServerEnforcement {
                 name:      "sandbox-server".to_string(),
+                transport: "stdio".to_string(),
                 isolation: "gvisor".to_string(),
                 landlock:  false, seccomp: false,
                 spawn_enforcement: "none".to_string(),
