@@ -201,6 +201,7 @@ mod tests {
                 provider:   "mock".to_string(),
                 model:      "mock-model".to_string(),
                 max_tokens: 1024,
+                streaming:  false,
             },
             messages:        vec![Msg {
                 role:   Role::User,

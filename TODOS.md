@@ -51,6 +51,25 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   or increase `MAX_DIR_KEYS` and add a per-call budget. Document the limit prominently in RUNBOOK.md.
   (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p6+.
 
+## Phase 7 — Open (deferred from p7.2 review)
+
+**p7.2-ar-01 (P2) — `stdout_lock` held across `write_all().await` + `flush()` per chunk**
+- `scheduler.rs:make_infer_future`: `tokio::sync::Mutex<()>` is correctly held across the
+  async write to prevent byte-level interleaving in multi-agent streaming runs.
+- Architectural concern: when stdout is a slow pipe, all concurrent streaming agents
+  serialise output at OS write speed. Correct tradeoff for the non-interleaving guarantee,
+  but future improvement: dedicated writer task that owns stdout, receives chunks from all
+  agents via a bounded channel (one queue-send per chunk instead of one lock+write+flush).
+- Only manifests with slow consumers (`agentd … | tee slow_log`); no correctness issue.
+
+**p7.2-ar-02 (P2) — `unbounded_channel` for SSE chunks has no backpressure**
+- `scheduler.rs:make_infer_future` uses `tokio::sync::mpsc::unbounded_channel` for SSE chunks.
+- If `print_fut` stalls (e.g. holding `stdout_lock` while another agent writes), the SSE
+  producer can buffer the full model response in memory before the consumer makes progress.
+- In practice, buffered data is bounded by `max_tokens × bytes/token`; not a practical risk
+  for typical usage. Improvement: switch to `channel(64)` for natural backpressure.
+- Pair with p7.2-ar-01: both resolved together by the dedicated-writer-task architecture.
+
 ## Phase 7 — Open (deferred from p7.1 review)
 
 **p7.1-ar-01 (P2) — `McpHttpError` event defined but never emitted**

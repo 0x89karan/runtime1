@@ -162,7 +162,7 @@ truncation in `agentctl list-templates`; 808 workspace tests.
 per MCP server + detects degradations; `agentctl` reader/views show per-server sandbox flags +
 degradation warnings; `View::Inspector` (`[i]` key) with load-once flight-log tail, filter
 (All/Errors/Sandbox/CapDenied), substring search, color-coded body; 840+ workspace tests.
-**Phase 6 complete. Next: see `docs/ROADMAP.md` §Beyond.**
+**Phase 6 complete.**
 
 **p7.1 complete (v0.35.0).** Streamable HTTP MCP transport (MCP spec 2025-03-26):
 `McpBackend` trait unifies stdio (`McpClient`) and HTTP (`McpHttpClient`); `McpTool.client`
@@ -176,6 +176,15 @@ read from env at startup, never logged; transport dispatch in `main.rs`; HTTP se
 `mcp_http_connected` + `mcp_http_error` flight events; `docs/MCP_SERVERS.md` new file (Linear,
 GitHub); `reqwest` `stream` feature + `tokio` `net` feature; security: notify() body drain bounded,
 10 s connect_timeout, redirect following disabled; 862 workspace tests (up from 841).
+**p7.2 complete (v0.36.0).** Streaming inference: `streaming: bool` on `ModelConfig` + `InferenceRequest`
+(opt-in, default `false`); `InferenceGateway::infer_with_stream()` async trait method with default
+fallback to `infer()`; `AnthropicGateway` override with `parse_sse_event()` + `parse_sse_stream()`
+(CRLF-safe, 1 MB line cap, `text_delta` → channel, `input_json_delta` → tool accumulator, 4 MB
+tool-input cap, empty `input_json` → `{}`); `make_infer_future()` scheduler helper shared by
+`enqueue_or_defer` + `drain_deferred`; `tokio::join!(infer_fut, print_fut)` with async stdout,
+`[agent-id]` prefix in multi-agent runs, BrokenPipe silenced; `Arc<Mutex<HashSet<String>>>
+streamed_agents` on `Scheduler` for double-print suppression; `InferenceStreamStarted` +
+`InferenceStreamCompleted` flight events; 889 workspace tests (up from 862).
 
 ## How to work here
 

@@ -745,6 +745,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         scheduler
     };
 
+    let streamed_agents = scheduler.streamed_agents();
     let outcomes = scheduler.run().await;
 
     #[cfg(target_os = "linux")]
@@ -765,7 +766,16 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     let mut any_failed = false;
     for (id, result) in &outcomes {
         match result {
-            Ok(answer) => println!("{answer}"),
+            Ok(answer) => {
+                // Suppress if this agent already wrote its answer via streaming stdout.
+                let was_streamed = streamed_agents
+                    .lock()
+                    .map(|s| s.contains(id.as_str()))
+                    .unwrap_or(false);
+                if !was_streamed {
+                    println!("{answer}");
+                }
+            }
             Err(e) => {
                 tracing::error!(agent = %id, error = %e, "agent failed");
                 any_failed = true;
@@ -928,8 +938,9 @@ async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
                 text: prompt.to_string(),
             }],
         }],
-        tools: vec![],
+        tools:      vec![],
         max_tokens: 4096,
+        streaming:  false,
     };
 
     let response = match gateway.infer(request).await {
@@ -1377,6 +1388,8 @@ mod tests {
             "memory_evicted",
             "mcp_http_connected",
             "mcp_http_error",
+            "inference_stream_started",
+            "inference_stream_completed",
         ];
         for kind in &required_kinds {
             assert!(

@@ -10,6 +10,19 @@ use serde::{Deserialize, Serialize};
 pub trait InferenceGateway: Send + Sync {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse>;
     fn model_id(&self) -> &str;
+
+    /// Streaming variant: sends text chunks to `chunk_tx` as they arrive, then
+    /// returns the completed `InferenceResponse`. Default implementation drops
+    /// the sender (no chunks) and falls back to `infer()`. Override in backends
+    /// that support SSE streaming (e.g. `AnthropicGateway`).
+    async fn infer_with_stream(
+        &self,
+        request: InferenceRequest,
+        chunk_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<InferenceResponse> {
+        drop(chunk_tx);
+        self.infer(request).await
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +73,9 @@ pub struct InferenceRequest {
     pub messages: Vec<Msg>,
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
+    /// When true, the scheduler calls `infer_with_stream` and prints text chunks
+    /// progressively. Set from `ModelConfig.streaming` at `agent/mod.rs:step_infer`.
+    pub streaming: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -520,10 +520,11 @@ impl AgentTask {
         );
 
         AgentEffect::Infer(InferenceRequest {
-            system: None,
-            messages: self.messages.clone(),
-            tools: self.specs.clone(),
+            system:     None,
+            messages:   self.messages.clone(),
+            tools:      self.specs.clone(),
             max_tokens: self.model_cfg.max_tokens,
+            streaming:  self.model_cfg.streaming,
         })
     }
 
@@ -874,9 +875,10 @@ mod tests {
 
     fn model_cfg() -> ModelConfig {
         ModelConfig {
-            provider: "mock".to_string(),
-            model: "mock-model".to_string(),
+            provider:  "mock".to_string(),
+            model:     "mock-model".to_string(),
             max_tokens: 4096,
+            streaming: false,
         }
     }
 

@@ -14,7 +14,7 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phases 0–7.1 complete (v0.35.0).** `agentd` is a working Rust binary.
+**Phases 0–7.2 complete (v0.36.0).** `agentd` is a working Rust binary.
 Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
 inference gateway, tools, MCP stdio client, cooperative scheduler, capability
 system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
@@ -31,11 +31,13 @@ inode pruning). Phase 6 added the template schema + on-disk catalogue
 (`agentd::template`, `templates/` directory, `TemplateResolver`), the
 `agentctl` operator CLI (`list-templates`, `spawn`, `watch`), a live TUI
 dashboard (Dashboard / AgentDetail / System / Topology / Memory / Spawn /
-Inspector views), and the sandbox-enforcement surface. Phase 7 adds connectivity:
-p7.1 ships the Streamable HTTP MCP transport (`McpHttpClient`, `McpBackend`
-trait, `url` + `headers_env` config, `mcp_http_connected` flight event) so
-agentd can connect to hosted MCP services like Linear and GitHub without running
-a local subprocess. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
+Inspector views), and the sandbox-enforcement surface. Phase 7 adds connectivity
+and streaming: p7.1 ships the Streamable HTTP MCP transport (`McpHttpClient`,
+`McpBackend` trait, `url` + `headers_env` config, `mcp_http_connected` flight
+event) so agentd can connect to hosted MCP services like Linear and GitHub
+without running a local subprocess; p7.2 adds opt-in SSE streaming inference
+(`streaming = true` in `[model]`) so tokens print to stdout as they arrive.
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
 

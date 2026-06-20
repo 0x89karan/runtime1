@@ -759,16 +759,13 @@ Two small, additive changes to the runtime. Both are protocol or infrastructure 
 that cannot live in a sidecar without losing the security or abstraction properties that
 make them meaningful.
 
-**p7.2 — Streaming inference** [CORE]
-Add `stream()` alongside `infer()` on `InferenceGateway`; wire Anthropic SSE streaming
-through `AnthropicGateway`; propagate chunks through the scheduler to stdout
-progressively. The existing run-to-completion path stays the default and unchanged;
-streaming is opt-in (`streaming = true` in `[model]`). Core rationale: this is a
-protocol-level extension to the inference gateway — the same layer as `infer()`. The
-display path (piping chunks through the scheduler) is infrastructure, not a capability.
-**Acceptance:** a streaming-enabled agent prints tokens as they arrive; the flight log
-still records complete `inference_response` events at turn end; non-streaming agents are
-unaffected.
+**p7.2 — Streaming inference** [CORE] ✅ done (v0.36.0)
+`infer_with_stream()` on `InferenceGateway`; `AnthropicGateway` SSE parser
+(`parse_sse_event` + `parse_sse_stream`); `make_infer_future` scheduler helper;
+`tokio::join!` dispatch with async stdout, BrokenPipe abort, final newline;
+`Arc<Mutex<HashSet>>` side-channel for double-print suppression; `streaming: bool`
+on `ModelConfig` and `InferenceRequest`; `InferenceStreamStarted` +
+`InferenceStreamCompleted` flight events; 889 tests.
 
 **p7.3 — Write-capable FUSE control surface** [CORE]
 `/agents/control` as a writable pseudo-file; writing a JSON command (`spawn`, `signal`)

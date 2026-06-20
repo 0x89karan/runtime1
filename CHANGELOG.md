@@ -3,6 +3,40 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.2] - 2026-06-20 (v0.36.0)
+
+Set `streaming = true` in `[model]` and text chunks print to stdout as the
+model generates them, instead of waiting for the full response. The existing
+run-to-completion path is unchanged — `streaming` defaults to `false`.
+
+- **`InferenceRequest.streaming: bool`** — flag propagated from `ModelConfig`
+  via `agent/mod.rs`; `DeferredInfer` carries it transparently.
+- **`InferenceGateway::infer_with_stream()`** — new async trait method with
+  default fallback (drops channel, calls `infer()`); `AnthropicGateway`
+  overrides with a real SSE parser.
+- **SSE parser** (`inference/anthropic.rs`) — `parse_sse_event()` helper +
+  `parse_sse_stream()`; CRLF-safe; 1 MB line cap; `text_delta` → channel;
+  `input_json_delta` → tool accumulator; index-ordered block assembly; sender
+  `Err` check to abort on dropped receiver.
+- **SSE correctness hardening** — `TextDelta` for an unregistered block index
+  now returns `Err` instead of silently drifting state; `input_json` accumulator
+  capped at 4 MB (`MAX_TOOL_INPUT_BYTES`) matching the non-streaming body limit;
+  empty `input_json` (tool called with no arguments) folds to `{}` instead of
+  failing JSON parse.
+- **`make_infer_future()`** helper (`scheduler.rs`) — extracts the 30-line
+  streaming dispatch block; used by both `enqueue_or_defer` and `drain_deferred`.
+- **Scheduler streaming** — `tokio::join!(infer_fut, print_fut)`; async stdout
+  via `tokio::io::AsyncWriteExt`; final `\n` after stream; BrokenPipe early
+  return (silenced, not fatal); `[agent-id]` prefix for multi-agent runs;
+  chunk count only incremented on successful `write_all` + `flush`.
+- **Double-print suppression** — `Arc<Mutex<HashSet<String>>> streamed_agents`
+  on `Scheduler`; main.rs reads it after `run()` and skips `println!` for
+  agents that already streamed.
+- **Flight events** — `InferenceStreamStarted` + `InferenceStreamCompleted`
+  (with `text_chunks_emitted`; `event_taxonomy_completeness` test updated).
+- **`docs/CONVENTIONS.md`** — two new event table rows.
+- 889 workspace tests (up from 862); 27 new tests.
+
 ## [p7.1] - 2026-06-20 (v0.35.0)
 
 You can now connect agentd to hosted MCP services (Linear, GitHub, and any

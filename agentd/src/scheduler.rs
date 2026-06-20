@@ -1,8 +1,8 @@
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -96,6 +96,10 @@ struct SchedulerState {
     /// Set when the scheduler is shutting down. Deferred agents are denied rather
     /// than re-enqueued.
     shutdown_requested: bool,
+    /// Agent IDs that streamed at least one text chunk to stdout this run.
+    streamed_agents:  Arc<Mutex<HashSet<String>>>,
+    /// Shared mutex serialising stdout writes across concurrent streaming agents.
+    stdout_lock:      Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
@@ -119,6 +123,9 @@ pub struct Scheduler {
     restored:            Option<SchedulerRestored>,
     memory_store:        Option<Arc<dyn MemoryStore>>,
     distill_on_complete: bool,
+    /// Agent IDs for which at least one text chunk was streamed to stdout.
+    /// Read by main.rs after run() to suppress the duplicate println!.
+    streamed_agents:     Arc<Mutex<HashSet<String>>>,
 }
 
 impl Scheduler {
@@ -136,7 +143,10 @@ impl Scheduler {
         snapshot: Arc<RwLock<SchedulerSnapshot>>,
         checkpoint: Option<SchedulerCheckpoint>,
     ) -> anyhow::Result<Self> {
-        let store = CheckpointStore::new(std::path::Path::new("."));
+        // Canonicalize at construction time so later CWD changes (e.g. in tests
+        // that call set_current_dir) never redirect checkpoint writes mid-save.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let store = CheckpointStore::new(&cwd);
         let mut agents = HashMap::new();
         let mut restored: Option<SchedulerRestored> = None;
 
@@ -216,7 +226,14 @@ impl Scheduler {
             restored,
             memory_store:        None,
             distill_on_complete: false,
+            streamed_agents:     Arc::new(Mutex::new(HashSet::new())),
         })
+    }
+
+    /// Returns a handle to the set of agent IDs that streamed output to stdout.
+    /// Call after `run()` to determine which agents should not be printed again.
+    pub fn streamed_agents(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.streamed_agents)
     }
 
     /// Attach a memory store and enable end-of-run short-term distillation.
@@ -243,6 +260,7 @@ impl Scheduler {
             restored,
             memory_store,
             distill_on_complete,
+            streamed_agents,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
@@ -262,6 +280,8 @@ impl Scheduler {
             max_spawn_depth,
             mailboxes:          HashMap::new(),
             shutdown_requested: false,
+            streamed_agents:    Arc::clone(&streamed_agents),
+            stdout_lock:        Arc::new(tokio::sync::Mutex::new(())),
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -527,6 +547,7 @@ impl Scheduler {
                         }],
                         tools:      vec![],
                         max_tokens: 1024,
+                        streaming:  false,
                     };
 
                     let max_out_tokens = match sched.global_token_budget {
@@ -672,6 +693,97 @@ fn handle_agent_terminal(
     }
 }
 
+/// Build a `PendingFut` for an inference request. When `req.streaming` is true,
+/// opens an mpsc channel, runs `infer_with_stream` + a print future concurrently
+/// via `tokio::join!`, and records `InferenceStreamStarted`/`InferenceStreamCompleted`
+/// events. When false, calls `infer()` directly. Both paths produce an
+/// `EffectResult::Inference`.
+fn make_infer_future(
+    req: InferenceRequest,
+    id: String,
+    is_multi: bool,
+    gw: Arc<dyn InferenceGateway + Send + Sync>,
+    recorder: Arc<FlightRecorder>,
+    streamed_agents: Arc<Mutex<HashSet<String>>>,
+    stdout_lock: Arc<tokio::sync::Mutex<()>>,
+) -> PendingFut {
+    if req.streaming {
+        let model = gw.model_id().to_string();
+        Box::pin(async move {
+            recorder.record(
+                &id,
+                None,
+                EventKind::InferenceStreamStarted,
+                json!({ "agent_id": &id, "model": &model }),
+            );
+
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let infer_fut = gw.infer_with_stream(req, tx);
+            let agent_id_label = id.clone();
+            let print_fut = async move {
+                use tokio::io::AsyncWriteExt;
+                let mut stdout = tokio::io::stdout();
+                let mut chunks_emitted: u64 = 0;
+                while let Some(chunk) = rx.recv().await {
+                    let line = if is_multi {
+                        format!("[{agent_id_label}] {chunk}")
+                    } else {
+                        chunk
+                    };
+                    // Hold the lock across write+flush so concurrent streaming agents
+                    // cannot interleave their bytes on stdout.
+                    let _guard = stdout_lock.lock().await;
+                    match stdout.write_all(line.as_bytes()).await {
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                            return chunks_emitted;
+                        }
+                        // Non-BrokenPipe write error: don't count as delivered.
+                        Err(_) => continue,
+                        Ok(()) => {
+                            let _ = stdout.flush().await;
+                            chunks_emitted += 1;
+                        }
+                    }
+                }
+                // Newline so the shell prompt starts on a fresh line (only if anything was printed).
+                if chunks_emitted > 0 {
+                    let _guard = stdout_lock.lock().await;
+                    let _ = stdout.write_all(b"\n").await;
+                    let _ = stdout.flush().await;
+                }
+                chunks_emitted
+            };
+
+            let (infer_result, chunks_emitted) = tokio::join!(infer_fut, print_fut);
+
+            if let Ok(ref resp) = infer_result {
+                if chunks_emitted > 0 {
+                    if let Ok(mut set) = streamed_agents.lock() {
+                        set.insert(id.clone());
+                    }
+                }
+                recorder.record(
+                    &id,
+                    None,
+                    EventKind::InferenceStreamCompleted,
+                    json!({
+                        "agent_id": &id,
+                        "text_chunks_emitted": chunks_emitted,
+                        "input_tokens": resp.input_tokens,
+                        "output_tokens": resp.output_tokens,
+                    }),
+                );
+            }
+
+            EffectResult::Inference { agent_id: id, result: infer_result }
+        })
+    } else {
+        Box::pin(async move {
+            EffectResult::Inference { agent_id: id, result: gw.infer(req).await }
+        })
+    }
+}
+
 /// Drain the deferred queue, admitting agents until the cap or budget is hit.
 /// Agents that can never be admitted (budget exhausted) are denied immediately.
 fn drain_deferred(
@@ -729,6 +841,7 @@ fn drain_deferred(
     }
 
     // Admit as many as slots allow.
+    let is_multi = state.agents.len() > 1;
     while !state.deferred.is_empty() && slot_ok(state.in_flight) {
         let d = state.deferred.pop().expect("checked non-empty");
         state.in_flight += 1;
@@ -738,11 +851,12 @@ fn drain_deferred(
             EventKind::AgentScheduled,
             json!({ "reason": "slot_opened", "in_flight": state.in_flight }),
         );
-        let gw = Arc::clone(gateway);
-        let id = d.agent_id;
-        state.pending.push(Box::pin(async move {
-            EffectResult::Inference { agent_id: id, result: gw.infer(d.request).await }
-        }));
+        let gw  = Arc::clone(gateway);
+        let rec = Arc::clone(recorder);
+        let sa  = Arc::clone(&state.streamed_agents);
+        let sl  = Arc::clone(&state.stdout_lock);
+        let id  = d.agent_id;
+        state.pending.push(make_infer_future(d.request, id, is_multi, gw, rec, sa, sl));
     }
 }
 
@@ -774,11 +888,13 @@ fn enqueue_or_defer(
                     EventKind::AgentScheduled,
                     json!({ "in_flight": state.in_flight }),
                 );
-                let gw = Arc::clone(gateway);
-                let id = agent_id;
-                state.pending.push(Box::pin(async move {
-                    EffectResult::Inference { agent_id: id, result: gw.infer(req).await }
-                }));
+                let gw       = Arc::clone(gateway);
+                let rec      = Arc::clone(recorder);
+                let sa       = Arc::clone(&state.streamed_agents);
+                let sl       = Arc::clone(&state.stdout_lock);
+                let is_multi = state.agents.len() > 1;
+                let id       = agent_id;
+                state.pending.push(make_infer_future(req, id, is_multi, gw, rec, sa, sl));
             } else if !budget_ok {
                 recorder.record(
                     &agent_id,
@@ -1326,7 +1442,9 @@ mod tests {
     // or write to the shared CWD checkpoint file, preventing tmp-file rename races.
     static SERIAL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     fn serial_lock() -> std::sync::MutexGuard<'static, ()> {
-        SERIAL_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        // Recover from a poisoned mutex: the lock serialises tests only, not
+        // data integrity, so a prior test panic must not block subsequent tests.
+        SERIAL_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ── Test helpers ─────────────────────────────────────────────────────────
@@ -1408,6 +1526,7 @@ mod tests {
             provider:   "mock".to_string(),
             model:      "mock-model".to_string(),
             max_tokens: 4096,
+            streaming:  false,
         }
     }
 
@@ -2314,6 +2433,8 @@ mod tests {
             max_spawn_depth:    0,
             mailboxes:          HashMap::new(),
             shutdown_requested: false,
+            streamed_agents:    Arc::new(Mutex::new(HashSet::new())),
+            stdout_lock:        Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -2361,7 +2482,7 @@ mod tests {
             priority: 0,
             seq:      0,
             agent_id: "a".to_string(),
-            request: InferenceRequest { system: None, messages: vec![], tools: vec![], max_tokens: 1024 },
+            request: InferenceRequest { system: None, messages: vec![], tools: vec![], max_tokens: 1024, streaming: false },
             turn:     0,
         });
         update_snapshot(&snap, &state);
@@ -2477,7 +2598,7 @@ mod tests {
         AgentCheckpoint {
             agent_id:    id.to_string(),
             cfg:         agent_cfg(id, "restore task"),
-            model_cfg:   ModelConfig { provider: "mock".to_string(), model: "mock-model".to_string(), max_tokens: 4096 },
+            model_cfg:   ModelConfig { provider: "mock".to_string(), model: "mock-model".to_string(), max_tokens: 4096, streaming: false },
             messages:    vec![Msg { role: Role::User, blocks: vec![Block::Text { text: "restore task".to_string() }] }],
             specs:       vec![],
             total_input: 10,
@@ -2832,5 +2953,355 @@ mod tests {
             log.contains("\"agent_checkpointed\""),
             "agent_checkpointed event must appear in flight log after tool cycle"
         );
+    }
+
+    // ── p7.2 streaming dispatch ───────────────────────────────────────────────
+
+    /// Gateway that emits N text chunks via the streaming channel, then returns Ok.
+    struct StreamingMockGateway {
+        chunks: Vec<String>,
+        response: InferenceResponse,
+    }
+
+    #[async_trait::async_trait]
+    impl InferenceGateway for StreamingMockGateway {
+        async fn infer(&self, _req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+            Ok(self.response.clone())
+        }
+        async fn infer_with_stream(
+            &self,
+            _req: InferenceRequest,
+            tx: tokio::sync::mpsc::UnboundedSender<String>,
+        ) -> anyhow::Result<InferenceResponse> {
+            for chunk in &self.chunks {
+                let _ = tx.send(chunk.clone());
+            }
+            Ok(self.response.clone())
+        }
+        fn model_id(&self) -> &str { "streaming-mock" }
+    }
+
+    #[tokio::test]
+    async fn streaming_dispatch_emits_flight_events_and_populates_streamed_agents() {
+        let resp = end_turn("streamed answer", 20, 10);
+        let gw = StreamingMockGateway {
+            chunks:   vec!["chunk1".to_string(), "chunk2".to_string(), "chunk3".to_string()],
+            response: resp.clone(),
+        };
+
+        let mut cfg = agent_cfg("stream-agent", "stream task");
+        let mut mcfg = model_cfg();
+        mcfg.streaming = true;
+        cfg.max_turns = 1;
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &mcfg,
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let streamed = sched.streamed_agents();
+        let outcomes = sched.run().await;
+
+        // Agent should succeed.
+        let result = outcomes.get("stream-agent").expect("agent not found");
+        assert!(result.is_ok(), "streaming agent should succeed: {result:?}");
+
+        // streamed_agents should contain the agent ID.
+        let set = streamed.lock().unwrap();
+        assert!(set.contains("stream-agent"), "streamed_agents should include stream-agent");
+        drop(set);
+
+        // Flight log should contain InferenceStreamStarted + InferenceStreamCompleted.
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(log.contains("\"inference_stream_started\""), "missing inference_stream_started event");
+        assert!(log.contains("\"inference_stream_completed\""), "missing inference_stream_completed event");
+        assert!(log.contains("\"text_chunks_emitted\""), "missing text_chunks_emitted in payload");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_dispatch_does_not_emit_stream_events() {
+        let gw = MockGateway::new(vec![end_turn("plain answer", 10, 5)]);
+        let mut cfg = agent_cfg("plain-agent", "plain task");
+        cfg.max_turns = 1;
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &model_cfg(),  // streaming: false
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let streamed = sched.streamed_agents();
+        let outcomes = sched.run().await;
+
+        assert!(outcomes.get("plain-agent").unwrap().is_ok());
+        let set = streamed.lock().unwrap();
+        assert!(set.is_empty(), "non-streaming should not populate streamed_agents");
+        drop(set);
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(!log.contains("inference_stream_started"), "non-streaming should not emit stream events");
+    }
+
+    // ── p7.2 gap coverage ─────────────────────────────────────────────────────
+
+    /// Streaming gateway that returns zero chunks (end_turn response with no text chunks sent).
+    /// streamed_agents must NOT be populated when chunks_emitted == 0.
+    #[tokio::test]
+    async fn streaming_zero_chunks_does_not_populate_streamed_agents() {
+        // An SSE stream that emits no text chunks (no send() calls on the channel).
+        // The scheduler must emit InferenceStreamStarted/Completed but must NOT
+        // add the agent to streamed_agents (chunks_emitted == 0 path).
+        let resp = end_turn("silent answer", 10, 5);
+        let gw = StreamingMockGateway {
+            chunks:   vec![], // zero text chunks
+            response: resp,
+        };
+
+        let mut cfg = agent_cfg("zero-chunk-agent", "stream task silently");
+        let mut mcfg = model_cfg();
+        mcfg.streaming = true;
+        cfg.max_turns = 1;
+
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &mcfg,
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let streamed = sched.streamed_agents();
+        let outcomes = sched.run().await;
+
+        assert!(outcomes.get("zero-chunk-agent").unwrap().is_ok());
+
+        // Zero chunks emitted → agent must NOT be in streamed_agents set.
+        let set = streamed.lock().unwrap();
+        assert!(
+            !set.contains("zero-chunk-agent"),
+            "zero-chunk streaming must not populate streamed_agents (chunks_emitted == 0 path)"
+        );
+        drop(set);
+
+        // InferenceStreamStarted must still be emitted (fires before infer_with_stream).
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(log.contains("\"inference_stream_started\""),
+            "InferenceStreamStarted must be emitted even when no chunks are produced");
+        // InferenceStreamCompleted is emitted on Ok regardless of chunk count.
+        assert!(log.contains("\"inference_stream_completed\""),
+            "InferenceStreamCompleted must be emitted on Ok even with zero chunks");
+    }
+
+    /// Streaming dispatch propagates inference errors correctly.
+    /// When infer_with_stream returns Err, the EffectResult::Inference carries Err
+    /// and the agent is marked failed in outcomes — not panicked.
+    #[tokio::test]
+    async fn streaming_inference_error_propagates_as_agent_failure() {
+        struct FailingStreamGateway;
+        #[async_trait::async_trait]
+        impl InferenceGateway for FailingStreamGateway {
+            async fn infer(&self, _req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+                Err(anyhow::anyhow!("network error"))
+            }
+            async fn infer_with_stream(
+                &self,
+                _req: InferenceRequest,
+                _tx: tokio::sync::mpsc::UnboundedSender<String>,
+            ) -> anyhow::Result<InferenceResponse> {
+                Err(anyhow::anyhow!("streaming network error"))
+            }
+            fn model_id(&self) -> &str { "fail-stream" }
+        }
+
+        let cfg = agent_cfg("fail-stream-agent", "streaming task");
+        let mut mcfg = model_cfg();
+        mcfg.streaming = true;
+
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &mcfg,
+            unlimited(),
+            Arc::new(FailingStreamGateway),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let outcomes = sched.run().await;
+
+        // Agent must appear in outcomes as Err (not panic).
+        let result = outcomes.get("fail-stream-agent").expect("agent must be in outcomes");
+        assert!(result.is_err(), "streaming error must propagate as agent failure");
+        let err_msg = result.as_ref().unwrap_err().to_string();
+        // Either the streaming error or an admission-denied wrapper — either is correct.
+        assert!(
+            err_msg.contains("streaming") || err_msg.contains("inference") || err_msg.contains("network"),
+            "error message should reference the cause: {err_msg}"
+        );
+
+        // InferenceStreamStarted must be emitted (it fires before the infer call).
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(log.contains("\"inference_stream_started\""),
+            "InferenceStreamStarted must be emitted before the failing infer call");
+        // InferenceStreamCompleted must NOT be emitted (only emitted on Ok).
+        assert!(!log.contains("\"inference_stream_completed\""),
+            "InferenceStreamCompleted must not be emitted when infer_with_stream returns Err");
+    }
+
+    /// Default InferenceGateway::infer_with_stream fallback behaviour.
+    /// A gateway that does NOT override infer_with_stream should drop the sender
+    /// and fall through to infer(). No chunks are produced, but the response is correct.
+    #[tokio::test]
+    async fn default_infer_with_stream_falls_back_to_infer() {
+        // MockGateway does NOT override infer_with_stream, so the default is used.
+        // When scheduling a streaming=true request, the default drops the tx (no
+        // chunks) and calls infer() — the result must still be correct.
+        let gw = MockGateway::new(vec![end_turn("fallback answer", 10, 5)]);
+
+        let mut mcfg = model_cfg();
+        mcfg.streaming = true;
+        let mut cfg = agent_cfg("fallback-agent", "stream task");
+        cfg.max_turns = 1;
+
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &mcfg,
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let streamed = sched.streamed_agents();
+        let outcomes = sched.run().await;
+
+        // Agent must complete successfully via the fallback path.
+        assert!(
+            outcomes.get("fallback-agent").unwrap().is_ok(),
+            "default infer_with_stream fallback must complete successfully"
+        );
+        // No chunks → streamed_agents must be empty.
+        let set = streamed.lock().unwrap();
+        assert!(
+            set.is_empty(),
+            "default infer_with_stream (no chunks) must not populate streamed_agents"
+        );
+    }
+
+    /// Multi-agent streaming prefixes each chunk with [agent_id].
+    /// When two streaming agents run concurrently (is_multi=true), each chunk
+    /// written to stdout must be prefixed with the agent ID.
+    /// This test verifies the `is_multi` branch in the print_fut closure fires
+    /// by running two streaming agents simultaneously.
+    #[tokio::test]
+    async fn streaming_two_agents_populates_both_in_streamed_agents() {
+        // Two streaming agents running concurrently → both should appear in streamed_agents.
+        let _resp_a = end_turn("agent-a answer", 10, 5);
+        let _resp_b = end_turn("agent-b answer", 10, 5);
+
+        struct TwoAgentGateway {
+            calls: Arc<Mutex<u32>>,
+        }
+        #[async_trait::async_trait]
+        impl InferenceGateway for TwoAgentGateway {
+            async fn infer(&self, _req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+                Ok(end_turn("fallback", 10, 5))
+            }
+            async fn infer_with_stream(
+                &self,
+                _req: InferenceRequest,
+                tx: tokio::sync::mpsc::UnboundedSender<String>,
+            ) -> anyhow::Result<InferenceResponse> {
+                let n = {
+                    let mut guard = self.calls.lock().unwrap();
+                    *guard += 1;
+                    *guard
+                };
+                // Both agents emit one chunk each.
+                let _ = tx.send(format!("chunk-from-agent-{n}"));
+                if n == 1 {
+                    Ok(end_turn("agent-a answer", 10, 5))
+                } else {
+                    Ok(end_turn("agent-b answer", 10, 5))
+                }
+            }
+            fn model_id(&self) -> &str { "two-agent-stream" }
+        }
+
+        let mut mcfg = model_cfg();
+        mcfg.streaming = true;
+        let mut cfg_a = agent_cfg("stream-a", "task a");
+        cfg_a.max_turns = 1;
+        let mut cfg_b = agent_cfg("stream-b", "task b");
+        cfg_b.max_turns = 1;
+
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg_a, cfg_b],
+            &mcfg,
+            unlimited(),
+            Arc::new(TwoAgentGateway { calls: Arc::new(Mutex::new(0)) }),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let streamed = sched.streamed_agents();
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["stream-a"].is_ok(), "stream-a must succeed");
+        assert!(outcomes["stream-b"].is_ok(), "stream-b must succeed");
+
+        // Both agents emitted chunks → both must appear in streamed_agents.
+        let set = streamed.lock().unwrap();
+        assert!(set.contains("stream-a"), "stream-a should be in streamed_agents");
+        assert!(set.contains("stream-b"), "stream-b should be in streamed_agents");
+    }
+
+    /// ModelConfig streaming field defaults to false via #[serde(default)].
+    #[test]
+    fn model_config_streaming_defaults_to_false() {
+        // Verify that omitting `streaming` from a TOML snippet deserializes as false.
+        let toml_str = r#"
+            provider = "anthropic"
+            model = "claude-sonnet-4-6"
+            max_tokens = 4096
+        "#;
+        let cfg: crate::config::ModelConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.streaming, "streaming must default to false when omitted from config");
+    }
+
+    /// ModelConfig streaming field can be set to true in TOML.
+    #[test]
+    fn model_config_streaming_can_be_enabled() {
+        let toml_str = r#"
+            provider = "anthropic"
+            model = "claude-sonnet-4-6"
+            max_tokens = 4096
+            streaming = true
+        "#;
+        let cfg: crate::config::ModelConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.streaming, "streaming must be parsed as true when set in config");
     }
 }

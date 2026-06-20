@@ -71,6 +71,12 @@ pub enum EventKind {
     /// HTTP MCP server returned a non-2xx status or JSON-RPC error during a tool call.
     /// data: { server_name, http_status: u16, method }
     McpHttpError,
+    /// SSE streaming inference started for an agent turn.
+    /// data: { agent_id, model }
+    InferenceStreamStarted,
+    /// SSE streaming inference completed successfully.
+    /// data: { agent_id, text_chunks_emitted: u64, input_tokens: u32, output_tokens: u32 }
+    InferenceStreamCompleted,
     Error,
 }
 
@@ -128,6 +134,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::MemoryEvicted), "memory_evicted");
         assert_eq!(kind_str(EventKind::McpHttpConnected), "mcp_http_connected");
         assert_eq!(kind_str(EventKind::McpHttpError), "mcp_http_error");
+        assert_eq!(kind_str(EventKind::InferenceStreamStarted), "inference_stream_started");
+        assert_eq!(kind_str(EventKind::InferenceStreamCompleted), "inference_stream_completed");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

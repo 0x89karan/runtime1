@@ -35,7 +35,7 @@ HTTP servers are externally isolated — no `command`, `args`, `isolation`, or
 | GitHub  | `https://api.githubcopilot.com/mcp/` | `Authorization` | `GITHUB_MCP_TOKEN` | Bearer token (PAT with `repo` scope) |
 
 > Note: OAuth-based services (Gmail, Google Drive, etc.) require a future
-> `auth_provider` field that is not yet implemented. Track p7.2.
+> `auth_provider` field that is not yet implemented. Deferred to a future increment.
 
 ## Security notes
 
@@ -49,4 +49,4 @@ HTTP servers are externally isolated — no `command`, `args`, `isolation`, or
   for the `https://` scheme; an operator-supplied URL like
   `https://169.254.169.254/...` passes. In the single-tenant threat model the
   operator controls config, so the risk is low. Structural blocking of metadata
-  endpoints is a p7.2+ hardening item. (See TODOS.md p7.1-ar-02.)
+  endpoints is a future hardening item. (See TODOS.md p7.1-ar-02.)
