@@ -1,0 +1,25 @@
+[agent]
+id          = "weather-scout"
+task        = """
+1. Use the get_weather tool to fetch the current weather in New York City.
+2. Save the raw weather data to long-term memory with mem_remember, key = "nyc_weather_latest".
+3. Write a short plain-English summary: temp, feels-like, conditions, humidity, wind.
+"""
+max_turns   = 10
+token_budget = 50_000
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 1024
+
+[tools]
+native = ["mem_remember", "mem_recall"]
+
+[[tools.mcp_servers]]
+name    = "weather"
+command = "python3"
+args    = ["/etc/agentd/weather_mcp.py"]
+
+[memory]
+store_path = "/run/memory/memory.redb"

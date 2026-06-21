@@ -1,0 +1,14 @@
+target/
+agentd/target/
+agentctl/target/
+surfaces/target/
+sandbox/target/
+agentd/flight.jsonl
+agentd/memory.redb
+agentd/checkpoint.json
+*.redb
+flight.jsonl
+distro/output/
+.git/
+.gstack/
+docs/SPIKES/

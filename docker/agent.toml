@@ -1,0 +1,19 @@
+# AgentOS demo agent — runs inside Docker
+# The /agents FUSE filesystem will be mounted while this runs.
+
+[agent]
+id          = "scout"
+task        = "List the /workspace directory, then summarize what AgentOS is based on any files you find."
+max_turns   = 20
+token_budget = 100_000
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 4096
+
+[tools]
+native = ["all"]
+
+[memory]
+store_path = "/run/memory/memory.redb"

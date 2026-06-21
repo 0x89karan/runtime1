@@ -1,0 +1,28 @@
+# Multi-agent demo — two agents running concurrently
+# Run: agentd /etc/agentd/agents.toml
+
+[[agents]]
+id          = "surveyor"
+task        = "List /workspace and describe each file you find."
+max_turns   = 10
+token_budget = 50_000
+
+[[agents]]
+id          = "analyst"
+task        = "Read /etc/agentd/agent.toml and explain every config field and what it does."
+max_turns   = 10
+token_budget = 50_000
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 4096
+
+[tools]
+native = ["all"]
+
+[memory]
+store_path = "/run/memory/memory.redb"
+
+[scheduler]
+max_concurrent_inferences = 2
