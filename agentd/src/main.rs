@@ -640,6 +640,10 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     #[cfg(target_os = "linux")]
     let fuse_mountpoint = PathBuf::from("/agents");
 
+    // Control channel: FUSE writes on /agents/control → scheduler's run loop.
+    #[cfg(target_os = "linux")]
+    let (control_tx, control_rx) = tokio::sync::mpsc::channel::<agentd::control::ControlCommand>(16);
+
     #[cfg(target_os = "linux")]
     let maybe_session = if no_fuse {
         tracing::info!("FUSE mount skipped (--no-fuse / AGENTOS_NO_FUSE)");
@@ -654,7 +658,20 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         let fuse_mem_access: Option<Arc<dyn MemoryAccess>> = memory_store_for_distillation
             .as_ref()
             .map(|s| Arc::new(MemoryAccessBridge(Arc::clone(s))) as Arc<dyn MemoryAccess>);
-        match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot), fuse_mem_access) {
+        let fuse_ctrl: Option<surfaces::ControlDispatch> = {
+            let tx = control_tx.clone();
+            Some(Arc::new(move |bytes: &[u8]| {
+                match agentd::control::parse_control_command(bytes) {
+                    Err(_) => libc::EINVAL,
+                    Ok(cmd) => match tx.try_send(cmd) {
+                        Ok(_)                                        => 0,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_))   => libc::EBUSY,
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => libc::EIO,
+                    },
+                }
+            }) as Arc<dyn Fn(&[u8]) -> i32 + Send + Sync>)
+        };
+        match surfaces::agents_fs::mount(&fuse_mountpoint, Arc::clone(&snapshot), fuse_mem_access, fuse_ctrl) {
             Ok(session) => {
                 recorder.record(
                     "agentd",
@@ -742,6 +759,16 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             scheduler
         }
     } else {
+        scheduler
+    };
+
+    // Only wire when FUSE is mounted: if no_fuse or mount failed, control_tx stays
+    // alive and rx.recv() would block forever once pending is empty.
+    #[cfg(target_os = "linux")]
+    let scheduler = if maybe_session.is_some() {
+        scheduler.with_control(control_rx)
+    } else {
+        drop(control_rx);
         scheduler
     };
 

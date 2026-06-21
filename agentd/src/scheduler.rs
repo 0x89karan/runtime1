@@ -123,6 +123,10 @@ pub struct Scheduler {
     restored:            Option<SchedulerRestored>,
     memory_store:        Option<Arc<dyn MemoryStore>>,
     distill_on_complete: bool,
+    /// Default model config used when no parent agent exists (operator spawns).
+    default_model_cfg:   crate::config::ModelConfig,
+    /// Optional receiver for operator spawn commands injected via /agents/control.
+    control_rx:          Option<tokio::sync::mpsc::Receiver<crate::control::ControlCommand>>,
     /// Agent IDs for which at least one text chunk was streamed to stdout.
     /// Read by main.rs after run() to suppress the duplicate println!.
     streamed_agents:     Arc<Mutex<HashSet<String>>>,
@@ -226,6 +230,8 @@ impl Scheduler {
             restored,
             memory_store:        None,
             distill_on_complete: false,
+            default_model_cfg:   model_cfg.clone(),
+            control_rx:          None,
             streamed_agents:     Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -246,6 +252,14 @@ impl Scheduler {
         self
     }
 
+    /// Attach a control receiver so the scheduler accepts live operator spawn commands
+    /// written to `/agents/control`. The scheduler's run loop stays alive after all
+    /// initial agents complete as long as this channel remains open.
+    pub fn with_control(mut self, rx: tokio::sync::mpsc::Receiver<crate::control::ControlCommand>) -> Self {
+        self.control_rx = Some(rx);
+        self
+    }
+
     /// Run all agents concurrently until every one reaches a terminal state.
     /// Returns a map from agent_id to Ok(answer) or Err.
     pub async fn run(self) -> HashMap<String, anyhow::Result<String>> {
@@ -260,6 +274,8 @@ impl Scheduler {
             restored,
             memory_store,
             distill_on_complete,
+            default_model_cfg,
+            mut control_rx,
             streamed_agents,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
@@ -325,10 +341,62 @@ impl Scheduler {
             tokio::signal::unix::SignalKind::interrupt()
         ).expect("failed to install SIGINT handler");
 
-        loop {
+        'main: loop {
+            // When all pending work is done, either wait for an operator command or exit.
+            if state.pending.is_empty() {
+                match control_rx {
+                    None => break 'main,
+                    Some(ref mut rx) => {
+                        tokio::select! {
+                            cmd = rx.recv() => {
+                                let Some(cmd) = cmd else { break 'main; };
+                                dispatch_operator_spawn(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
+                                update_snapshot(&snapshot, &state);
+                            }
+                            _ = sigterm.recv() => {
+                                recorder.record(
+                                    "agentd",
+                                    None,
+                                    EventKind::SystemShutdownRequested,
+                                    json!({ "signal": "SIGTERM" }),
+                                );
+                                state.shutdown_requested = true;
+                                break 'main;
+                            }
+                            _ = sigint.recv() => {
+                                recorder.record(
+                                    "agentd",
+                                    None,
+                                    EventKind::SystemShutdownRequested,
+                                    json!({ "signal": "SIGINT" }),
+                                );
+                                state.shutdown_requested = true;
+                                break 'main;
+                            }
+                        }
+                        continue 'main;
+                    }
+                }
+            }
+
             tokio::select! {
+                // Interleave operator control commands while agents are running.
+                cmd = async {
+                    match control_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None     => std::future::pending::<Option<crate::control::ControlCommand>>().await,
+                    }
+                } => {
+                    match cmd {
+                        Some(cmd) => {
+                            dispatch_operator_spawn(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
+                            update_snapshot(&snapshot, &state);
+                        }
+                        None => { control_rx = None; }
+                    }
+                }
                 er = state.pending.next() => {
-                    let Some(er) = er else { break; };
+                    let Some(er) = er else { continue 'main; };
                     match er {
                         EffectResult::Inference { agent_id, result: Err(e) } => {
                             assert!(
@@ -458,7 +526,7 @@ impl Scheduler {
                         json!({ "signal": "SIGTERM" }),
                     );
                     state.shutdown_requested = true;
-                    break;
+                    break 'main;
                 }
                 _ = sigint.recv() => {
                     recorder.record(
@@ -468,7 +536,7 @@ impl Scheduler {
                         json!({ "signal": "SIGINT" }),
                     );
                     state.shutdown_requested = true;
-                    break;
+                    break 'main;
                 }
             }
         }
@@ -1208,6 +1276,111 @@ fn dispatch_spawn(
         registry,
         recorder,
     );
+}
+
+/// Handle a ControlCommand::Spawn from the /agents/control FUSE surface.
+/// Injects a new top-level agent into the running scheduler. The agent runs
+/// independently (no awaiting parent); its outcome is recorded but not returned
+/// to any caller. Emits FuseControlReceived on success, FuseControlError on failure.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_operator_spawn(
+    cmd:            crate::control::ControlCommand,
+    default_model:  &crate::config::ModelConfig,
+    state:          &mut SchedulerState,
+    sched:          &crate::config::SchedulerConfig,
+    gateway:        &Arc<dyn InferenceGateway + Send + Sync>,
+    registry:       &Arc<ToolRegistry>,
+    recorder:       &Arc<FlightRecorder>,
+) {
+    use crate::control::ControlCommand;
+    use crate::config::{default_max_turns, default_token_budget};
+
+    let ControlCommand::Spawn(req) = cmd;
+
+    // Validate / derive agent ID.
+    let agent_id = match req.id {
+        Some(ref id) => {
+            if let Err(e) = validate_child_id(id) {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::FuseControlError,
+                    json!({ "error": e.to_string(), "is_error": true }),
+                );
+                return;
+            }
+            id.clone()
+        }
+        None => {
+            let id = format!("operator-{}", state.child_seq);
+            state.child_seq += 1;
+            id
+        }
+    };
+
+    // Guard against ID collisions.
+    if state.agents.contains_key(&agent_id) || state.outcomes.contains_key(&agent_id) {
+        recorder.record(
+            "agentd",
+            None,
+            EventKind::FuseControlError,
+            json!({ "error": format!("agent ID '{}' already in use", agent_id), "is_error": true }),
+        );
+        return;
+    }
+
+    let max_turns    = req.max_turns.unwrap_or_else(default_max_turns);
+    let token_budget = req.token_budget.unwrap_or_else(default_token_budget);
+    let priority     = req.priority.unwrap_or(0);
+
+    let agent_cfg = crate::config::AgentConfig {
+        id:           agent_id.clone(),
+        task:         req.task.clone(),
+        max_turns,
+        token_budget,
+        priority,
+        capabilities: req.capabilities.clone(),
+        name:         None,
+        description:  String::new(),
+        skills:       vec![],
+    };
+
+    let specs     = registry.filtered_specs(agent_cfg.capabilities.as_deref());
+    let task      = crate::agent::AgentTask::new(&agent_id, &req.task, &agent_cfg, default_model, specs);
+
+    state.agents.insert(agent_id.clone(), task);
+    state.spawn_depths.insert(agent_id.clone(), 0);
+    state.mailboxes.entry(agent_id.clone()).or_default();
+    state.parent_map.insert(agent_id.clone(), "operator".to_string());
+
+    recorder.record(
+        &agent_id,
+        None,
+        EventKind::FuseControlReceived,
+        json!({
+            "task_preview": crate::agent::truncate(&req.task, crate::agent::PREVIEW_CHARS),
+            "id":           &agent_id,
+        }),
+    );
+    recorder.record(
+        &agent_id,
+        None,
+        EventKind::AgentSpawned,
+        json!({
+            "parent_id":    "operator",
+            "task_preview": crate::agent::truncate(&req.task, crate::agent::PREVIEW_CHARS),
+            "depth":        0_u32,
+        }),
+    );
+
+    // Seed the new agent.
+    let cap_set = state.agents[&agent_id].cap_set_cloned();
+    let (effect, turn) = {
+        let sm = state.agents.get_mut(&agent_id).unwrap();
+        let t  = sm.turn();
+        (sm.step(recorder), t)
+    };
+    enqueue_or_defer(effect, agent_id, turn, priority, cap_set, state, sched, gateway, registry, recorder);
 }
 
 /// Handle an AgentEffect::SendMessage: deliver to recipient's mailbox, then

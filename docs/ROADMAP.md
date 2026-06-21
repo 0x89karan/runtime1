@@ -766,15 +766,17 @@ make them meaningful.
 `Arc<Mutex<HashSet>>` side-channel for double-print suppression; `streaming: bool`
 on `ModelConfig` and `InferenceRequest`; `InferenceStreamStarted` +
 `InferenceStreamCompleted` flight events; 889 tests.
+**p7.3 complete (v0.37.0).** FUSE write control surface: `agentd::control` module with
+`OperatorSpawnRequest` + `parse_control_command`; `ControlDispatch = Arc<dyn Fn(&[u8]) -> i32 + Send + Sync>`
+in `surfaces`; `INO_CONTROL = 15` write-only pseudo-file in `AgentsFs` with per-fh write buffers,
+`process_control_flush`, and `MountOption::RO` removed; `with_control()` builder on `Scheduler`
+with `default_model_cfg: ModelConfig` for operator-spawned agents; `dispatch_operator_spawn()`
+emits `FuseControlReceived` / `FuseControlError`; `SpawnOutcome` enum in `agentctl watch` with
+`InjectedViaControl` path (JSON payload, green banner, TUI re-entry) and `FellBackToExec` fallback;
+`do_generate()` shows JSON preview when control surface is present; `docs/CONTROL_SURFACE.md`
+operator reference; 2 new flight events in CONVENTIONS.md; 894 tests.
 
-**p7.3 — Write-capable FUSE control surface** [CORE]
-`/agents/control` as a writable pseudo-file; writing a JSON command (`spawn`, `signal`)
-injects it into the running scheduler without restart. Completes p6.6 mode (b): `agentctl
-watch` can spawn agents into the live runtime. Core rationale: same as the read-only
-FUSE surface already in the core — it is operator infrastructure over the scheduler, not
-a tool an agent calls. **Acceptance:** `echo '{"spawn":...}' > /agents/control` starts a
-new agent in the running scheduler; `agentctl watch` spawn view uses it instead of
-exec'ing a new `agentd` process.
+**p7.3 — Write-capable FUSE control surface** [CORE] *(superseded by p7.3 complete above)*
 
 ---
 

@@ -77,6 +77,12 @@ pub enum EventKind {
     /// SSE streaming inference completed successfully.
     /// data: { agent_id, text_chunks_emitted: u64, input_tokens: u32, output_tokens: u32 }
     InferenceStreamCompleted,
+    /// Operator wrote a valid spawn command to /agents/control; agent queued.
+    /// data: { task_preview, id }
+    FuseControlReceived,
+    /// Operator command via /agents/control could not be dispatched (bad ID, collision, etc.).
+    /// data: { error, is_error: true }
+    FuseControlError,
     Error,
 }
 
@@ -136,6 +142,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::McpHttpError), "mcp_http_error");
         assert_eq!(kind_str(EventKind::InferenceStreamStarted), "inference_stream_started");
         assert_eq!(kind_str(EventKind::InferenceStreamCompleted), "inference_stream_completed");
+        assert_eq!(kind_str(EventKind::FuseControlReceived), "fuse_control_received");
+        assert_eq!(kind_str(EventKind::FuseControlError), "fuse_control_error");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

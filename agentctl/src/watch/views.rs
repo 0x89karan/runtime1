@@ -59,7 +59,24 @@ fn status_style(status: &str) -> Style {
 }
 
 fn render_dashboard(f: &mut Frame, app: &App) {
-    let (header_area, content_area, footer_area) = header_footer_layout(f.area());
+    let area = f.area();
+
+    // When a spawn banner is active, carve out an extra line below the header.
+    let (header_area, banner_area, content_area, footer_area) = if app.spawn_banner.is_some() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),  // header bar
+                Constraint::Length(1),  // spawn banner
+                Constraint::Min(1),     // main content
+                Constraint::Length(1),  // footer / key hints
+            ])
+            .split(area);
+        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+    } else {
+        let (h, c, f2) = header_footer_layout(area);
+        (h, None, c, f2)
+    };
 
     // Header
     let title = match app.provider.as_ref().map(|p| p.model.as_str()) {
@@ -70,6 +87,15 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         Paragraph::new(title).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         header_area,
     );
+
+    // Spawn banner (shown after live injection via /agents/control).
+    if let (Some(msg), Some(banner_rect)) = (&app.spawn_banner, banner_area) {
+        let text = format!(" ✓ {} ", sanitize(msg));
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().bg(Color::Green).fg(Color::Black)),
+            banner_rect,
+        );
+    }
 
     // Agent table
     let selected_idx = app.selected_index();

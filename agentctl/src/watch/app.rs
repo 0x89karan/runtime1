@@ -229,8 +229,12 @@ impl SpawnViewState {
         };
     }
 
-    /// Generate the `agent.toml` preview from the current form state.
-    pub fn do_generate(&mut self) {
+    /// Generate a preview from the current form state.
+    ///
+    /// When `/agents/control` is present (live agentd running), the preview is
+    /// the JSON payload that will be injected. Otherwise it falls back to the
+    /// full `agent.toml` TOML that will be exec'd.
+    pub fn do_generate(&mut self, agents_dir: Option<&std::path::Path>) {
         let Some(template) = self.selected_template() else {
             self.result_msg = Some("No template selected.".to_string());
             return;
@@ -262,13 +266,44 @@ impl SpawnViewState {
                                 caps.retain(|c| !disabled.contains(c));
                             }
                         }
-                        match toml::to_string_pretty(&config) {
-                            Err(e) => {
-                                self.result_msg = Some(format!("toml error: {e:#}"));
+                        let use_control = agents_dir
+                            .map(|d| d.join("control").exists())
+                            .unwrap_or(false);
+                        if use_control {
+                            // JSON preview matches the OperatorSpawnRequest payload
+                            // that execute_pending_spawn writes to /agents/control.
+                            let agent_id = config.agent.as_ref()
+                                .map(|a| a.id.clone())
+                                .unwrap_or_else(|| "operator".to_string());
+                            let capabilities = config.agent.as_ref()
+                                .and_then(|a| a.capabilities.clone());
+                            let payload = serde_json::json!({
+                                "task":         self.task_input,
+                                "id":           agent_id,
+                                "capabilities": capabilities,
+                            });
+                            match serde_json::to_string_pretty(&payload) {
+                                Err(e) => {
+                                    self.result_msg = Some(format!("json error: {e:#}"));
+                                }
+                                Ok(json_str) => {
+                                    self.preview    = Some(json_str);
+                                    self.result_msg = Some(
+                                        "JSON preview (live inject). Press [r] to send.".to_string()
+                                    );
+                                }
                             }
-                            Ok(toml_str) => {
-                                self.preview    = Some(toml_str);
-                                self.result_msg = Some("Preview generated. Press [r] to spawn.".to_string());
+                        } else {
+                            match toml::to_string_pretty(&config) {
+                                Err(e) => {
+                                    self.result_msg = Some(format!("toml error: {e:#}"));
+                                }
+                                Ok(toml_str) => {
+                                    self.preview    = Some(toml_str);
+                                    self.result_msg = Some(
+                                        "TOML preview (exec fallback). Press [r] to spawn.".to_string()
+                                    );
+                                }
                             }
                         }
                     }
@@ -388,6 +423,9 @@ pub struct App {
     pub spawn_view:      SpawnViewState,
     /// UI state for the Inspector view.
     pub inspector_view:  InspectorState,
+    /// Shown as a green banner on the Dashboard after a successful live injection
+    /// via /agents/control; cleared on the next keypress.
+    pub spawn_banner:    Option<String>,
 }
 
 impl App {
@@ -408,6 +446,7 @@ impl App {
             memory_view:     MemoryPaneState::default(),
             spawn_view:      SpawnViewState::default(),
             inspector_view:  InspectorState::default(),
+            spawn_banner:    None,
         }
     }
 
@@ -1223,7 +1262,7 @@ mod tests {
     fn spawn_view_do_generate_sets_error_when_no_templates_loaded() {
         let mut state = SpawnViewState::default();
         // No templates — do_generate must set an error result_msg.
-        state.do_generate();
+        state.do_generate(None);
         assert_eq!(state.result_msg.as_deref(), Some("No template selected."),
             "do_generate with no templates must set error result_msg");
         assert!(state.preview.is_none(), "preview must stay None on error");

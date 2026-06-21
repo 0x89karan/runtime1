@@ -3,6 +3,7 @@ pub mod bus;
 pub mod capability;
 pub mod checkpoint;
 pub mod config;
+pub mod control;
 pub mod events;
 pub mod flight_recorder;
 pub mod inference;

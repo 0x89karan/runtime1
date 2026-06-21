@@ -1,6 +1,6 @@
 use std::{
     io::{self, IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -22,6 +22,15 @@ pub mod views;
 
 use app::{App, MemoryPane, PendingSpawn, SpawnFocus, View};
 use reader::load_snapshot;
+
+/// Outcome of `execute_pending_spawn`. Determines whether the TUI stays alive
+/// (InjectedViaControl) or the process is replaced by agentd (FellBackToExec).
+enum SpawnOutcome {
+    /// Written successfully to /agents/control; TUI stays in Dashboard with banner.
+    InjectedViaControl { agent_id_hint: String },
+    /// Control file absent or write failed; the fallback exec path was taken.
+    FellBackToExec,
+}
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -124,7 +133,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
     let mut term = Terminal::new(backend).context("creating terminal")?;
 
     let mut app  = App::new(agents_dir.clone());
-    app.log_path = log_path;
+    app.log_path = log_path.clone();
     let tick_ms  = interval.as_millis().max(100) as u64;
 
     loop {
@@ -192,9 +201,75 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
     drop(_guard);
     let _ = std::panic::take_hook();
 
-    // Pending spawn: generate agent.toml, write to tempfile, exec agentd.
+    // Pending spawn: try /agents/control first; fall back to exec agentd.
     if let Some(pending) = app.spawn_view.pending_exec.take() {
-        execute_pending_spawn(pending)?;
+        match execute_pending_spawn(&agents_dir, pending)? {
+            SpawnOutcome::FellBackToExec => {
+                // exec_agentd() replaced this process — unreachable on success.
+            }
+            SpawnOutcome::InjectedViaControl { agent_id_hint } => {
+                // Re-enter TUI to show the banner and let the operator watch the agent.
+                enable_raw_mode().context("re-enabling raw mode after inject")?;
+                let _guard2 = CleanupGuard;
+                execute!(io::stdout(), EnterAlternateScreen).context("re-entering alternate screen")?;
+                let backend2  = CrosstermBackend::new(io::stdout());
+                let mut term2 = Terminal::new(backend2).context("recreating terminal")?;
+                let mut app2  = App::new(agents_dir.clone());
+                app2.log_path = log_path;
+                app2.spawn_banner = Some(format!("Agent '{}' injected via /agents/control", agent_id_hint));
+
+                loop {
+                    let snap = load_snapshot(&agents_dir);
+                    app2.apply_snapshot(snap);
+                    term2.draw(|f| views::render(f, &app2))?;
+                    if event::poll(Duration::from_millis(tick_ms))? {
+                        match event::read()? {
+                            Event::Key(key) => {
+                                let ctrl_c = key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL);
+                                if ctrl_c { break; }
+                                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                                    && app2.view == View::Dashboard
+                                {
+                                    break;
+                                }
+                                // Any key clears the banner.
+                                app2.spawn_banner = None;
+                                let was_dashboard = app2.view == View::Dashboard;
+                                match app2.view {
+                                    View::Dashboard => handle_dashboard_key(key.code, &mut app2),
+                                    View::AgentDetail | View::System => {
+                                        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                                            app2.view = View::Dashboard;
+                                        }
+                                    }
+                                    View::Topology => {
+                                        match key.code {
+                                            KeyCode::Char('q') | KeyCode::Esc => { app2.view = View::Dashboard; }
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                app2.topology_scroll = app2.topology_scroll.saturating_sub(1);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                app2.topology_scroll += 1;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    View::Memory    => handle_memory_key(key.code, &mut app2),
+                                    View::Spawn     => handle_spawn_key(key.code, &mut app2),
+                                    View::Inspector => handle_inspector_key(key.code, &mut app2),
+                                }
+                                if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
+                                    break;
+                                }
+                            }
+                            Event::Resize(_, _) => {}
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(())
@@ -320,10 +395,12 @@ fn handle_spawn_key(code: KeyCode, app: &mut App) {
         }
         // Generate action: [g] shortcut (outside TaskField) or Enter on button.
         (_, KeyCode::Char('g')) => {
-            app.spawn_view.do_generate();
+            let dir = app.agents_dir.clone();
+            app.spawn_view.do_generate(Some(&dir));
         }
         (SpawnFocus::ActionGenerate, KeyCode::Enter | KeyCode::Char(' ')) => {
-            app.spawn_view.do_generate();
+            let dir = app.agents_dir.clone();
+            app.spawn_view.do_generate(Some(&dir));
         }
         // Spawn action: [r] shortcut (outside TaskField) or Enter on button.
         (_, KeyCode::Char('r')) => {
@@ -395,23 +472,65 @@ fn handle_inspector_key(code: KeyCode, app: &mut App) {
     }
 }
 
-/// Called after the TUI loop exits when `pending_exec` is set.
-/// Resolves the template, writes a temp config, and execs agentd.
-fn execute_pending_spawn(pending: PendingSpawn) -> anyhow::Result<()> {
+/// Resolve the template, build the config, then:
+///   1. Try writing JSON to `/agents/control` (live injection if agentd is running).
+///   2. Fall back to writing a temp TOML and exec'ing agentd.
+fn execute_pending_spawn(agents_dir: &Path, pending: PendingSpawn) -> anyhow::Result<SpawnOutcome> {
     use std::io::Write as _;
+
     let resolver = crate::build_resolver(None, None);
     let (cfg, _) = resolver.resolve(&pending.template_name)?;
     if let Some(requires) = &cfg.template.gated_requires {
         crate::spawn::warn_gated_requires(requires);
     }
     let task_str = if pending.task.is_empty() { None } else { Some(pending.task.as_str()) };
-    let mut config = cfg.to_agent_config(task_str, pending.extra_caps)?;
+    let mut config = cfg.to_agent_config(task_str, pending.extra_caps.clone())?;
     // Strip caps the user explicitly disabled so unchecking a baseline cap revokes it.
     if let Some(agent) = config.agent.as_mut() {
         if let Some(caps) = agent.capabilities.as_mut() {
             caps.retain(|c| !pending.disabled_caps.contains(c));
         }
     }
+
+    // Try live injection via /agents/control if agentd is running.
+    let control_path = agents_dir.join("control");
+    if control_path.exists() {
+        let agent_id = config.agent.as_ref()
+            .map(|a| a.id.clone())
+            .unwrap_or_else(|| "operator".to_string());
+        let capabilities = config.agent.as_ref()
+            .and_then(|a| a.capabilities.clone());
+        let payload = serde_json::json!({
+            "task":         pending.task,
+            "id":           agent_id,
+            "capabilities": capabilities,
+        });
+        let json_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| anyhow::anyhow!("JSON serialization failed: {e}"))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&control_path)
+            .context("opening /agents/control")?;
+        f.write_all(&json_bytes).context("writing to /agents/control")?;
+        // Explicitly close to propagate FUSE flush() errors (e.g. EBUSY when
+        // the scheduler channel is full). Rust File::drop silently discards close errors.
+        let fd = {
+            use std::os::unix::io::IntoRawFd as _;
+            f.into_raw_fd()
+        };
+        // SAFETY: fd is valid and exclusively owned — into_raw_fd() consumed the File.
+        let rc = unsafe { libc::close(fd) };
+        if rc != 0 {
+            return Err(anyhow::anyhow!(
+                "scheduler rejected the command ({}): try again shortly",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let agent_id_hint = payload["id"].as_str().unwrap_or("operator").to_string();
+        return Ok(SpawnOutcome::InjectedViaControl { agent_id_hint });
+    }
+
+    // Fall back: write TOML config to a temp file and exec agentd.
     let toml_str = toml::to_string_pretty(&config)
         .map_err(|e| anyhow::anyhow!("config serialization failed: {e}"))?;
     let mut tmpfile = tempfile::NamedTempFile::new()
@@ -422,7 +541,8 @@ fn execute_pending_spawn(pending: PendingSpawn) -> anyhow::Result<()> {
         .context("flushing temp config")?;
     let (_, path) = tmpfile.keep().context("keeping temp file")?;
     let agentd = crate::spawn::resolve_agentd(&None)?;
-    crate::spawn::exec_agentd(&agentd, &path)
+    crate::spawn::exec_agentd(&agentd, &path)?;
+    Ok(SpawnOutcome::FellBackToExec)
 }
 
 #[cfg(test)]

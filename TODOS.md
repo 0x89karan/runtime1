@@ -51,6 +51,25 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   or increase `MAX_DIR_KEYS` and add a per-call budget. Document the limit prominently in RUNBOOK.md.
   (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p6+.
 
+## Phase 7 — Open (deferred from p7.3 review)
+
+**p7.3-ar-01 (LOW) — `child_seq` consumed on auto-ID collision with existing named agents**
+- `dispatch_operator_spawn` increments `state.child_seq` before the collision guard runs.
+  If the auto-generated `"operator-N"` collides with a user-named agent and the command is
+  rejected, `child_seq` is permanently incremented — causing gaps in numbering on the next spawn.
+- Not data-loss class; only manifests if the operator boots an agent named `"operator-0"` etc.
+  Silent rejection is observable via `FuseControlError` in `tail flight.jsonl`.
+- Fix path: move the `child_seq` increment to after the collision guard, or generate the ID
+  without incrementing (probe loop). Deferred — not worth restructuring the lock for this.
+
+**p7.3-ar-02 (P3) — `agentctl spawn` CLI execs a second agentd instead of using /agents/control**
+- The `agentctl spawn <template> --task "…"` CLI path always execs a new agentd binary,
+  even when an agentd scheduler is already running with the FUSE surface mounted.
+- Correct fix: detect `/agents/control` exists → write JSON there → print confirmation.
+  `execute_pending_spawn()` already implements this logic in the TUI watch path; extract
+  it as a shared helper so both the TUI and CLI spawn paths route correctly.
+- Deferred; tracked in memory as p7.3-cli-revisit. Implement before p8.
+
 ## Phase 7 — Open (deferred from p7.2 review)
 
 **p7.2-ar-01 (P2) — `stdout_lock` held across `write_all().await` + `flush()` per chunk**

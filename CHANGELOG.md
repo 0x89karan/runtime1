@@ -3,6 +3,35 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.3] - 2026-06-21 (v0.37.0)
+
+Write JSON to `/agents/control` to inject a new agent into a running scheduler
+without restarting it. `agentctl watch` spawn view routes through the control
+surface when available, staying in the TUI with a green banner after injection.
+
+- **`agentd/src/control.rs`** — `OperatorSpawnRequest` (task, id, max_turns,
+  token_budget, priority, capabilities) + `parse_control_command()` with
+  empty-task rejection; 5 unit tests.
+- **FUSE surface** (`surfaces/`) — `INO_CONTROL = 15` write-only pseudo-file at
+  `/agents/control`; per-fh `write_buffers` (64 KiB cap → EFBIG); dispatches
+  on `flush()` and `release()`; `perm 0o222`; `read()` returns empty bytes;
+  `MountOption::RO` removed; `mount()` accepts `Option<ControlDispatch>`.
+- **`ControlDispatch`** — `Arc<dyn Fn(&[u8]) -> i32 + Send + Sync>` callback
+  (opaque, avoids circular dep); `try_send` in main.rs returns EBUSY if channel
+  full; explicit `libc::close()` in agentctl propagates the error.
+- **Scheduler** (`agentd/src/scheduler.rs`) — `with_control(rx)` builder;
+  two-case `'main` loop (select on `control_rx` or break when empty, interleave
+  when pending); `dispatch_operator_spawn()` (ID validation, collision guard,
+  `validate_child_id`, inserts into `parent_map`); gated on `maybe_session`
+  (fixes deadlock when FUSE not mounted).
+- **`agentctl watch`** — `SpawnOutcome` enum (`InjectedViaControl` keeps TUI,
+  `FellBackToExec` replaces process); JSON preview when control surface present;
+  green banner on successful injection.
+- **Flight events** — `FuseControlReceived`, `FuseControlError`.
+- **`docs/CONTROL_SURFACE.md`** — operator reference (wire format, errno table,
+  shell examples, TUI integration, EBUSY footgun warning).
+- 902 workspace tests (up from 889); 13 new tests.
+
 ## [p7.2] - 2026-06-20 (v0.36.0)
 
 Set `streaming = true` in `[model]` and text chunks print to stdout as the

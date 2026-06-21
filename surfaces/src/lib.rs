@@ -3,6 +3,17 @@ pub mod snapshot;
 
 pub use snapshot::{AgentSnapshot, AgentStatus, SchedulerSnapshot, SandboxSummary, ServerEnforcement};
 
+/// Opaque write-control callback passed to the FUSE handler.
+///
+/// The closure receives raw bytes written to `/agents/control`, dispatches a
+/// `ControlCommand` to the running scheduler, and returns an i32 errno
+/// (0 = success, EBUSY = channel full, EIO = scheduler gone, EINVAL = bad JSON).
+///
+/// Defined in `surfaces` (the leaf crate) so the FUSE handler can hold it
+/// without importing agentd types — which would create a circular dependency.
+#[cfg(any(test, target_os = "linux"))]
+pub type ControlDispatch = std::sync::Arc<dyn Fn(&[u8]) -> i32 + Send + Sync>;
+
 /// Minimal read-only view of the memory store, used by the FUSE filesystem.
 ///
 /// Defined here (in `surfaces`) so the FUSE handler can hold an

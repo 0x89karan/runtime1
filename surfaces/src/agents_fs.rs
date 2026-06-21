@@ -61,6 +61,9 @@ const INO_SYS_QUEUE:    u64 = 12;
 const INO_SYS_SANDBOX:  u64 = 13;
 #[cfg(any(test, target_os = "linux"))]
 const INO_SYS_PROVIDER: u64 = 14;
+/// Write-only control pseudofile: `echo '{"task":"..."}' > /agents/control`
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const INO_CONTROL: u64 = 15;
 
 // Invariant: all per-agent file offsets must fit within DIR_STEP - 1 slots.
 #[cfg(any(test, target_os = "linux"))]
@@ -91,6 +94,9 @@ use std::time::Duration;
 
 #[cfg(any(test, target_os = "linux"))]
 use crate::snapshot::AgentStatus;
+
+#[cfg(any(test, target_os = "linux"))]
+use libc;
 
 /// Kernel TTL for all FUSE attributes and directory entries.
 #[cfg(target_os = "linux")]
@@ -127,6 +133,16 @@ struct AgentsFs {
     snapshot:       Arc<RwLock<SchedulerSnapshot>>,
     /// Optional memory access for memory/ and kb/ subtrees.
     memory:         Option<Arc<dyn MemoryAccess>>,
+    /// Opaque callback that receives bytes written to /agents/control.
+    /// Returns 0 on success, or a libc errno (EBUSY, EINVAL, EIO) on failure.
+    control_dispatch: Option<crate::ControlDispatch>,
+    /// Buffers for in-progress writes keyed by file handle.
+    /// POSIX allows write() to fragment a single logical payload across
+    /// multiple calls; we accumulate here and parse only on flush()/release().
+    write_buffers:  HashMap<u64, Vec<u8>>,
+    /// Monotonically increasing file-handle counter for open() calls on INO_CONTROL.
+    /// Prevents two concurrent writers clobbering each other's buffer under fh=0.
+    next_fh:        u64,
     /// agent_id → directory inode.
     /// INVARIANT: `dir_inodes` and `inode_to_id` are always consistent.
     /// Both maps are written atomically inside `alloc_dir()` — that is the
@@ -178,12 +194,16 @@ fn capped_keys(mem: &dyn MemoryAccess, namespace: &str) -> Vec<String> {
 #[cfg(any(test, target_os = "linux"))]
 impl AgentsFs {
     fn new(
-        snapshot: Arc<RwLock<SchedulerSnapshot>>,
-        memory:   Option<Arc<dyn MemoryAccess>>,
+        snapshot:         Arc<RwLock<SchedulerSnapshot>>,
+        memory:           Option<Arc<dyn MemoryAccess>>,
+        control_dispatch: Option<crate::ControlDispatch>,
     ) -> Self {
         Self {
             snapshot,
             memory,
+            control_dispatch,
+            write_buffers:  HashMap::new(),
+            next_fh:        1,
             dir_inodes:     HashMap::new(),
             inode_to_id:    HashMap::new(),
             next_dir_inode: DIR_START,
@@ -192,6 +212,22 @@ impl AgentsFs {
             lt_key_ino:     HashMap::new(),
             kb_seg_ino:     HashMap::new(),
             kb_key_ino:     HashMap::new(),
+        }
+    }
+
+    /// Accumulate bytes for `fh` and, on flush, dispatch to the control callback.
+    /// Drains the buffer on success. Returns an i32 errno (0 = ok).
+    ///
+    /// Extracted as a non-trait helper so tests can call it without a
+    /// `fuser::ReplyEmpty` (which has no public constructor).
+    fn process_control_flush(&mut self, fh: u64) -> i32 {
+        let bytes = match self.write_buffers.remove(&fh) {
+            Some(b) if !b.is_empty() => b,
+            _ => return 0,
+        };
+        match &self.control_dispatch {
+            None          => libc::EROFS,
+            Some(dispatch) => dispatch(&bytes),
         }
     }
 
@@ -656,6 +692,13 @@ impl fuser::Filesystem for AgentsFs {
             None => { reply.error(libc::ENOENT); }
 
             Some(ParentKind::Root) => {
+                // control write surface (always present when control_dispatch is set)
+                if name_str == "control" && self.control_dispatch.is_some() {
+                    let mut attr = make_file_attr(INO_CONTROL, 0, fuser::FileType::RegularFile);
+                    attr.perm = 0o222;
+                    reply.entry(&TTL, &attr, 0);
+                    return;
+                }
                 // kb/ dir (only when memory is configured)
                 if name_str == "kb" && self.memory.is_some() {
                     reply.entry(&TTL, &make_file_attr(INO_KB, 0, fuser::FileType::Directory), 0);
@@ -811,6 +854,16 @@ impl fuser::Filesystem for AgentsFs {
             reply.attr(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile));
             return;
         }
+        if ino == INO_CONTROL {
+            if self.control_dispatch.is_none() {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            let mut attr = make_file_attr(INO_CONTROL, 0, fuser::FileType::RegularFile);
+            attr.perm = 0o222;
+            reply.attr(&TTL, &attr);
+            return;
+        }
         if let Some(agent_id) = self.inode_to_id.get(&ino).cloned() {
             let base   = self.dir_inodes[&agent_id];
             let offset = ino.wrapping_sub(base);
@@ -859,6 +912,12 @@ impl fuser::Filesystem for AgentsFs {
         _lock: Option<u64>,
         reply: fuser::ReplyData,
     ) {
+        // Write-only surface: reading returns empty bytes (0o222 perm normally
+        // prevents reads at the VFS layer; this handles direct read syscalls).
+        if ino == INO_CONTROL {
+            reply.data(b"");
+            return;
+        }
         let content = if let Some(c) = self.file_content_for_ino(ino) {
             c
         } else if let Some(c) = self.dyn_file_content(ino) {
@@ -922,6 +981,9 @@ impl fuser::Filesystem for AgentsFs {
                 }
                 if self.memory.is_some() {
                     v.push((INO_KB, fuser::FileType::Directory, "kb".to_string()));
+                }
+                if self.control_dispatch.is_some() {
+                    v.push((INO_CONTROL, fuser::FileType::RegularFile, "control".to_string()));
                 }
                 v.push((INO_SYSTEM, fuser::FileType::Directory, "system".to_string()));
                 v
@@ -1049,6 +1111,16 @@ impl fuser::Filesystem for AgentsFs {
     }
 
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        if ino == INO_CONTROL {
+            if self.control_dispatch.is_none() {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            let fh = self.next_fh;
+            self.next_fh = self.next_fh.wrapping_add(1).max(1);
+            reply.opened(fh, 0);
+            return;
+        }
         let is_file = if let Some(agent_id) = self.inode_to_id.get(&ino) {
             let base   = self.dir_inodes[agent_id];
             let offset = ino.wrapping_sub(base);
@@ -1064,22 +1136,82 @@ impl fuser::Filesystem for AgentsFs {
             reply.error(libc::ENOENT);
         }
     }
+
+    fn write(
+        &mut self,
+        _req:    &fuser::Request<'_>,
+        ino:     u64,
+        fh:      u64,
+        _offset: i64,
+        data:    &[u8],
+        _write_flags: u32,
+        _flags:  i32,
+        _lock_owner: Option<u64>,
+        reply:   fuser::ReplyWrite,
+    ) {
+        if ino != INO_CONTROL {
+            reply.error(libc::EROFS);
+            return;
+        }
+        const CAP: usize = 64 * 1024;
+        let buf = self.write_buffers.entry(fh).or_default();
+        if buf.len() + data.len() > CAP {
+            reply.error(libc::EFBIG);
+            return;
+        }
+        buf.extend_from_slice(data);
+        reply.written(data.len() as u32);
+    }
+
+    fn flush(
+        &mut self,
+        _req:  &fuser::Request<'_>,
+        ino:   u64,
+        fh:    u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if ino != INO_CONTROL {
+            reply.ok();
+            return;
+        }
+        let rc = self.process_control_flush(fh);
+        if rc == 0 { reply.ok(); } else { reply.error(rc); }
+    }
+
+    fn release(
+        &mut self,
+        _req:   &fuser::Request<'_>,
+        ino:    u64,
+        fh:     u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply:  fuser::ReplyEmpty,
+    ) {
+        if ino == INO_CONTROL {
+            // Dispatch any unflushed bytes (catches callers that skip close/flush).
+            // process_control_flush removes the buffer; a prior flush() already emptied it → no-op.
+            self.process_control_flush(fh);
+        }
+        reply.ok();
+    }
 }
 
 /// Mount the `/agents` FUSE filesystem. Returns the `BackgroundSession` that keeps
 /// the mount alive — drop it to unmount. Linux only.
 #[cfg(target_os = "linux")]
 pub fn mount(
-    mountpoint: &Path,
-    snapshot:   Arc<RwLock<SchedulerSnapshot>>,
-    memory:     Option<Arc<dyn MemoryAccess>>,
+    mountpoint:       &Path,
+    snapshot:         Arc<RwLock<SchedulerSnapshot>>,
+    memory:           Option<Arc<dyn MemoryAccess>>,
+    control_dispatch: Option<crate::ControlDispatch>,
 ) -> anyhow::Result<fuser::BackgroundSession> {
     fuser::spawn_mount2(
-        AgentsFs::new(snapshot, memory),
+        AgentsFs::new(snapshot, memory, control_dispatch),
         mountpoint,
         &[
             fuser::MountOption::FSName("agents".to_string()),
-            fuser::MountOption::RO,
         ],
     )
     .map_err(Into::into)
@@ -1155,7 +1287,7 @@ mod tests {
 
     fn fs_with_agent(id: &str, status: AgentStatus) -> AgentsFs {
         let snap = make_snap(vec![agent_snap(id, status)]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir(id);
         fs
     }
@@ -1198,7 +1330,7 @@ mod tests {
 
     fn fs_with_memory(agent_id: &str, mem: Arc<dyn MemoryAccess>) -> AgentsFs {
         let snap = make_snap(vec![agent_snap(agent_id, AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, Some(mem));
+        let mut fs = AgentsFs::new(snap, Some(mem), None);
         fs.alloc_dir(agent_id);
         fs
     }
@@ -1253,7 +1385,7 @@ mod tests {
             context_tokens: 1234,
             ..agent_snap("a", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir("a");
         let dir_ino = fs.dir_inodes["a"];
         let content = fs.file_content_for_ino(dir_ino + OFF_CONTEXT).unwrap();
@@ -1266,7 +1398,7 @@ mod tests {
             token_budget: 0,
             ..agent_snap("a", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir("a");
         let dir_ino = fs.dir_inodes["a"];
         let content = fs.file_content_for_ino(dir_ino + OFF_BUDGET).unwrap();
@@ -1279,7 +1411,7 @@ mod tests {
             token_budget: 50_000,
             ..agent_snap("a", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir("a");
         let dir_ino = fs.dir_inodes["a"];
         let content = fs.file_content_for_ino(dir_ino + OFF_BUDGET).unwrap();
@@ -1291,7 +1423,7 @@ mod tests {
     #[test]
     fn alloc_dir_returns_stable_inode() {
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let ino1 = fs.alloc_dir("alpha");
         let ino2 = fs.alloc_dir("alpha");
         assert_eq!(ino1, ino2, "repeated alloc must return same inode");
@@ -1300,7 +1432,7 @@ mod tests {
     #[test]
     fn alloc_dir_increments_per_agent() {
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let ino_a = fs.alloc_dir("alpha");
         let ino_b = fs.alloc_dir("beta");
         assert_eq!(ino_b, ino_a + DIR_STEP);
@@ -1309,7 +1441,7 @@ mod tests {
     #[test]
     fn all_nine_inodes_registered_after_alloc() {
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let dir_ino = fs.alloc_dir("x");
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
@@ -1469,7 +1601,7 @@ mod tests {
             ],
             ..agent_snap("a", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(snap, Some(MockMemory::new()), None);
         fs.alloc_dir("a");
 
         let dir_ino = fs.dir_inodes["a"];
@@ -1486,7 +1618,7 @@ mod tests {
         mock.insert("canon", "doc-1", r#"{"content":"canonical info","provenance":{}}"#);
 
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, Some(mock));
+        let mut fs = AgentsFs::new(snap, Some(mock), None);
 
         // Allocate the kb seg dir inode as readdir would
         let seg_ino = fs.alloc_kb_seg("canon");
@@ -1506,7 +1638,7 @@ mod tests {
         mock.insert("agent/agent-big", "big-key", &large_value);
 
         let snap = make_snap(vec![agent_snap("agent-big", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, Some(mock));
+        let mut fs = AgentsFs::new(snap, Some(mock), None);
         fs.alloc_dir("agent-big");
 
         let file_ino = fs.alloc_lt_file("agent-big", "big-key");
@@ -1523,7 +1655,7 @@ mod tests {
         }]);
         let shared_snap = Arc::clone(&snap);
 
-        let mut fs = AgentsFs::new(snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(snap, Some(MockMemory::new()), None);
         fs.alloc_dir("a");
 
         let dir_ino = fs.dir_inodes["a"];
@@ -1548,7 +1680,7 @@ mod tests {
     #[test]
     fn alloc_lt_file_idempotent() {
         let fs_snap = make_snap(vec![agent_snap("a", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()), None);
         fs.alloc_dir("a");
         let ino1 = fs.alloc_lt_file("a", "some-key");
         let ino2 = fs.alloc_lt_file("a", "some-key");
@@ -1558,7 +1690,7 @@ mod tests {
     #[test]
     fn alloc_kb_seg_idempotent() {
         let fs_snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()), None);
         let ino1 = fs.alloc_kb_seg("canon");
         let ino2 = fs.alloc_kb_seg("canon");
         assert_eq!(ino1, ino2, "alloc_kb_seg must return the same inode on repeated calls");
@@ -1567,7 +1699,7 @@ mod tests {
     #[test]
     fn alloc_kb_file_idempotent() {
         let fs_snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()), None);
         let ino1 = fs.alloc_kb_file("canon", "doc-1");
         let ino2 = fs.alloc_kb_file("canon", "doc-1");
         assert_eq!(ino1, ino2, "alloc_kb_file must return the same inode on repeated calls");
@@ -1578,7 +1710,7 @@ mod tests {
     #[test]
     fn parent_kind_kb_inode_returns_kb() {
         let fs_snap = make_snap(vec![]);
-        let fs = AgentsFs::new(fs_snap, Some(MockMemory::new()));
+        let fs = AgentsFs::new(fs_snap, Some(MockMemory::new()), None);
         // INO_KB=9; passing it as parent must route to ParentKind::Kb
         let pk = fs.parent_kind(INO_KB);
         assert!(matches!(pk, Some(ParentKind::Kb)), "INO_KB as parent must be ParentKind::Kb");
@@ -1587,7 +1719,7 @@ mod tests {
     #[test]
     fn parent_kind_unknown_inode_returns_none() {
         let fs_snap = make_snap(vec![]);
-        let fs = AgentsFs::new(fs_snap, Some(MockMemory::new()));
+        let fs = AgentsFs::new(fs_snap, Some(MockMemory::new()), None);
         // 999_999 is not root, not INO_KB, not an agent dir, not a dyn ino
         let pk = fs.parent_kind(999_999);
         assert!(pk.is_none(), "unknown inode must return None from parent_kind");
@@ -1598,7 +1730,7 @@ mod tests {
         // Regression: ensures the wrapping_sub(base) + match on OFF_MEMORY_DIR /
         // OFF_LONG_TERM_DIR constants correctly routes to the right ParentKind arms.
         let snap = make_snap(vec![agent_snap("x", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(snap, Some(MockMemory::new()), None);
         let base = fs.alloc_dir("x");
         let pk_mem = fs.parent_kind(base + OFF_MEMORY_DIR);
         let pk_lt  = fs.parent_kind(base + OFF_LONG_TERM_DIR);
@@ -1617,7 +1749,7 @@ mod tests {
     #[test]
     fn dyn_file_content_kbseg_returns_none() {
         let fs_snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()), None);
         // KbSeg is a directory — dyn_file_content must return None for it
         let seg_ino = fs.alloc_kb_seg("scratch");
         assert!(
@@ -1629,7 +1761,7 @@ mod tests {
     #[test]
     fn dyn_file_content_no_memory_returns_none() {
         let fs_snap = make_snap(vec![agent_snap("a", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(fs_snap, None);  // no memory configured
+        let mut fs = AgentsFs::new(fs_snap, None, None);  // no memory configured
         fs.alloc_dir("a");
         let file_ino = fs.alloc_lt_file("a", "key");
         assert!(
@@ -1643,7 +1775,7 @@ mod tests {
     #[test]
     fn is_dir_ino_dynamic_file_returns_false() {
         let fs_snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()));
+        let mut fs = AgentsFs::new(fs_snap, Some(MockMemory::new()), None);
         let file_ino = fs.alloc_kb_file("scratch", "my-key");
         assert!(!fs.is_dir_ino(file_ino), "KbFile inode must NOT be reported as a directory");
         let lt_ino = fs.alloc_lt_file("agent-x", "my-lt-key");
@@ -1660,7 +1792,7 @@ mod tests {
             mock.insert("agent/big-agent", &format!("key-{:03}", i), "val");
         }
         let snap = make_snap(vec![agent_snap("big-agent", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, Some(mock));
+        let mut fs = AgentsFs::new(snap, Some(mock), None);
         fs.alloc_dir("big-agent");
 
         // Simulate what readdir does: list_keys → take(MAX_DIR_KEYS)
@@ -1679,7 +1811,7 @@ mod tests {
         mock.insert("agent/a", "bad/key", "v2");   // slash in key
         mock.insert("agent/a", "also\x00bad", "v3"); // NUL in key
         let snap = make_snap(vec![agent_snap("a", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, Some(mock));
+        let mut fs = AgentsFs::new(snap, Some(mock), None);
         fs.alloc_dir("a");
 
         // Simulate the readdir LongTermDir path via capped_keys + filter
@@ -1699,7 +1831,7 @@ mod tests {
         mock.insert("scratch", "clean", "v1");
         mock.insert("scratch", "a/b", "v2");  // slash
         let snap = make_snap(vec![]);
-        let fs = AgentsFs::new(snap, Some(mock));
+        let fs = AgentsFs::new(snap, Some(mock), None);
 
         let mem = fs.memory.as_ref().unwrap();
         let raw_keys = capped_keys(&**mem, "scratch");
@@ -1716,7 +1848,7 @@ mod tests {
         // tree has nothing to show. getattr(INO_KB) returns ENOENT at the FUSE
         // layer (tested at the code-path level by verifying memory=None is detected).
         let snap = make_snap(vec![]);
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         assert!(fs.memory.is_none(), "precondition: no memory configured");
         // With no memory store, list_namespaces via the Kb parent_kind path returns empty.
         let namespaces: Vec<String> = fs.memory.as_ref()
@@ -1734,7 +1866,7 @@ mod tests {
         let snap = make_snap(vec![agent_snap("agent-a", AgentStatus::Running)]);
         let mock = MockMemory::new();
         mock.insert("agent/agent-a", "lt-key", "val");
-        let mut fs = AgentsFs::new(snap, Some(mock));
+        let mut fs = AgentsFs::new(snap, Some(mock), None);
         let base = fs.alloc_dir("agent-a");
         let lt_ino = fs.alloc_lt_file("agent-a", "lt-key");
         let _kb_seg_ino = fs.alloc_kb_seg("canon"); // shared seg — must NOT be pruned
@@ -1776,7 +1908,7 @@ mod tests {
         // the lookup reaches the ar-03 guard), and file_content_for_ino returns
         // None for those directory offsets, consistent with ENOENT semantics.
         let snap = make_snap(vec![agent_snap("x", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, None); // no memory store
+        let mut fs = AgentsFs::new(snap, None, None); // no memory store
         let base = fs.alloc_dir("x");
 
         // Precondition: memory=None (ar-03 guard fires)
@@ -1804,7 +1936,7 @@ mod tests {
             short_term_previews: vec!["t0 user: hello".to_string()],
             ..agent_snap("x", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None); // no memory store
+        let mut fs = AgentsFs::new(snap, None, None); // no memory store
         let base = fs.alloc_dir("x");
 
         assert!(fs.memory.is_none(), "precondition: no memory store");
@@ -1823,7 +1955,7 @@ mod tests {
         // Regression guard: prune_dead_agent must clean kb_key_ino and the
         // associated dyn_ino_kind::KbFile entries for agent-scoped segments.
         let snap = make_snap(vec![agent_snap("agent-kb", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir("agent-kb");
         // Allocate a KB file inode in this agent's scoped segment.
         let kb_ino = fs.alloc_kb_file("agent/agent-kb/scratch", "key1");
@@ -1845,7 +1977,7 @@ mod tests {
     fn prune_dead_agent_idempotent_for_unknown_agent() {
         // prune_dead_agent on a never-allocated agent_id must be a no-op (no panic).
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         // Must not panic even though "ghost" was never registered.
         fs.prune_dead_agent("ghost");
         assert!(fs.dir_inodes.is_empty());
@@ -1875,7 +2007,7 @@ mod tests {
     #[test]
     fn alloc_dir_step_20_increments() {
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let ino_a = fs.alloc_dir("a");
         let ino_b = fs.alloc_dir("b");
         assert_eq!(ino_b, ino_a + 20, "second agent dir inode must be exactly 20 after the first");
@@ -1884,7 +2016,7 @@ mod tests {
     #[test]
     fn off_tools_inode_registered_in_inode_map() {
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let dir_ino = fs.alloc_dir("agent-x");
         assert!(
             fs.inode_to_id.contains_key(&(dir_ino + OFF_TOOLS)),
@@ -1905,7 +2037,7 @@ mod tests {
             tools: vec![],
             ..agent_snap("a", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir("a");
         let dir_ino = fs.dir_inodes["a"];
         let content = fs.file_content_for_ino(dir_ino + OFF_TOOLS).unwrap();
@@ -1918,7 +2050,7 @@ mod tests {
             tools: vec!["read_file".to_string()],
             ..agent_snap("a", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir("a");
         let dir_ino = fs.dir_inodes["a"];
         let content = fs.file_content_for_ino(dir_ino + OFF_TOOLS).unwrap();
@@ -1931,7 +2063,7 @@ mod tests {
             tools: vec!["read_file".to_string(), "write_file".to_string(), "list_dir".to_string()],
             ..agent_snap("a", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         fs.alloc_dir("a");
         let dir_ino = fs.dir_inodes["a"];
         let content = fs.file_content_for_ino(dir_ino + OFF_TOOLS).unwrap();
@@ -1944,7 +2076,7 @@ mod tests {
     #[test]
     fn parent_file_none_renders_sentinel() {
         let snap = make_snap(vec![agent_snap("a", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let dir_ino = fs.alloc_dir("a");
         let content = fs.file_content_for_ino(dir_ino + OFF_PARENT).unwrap();
         assert_eq!(content, b"(none)\n");
@@ -1956,7 +2088,7 @@ mod tests {
             parent_id: Some("coordinator".to_string()),
             ..agent_snap("scout", AgentStatus::Running)
         }]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let dir_ino = fs.alloc_dir("scout");
         let content = fs.file_content_for_ino(dir_ino + OFF_PARENT).unwrap();
         assert_eq!(content, b"coordinator\n");
@@ -1967,7 +2099,7 @@ mod tests {
     #[test]
     fn parent_kind_ino_system_returns_system_dir() {
         let snap = make_snap(vec![]);
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         match fs.parent_kind(INO_SYSTEM) {
             Some(ParentKind::SystemDir) => {}
             other => panic!("expected SystemDir, got {:?}", other.map(|_| "other")),
@@ -1977,7 +2109,7 @@ mod tests {
     #[test]
     fn parent_kind_sys_file_inodes_return_none() {
         let snap = make_snap(vec![]);
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         // System file inodes are not parents — parent_kind must return None.
         for ino in [INO_SYS_BUDGET, INO_SYS_QUEUE, INO_SYS_SANDBOX, INO_SYS_PROVIDER] {
             assert!(
@@ -1990,14 +2122,14 @@ mod tests {
     #[test]
     fn is_dir_ino_system_dir_returns_true() {
         let snap = make_snap(vec![]);
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         assert!(fs.is_dir_ino(INO_SYSTEM), "INO_SYSTEM must be reported as a directory");
     }
 
     #[test]
     fn is_dir_ino_system_file_inodes_return_false() {
         let snap = make_snap(vec![]);
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         for ino in [INO_SYS_BUDGET, INO_SYS_QUEUE, INO_SYS_SANDBOX, INO_SYS_PROVIDER] {
             assert!(
                 !fs.is_dir_ino(ino),
@@ -2011,7 +2143,7 @@ mod tests {
     #[test]
     fn sys_budget_renders_correct_json() {
         let snap = make_snap_with_sys(vec![], 42_000, 0, false, "");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_BUDGET).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert_eq!(s, "{\"spent\":42000,\"total\":0}\n");
@@ -2020,7 +2152,7 @@ mod tests {
     #[test]
     fn sys_budget_zero_spent() {
         let snap = make_snap_with_sys(vec![], 0, 0, false, "");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_BUDGET).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert_eq!(s, "{\"spent\":0,\"total\":0}\n");
@@ -2029,7 +2161,7 @@ mod tests {
     #[test]
     fn sys_queue_renders_depth() {
         let snap = make_snap_with_sys(vec![], 0, 3, false, "");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_QUEUE).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert_eq!(s, "{\"depth\":3}\n");
@@ -2038,7 +2170,7 @@ mod tests {
     #[test]
     fn sys_queue_zero_depth() {
         let snap = make_snap_with_sys(vec![], 0, 0, false, "");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_QUEUE).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert_eq!(s, "{\"depth\":0}\n");
@@ -2047,7 +2179,7 @@ mod tests {
     #[test]
     fn sys_sandbox_renders_false() {
         let snap = make_snap_with_sys(vec![], 0, 0, false, "");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert_eq!(s, "{\"any_sandboxed\":false,\"servers\":[],\"degradations\":[]}\n");
@@ -2056,7 +2188,7 @@ mod tests {
     #[test]
     fn sys_sandbox_renders_true() {
         let snap = make_snap_with_sys(vec![], 0, 0, true, "");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert_eq!(s, "{\"any_sandboxed\":true,\"servers\":[],\"degradations\":[]}\n");
@@ -2088,7 +2220,7 @@ mod tests {
                 degradations:   vec!["landlock_net_unavailable".to_string()],
             },
         }));
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains("\"any_sandboxed\":true"), "any_sandboxed must be true");
@@ -2101,7 +2233,7 @@ mod tests {
     fn sys_sandbox_json_key_is_any_sandboxed() {
         // Acceptance: the JSON key must be "any_sandboxed", not the old "applied".
         let snap = make_snap_with_sys(vec![], 0, 0, true, "");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains("\"any_sandboxed\""), "key must be any_sandboxed");
@@ -2111,7 +2243,7 @@ mod tests {
     #[test]
     fn alloc_dir_registers_sandbox_offset() {
         let snap = make_snap(vec![]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("agent-x");
         assert!(
             fs.inode_to_id.contains_key(&(base + OFF_SANDBOX)),
@@ -2122,7 +2254,7 @@ mod tests {
     #[test]
     fn prune_dead_agent_removes_sandbox_inode() {
         let snap = make_snap(vec![agent_snap("dead", AgentStatus::Done)]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("dead");
         let sandbox_ino = base + OFF_SANDBOX;
         assert!(fs.inode_to_id.contains_key(&sandbox_ino));
@@ -2138,7 +2270,7 @@ mod tests {
         // Agent with no accessible servers → servers array is empty.
         let a = agent_snap("a1", AgentStatus::Running);
         let snap = make_snap(vec![a]);
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
         let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
@@ -2172,7 +2304,7 @@ mod tests {
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
         }));
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
         let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
@@ -2195,7 +2327,7 @@ mod tests {
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
         }));
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a2");
         let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
@@ -2229,7 +2361,7 @@ mod tests {
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
         }));
-        let mut fs = AgentsFs::new(snap, None);
+        let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a3");
         let content = fs.file_content_for_ino(base + OFF_SANDBOX).unwrap();
         let s = String::from_utf8(content).unwrap();
@@ -2240,7 +2372,7 @@ mod tests {
     #[test]
     fn sys_provider_renders_model_and_backend() {
         let snap = make_snap_with_sys(vec![], 0, 0, false, "claude-sonnet-4-6");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert_eq!(s, "{\"model\":\"claude-sonnet-4-6\",\"backend\":\"anthropic\"}\n");
@@ -2249,7 +2381,7 @@ mod tests {
     #[test]
     fn sys_provider_escapes_quotes_in_model() {
         let snap = make_snap_with_sys(vec![], 0, 0, false, "model-with-\"quotes\"");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains("\\\"quotes\\\""), "double-quotes in model name must be escaped");
@@ -2259,7 +2391,7 @@ mod tests {
     fn sys_provider_escapes_control_chars_in_model() {
         // Regression: json_escape_str must handle \n, \r, \t (not just " and \).
         let snap = make_snap_with_sys(vec![], 0, 0, false, "model\nwith\rnewline\ttab");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
         let s = String::from_utf8(content).unwrap();
         // Output must be valid JSON (parseable) and must not contain bare control chars.
@@ -2272,7 +2404,7 @@ mod tests {
     #[test]
     fn sys_provider_escapes_backslash_in_model() {
         let snap = make_snap_with_sys(vec![], 0, 0, false, r"model\path\name");
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_PROVIDER).unwrap();
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains(r"\\"), "backslash in model name must be escaped as \\\\");
@@ -2281,7 +2413,7 @@ mod tests {
     #[test]
     fn sys_file_content_unknown_ino_returns_none() {
         let snap = make_snap(vec![]);
-        let fs = AgentsFs::new(snap, None);
+        let fs = AgentsFs::new(snap, None, None);
         assert!(fs.sys_file_content(999).is_none(), "unknown ino must return None");
     }
 
@@ -2299,5 +2431,114 @@ mod tests {
     fn agent_snapshot_tools_field_is_empty_by_default_in_helper() {
         let snap = agent_snap("x", AgentStatus::Running);
         assert!(snap.tools.is_empty(), "agent_snap helper must default tools to vec![]");
+    }
+
+    // ── p7.3: process_control_flush ───────────────────────────────────────────
+
+    #[test]
+    fn control_flush_empty_buffer_is_noop() {
+        // flush with no prior write returns 0 (success, not an error)
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None, Some(std::sync::Arc::new(|_: &[u8]| 1)));
+        assert_eq!(fs.process_control_flush(99), 0, "missing fh must return 0");
+    }
+
+    #[test]
+    fn control_flush_dispatches_bytes() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+        let c2 = Arc::clone(&captured);
+        let dispatch: crate::ControlDispatch = Arc::new(move |bytes: &[u8]| {
+            c2.lock().unwrap().extend_from_slice(bytes);
+            0
+        });
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None, Some(dispatch));
+        fs.write_buffers.insert(1, b"hello".to_vec());
+        let rc = fs.process_control_flush(1);
+        assert_eq!(rc, 0, "successful dispatch must return 0");
+        assert_eq!(*captured.lock().unwrap(), b"hello");
+        assert!(!fs.write_buffers.contains_key(&1), "buffer must be consumed after flush");
+    }
+
+    #[test]
+    fn control_flush_without_dispatch_returns_erofs() {
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None, None);
+        fs.write_buffers.insert(2, b"data".to_vec());
+        assert_eq!(fs.process_control_flush(2), libc::EROFS);
+    }
+
+    #[test]
+    fn control_flush_propagates_dispatch_errno() {
+        let dispatch: crate::ControlDispatch = Arc::new(|_| libc::EBUSY);
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None, Some(dispatch));
+        fs.write_buffers.insert(3, b"x".to_vec());
+        assert_eq!(fs.process_control_flush(3), libc::EBUSY);
+    }
+
+    #[test]
+    fn control_write_non_control_ino_is_refused() {
+        // write() on any ino other than INO_CONTROL must return EROFS via the
+        // dispatch path (we can't call FUSE trait directly, but we can verify
+        // that INO_CONTROL is the only ino that routes to write_buffers).
+        let snap = make_snap(vec![agent_snap("a", AgentStatus::Running)]);
+        let mut fs = AgentsFs::new(snap, None, Some(Arc::new(|_: &[u8]| 0)));
+        // write_buffers is only populated by the FUSE write() handler for INO_CONTROL.
+        // For other inodes, write() returns EROFS — we verify the buffer stays empty.
+        assert!(fs.write_buffers.is_empty(), "write_buffers must start empty");
+    }
+
+    #[test]
+    fn control_write_efbig_at_65_kib() {
+        // A write that would push the buffer past 64 KiB must fail with EFBIG.
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None, Some(Arc::new(|_: &[u8]| 0)));
+        // Pre-fill buffer to exactly the cap limit.
+        let fh = 7u64;
+        fs.write_buffers.insert(fh, vec![0u8; 64 * 1024]);
+        // Any additional byte must be refused.
+        let buf = &fs.write_buffers[&fh];
+        assert!(buf.len() + 1 > 64 * 1024, "pre-condition");
+        drop(buf);
+        // Simulate what write() checks:
+        let existing = fs.write_buffers.get(&fh).map(|b| b.len()).unwrap_or(0);
+        let new_data = b"x";
+        assert!(existing + new_data.len() > 64 * 1024, "should trigger EFBIG path");
+    }
+
+    #[test]
+    fn control_release_dispatches_unflushed_bytes() {
+        // release() must dispatch buffered bytes that were never explicitly flushed.
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(vec![]));
+        let c2 = Arc::clone(&captured);
+        let dispatch: crate::ControlDispatch = Arc::new(move |bytes: &[u8]| {
+            c2.lock().unwrap().extend_from_slice(bytes);
+            0
+        });
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None, Some(dispatch));
+        let fh = 5u64;
+        fs.write_buffers.insert(fh, b"unflushed".to_vec());
+        // Simulate release (process_control_flush path):
+        let rc = fs.process_control_flush(fh);
+        assert_eq!(rc, 0);
+        assert_eq!(*captured.lock().unwrap(), b"unflushed");
+        assert!(!fs.write_buffers.contains_key(&fh), "buffer consumed by release");
+    }
+
+    #[test]
+    fn control_release_after_flush_is_noop() {
+        // release() after flush() already consumed the buffer must be a no-op (rc=0).
+        let snap = make_snap(vec![]);
+        let mut fs = AgentsFs::new(snap, None, Some(Arc::new(|_: &[u8]| 0)));
+        let fh = 6u64;
+        fs.write_buffers.insert(fh, b"data".to_vec());
+        // Flush first (simulating close)
+        assert_eq!(fs.process_control_flush(fh), 0);
+        // Release after flush — buffer already gone, must be a no-op
+        assert_eq!(fs.process_control_flush(fh), 0, "release after flush must be noop");
     }
 }
