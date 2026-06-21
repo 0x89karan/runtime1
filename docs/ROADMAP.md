@@ -778,6 +778,19 @@ operator reference; 2 new flight events in CONVENTIONS.md; 894 tests.
 
 **p7.3 — Write-capable FUSE control surface** [CORE] *(superseded by p7.3 complete above)*
 
+**p7.4 — Approval gate (human-in-the-loop primitive)** [CORE] *(planned — gate before any
+harness increment that performs external writes)*
+The keystone the ops harness needs (`docs/HARNESS-OPS-PLAN.md`): a `request_approval`
+sole-call native tool + `AgentEffect::RequestApproval` that **parks** an agent until an
+operator resolves it (reusing the p1.5 await/resume path); a read-only `/agents/approvals`
+FUSE surface (`INO_APPROVALS = 16`); and `Approve`/`Reject` commands added to p7.3's
+`ControlCommand` (now a tagged enum). Resolving via `/agents/control` delivers an
+`is_error:false` (approved, optionally edited args) or `is_error:true` (rejected) tool
+result and the agent resumes. The agent owns the write tool + capability — the gate only
+decides *whether it proceeds* (least-privilege intact; scheduler performs no external
+writes). New events: `approval_requested`/`granted`/`rejected`. Risk classification and
+autonomy policy (L0–L4) are **harness**, not core. Full spec: `docs/plans/p7.4-approval-gate.md`.
+
 ---
 
 ## Phase 7 — Standard library (harness)
