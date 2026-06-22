@@ -791,6 +791,45 @@ decides *whether it proceeds* (least-privilege intact; scheduler performs no ext
 writes). New events: `approval_requested`/`granted`/`rejected`. Risk classification and
 autonomy policy (L0–L4) are **harness**, not core. Full spec: `docs/plans/p7.4-approval-gate.md`.
 
+**p7.5 — Egress mediator (governance linchpin)** [CORE] *(planned — gate before the universal
+tier and any "bounded/audited" claim)*
+The keystone of the product thesis (`docs/PRODUCT-THESIS.md`): "secure + observable +
+framework-agnostic + per-agent model metering" all collapse without it. Each governed workload
+runs in a network namespace with **no internet route except a local AgentOS proxy** = the LLM
+gateway (served Anthropic/OpenAI-compatible endpoint wrapping `InferenceGateway`) + the MCP
+gateway + a per-agent `Net{hosts,ports}` allowlist; everything else is dropped and recorded.
+Lets AgentOS govern a foreign-framework agent or headless `claude`/`codex` **without a rewrite**
+(point its `base_url` at the proxy, confine egress) — the rebuttal to the insertion-point
+objection. Honest boundaries baked into the events: confinement is strong but the allowed
+channels are covert channels (bounded, not sealed); content audit is full on the native tier,
+best-effort on TLS-pinning foreign workloads (`content_audited` flag). Adds **boundary secret
+rewriting** (placeholder secrets in the agent env; proxy swaps placeholder→real at the boundary
+— a memory dump yields inert strings) and **tamper-evident signed audit receipts** (Ed25519,
+hash-chained, emitted by the proxy outside agent memory; offline-verifiable forensic evidence
+vs. forgeable logs). New events: `egress_brokered`/`egress_denied`/`action_receipt_emitted`.
+Builds on p4.2 `IsolateNetwork` + p4.6 Landlock-V4 net + p7.1 HTTP. Full spec:
+`docs/plans/p7.5-egress-mediator.md`.
+
+**p7.6 — Isolation floor (microVM / gVisor) for the universal tier** [CORE] *(planned —
+prerequisite for hosting untrusted/foreign code)*
+The capability layer (Landlock/seccomp/namespaces) is least-privilege on a shared host kernel —
+**not** an isolation boundary for untrusted, agent-generated, or foreign-framework code (one
+kernel exploit from host compromise). The real floor is a **microVM (Firecracker, dedicated
+guest kernel)** or a **user-space kernel (gVisor)**. Native-tier agents can run with the
+capability layer alone; the *universal tier* needs this floor underneath the egress netns.
+**Couples to observability** (eBPF for native/Firecracker-guest; gVisor remote sink for gVisor —
+host eBPF is blind inside gVisor). A dual-backend (gVisor when nested-KVM is unavailable,
+Firecracker when hardware isolation is demanded) is the resilient posture. Design context:
+`docs/PRODUCT-THESIS.md` security model + `docs/OBSERVABILITY-PLAN.md`.
+
+**obs.1 — flight→OTLP sidecar + GenAI semconv** [HARNESS] *(planned — rides on p7.5)*
+Export the existing flight-event stream as OpenTelemetry: run=trace, agent=span, turn/inference/
+tool/egress=child spans, tokens/$=metrics, GenAI `gen_ai.*` semconv. Ships as the `agentos-otel`
+sidecar (tails `flight.jsonl`; keeps the heavy OTEL deps out of the ≤6 MB core); optional
+cargo-feature in-core exporter later. W3C `traceparent` injected at the egress mediator so
+hosted foreign workloads join the same trace. The value is interop with standard backends, not
+new signal. Full design: `docs/OBSERVABILITY-PLAN.md`.
+
 ---
 
 ## Phase 7 — Standard library (harness)
@@ -855,3 +894,30 @@ portable artifact and restore it on another device. The checkpoint format (p3.2)
 detachable memory volume (p5.3.5) provide the groundwork; the remaining work is a
 transfer protocol and identity continuity. Delivered as a command in `agentctl` — not a
 core runtime change. No plan doc yet; revisit when a concrete use case demands it.
+
+---
+
+## Phase 9 — Kernel observability (eBPF) [CORE, privileged]
+
+The **observe** complement to the sandbox's **enforce**, and the syscall-level ground truth
+that the flight recorder (records what agentd *chose* to) and the egress proxy (sees brokered
+calls) cannot. Closes the universal-tier audit gap: even a TLS-pinning foreign agent's *actual*
+file/network/syscall behavior is observed. Note: p3.3's "eBPF/LSM" deliberately used Landlock+
+seccomp — there is **no eBPF code yet**; this is a new subsystem. Lift: `aya` (pure-Rust eBPF),
+kernel BTF/CO-RE + `CONFIG_BPF*`, elevated privilege (`CAP_BPF`/`CAP_SYS_ADMIN` — the observer
+outranks the agents it watches), Linux-gated, kernel-version floor. Tractable on the appliance
+(controlled kernel); degrades "run anywhere." Full design: `docs/OBSERVABILITY-PLAN.md`.
+
+- **ebpf.1** — aya scaffold + capability + kernel-config + a single per-child-PID syscall-trace probe.
+- **ebpf.2** — network + file-access probes.
+- **ebpf.3** — perf / latency.
+- **ebpf.4** — surface integration: kernel events as flight/OTEL span-events; `/agents/<id>/syscalls`.
+- **ebpf.5** — policy-violation detection (eBPF sees an action Landlock should have blocked → alert).
+- **sink.1** — gVisor remote-sink listener (`seccheck.Sink`: ingest + decode the Sentry's
+  protobuf syscall stream over a Unix socket). Required for gVisor-isolated workloads, where
+  **host eBPF is blind**. The kernel-observability mechanism is conditional on the p7.6 floor:
+  eBPF for native/Firecracker-guest, the sink for gVisor — pick per the chosen floor.
+
+(Sequencing across Phases 7-9: **p7.5 egress mediator → obs.1 OTLP → Phase 9 eBPF**. p7.5 is the
+prerequisite — you can't observe what you don't broker. See `docs/PRODUCT-THESIS.md` for why
+observability is ~half the product.)
