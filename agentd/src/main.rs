@@ -1417,6 +1417,9 @@ mod tests {
             "mcp_http_error",
             "inference_stream_started",
             "inference_stream_completed",
+            "approval_requested",
+            "approval_granted",
+            "approval_rejected",
         ];
         for kind in &required_kinds {
             assert!(

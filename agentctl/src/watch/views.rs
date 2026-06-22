@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use super::app::{App, MemoryAbsence, MemoryPane, SpawnFocus, View};
+use super::approvals::ApprovalsMode;
 use super::memory::{
     filter_entries, filter_short_term, read_agent_memory, read_kb_segments, MAX_DISPLAY_ENTRIES,
     MAX_SEARCH_ENTRIES,
@@ -32,6 +33,7 @@ pub fn render(f: &mut Frame, app: &App) {
         View::Memory      => render_memory(f, app),
         View::Spawn       => render_spawn(f, app),
         View::Inspector   => render_inspector(f, app),
+        View::Approvals   => render_approvals(f, app),
     }
 }
 
@@ -49,12 +51,13 @@ fn header_footer_layout(area: Rect) -> (Rect, Rect, Rect) {
 
 fn status_style(status: &str) -> Style {
     match status {
-        s if s.starts_with("running")         => Style::default().fg(Color::Green),
-        s if s.starts_with("deferred")        => Style::default().fg(Color::Yellow),
-        s if s.starts_with("awaiting_child")  => Style::default().fg(Color::Cyan),
-        s if s.starts_with("done")            => Style::default().fg(Color::Blue),
-        s if s.starts_with("failed")          => Style::default().fg(Color::Red),
-        _                                     => Style::default(),
+        s if s.starts_with("running")           => Style::default().fg(Color::Green),
+        s if s.starts_with("deferred")          => Style::default().fg(Color::Yellow),
+        s if s.starts_with("awaiting_child")    => Style::default().fg(Color::Cyan),
+        s if s.starts_with("awaiting_approval") => Style::default().fg(Color::Magenta),
+        s if s.starts_with("done")              => Style::default().fg(Color::Blue),
+        s if s.starts_with("failed")            => Style::default().fg(Color::Red),
+        _                                       => Style::default(),
     }
 }
 
@@ -145,7 +148,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     }
 
     // Footer
-    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  [n]ew  q quit ";
+    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  q quit ";
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_area,
@@ -793,6 +796,179 @@ fn render_inspector(f: &mut Frame, app: &App) {
     );
 }
 
+fn render_approvals(f: &mut Frame, app: &App) {
+    let (header_area, content_area, footer_area) = header_footer_layout(f.area());
+
+    let pending_count = app.approvals_items.len();
+    f.render_widget(
+        Paragraph::new(format!(
+            " agentctl watch › approvals ({pending_count} pending) "
+        )).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        header_area,
+    );
+
+    let av = &app.approvals_view;
+
+    match av.mode {
+        ApprovalsMode::List => {
+            if app.approvals_items.is_empty() {
+                let lines = vec![
+                    Line::from(""),
+                    Line::from("  No pending approvals."),
+                ];
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .block(Block::default().borders(Borders::ALL).title(" pending approvals ")),
+                    content_area,
+                );
+            } else {
+                let rows: Vec<Row> = app.approvals_items.iter().enumerate().map(|(i, a)| {
+                    let is_sel = av.selected_idx == i;
+                    let bg = if is_sel { Color::Blue } else { Color::Reset };
+                    let risk_style = match a.risk.as_str() {
+                        "high"   => Style::default().fg(Color::Red),
+                        "medium" => Style::default().fg(Color::Yellow),
+                        _        => Style::default().fg(Color::Green),
+                    };
+                    Row::new(vec![
+                        Cell::from(a.id.clone()),
+                        Cell::from(a.agent_id.clone()),
+                        Cell::from(a.kind.clone()),
+                        Cell::from(a.risk.clone()).style(risk_style),
+                        Cell::from(sanitize(&a.summary)),
+                        Cell::from(format!("{}s", a.age_secs)),
+                    ]).style(Style::default().bg(bg))
+                }).collect();
+
+                let header_row = Row::new(vec![
+                    Cell::from("ID").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Agent").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Kind").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Risk").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Summary").style(Style::default().add_modifier(Modifier::BOLD)),
+                    Cell::from("Age").style(Style::default().add_modifier(Modifier::BOLD)),
+                ]).style(Style::default().bg(Color::DarkGray));
+
+                let table = Table::new(
+                    rows,
+                    [
+                        Constraint::Length(12),  // ID
+                        Constraint::Length(14),  // Agent
+                        Constraint::Length(14),  // Kind
+                        Constraint::Length(7),   // Risk
+                        Constraint::Min(20),     // Summary
+                        Constraint::Length(6),   // Age
+                    ],
+                )
+                .header(header_row)
+                .block(Block::default().borders(Borders::ALL).title(" pending approvals "));
+                f.render_widget(table, content_area);
+            }
+
+            // Result message banner (shown briefly after approve/reject).
+            if let Some(msg) = &av.result_msg {
+                let style = if msg.starts_with("Error") || msg.starts_with("error") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(" {msg} ")).style(style),
+                    footer_area,
+                );
+                return;
+            }
+
+            let hints = " ↑/↓/j/k select  Enter resolve  Esc/q back to dashboard ";
+            f.render_widget(
+                Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                footer_area,
+            );
+        }
+
+        ApprovalsMode::Confirm => {
+            let item = app.approvals_items.get(av.selected_idx);
+            let (id, agent, kind, risk, summary) = item
+                .map(|a| (a.id.as_str(), a.agent_id.as_str(), a.kind.as_str(), a.risk.as_str(), a.summary.as_str()))
+                .unwrap_or(("?", "?", "?", "?", "?"));
+
+            let risk_style = match risk {
+                "high"   => Style::default().fg(Color::Red),
+                "medium" => Style::default().fg(Color::Yellow),
+                _        => Style::default().fg(Color::Green),
+            };
+
+            let lines = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  ID:      ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(id),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Agent:   ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(agent),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Kind:    ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(kind),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Risk:    ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(risk, risk_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Summary: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(sanitize(summary)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  [a] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Span::raw("Approve"),
+                    Span::raw("    "),
+                    Span::styled("[d] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw("Approve (don't ask again for this kind)"),
+                    Span::raw("    "),
+                    Span::styled("[r] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::raw("Reject"),
+                ]),
+            ];
+
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::default().borders(Borders::ALL).title(" confirm action ")),
+                content_area,
+            );
+
+            let hints = " [a]pprove  [d] approve+don't ask  [r]eject  Esc cancel ";
+            f.render_widget(
+                Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                footer_area,
+            );
+        }
+
+        ApprovalsMode::RejectReason => {
+            let lines = vec![
+                Line::from(""),
+                Line::from("  Enter rejection reason (optional, press Enter to submit):"),
+                Line::from(""),
+                Line::from(format!("  > {}_", av.reject_reason)),
+            ];
+
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(Block::default().borders(Borders::ALL).title(" reject reason ")),
+                content_area,
+            );
+
+            let hints = " Enter submit  Esc cancel ";
+            f.render_widget(
+                Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                footer_area,
+            );
+        }
+    }
+}
+
 /// Render a plain-text snapshot to a string (for --plain mode, no ANSI).
 pub fn render_plain(app: &App) -> String {
     let mut out = String::new();
@@ -897,6 +1073,23 @@ pub fn render_plain(app: &App) -> String {
         out.push_str(&format!("  templates: {}\n", app.spawn_view.templates.len()));
         for t in &app.spawn_view.templates {
             out.push_str(&format!("    {} — {}\n", t.name, sanitize(&t.description)));
+        }
+    }
+    // Approvals section.
+    if app.approvals_items.is_empty() {
+        out.push_str("approvals: (none pending)\n");
+    } else {
+        out.push_str(&format!("approvals: {} pending\n", app.approvals_items.len()));
+        for a in &app.approvals_items {
+            out.push_str(&format!(
+                "  {} agent={} kind={} risk={} age={}s — {}\n",
+                a.id,
+                a.agent_id,
+                a.kind,
+                a.risk,
+                a.age_secs,
+                sanitize(&a.summary),
+            ));
         }
     }
     out

@@ -64,6 +64,9 @@ const INO_SYS_PROVIDER: u64 = 14;
 /// Write-only control pseudofile: `echo '{"task":"..."}' > /agents/control`
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const INO_CONTROL: u64 = 15;
+/// Read-only approvals pseudofile: JSON lines of pending approval requests.
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const INO_APPROVALS: u64 = 16;
 
 // Invariant: all per-agent file offsets must fit within DIR_STEP - 1 slots.
 #[cfg(any(test, target_os = "linux"))]
@@ -464,6 +467,38 @@ impl AgentsFs {
         Some(content.into_bytes())
     }
 
+    /// Content for /agents/approvals — one JSON object per pending approval, one per line.
+    fn approvals_content(&self) -> Vec<u8> {
+        let snap = match self.snapshot.read() {
+            Ok(s)  => s,
+            Err(_) => return b"[]\n".to_vec(),
+        };
+        if snap.pending_actions.is_empty() {
+            return b"[]\n".to_vec();
+        }
+        let lines: Vec<String> = snap
+            .pending_actions
+            .iter()
+            .map(|pa| {
+                format!(
+                    "{{\"id\":\"{}\",\"agent_id\":\"{}\",\"kind\":\"{}\",\
+                     \"risk\":\"{}\",\"summary\":\"{}\",\"args\":{},\"age_secs\":{}}}",
+                    json_escape_str(&pa.id),
+                    json_escape_str(&pa.agent_id),
+                    json_escape_str(&pa.kind),
+                    json_escape_str(&pa.risk),
+                    json_escape_str(&pa.summary),
+                    // args_json is already valid JSON
+                    if pa.args_json.is_empty() { "{}".to_string() } else { pa.args_json.clone() },
+                    pa.age_secs,
+                )
+            })
+            .collect();
+        let mut out = lines.join("\n");
+        out.push('\n');
+        out.into_bytes()
+    }
+
     /// Content for dynamic file inodes (long_term/<key>, kb/<seg>/<key>).
     fn dyn_file_content(&self, ino: u64) -> Option<Vec<u8>> {
         let mem = self.memory.as_ref()?;
@@ -699,6 +734,12 @@ impl fuser::Filesystem for AgentsFs {
                     reply.entry(&TTL, &attr, 0);
                     return;
                 }
+                // approvals read-only pseudofile (always present)
+                if name_str == "approvals" {
+                    let sz = self.approvals_content().len() as u64;
+                    reply.entry(&TTL, &make_file_attr(INO_APPROVALS, sz, fuser::FileType::RegularFile), 0);
+                    return;
+                }
                 // kb/ dir (only when memory is configured)
                 if name_str == "kb" && self.memory.is_some() {
                     reply.entry(&TTL, &make_file_attr(INO_KB, 0, fuser::FileType::Directory), 0);
@@ -864,6 +905,11 @@ impl fuser::Filesystem for AgentsFs {
             reply.attr(&TTL, &attr);
             return;
         }
+        if ino == INO_APPROVALS {
+            let sz = self.approvals_content().len() as u64;
+            reply.attr(&TTL, &make_file_attr(INO_APPROVALS, sz, fuser::FileType::RegularFile));
+            return;
+        }
         if let Some(agent_id) = self.inode_to_id.get(&ino).cloned() {
             let base   = self.dir_inodes[&agent_id];
             let offset = ino.wrapping_sub(base);
@@ -916,6 +962,15 @@ impl fuser::Filesystem for AgentsFs {
         // prevents reads at the VFS layer; this handles direct read syscalls).
         if ino == INO_CONTROL {
             reply.data(b"");
+            return;
+        }
+        // Read-only approvals pseudofile — JSON lines of pending approvals.
+        if ino == INO_APPROVALS {
+            let content = self.approvals_content();
+            let offset = if offset < 0 { 0usize } else { offset as usize };
+            let start = offset.min(content.len());
+            let end   = offset.saturating_add(size as usize).min(content.len());
+            reply.data(&content[start..end]);
             return;
         }
         let content = if let Some(c) = self.file_content_for_ino(ino) {
@@ -985,6 +1040,7 @@ impl fuser::Filesystem for AgentsFs {
                 if self.control_dispatch.is_some() {
                     v.push((INO_CONTROL, fuser::FileType::RegularFile, "control".to_string()));
                 }
+                v.push((INO_APPROVALS, fuser::FileType::RegularFile, "approvals".to_string()));
                 v.push((INO_SYSTEM, fuser::FileType::Directory, "system".to_string()));
                 v
             }
@@ -1248,6 +1304,7 @@ mod tests {
             queue_depth:         0,
             provider_model:      String::new(),
             sandbox:             Default::default(),
+            pending_actions:     vec![],
         }))
     }
 
@@ -1266,6 +1323,7 @@ mod tests {
             queue_depth,
             provider_model:      provider_model.to_string(),
             sandbox:             SandboxSummary { any_sandboxed, ..Default::default() },
+            pending_actions:     vec![],
         }))
     }
 
@@ -2219,6 +2277,7 @@ mod tests {
                 servers:        vec![enf],
                 degradations:   vec!["landlock_net_unavailable".to_string()],
             },
+            pending_actions:     vec![],
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
@@ -2303,6 +2362,7 @@ mod tests {
             queue_depth:         0,
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
+            pending_actions:     vec![],
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
@@ -2326,6 +2386,7 @@ mod tests {
             queue_depth:         0,
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
+            pending_actions:     vec![],
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a2");
@@ -2360,6 +2421,7 @@ mod tests {
             queue_depth:         0,
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
+            pending_actions:     vec![],
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a3");

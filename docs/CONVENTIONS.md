@@ -103,6 +103,9 @@ Phase 0 kinds (canonical — do not rename):
 | `inference_stream_completed` | SSE streaming inference completed successfully (agent_id, text_chunks_emitted: u64, input_tokens: u32, output_tokens: u32) (p7.2+) |
 | `fuse_control_received` | operator wrote a valid spawn command to `/agents/control`; agent queued (task_preview, id) (p7.3+) |
 | `fuse_control_error` | operator command via `/agents/control` could not be dispatched (error, is_error: true) (p7.3+) |
+| `approval_requested` | agent invoked `request_approval`; scheduler parks agent pending operator decision (agent_id, approval_id, kind, risk, summary) (p7.4+) |
+| `approval_granted` | operator approved a pending action; agent resumed (agent_id, approval_id, auto_approve_kind: Option<String>) (p7.4+) |
+| `approval_rejected` | operator rejected a pending action; agent receives rejection reason (agent_id, approval_id, reason: Option<String>) (p7.4+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it
@@ -171,13 +174,14 @@ Each agent appears as a directory; memory and KB surfaces appeared in p5.7.
 
 | Path | Content | Format | Notes |
 |---|---|---|---|
-| `/agents/<id>/status` | agent lifecycle state | `running` \| `deferred` \| `awaiting_child:<id>` \| `done` \| `failed` | |
+| `/agents/<id>/status` | agent lifecycle state | `running` \| `deferred` \| `awaiting_child:<id>` \| `awaiting_approval:<id>` \| `done` \| `failed` | |
 | `/agents/<id>/context_size` | token count | integer | |
 | `/agents/<id>/budget` | token budget | integer or `unlimited` | |
 | `/agents/<id>/flight` | recent flight events for this agent | JSONL tail (last 20 lines) | |
 | `/agents/<id>/memory/short_term` | in-context conversation previews | one `t{n} {role}: {preview}` per line, ≤20 entries | absent if no memory store configured |
 | `/agents/<id>/memory/long_term/<key>` | per-agent Tier-3 KB entry | raw JSON value + provenance | key is nanosecond timestamp; ≤100 keys shown |
 | `/agents/kb/<segment>/<key>` | shared KB segment entry | raw JSON value + provenance | agent-namespaced entries (`agent/…`) excluded; ≤100 keys per segment |
+| `/agents/approvals` | all pending approval requests (all agents) | JSONL one `PendingActionView` JSON per line; `[]\n` when empty (p7.4+) | read-only; write approvals/rejections via `/agents/control` |
 
 Silent truncation: directories with more than 100 entries show the first 100 (no overflow marker). An ENTRIES index per segment (NAMESPACES table) is deferred to p5.8.
 

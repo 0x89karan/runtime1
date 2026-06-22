@@ -58,6 +58,7 @@ pub struct KbSearch {
 }
 
 pub struct SpawnAgentTool;
+pub struct RequestApprovalTool;
 pub struct ListAgentsTool {
     pub cards: Arc<Vec<AgentCard>>,
 }
@@ -909,6 +910,48 @@ impl Tool for SendMessageTool {
     }
 }
 
+#[async_trait]
+impl Tool for RequestApprovalTool {
+    fn name(&self) -> &str {
+        "request_approval"
+    }
+
+    fn description(&self) -> &str {
+        "Propose a risk-bearing action for operator review before executing it. \
+         The agent parks until the operator approves or rejects via /agents/control \
+         or the agentctl approval view. Must be the sole tool call in a turn. \
+         On approval, the agent receives its args back (possibly edited by the operator). \
+         On rejection, the agent receives an is_error result with the operator's reason."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "kind":       { "type": "string",  "description": "Action type, e.g. \"write_file\", \"send_email\"" },
+                "risk":       { "type": "string",  "description": "Operator-visible severity: \"low\", \"medium\", or \"high\"" },
+                "summary":    { "type": "string",  "description": "One-sentence description of what the agent intends to do" },
+                "args":       { "type": "object",  "description": "Full argument set the agent will use once approved" },
+                "prev_state": { "description": "Optional: state snapshot before the action (diff context for operator)" },
+                "new_state":  { "description": "Optional: expected state snapshot after the action" }
+            },
+            "required": ["kind", "risk", "summary", "args"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        None
+    }
+
+    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<String> {
+        // request_approval is intercepted by step_with_response() before reaching invoke().
+        Err(anyhow::anyhow!(
+            "request_approval must be intercepted by the scheduler; invoke() should never be called"
+        ))
+    }
+}
+
 /// Register native tools by name. Pass `["all"]` to register all general-purpose
 /// tools, or a subset by name (e.g. `["read_file", "list_dir"]`).
 /// Returns an error if any name collides with an already-registered tool.
@@ -945,6 +988,9 @@ pub fn register_native(
     }
     if want("send_message") {
         reg.register(Box::new(SendMessageTool))?;
+    }
+    if want("request_approval") {
+        reg.register(Box::new(RequestApprovalTool))?;
     }
     // kv_get / kv_set — NOT included in "all"; require explicit opt-in.
     if names.iter().any(|n| n == "kv_get") {

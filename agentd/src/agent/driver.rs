@@ -67,6 +67,14 @@ pub(crate) async fn run(
                 ));
             }
 
+            AgentEffect::RequestApproval { .. } => {
+                // The single-agent driver does not support the approval gate.
+                // Use the Scheduler for operator-gated workloads.
+                return Err(anyhow::anyhow!(
+                    "request_approval is not supported in the single-agent driver; use the Scheduler"
+                ));
+            }
+
             AgentEffect::Completed(answer) => return Ok(answer),
             AgentEffect::Failed(msg) => return Err(anyhow::anyhow!("{msg}")),
         }

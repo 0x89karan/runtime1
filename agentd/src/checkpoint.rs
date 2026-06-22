@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     bus::MailMessage,
-    config::{AgentConfig, ModelConfig},
+    config::{AgentConfig, ModelConfig, PendingActionRequest},
     inference::{InferenceResponse, Msg, ToolSpec},
     memory::MemItem,
 };
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Create `path` with mode 0600 on Unix, then write `data`.
 ///
@@ -83,6 +83,20 @@ pub struct AwaitingEntry {
     pub call_id:   String,
 }
 
+/// A serializable snapshot of a parked approval (written to checkpoint so
+/// in-flight approvals survive restart). `created_at` is wall-clock time
+/// and cannot be stored; the age resets to zero on restore (acceptable).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ParkedApprovalEntry {
+    pub approval_id: String,
+    pub agent_id:    String,
+    pub call_id:     String,
+    pub action:      PendingActionRequest,
+    /// Scheduler-level sequence counter value at creation.
+    /// Stored so we can reconstruct `approval_seq` after restore.
+    pub seq:         u64,
+}
+
 /// Full scheduler checkpoint, written atomically on shutdown or periodic tick.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SchedulerCheckpoint {
@@ -95,6 +109,12 @@ pub struct SchedulerCheckpoint {
     pub spawn_depths:   HashMap<String, u32>,
     #[serde(default)]
     pub parent_map:     HashMap<String, String>,
+    /// Pending operator-approval requests (parked agents). Absent in v1/v2 → empty vec.
+    #[serde(default)]
+    pub pending_approvals: Vec<ParkedApprovalEntry>,
+    /// Monotonic counter used to generate "act_{seq}" approval IDs.
+    #[serde(default)]
+    pub approval_seq:   u64,
 }
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
@@ -219,14 +239,16 @@ mod tests {
 
     fn minimal_scheduler_checkpoint() -> SchedulerCheckpoint {
         SchedulerCheckpoint {
-            format_version: FORMAT_VERSION,
-            agents:         vec![minimal_agent_checkpoint("agent-a")],
-            awaiting:       vec![],
-            mailboxes:      HashMap::new(),
-            tokens_spent:   15,
-            child_seq:      0,
-            spawn_depths:   [("agent-a".to_string(), 0)].into_iter().collect(),
-            parent_map:     HashMap::new(),
+            format_version:    FORMAT_VERSION,
+            agents:            vec![minimal_agent_checkpoint("agent-a")],
+            awaiting:          vec![],
+            mailboxes:         HashMap::new(),
+            tokens_spent:      15,
+            child_seq:         0,
+            spawn_depths:      [("agent-a".to_string(), 0)].into_iter().collect(),
+            parent_map:        HashMap::new(),
+            pending_approvals: vec![],
+            approval_seq:      0,
         }
     }
 
@@ -289,17 +311,39 @@ mod tests {
         // Pre-p6.4 checkpoints have no "parent_map" field. Deserializing them must
         // succeed with an empty map, not fail. This guards the `#[serde(default)]`.
         let json = serde_json::json!({
-            "format_version": FORMAT_VERSION,
+            "format_version": 2,
             "agents": [],
             "awaiting": [],
             "mailboxes": {},
             "tokens_spent": 0,
             "child_seq": 0,
             "spawn_depths": {}
-            // "parent_map" is intentionally absent
+            // "parent_map", "pending_approvals", "approval_seq" are intentionally absent
         });
         let cp: SchedulerCheckpoint = serde_json::from_str(&serde_json::to_string(&json).unwrap()).unwrap();
         assert!(cp.parent_map.is_empty(), "missing parent_map field must deserialize to empty map");
+        assert!(cp.pending_approvals.is_empty(), "missing pending_approvals must deserialize to empty vec");
+        assert_eq!(cp.approval_seq, 0, "missing approval_seq must deserialize to 0");
+    }
+
+    #[test]
+    fn scheduler_checkpoint_pending_approvals_serde_default() {
+        // Pre-p7.4 checkpoints (format_version=2) have no pending_approvals field.
+        // Deserializing them must succeed with an empty vec. Guards `#[serde(default)]`.
+        let json = serde_json::json!({
+            "format_version": 2,
+            "agents": [],
+            "awaiting": [],
+            "mailboxes": {},
+            "tokens_spent": 0,
+            "child_seq": 0,
+            "spawn_depths": {},
+            "parent_map": {}
+            // "pending_approvals" and "approval_seq" are intentionally absent
+        });
+        let cp: SchedulerCheckpoint = serde_json::from_str(&serde_json::to_string(&json).unwrap()).unwrap();
+        assert!(cp.pending_approvals.is_empty());
+        assert_eq!(cp.approval_seq, 0);
     }
 
     #[test]

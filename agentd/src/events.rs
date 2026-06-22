@@ -83,6 +83,15 @@ pub enum EventKind {
     /// Operator command via /agents/control could not be dispatched (bad ID, collision, etc.).
     /// data: { error, is_error: true }
     FuseControlError,
+    /// Agent called request_approval; action parked pending operator decision.
+    /// data: { agent_id, approval_id, kind, risk, summary }
+    ApprovalRequested,
+    /// Operator approved a pending action; agent resumed.
+    /// data: { agent_id, approval_id, edits_applied: bool, auto_approve_kind? }
+    ApprovalGranted,
+    /// Operator rejected a pending action; agent resumed with is_error result.
+    /// data: { agent_id, approval_id, reason? }
+    ApprovalRejected,
     Error,
 }
 
@@ -144,6 +153,9 @@ mod tests {
         assert_eq!(kind_str(EventKind::InferenceStreamCompleted), "inference_stream_completed");
         assert_eq!(kind_str(EventKind::FuseControlReceived), "fuse_control_received");
         assert_eq!(kind_str(EventKind::FuseControlError), "fuse_control_error");
+        assert_eq!(kind_str(EventKind::ApprovalRequested), "approval_requested");
+        assert_eq!(kind_str(EventKind::ApprovalGranted), "approval_granted");
+        assert_eq!(kind_str(EventKind::ApprovalRejected), "approval_rejected");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

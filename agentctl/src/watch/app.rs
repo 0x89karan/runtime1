@@ -2,9 +2,10 @@ use std::path::PathBuf;
 
 use agentd::capability::Capability;
 
+use super::approvals::ApprovalsViewState;
 use super::inspector::InspectorState;
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
-use super::reader::{AgentInfo, Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox};
+use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox};
 use super::spawn::{load_spawn_templates, SpawnTemplate};
 use super::topology::{build_graph, TopologyGraph};
 
@@ -25,6 +26,8 @@ pub enum View {
     Spawn,
     /// Read-only flight-log inspector with filter cycling and search.
     Inspector,
+    /// Browse and resolve pending operator approval requests.
+    Approvals,
 }
 
 // ── Spawn view ───────────────────────────────────────────────────────────────
@@ -423,6 +426,10 @@ pub struct App {
     pub spawn_view:      SpawnViewState,
     /// UI state for the Inspector view.
     pub inspector_view:  InspectorState,
+    /// Current approval queue (refreshed every tick from /agents/approvals).
+    pub approvals_items: Vec<PendingAction>,
+    /// UI state for the Approvals view.
+    pub approvals_view:  ApprovalsViewState,
     /// Shown as a green banner on the Dashboard after a successful live injection
     /// via /agents/control; cleared on the next keypress.
     pub spawn_banner:    Option<String>,
@@ -446,6 +453,8 @@ impl App {
             memory_view:     MemoryPaneState::default(),
             spawn_view:      SpawnViewState::default(),
             inspector_view:  InspectorState::default(),
+            approvals_items: vec![],
+            approvals_view:  ApprovalsViewState::default(),
             spawn_banner:    None,
         }
     }
@@ -487,6 +496,15 @@ impl App {
         // Load inspector lines once on first entry to this view; [r] triggers reload.
         if self.view == View::Inspector && !self.inspector_view.loaded {
             self.inspector_view.load(self.log_path.as_deref());
+        }
+
+        // Refresh the approval queue on every tick (small pseudofile, always relevant).
+        self.approvals_items = reader::read_approvals(&self.agents_dir);
+        // Clamp selection to stay in-bounds if items were resolved since last tick.
+        if !self.approvals_items.is_empty()
+            && self.approvals_view.selected_idx >= self.approvals_items.len()
+        {
+            self.approvals_view.selected_idx = self.approvals_items.len() - 1;
         }
 
         // Read memory only while the Memory view is active to avoid FUSE I/O on

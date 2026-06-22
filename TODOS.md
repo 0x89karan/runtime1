@@ -51,6 +51,22 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   or increase `MAX_DIR_KEYS` and add a per-call budget. Document the limit prominently in RUNBOOK.md.
   (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p6+.
 
+## Phase 7 — Open (deferred from p7.4 QA)
+
+**p7.4-qa-01 (LOW) — Silent no-op when approval item disappears between List→Confirm mode transitions**
+- Repro: operator enters Confirm mode on `act_0`; external process resolves `act_0` via FUSE;
+  next tick refreshes `approvals_items` (item gone); operator presses 'a' (approve).
+- `approvals_items.get(selected_idx)` returns `None` → no `write_control_command` sent,
+  mode silently returns to List with no result message. User may be confused whether approve fired.
+- In practice the List view correctly shows 0 items (item was already resolved), so no data loss.
+- Fix path: add `result_msg = Some("Item already resolved")` in the `if let Some` else branch
+  in `handle_approvals_key` Confirm arms (`agentctl/src/watch/mod.rs`).
+
+**p7.4-qa-02 (LOW) — `read_approvals` has no unit test**
+- `agentctl/src/watch/reader.rs::read_approvals()` parses the `/agents/approvals` JSONL file
+  (11 lines) but has no coverage for: empty/`[]\n` sentinel, multi-item path, malformed-line skip.
+- Fix path: add 3 unit tests to `reader.rs` covering these paths.
+
 ## Phase 7 — Open (deferred from p7.3 review)
 
 **p7.3-ar-01 (LOW) — `child_seq` consumed on auto-ID collision with existing named agents**

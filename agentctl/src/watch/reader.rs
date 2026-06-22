@@ -73,6 +73,22 @@ pub struct SysProvider {
     pub backend: String,
 }
 
+/// One pending approval request, parsed from a JSON line in /agents/approvals.
+#[derive(Deserialize, Debug, Clone)]
+pub struct PendingAction {
+    pub id:       String,
+    pub agent_id: String,
+    pub kind:     String,
+    pub risk:     String,
+    pub summary:  String,
+    /// JSON-encoded args object (raw Value for flexible display in future views).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub args:     serde_json::Value,
+    #[serde(default)]
+    pub age_secs: u64,
+}
+
 /// Snapshot of one running agent, assembled from per-file reads.
 #[derive(Debug, Clone, Default)]
 pub struct AgentInfo {
@@ -153,6 +169,26 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
 /// Read /agents/<id>/sandbox
 pub fn read_agent_sandbox(agents_dir: &Path, id: &str) -> Option<AgentSandbox> {
     read_json(&agents_dir.join(id).join("sandbox"))
+}
+
+/// Read /agents/approvals and parse each JSON line into a PendingAction.
+///
+/// Returns an empty vec when the file is absent, empty, or contains the "[]" sentinel
+/// that agentd writes when there are no pending approvals.
+pub fn read_approvals(agents_dir: &Path) -> Vec<PendingAction> {
+    let content = match fs::read_to_string(agents_dir.join("approvals")) {
+        Ok(s)  => s,
+        Err(_) => return vec![],
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return vec![];
+    }
+    trimmed
+        .lines()
+        .filter(|l| !l.is_empty() && *l != "[]")
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
 }
 
 /// Read /agents/system/budget

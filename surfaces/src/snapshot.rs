@@ -37,6 +37,26 @@ pub struct SandboxSummary {
     pub degradations:   Vec<String>,
 }
 
+/// A pending operator approval, projected from the scheduler into the snapshot.
+/// Used by the FUSE `/agents/approvals` file and the `agentctl` Approvals view.
+#[derive(Clone, Debug)]
+pub struct PendingActionView {
+    /// Unique approval ID: "act_{seq}".
+    pub id:        String,
+    /// ID of the agent waiting for resolution.
+    pub agent_id:  String,
+    /// Action kind, e.g. "write_file".
+    pub kind:      String,
+    /// Operator-visible severity: "low" | "medium" | "high".
+    pub risk:      String,
+    /// One-sentence summary of the proposed action.
+    pub summary:   String,
+    /// JSON-serialized args the agent will pass to the underlying tool.
+    pub args_json: String,
+    /// Seconds elapsed since the approval was requested.
+    pub age_secs:  u64,
+}
+
 #[derive(Clone, Default)]
 pub struct SchedulerSnapshot {
     pub agents:              Vec<AgentSnapshot>,
@@ -49,6 +69,8 @@ pub struct SchedulerSnapshot {
     pub provider_model:      String,
     /// Startup-time sandbox posture. Set once in main.rs after MCP servers spawn.
     pub sandbox:             SandboxSummary,
+    /// Current approval queue (bounded to ≤100 entries).
+    pub pending_actions:     Vec<PendingActionView>,
 }
 
 #[derive(Clone)]
@@ -81,6 +103,9 @@ pub enum AgentStatus {
     Running,
     Deferred,
     AwaitingChild(String),
+    /// Agent called `request_approval` and is parked until resolved.
+    /// The String is the approval ID (e.g. "act_3").
+    AwaitingApproval(String),
     Done,
     Failed,
 }
@@ -88,11 +113,12 @@ pub enum AgentStatus {
 impl AgentStatus {
     pub fn as_str(&self) -> &str {
         match self {
-            AgentStatus::Running           => "running",
-            AgentStatus::Deferred          => "deferred",
-            AgentStatus::AwaitingChild(_)  => "awaiting_child",
-            AgentStatus::Done              => "done",
-            AgentStatus::Failed            => "failed",
+            AgentStatus::Running               => "running",
+            AgentStatus::Deferred              => "deferred",
+            AgentStatus::AwaitingChild(_)      => "awaiting_child",
+            AgentStatus::AwaitingApproval(_)   => "awaiting_approval",
+            AgentStatus::Done                  => "done",
+            AgentStatus::Failed                => "failed",
         }
     }
 }

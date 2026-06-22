@@ -41,6 +41,9 @@ pub enum AgentEffect {
     /// Emitted when the model calls `send_message` as its sole tool in a turn.
     /// The scheduler delivers the message and synthesizes a ToolResult.
     SendMessage { call_id: String, to: String, content: String },
+    /// Emitted when the model calls `request_approval` as its sole tool in a turn.
+    /// The scheduler parks the agent until an operator approves or rejects.
+    RequestApproval { call_id: String, action: crate::config::PendingActionRequest },
     Completed(String),
     Failed(String),
 }
@@ -707,6 +710,45 @@ impl AgentTask {
                         call_id: call_id.clone(),
                         to,
                         content,
+                    };
+                }
+
+                // Intercept request_approval before tool dispatch — must be sole call.
+                let approval_idx = call_blocks.iter().position(|b| {
+                    matches!(b, Block::ToolUse { name, .. } if name == "request_approval")
+                });
+
+                if let Some(idx) = approval_idx {
+                    if call_blocks.len() > 1 {
+                        return self.reject_batched_sole_tool(
+                            "request_approval",
+                            &call_blocks,
+                            recorder,
+                        );
+                    }
+                    let Block::ToolUse { id: call_id, input, .. } = &call_blocks[idx] else {
+                        unreachable!("filtered to ToolUse above")
+                    };
+                    let action: crate::config::PendingActionRequest =
+                        match serde_json::from_value(input.clone()) {
+                            Ok(a) => a,
+                            Err(e) => {
+                                self.provide_tool_results(
+                                    vec![Block::ToolResult {
+                                        tool_use_id: call_id.clone(),
+                                        content: format!(
+                                            "request_approval input could not be parsed: {e}"
+                                        ),
+                                        is_error: true,
+                                    }],
+                                    recorder,
+                                );
+                                return self.step_need_infer(recorder);
+                            }
+                        };
+                    return AgentEffect::RequestApproval {
+                        call_id: call_id.clone(),
+                        action,
                     };
                 }
 

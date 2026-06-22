@@ -3,6 +3,48 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.4] - 2026-06-22 (v0.38.0)
+
+Human-in-the-loop approval gate: agents can pause and ask the operator for
+explicit approval before executing high-risk actions. The operator resolves
+pending approvals from the `agentctl watch` TUI or any shell script.
+
+- **`request_approval` native tool** — `kind`, `risk`, `summary`, `args_json`
+  inputs; returns `{"approved":true}` or `{"approved":false,"reason":"..."}`;
+  available without capability grant (implicit; requires `HumanApprovals` cap).
+- **`AgentEffect::RequestApproval`** — new scheduler effect; agent yields until
+  operator resolves via `/agents/control`.
+- **`ParkedApproval`** / `pending_approvals: HashMap<String, ParkedApproval>`
+  on `SchedulerState` — approval ID counter, parked sender, snapshot fields.
+- **`ControlCommand` tagged enum** — `{"approve":{"id":"…"}}`,
+  `{"approve":{"id":"…","auto_approve_kind":"write_file"}}`,
+  `{"reject":{"id":"…","reason":"…"}}`; existing spawn path unchanged.
+- **`PendingActionView`** in `surfaces/` — `id`, `agent_id`, `kind`, `risk`,
+  `summary`, `args_json`, `age_secs`; exposed via `SchedulerSnapshot`.
+- **`INO_APPROVALS = 16`** — read-only root-level FUSE pseudofile
+  `/agents/approvals`; JSONL one `PendingActionView` per line; `[]\n` sentinel
+  when empty.
+- **`AgentStatus::AwaitingApproval(String)`** — new variant; renders as
+  `awaiting_approval:<id>` in FUSE status file and `agentctl` table.
+- **Checkpoint FORMAT_VERSION 2→3** — `pending_approvals` field added with
+  `#[serde(default)]` for backward compat.
+- **Flight events** — `ApprovalRequested`, `ApprovalGranted`, `ApprovalRejected`.
+- **`agentctl watch` Approvals view** (`[a]` from dashboard) — list of pending
+  actions with ID/agent/kind/risk/summary/age columns; `Enter` opens 3-option
+  confirm dialog (`[a]pprove`, `[d]` approve+don't-ask-again, `[r]eject`);
+  reject reason text input; `write_control_command()` helper (libc::close flush
+  guard); `approvals_items` refreshed every tick (time-critical).
+- **`agentctl/src/watch/approvals.rs`** — `ApprovalsMode` enum,
+  `ApprovalsViewState` struct; 4 unit tests.
+- **`agentctl/src/watch/reader.rs`** — `PendingAction` struct +
+  `read_approvals()` (handles `[]\n` sentinel + JSONL).
+- **`views.rs`** — `render_approvals()` TUI function; `awaiting_approval`
+  case in `status_style()` (magenta); `[a]pprove` hint in dashboard footer;
+  approvals section in `render_plain()`.
+- **`docs/CONVENTIONS.md`** — 3 new event rows, FUSE path row for
+  `/agents/approvals`, `awaiting_approval:<id>` added to status table.
+- 932 workspace tests (up from 902); 30 new tests.
+
 ## [p7.3] - 2026-06-21 (v0.37.0)
 
 Write JSON to `/agents/control` to inject a new agent into a running scheduler

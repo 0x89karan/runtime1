@@ -216,6 +216,30 @@ pub struct SpawnConfig {
     pub token_budget: Option<u64>,
 }
 
+/// The action an agent is requesting approval for. Passed by the agent as the
+/// input to the `request_approval` tool; stored in `ParkedApproval` until resolved.
+///
+/// `kind` and `risk` are free-form strings in v1 (the harness defines taxonomy).
+/// `linked` is intentionally absent — cross-action coordination is harness territory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingActionRequest {
+    /// Short noun phrase: the action type, e.g. "write_file", "send_email".
+    pub kind:       String,
+    /// Operator-visible severity: "low" | "medium" | "high" (free-form in v1).
+    pub risk:       String,
+    /// One-sentence human summary of what the agent intends to do.
+    pub summary:    String,
+    /// Full argument set the agent will pass to the underlying tool once approved.
+    /// The operator may override these via the `edits` field on Approve.
+    pub args:       serde_json::Value,
+    /// Optional snapshot of state before the action (diff context for the operator).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_state: Option<serde_json::Value>,
+    /// Optional snapshot of state after the action would complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_state:  Option<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {

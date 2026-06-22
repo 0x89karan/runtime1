@@ -12,14 +12,14 @@ use crate::{
     agent::{run_tools_sequential, truncate, AgentEffect, AgentTask, PREVIEW_CHARS},
     bus::{MailMessage, Mailboxes},
     capability::Capability,
-    checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, SchedulerCheckpoint},
-    config::{AgentConfig, ModelConfig, SchedulerConfig, SpawnConfig},
+    checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, ParkedApprovalEntry, SchedulerCheckpoint},
+    config::{AgentConfig, ModelConfig, PendingActionRequest, SchedulerConfig, SpawnConfig},
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse, Msg, Role},
     memory::MemoryStore,
     tools::ToolRegistry,
 };
-use surfaces::{AgentSnapshot, AgentStatus, SchedulerSnapshot};
+use surfaces::{AgentSnapshot, AgentStatus, PendingActionView, SchedulerSnapshot};
 
 const MAX_SHORT_TERM_PREVIEWS: usize = 20;
 
@@ -73,6 +73,15 @@ struct AwaitingParent {
     call_id:   String,
 }
 
+/// An agent parked waiting for operator approval via /agents/control.
+struct ParkedApproval {
+    agent_id:   String,
+    call_id:    String,
+    action:     PendingActionRequest,
+    /// Monotonic timestamp for age display in the TUI.
+    created_at: std::time::Instant,
+}
+
 /// All mutable state that evolves during a scheduler run.
 struct SchedulerState {
     agents:           HashMap<String, AgentTask>,
@@ -100,16 +109,25 @@ struct SchedulerState {
     streamed_agents:  Arc<Mutex<HashSet<String>>>,
     /// Shared mutex serialising stdout writes across concurrent streaming agents.
     stdout_lock:      Arc<tokio::sync::Mutex<()>>,
+    /// approval_id → parked agent awaiting operator decision.
+    pending_approvals: HashMap<String, ParkedApproval>,
+    /// Counter for generating "act_{seq}" approval IDs.
+    approval_seq:     u64,
+    /// True when a control channel (FUSE /agents/control) was provided at startup.
+    /// When false, request_approval is immediately rejected — no way to resolve it otherwise.
+    has_control:      bool,
 }
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
 struct SchedulerRestored {
-    awaiting:     Vec<AwaitingEntry>,
-    mailboxes:    HashMap<String, Vec<MailMessage>>,
-    tokens_spent: u64,
-    child_seq:    u64,
-    spawn_depths: HashMap<String, u32>,
-    parent_map:   HashMap<String, String>,
+    awaiting:          Vec<AwaitingEntry>,
+    mailboxes:         HashMap<String, Vec<MailMessage>>,
+    tokens_spent:      u64,
+    child_seq:         u64,
+    spawn_depths:      HashMap<String, u32>,
+    parent_map:        HashMap<String, String>,
+    pending_approvals: Vec<ParkedApprovalEntry>,
+    approval_seq:      u64,
 }
 
 pub struct Scheduler {
@@ -156,13 +174,15 @@ impl Scheduler {
 
         if let Some(cp) = checkpoint {
             let SchedulerCheckpoint {
-                agents:      cp_agent_list,
-                awaiting:    cp_awaiting,
-                mailboxes:   cp_mailboxes,
-                tokens_spent: cp_tokens,
-                child_seq:   cp_child_seq,
-                spawn_depths: cp_spawn_depths,
-                parent_map:  cp_parent_map,
+                agents:            cp_agent_list,
+                awaiting:          cp_awaiting,
+                mailboxes:         cp_mailboxes,
+                tokens_spent:      cp_tokens,
+                child_seq:         cp_child_seq,
+                spawn_depths:      cp_spawn_depths,
+                parent_map:        cp_parent_map,
+                pending_approvals: cp_pending_approvals,
+                approval_seq:      cp_approval_seq,
                 ..
             } = cp;
 
@@ -198,12 +218,14 @@ impl Scheduler {
             }
 
             restored = Some(SchedulerRestored {
-                awaiting:     cp_awaiting,
-                mailboxes:    cp_mailboxes,
-                tokens_spent: cp_tokens,
-                child_seq:    cp_child_seq,
-                spawn_depths: cp_spawn_depths,
-                parent_map:   cp_parent_map,
+                awaiting:          cp_awaiting,
+                mailboxes:         cp_mailboxes,
+                tokens_spent:      cp_tokens,
+                child_seq:         cp_child_seq,
+                spawn_depths:      cp_spawn_depths,
+                parent_map:        cp_parent_map,
+                pending_approvals: cp_pending_approvals,
+                approval_seq:      cp_approval_seq,
             });
         } else {
             agents.reserve(agent_configs.len());
@@ -298,6 +320,9 @@ impl Scheduler {
             shutdown_requested: false,
             streamed_agents:    Arc::clone(&streamed_agents),
             stdout_lock:        Arc::new(tokio::sync::Mutex::new(())),
+            pending_approvals:  HashMap::new(),
+            approval_seq:       0,
+            has_control:        control_rx.is_some(),
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -306,6 +331,7 @@ impl Scheduler {
             state.child_seq    = r.child_seq;
             state.spawn_depths = r.spawn_depths;
             state.parent_map   = r.parent_map;
+            state.approval_seq = r.approval_seq;
             for entry in r.awaiting {
                 state.awaiting.insert(entry.child_id, AwaitingParent {
                     parent_id: entry.parent_id,
@@ -315,14 +341,32 @@ impl Scheduler {
             for (id, msgs) in r.mailboxes {
                 state.mailboxes.insert(id, msgs);
             }
+            for entry in r.pending_approvals {
+                state.pending_approvals.insert(entry.approval_id.clone(), ParkedApproval {
+                    agent_id:   entry.agent_id,
+                    call_id:    entry.call_id,
+                    action:     entry.action,
+                    created_at: std::time::Instant::now(),
+                });
+            }
         }
 
         // Seed: step each agent once to kick off its first effect.
         // `or_insert` preserves restored spawn_depths; fresh agents get depth 0.
+        // Agents already parked in pending_approvals must NOT be re-stepped — doing so
+        // would re-emit RequestApproval and create a duplicate pending_approvals entry.
+        let parked_agent_ids: std::collections::HashSet<String> = state
+            .pending_approvals
+            .values()
+            .map(|pa| pa.agent_id.clone())
+            .collect();
         let ids: Vec<String> = state.agents.keys().cloned().collect();
         for id in ids {
             state.spawn_depths.entry(id.clone()).or_insert(0);
             state.mailboxes.entry(id.clone()).or_default();
+            if parked_agent_ids.contains(&id) {
+                continue; // Already awaiting approval — do not re-step.
+            }
             let priority = state.agents[&id].priority();
             let cap_set = state.agents[&id].cap_set_cloned();
             let (effect, turn) = {
@@ -350,7 +394,7 @@ impl Scheduler {
                         tokio::select! {
                             cmd = rx.recv() => {
                                 let Some(cmd) = cmd else { break 'main; };
-                                dispatch_operator_spawn(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
+                                dispatch_control_command(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
                                 update_snapshot(&snapshot, &state);
                             }
                             _ = sigterm.recv() => {
@@ -389,7 +433,7 @@ impl Scheduler {
                 } => {
                     match cmd {
                         Some(cmd) => {
-                            dispatch_operator_spawn(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
+                            dispatch_control_command(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
                             update_snapshot(&snapshot, &state);
                         }
                         None => { control_rx = None; }
@@ -1019,6 +1063,64 @@ fn enqueue_or_defer(
                 state, sched, gateway, registry, recorder,
             );
         }
+        AgentEffect::RequestApproval { call_id, action } => {
+            if !state.has_control {
+                // No control channel — cannot park the agent because there is no way to
+                // resolve it later. Immediately reject the tool call so the agent can
+                // continue rather than hanging the scheduler.
+                recorder.record(
+                    &agent_id,
+                    Some(turn),
+                    EventKind::ApprovalRejected,
+                    json!({
+                        "agent_id": &agent_id,
+                        "call_id":  &call_id,
+                        "reason":   "no control channel available (FUSE not mounted)",
+                    }),
+                );
+                if let Some(sm) = state.agents.get_mut(&agent_id) {
+                    let priority = sm.priority();
+                    let cap_set  = sm.cap_set_cloned();
+                    sm.provide_tool_results(
+                        vec![Block::ToolResult {
+                            tool_use_id: call_id,
+                            content: "request_approval: no control channel available — \
+                                      start agentd with FUSE mount to enable approvals"
+                                .to_string(),
+                            is_error: true,
+                        }],
+                        recorder,
+                    );
+                    let t = sm.turn();
+                    let effect = sm.step(recorder);
+                    enqueue_or_defer(effect, agent_id, t, priority, cap_set,
+                                     state, sched, gateway, registry, recorder);
+                }
+                return;
+            }
+            let approval_id = format!("act_{}", state.approval_seq);
+            state.approval_seq += 1;
+            recorder.record(
+                &agent_id,
+                Some(turn),
+                EventKind::ApprovalRequested,
+                json!({
+                    "agent_id":    &agent_id,
+                    "approval_id": &approval_id,
+                    "kind":        &action.kind,
+                    "risk":        &action.risk,
+                    "summary":     &action.summary,
+                }),
+            );
+            state.pending_approvals.insert(approval_id, ParkedApproval {
+                agent_id:   agent_id.clone(),
+                call_id,
+                action,
+                created_at: std::time::Instant::now(),
+            });
+            // Agent is now parked — do not enqueue it. update_snapshot() will
+            // reflect AgentStatus::AwaitingApproval for this agent.
+        }
         AgentEffect::Completed(answer) => {
             // AgentCompleted event already emitted by AgentTask::step_with_response().
             handle_agent_terminal(agent_id, Ok(answer), state, sched, gateway, registry, recorder);
@@ -1278,12 +1380,10 @@ fn dispatch_spawn(
     );
 }
 
-/// Handle a ControlCommand::Spawn from the /agents/control FUSE surface.
-/// Injects a new top-level agent into the running scheduler. The agent runs
-/// independently (no awaiting parent); its outcome is recorded but not returned
-/// to any caller. Emits FuseControlReceived on success, FuseControlError on failure.
+/// Dispatch a ControlCommand from the /agents/control FUSE surface.
+/// Handles Spawn (new agent), Approve, and Reject (approval gate).
 #[allow(clippy::too_many_arguments)]
-fn dispatch_operator_spawn(
+fn dispatch_control_command(
     cmd:            crate::control::ControlCommand,
     default_model:  &crate::config::ModelConfig,
     state:          &mut SchedulerState,
@@ -1293,9 +1393,123 @@ fn dispatch_operator_spawn(
     recorder:       &Arc<FlightRecorder>,
 ) {
     use crate::control::ControlCommand;
-    use crate::config::{default_max_turns, default_token_budget};
 
-    let ControlCommand::Spawn(req) = cmd;
+    match cmd {
+        ControlCommand::Approve { id: approval_id, edits, auto_approve_kind } => {
+            let Some(parked) = state.pending_approvals.remove(&approval_id) else {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::FuseControlError,
+                    json!({ "error": format!("no pending approval with id '{approval_id}'"), "is_error": true }),
+                );
+                return;
+            };
+            let agent_id = parked.agent_id;
+            let call_id  = parked.call_id;
+            // The operator may supply edited args; fall back to the original args.
+            let result_args = edits.unwrap_or_else(|| parked.action.args.clone());
+            recorder.record(
+                &agent_id,
+                None,
+                EventKind::ApprovalGranted,
+                json!({
+                    "agent_id":           &agent_id,
+                    "approval_id":        &approval_id,
+                    "edits_applied":      result_args != parked.action.args,
+                    "auto_approve_kind":  auto_approve_kind,
+                }),
+            );
+            if let Some(task) = state.agents.get_mut(&agent_id) {
+                let priority = task.priority();
+                let caps     = task.cap_set_cloned();
+                task.provide_tool_results(
+                    vec![Block::ToolResult {
+                        tool_use_id: call_id,
+                        content:     serde_json::to_string(&result_args)
+                                         .unwrap_or_else(|_| "{}".to_string()),
+                        is_error:    false,
+                    }],
+                    recorder,
+                );
+                let (effect, next_turn) = {
+                    let t = task.turn();
+                    (task.step(recorder), t)
+                };
+                enqueue_or_defer(effect, agent_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
+            } else {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::FuseControlError,
+                    json!({ "error": format!("agent '{}' not found after approval", agent_id), "is_error": true }),
+                );
+            }
+        }
+        ControlCommand::Reject { id: approval_id, reason } => {
+            let Some(parked) = state.pending_approvals.remove(&approval_id) else {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::FuseControlError,
+                    json!({ "error": format!("no pending approval with id '{approval_id}'"), "is_error": true }),
+                );
+                return;
+            };
+            let agent_id = parked.agent_id;
+            let call_id  = parked.call_id;
+            recorder.record(
+                &agent_id,
+                None,
+                EventKind::ApprovalRejected,
+                json!({
+                    "agent_id":    &agent_id,
+                    "approval_id": &approval_id,
+                    "reason":      &reason,
+                }),
+            );
+            if let Some(task) = state.agents.get_mut(&agent_id) {
+                let priority = task.priority();
+                let caps     = task.cap_set_cloned();
+                let reason_text = reason.unwrap_or_else(|| "operator rejected the action".to_string());
+                task.provide_tool_results(
+                    vec![Block::ToolResult {
+                        tool_use_id: call_id,
+                        content:     format!("approval rejected: {reason_text}"),
+                        is_error:    true,
+                    }],
+                    recorder,
+                );
+                let (effect, next_turn) = {
+                    let t = task.turn();
+                    (task.step(recorder), t)
+                };
+                enqueue_or_defer(effect, agent_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
+            } else {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::FuseControlError,
+                    json!({ "error": format!("agent '{}' not found after rejection", agent_id), "is_error": true }),
+                );
+            }
+        }
+        ControlCommand::Spawn(req) => dispatch_operator_spawn_inner(req, default_model, state, sched, gateway, registry, recorder),
+    }
+}
+
+/// Inner handler for ControlCommand::Spawn — injects a new top-level agent.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_operator_spawn_inner(
+    req:            crate::control::OperatorSpawnRequest,
+    default_model:  &crate::config::ModelConfig,
+    state:          &mut SchedulerState,
+    sched:          &crate::config::SchedulerConfig,
+    gateway:        &Arc<dyn InferenceGateway + Send + Sync>,
+    registry:       &Arc<ToolRegistry>,
+    recorder:       &Arc<FlightRecorder>,
+) {
+    use crate::config::{default_max_turns, default_token_budget};
 
     // Validate / derive agent ID.
     let agent_id = match req.id {
@@ -1478,6 +1692,12 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     .map(|(k, _)| k.clone());
                 if let Some(child_id) = maybe_child {
                     AgentStatus::AwaitingChild(child_id)
+                } else if let Some((approval_id, _)) = state
+                    .pending_approvals
+                    .iter()
+                    .find(|(_, pa)| &pa.agent_id == id)
+                {
+                    AgentStatus::AwaitingApproval(approval_id.clone())
                 } else if state.deferred.iter().any(|d| &d.agent_id == id) {
                     AgentStatus::Deferred
                 } else {
@@ -1514,11 +1734,28 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         })
         .collect();
 
+    // Project pending approvals into the snapshot (bounded to ≤100 entries).
+    let pending_actions: Vec<PendingActionView> = state
+        .pending_approvals
+        .iter()
+        .take(100)
+        .map(|(approval_id, pa)| PendingActionView {
+            id:        approval_id.clone(),
+            agent_id:  pa.agent_id.clone(),
+            kind:      pa.action.kind.clone(),
+            risk:      pa.action.risk.clone(),
+            summary:   pa.action.summary.clone(),
+            args_json: serde_json::to_string(&pa.action.args).unwrap_or_default(),
+            age_secs:  pa.created_at.elapsed().as_secs(),
+        })
+        .collect();
+
     if let Ok(mut s) = snapshot.try_write() {
         s.agents              = agents;
         s.global_tokens_spent = state.tokens_spent;
         s.in_flight           = state.in_flight;
         s.queue_depth         = state.deferred.len();
+        s.pending_actions     = pending_actions;
     }
 }
 
@@ -1544,15 +1781,30 @@ fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
         })
         .collect();
 
+    let pending_approvals: Vec<ParkedApprovalEntry> = state
+        .pending_approvals
+        .iter()
+        .enumerate()
+        .map(|(i, (approval_id, pa))| ParkedApprovalEntry {
+            approval_id: approval_id.clone(),
+            agent_id:    pa.agent_id.clone(),
+            call_id:     pa.call_id.clone(),
+            action:      pa.action.clone(),
+            seq:         i as u64,
+        })
+        .collect();
+
     SchedulerCheckpoint {
-        format_version: crate::checkpoint::FORMAT_VERSION,
+        format_version:    crate::checkpoint::FORMAT_VERSION,
         agents,
         awaiting,
-        mailboxes:    state.mailboxes.clone(),
-        tokens_spent: state.tokens_spent,
-        child_seq:    state.child_seq,
-        spawn_depths: state.spawn_depths.clone(),
-        parent_map:   state.parent_map.clone(),
+        mailboxes:         state.mailboxes.clone(),
+        tokens_spent:      state.tokens_spent,
+        child_seq:         state.child_seq,
+        spawn_depths:      state.spawn_depths.clone(),
+        parent_map:        state.parent_map.clone(),
+        pending_approvals,
+        approval_seq:      state.approval_seq,
     }
 }
 
@@ -2608,6 +2860,9 @@ mod tests {
             shutdown_requested: false,
             streamed_agents:    Arc::new(Mutex::new(HashSet::new())),
             stdout_lock:        Arc::new(tokio::sync::Mutex::new(())),
+            pending_approvals:  HashMap::new(),
+            approval_seq:       0,
+            has_control:        false,
         }
     }
 
@@ -2785,14 +3040,16 @@ mod tests {
 
     fn minimal_scheduler_checkpoint(ids: &[&str]) -> SchedulerCheckpoint {
         SchedulerCheckpoint {
-            format_version: crate::checkpoint::FORMAT_VERSION,
-            agents:        ids.iter().map(|id| minimal_agent_checkpoint(id)).collect(),
-            awaiting:      vec![],
-            mailboxes:     HashMap::new(),
-            tokens_spent:  20,
-            child_seq:     3,
-            spawn_depths:  ids.iter().map(|id| (id.to_string(), 0u32)).collect(),
-            parent_map:    HashMap::new(),
+            format_version:    crate::checkpoint::FORMAT_VERSION,
+            agents:            ids.iter().map(|id| minimal_agent_checkpoint(id)).collect(),
+            awaiting:          vec![],
+            mailboxes:         HashMap::new(),
+            tokens_spent:      20,
+            child_seq:         3,
+            spawn_depths:      ids.iter().map(|id| (id.to_string(), 0u32)).collect(),
+            parent_map:        HashMap::new(),
+            pending_approvals: vec![],
+            approval_seq:      0,
         }
     }
 
@@ -2884,14 +3141,16 @@ mod tests {
         // We check them by running a fresh scheduler seeded with a checkpoint that has non-zero values,
         // then immediately completing the agent before it can touch these values.
         let cp = SchedulerCheckpoint {
-            format_version: crate::checkpoint::FORMAT_VERSION,
-            agents:         vec![minimal_agent_checkpoint("agent")],
-            awaiting:       vec![],
-            mailboxes:      HashMap::new(),
-            tokens_spent:   42,
-            child_seq:      7,
-            spawn_depths:   [("agent".to_string(), 0u32)].into_iter().collect(),
-            parent_map:     HashMap::new(),
+            format_version:    crate::checkpoint::FORMAT_VERSION,
+            agents:            vec![minimal_agent_checkpoint("agent")],
+            awaiting:          vec![],
+            mailboxes:         HashMap::new(),
+            tokens_spent:      42,
+            child_seq:         7,
+            spawn_depths:      [("agent".to_string(), 0u32)].into_iter().collect(),
+            parent_map:        HashMap::new(),
+            pending_approvals: vec![],
+            approval_seq:      0,
         };
         let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
         let (rec, _tmp) = recorder();
