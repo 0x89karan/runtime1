@@ -784,62 +784,14 @@ FUSE pseudofile (JSONL, `INO_APPROVALS=16`); `ControlCommand` extended with `App
 variants; `AgentStatus::AwaitingApproval`; checkpoint FORMAT_VERSION 2→3; `agentctl watch`
 Approvals view (`[a]`); 932 workspace tests. Full spec: `docs/plans/p7.4-approval-gate.md`.
 
-**p7.5 — Egress mediator (governance linchpin)** [CORE] *(planned — gate before the universal
-tier and any "bounded/audited" claim)*
-The keystone of the product thesis (`docs/PRODUCT-THESIS.md`): "secure + observable +
-framework-agnostic + per-agent model metering" all collapse without it. Each governed workload
-runs in a network namespace with **no internet route except a local AgentOS proxy** = the LLM
-gateway (served Anthropic/OpenAI-compatible endpoint wrapping `InferenceGateway`) + the MCP
-gateway + a per-agent `Net{hosts,ports}` allowlist; everything else is dropped and recorded.
-Lets AgentOS govern a foreign-framework agent or headless `claude`/`codex` **without a rewrite**
-(point its `base_url` at the proxy, confine egress) — the rebuttal to the insertion-point
-objection. Honest boundaries baked into the events: confinement is strong but the allowed
-channels are covert channels (bounded, not sealed); content audit is full on the native tier,
-best-effort on TLS-pinning foreign workloads (`content_audited` flag). Adds **boundary secret
-rewriting** (placeholder secrets in the agent env; proxy swaps placeholder→real at the boundary
-— a memory dump yields inert strings) and **tamper-evident signed audit receipts** (Ed25519,
-hash-chained, emitted by the proxy outside agent memory; offline-verifiable forensic evidence
-vs. forgeable logs). New events: `egress_brokered`/`egress_denied`/`action_receipt_emitted`.
-Builds on p4.2 `IsolateNetwork` + p4.6 Landlock-V4 net + p7.1 HTTP. Full spec:
-`docs/plans/p7.5-egress-mediator.md`.
-
-**p7.6 — Isolation floor (microVM / gVisor) for the universal tier** [CORE] *(planned —
-prerequisite for hosting untrusted/foreign code)*
-The capability layer (Landlock/seccomp/namespaces) is least-privilege on a shared host kernel —
-**not** an isolation boundary for untrusted, agent-generated, or foreign-framework code (one
-kernel exploit from host compromise). The real floor is a **microVM (Firecracker, dedicated
-guest kernel)** or a **user-space kernel (gVisor)**. Native-tier agents can run with the
-capability layer alone; the *universal tier* needs this floor underneath the egress netns.
-**Couples to observability** (eBPF for native/Firecracker-guest; gVisor remote sink for gVisor —
-host eBPF is blind inside gVisor). A dual-backend (gVisor when nested-KVM is unavailable,
-Firecracker when hardware isolation is demanded) is the resilient posture. Design context:
-`docs/PRODUCT-THESIS.md` security model + `docs/OBSERVABILITY-PLAN.md`.
-
-**obs.1 — flight→OTLP sidecar + GenAI semconv** [HARNESS] *(planned — rides on p7.5)*
-Export the existing flight-event stream as OpenTelemetry: run=trace, agent=span, turn/inference/
-tool/egress=child spans, tokens/$=metrics, GenAI `gen_ai.*` semconv. Ships as the `agentos-otel`
-sidecar (tails `flight.jsonl`; keeps the heavy OTEL deps out of the ≤6 MB core); optional
-cargo-feature in-core exporter later. W3C `traceparent` injected at the egress mediator so
-hosted foreign workloads join the same trace. The value is interop with standard backends, not
-new signal. Full design: `docs/OBSERVABILITY-PLAN.md`.
-
-**p7.5 — Egress mediator (governance linchpin)** [CORE] *(planned — gate before the universal
-tier and any "bounded/audited" claim)*
-The keystone of the product thesis (`docs/PRODUCT-THESIS.md`): "secure + observable +
-framework-agnostic + per-agent model metering" all collapse without it. Each governed workload
-runs in a network namespace with **no internet route except a local AgentOS proxy** = the LLM
-gateway (served Anthropic/OpenAI-compatible endpoint wrapping `InferenceGateway`) + the MCP
-gateway + a per-agent `Net{hosts,ports}` allowlist; everything else is dropped and recorded.
-Lets AgentOS govern a foreign-framework agent or headless `claude`/`codex` **without a rewrite**
-(point its `base_url` at the proxy, confine egress) — the rebuttal to the insertion-point
-objection. Honest boundaries baked into the events: confinement is strong but the allowed
-channels are covert channels (bounded, not sealed); content audit is full on the native tier,
-best-effort on TLS-pinning foreign workloads (`content_audited` flag). Adds **boundary secret
-rewriting** (placeholder secrets in the agent env; proxy swaps placeholder→real at the boundary
-— a memory dump yields inert strings) and **tamper-evident signed audit receipts** (Ed25519,
-hash-chained, emitted by the proxy outside agent memory; offline-verifiable forensic evidence
-vs. forgeable logs). New events: `egress_brokered`/`egress_denied`/`action_receipt_emitted`.
-Builds on p4.2 `IsolateNetwork` + p4.6 Landlock-V4 net + p7.1 HTTP. Full spec:
+**p7.5 — Egress mediator (governance linchpin) — vertical slice** [CORE] ✅ *complete (v0.39.0)*
+Native-tier egress governance: Ed25519 + SHA-256 hash-chained `evidence.jsonl` receipts;
+boundary secret rewriting (`ANTHROPIC_API_KEY` → placeholder in agent env at startup);
+`EgressProxy` in-process mediator intercepts inference results and calls `EvidenceWriter`;
+`agentctl verify` offline chain verifier; Inspector `Egress` filter in `agentctl watch`;
+hyper v1 HTTP stub (p7.5b readiness); 4 new flight events (`egress_brokered`,
+`egress_denied`, `action_receipt_emitted`, `egress_proxy_failed`); 937 workspace tests.
+Universal-tier (netns proxy) deferred to p7.5b after p7.6 isolation floor. Full spec:
 `docs/plans/p7.5-egress-mediator.md`.
 
 **p7.6 — Isolation floor (microVM / gVisor) for the universal tier** [CORE] *(planned —

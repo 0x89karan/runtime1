@@ -718,13 +718,15 @@ mod tests {
     fn make_snapshot(ids: &[&str]) -> Snapshot {
         Snapshot {
             agents: ids.iter().map(|id| AgentInfo {
-                id:             id.to_string(),
-                status:         "running".to_string(),
-                context_tokens: 0,
-                budget:         BudgetKind::Unlimited,
-                tools:          vec![],
-                parent_id:      None,
-                sandbox:        None,
+                id:              id.to_string(),
+                status:          "running".to_string(),
+                context_tokens:  0,
+                budget:          BudgetKind::Unlimited,
+                tools:           vec![],
+                parent_id:       None,
+                sandbox:         None,
+                egress_brokered: 0,
+                egress_denied:   0,
             }).collect(),
             budget: None, queue: None, sandbox: None, provider: None, error: None,
         }

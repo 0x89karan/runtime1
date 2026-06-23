@@ -705,6 +705,86 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     };
     let registry = Arc::new(registry);
 
+    // ── p7.5 egress mediator ─────────────────────────────────────────────────
+    let evidence_path = {
+        let p = std::path::Path::new(&cfg.egress.evidence_path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(p)
+        }
+    };
+    let egress_key_path = {
+        let p = std::path::Path::new(&cfg.egress.key_path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(p)
+        }
+    };
+    // OV-1 (p5.8 pattern): evidence file must not fall inside any MCP server's FsWrite prefix.
+    // A sandboxed server with write access to evidence_path could tamper with the receipt chain.
+    {
+        let norm_ev = normalize_path(&evidence_path);
+        for srv in &cfg.tools.mcp_servers {
+            for cap in srv.capabilities.iter().flatten() {
+                let prefix = match cap {
+                    Capability::FsWrite { prefix } => prefix,
+                    _ => continue,
+                };
+                let norm_prefix = normalize_path(std::path::Path::new(prefix));
+                if norm_prefix.as_os_str().is_empty() {
+                    continue;
+                }
+                anyhow::ensure!(
+                    !norm_ev.starts_with(&norm_prefix),
+                    "evidence file {} falls inside MCP server {:?}'s FsWrite sandbox prefix {}; \
+                     move the evidence file outside all server FS write prefixes \
+                     (e.g. set evidence_path = \"/run/evidence.jsonl\" in [egress])",
+                    norm_ev.display(),
+                    srv.name,
+                    norm_prefix.display()
+                );
+            }
+        }
+    }
+    let evidence_writer = match agentd::evidence::EvidenceWriter::open(&evidence_path, &egress_key_path) {
+        Ok(w) => Arc::new(w),
+        Err(e) => {
+            for client in &mcp_backends {
+                client.shutdown().await;
+            }
+            return Err(e.context("initializing egress evidence writer (fail-closed)"));
+        }
+    };
+    // Overwrite ANTHROPIC_API_KEY with a placeholder after the gateway has
+    // captured the real key into its field. Native agents never see real credentials.
+    // Safety: called before scheduler.run() (i.e. before any agent tasks are spawned),
+    // so no concurrent threads are reading env vars at this point.
+    std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-PLACEHOLDER-agentd");
+    let egress_proxy = Arc::new(agentd::egress::EgressProxy::new(
+        Arc::clone(&evidence_writer),
+        Arc::clone(&recorder),
+    ));
+    if let Some(ref addr) = cfg.egress.proxy_addr {
+        match agentd::egress::start_http_stub(addr).await {
+            Ok(bound) => {
+                tracing::info!(addr = %bound, "egress HTTP stub started");
+            }
+            Err(e) => {
+                for client in &mcp_backends {
+                    client.shutdown().await;
+                }
+                return Err(e.context("egress HTTP stub failed to bind (fail-closed)"));
+            }
+        }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Attempt to restore from a prior checkpoint. On corrupt file: rename and start fresh.
     let store = CheckpointStore::new(std::path::Path::new("."));
     let maybe_checkpoint = match store.load() {
@@ -771,6 +851,8 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         drop(control_rx);
         scheduler
     };
+
+    let scheduler = scheduler.with_egress(egress_proxy);
 
     let streamed_agents = scheduler.streamed_agents();
     let outcomes = scheduler.run().await;
@@ -1420,6 +1502,10 @@ mod tests {
             "approval_requested",
             "approval_granted",
             "approval_rejected",
+            "egress_brokered",
+            "egress_denied",
+            "action_receipt_emitted",
+            "egress_proxy_failed",
         ];
         for kind in &required_kinds {
             assert!(

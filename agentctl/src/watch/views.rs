@@ -219,6 +219,13 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
             Span::styled("  Sandbox:  ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(sandbox_str),
         ]),
+        Line::from(vec![
+            Span::styled("  Egress:   ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                "{} brokered  {} denied",
+                agent.egress_brokered, agent.egress_denied
+            )),
+        ]),
     ];
     f.render_widget(
         Paragraph::new(lines)
@@ -226,7 +233,7 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
         content_area,
     );
 
-    let hints = " Esc/q back to dashboard ";
+    let hints = " Esc/q back to dashboard | [i] inspector ";
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_area,
@@ -1105,13 +1112,15 @@ mod tests {
 
     fn make_agent(id: &str, status: &str, ctx: u64, tools: Vec<String>) -> AgentInfo {
         AgentInfo {
-            id:             id.to_string(),
-            status:         status.to_string(),
-            context_tokens: ctx,
-            budget:         BudgetKind::Unlimited,
+            id:              id.to_string(),
+            status:          status.to_string(),
+            context_tokens:  ctx,
+            budget:          BudgetKind::Unlimited,
             tools,
-            parent_id:      None,
-            sandbox:        None,
+            parent_id:       None,
+            sandbox:         None,
+            egress_brokered: 0,
+            egress_denied:   0,
         }
     }
 

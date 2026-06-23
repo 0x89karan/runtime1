@@ -92,6 +92,18 @@ pub enum EventKind {
     /// Operator rejected a pending action; agent resumed with is_error result.
     /// data: { agent_id, approval_id, reason? }
     ApprovalRejected,
+    /// Egress call permitted and action receipt written.
+    /// data: { agent, kind, dest, input_tokens, output_tokens, content_audited }
+    EgressBrokered,
+    /// Egress call denied by policy; receipt written.
+    /// data: { agent, attempted_dest }
+    EgressDenied,
+    /// Action receipt appended to evidence.jsonl.
+    /// data: { agent, verdict, chain_seq }
+    ActionReceiptEmitted,
+    /// Egress proxy failed to initialise or write a receipt.
+    /// data: { error }
+    EgressProxyFailed,
     Error,
 }
 
@@ -156,6 +168,10 @@ mod tests {
         assert_eq!(kind_str(EventKind::ApprovalRequested), "approval_requested");
         assert_eq!(kind_str(EventKind::ApprovalGranted), "approval_granted");
         assert_eq!(kind_str(EventKind::ApprovalRejected), "approval_rejected");
+        assert_eq!(kind_str(EventKind::EgressBrokered), "egress_brokered");
+        assert_eq!(kind_str(EventKind::EgressDenied), "egress_denied");
+        assert_eq!(kind_str(EventKind::ActionReceiptEmitted), "action_receipt_emitted");
+        assert_eq!(kind_str(EventKind::EgressProxyFailed), "egress_proxy_failed");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

@@ -488,6 +488,21 @@ impl App {
         let log = if self.view == View::Topology { self.log_path.as_deref() } else { None };
         self.topology = build_graph(&self.agents, log);
 
+        // Count egress events per agent only when AgentDetail is open; egress
+        // events are sparse so the scan is cheap, but we still avoid it on every
+        // tick in other views.
+        if self.view == View::AgentDetail {
+            if let Some(lp) = self.log_path.as_deref() {
+                let counts = reader::count_egress_by_agent(lp);
+                for agent in &mut self.agents {
+                    if let Some(&(b, d)) = counts.get(&agent.id) {
+                        agent.egress_brokered = b;
+                        agent.egress_denied   = d;
+                    }
+                }
+            }
+        }
+
         // Load templates once when the Spawn view is first entered.
         if self.view == View::Spawn {
             self.spawn_view.load();
@@ -569,13 +584,15 @@ mod tests {
 
     fn make_agent(id: &str) -> AgentInfo {
         AgentInfo {
-            id:             id.to_string(),
-            status:         "running".to_string(),
-            context_tokens: 0,
-            budget:         BudgetKind::Unlimited,
-            tools:          vec![],
-            parent_id:      None,
-            sandbox:        None,
+            id:              id.to_string(),
+            status:          "running".to_string(),
+            context_tokens:  0,
+            budget:          BudgetKind::Unlimited,
+            tools:           vec![],
+            parent_id:       None,
+            sandbox:         None,
+            egress_brokered: 0,
+            egress_denied:   0,
         }
     }
 

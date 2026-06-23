@@ -3,6 +3,40 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.5] - 2026-06-23 (v0.39.0)
+
+Native-tier egress governance — tamper-evident signed audit receipts, boundary
+secret rewriting, in-process inference mediator, and offline chain verifier.
+
+- **`agentd/src/evidence.rs`** — `EvidenceWriter` with Ed25519 signing (via `ring`)
+  and SHA-256 hash-chaining; `ActionReceipt` / `ReceiptBody` serde types; genesis
+  hash = 64 zero hex chars; `record_allowed()` / `record_denied()` return u64 seq;
+  `verify_chain()` for offline verification; private key written at 0600 permissions
+  on Unix; `resume_chain()` on restart; 5 unit tests.
+- **`agentd/src/egress.rs`** — `EgressProxy { writer, recorder }`; `record_inference()`
+  emits `EgressBrokered` + `ActionReceiptEmitted`; `record_denied()` emits `EgressDenied`
+  + `ActionReceiptEmitted`; `start_http_stub()` binds hyper v1 HTTP server returning 501
+  on all paths (p7.5b readiness).
+- **Boundary secret rewriting** — after `AnthropicGateway::from_env()` captures the real
+  `ANTHROPIC_API_KEY`, `main.rs` overwrites the env var with `sk-ant-PLACEHOLDER-agentd`
+  so a memory dump of the agent process yields an inert string.
+- **`[egress]` TOML config** — `EgressConfig { evidence_path, key_path, proxy_addr }`;
+  `#[serde(default)]`; fail-closed startup if `EvidenceWriter::open()` fails; evidence
+  path resolved to absolute at startup (OV-1 pattern).
+- **Scheduler threading** — `SchedulerState.egress: Option<Arc<EgressProxy>>`; builder
+  `Scheduler::with_egress()`; `make_infer_future()` calls `record_inference()` on both
+  streaming and non-streaming paths after a successful response.
+- **4 new `EventKind` variants** — `EgressBrokered`, `EgressDenied`,
+  `ActionReceiptEmitted`, `EgressProxyFailed`.
+- **`agentctl verify`** — offline chain verifier subcommand; reads `evidence.jsonl` +
+  Ed25519 public key file; prints `chain ok: N receipts verified` on success.
+- **Inspector `Egress` filter** — cycles `All → Errors → Sandbox → CapDenied → Egress → All`
+  in `agentctl watch`; matches `egress_brokered`, `egress_denied`, `action_receipt_emitted`.
+- **`docs/CONVENTIONS.md`** — 4 new event rows for the egress tier.
+- **`ring` / `hyper` / `hyper-util` / `http-body-util`** made explicit in `Cargo.toml`
+  (all were already transitive; now declarative).
+- 945 workspace tests (up from 932); 13 new tests.
+
 ## [p7.4] - 2026-06-22 (v0.38.0)
 
 Human-in-the-loop approval gate: agents can pause and ask the operator for

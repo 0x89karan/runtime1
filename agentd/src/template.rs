@@ -231,6 +231,7 @@ impl TemplateConfig {
             scheduler: self.scheduler.clone(),
             memory: self.memory.clone(),
             log_path: None,
+            egress: Default::default(),
         })
     }
 }

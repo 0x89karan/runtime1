@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, io::{BufRead, BufReader}, path::Path};
 
 use serde::Deserialize;
 
@@ -92,13 +92,15 @@ pub struct PendingAction {
 /// Snapshot of one running agent, assembled from per-file reads.
 #[derive(Debug, Clone, Default)]
 pub struct AgentInfo {
-    pub id:             String,
-    pub status:         String,
-    pub context_tokens: u64,
-    pub budget:         BudgetKind,
-    pub tools:          Vec<String>,
-    pub parent_id:      Option<String>,
-    pub sandbox:        Option<AgentSandbox>,
+    pub id:               String,
+    pub status:           String,
+    pub context_tokens:   u64,
+    pub budget:           BudgetKind,
+    pub tools:            Vec<String>,
+    pub parent_id:        Option<String>,
+    pub sandbox:          Option<AgentSandbox>,
+    pub egress_brokered:  u64,
+    pub egress_denied:    u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -163,12 +165,48 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
         Some(s)               => Some(s.to_string()),
     };
     let sandbox = read_agent_sandbox(agents_dir, id);
-    AgentInfo { id: id.to_string(), status, context_tokens, budget, tools, parent_id, sandbox }
+    AgentInfo {
+        id: id.to_string(),
+        status,
+        context_tokens,
+        budget,
+        tools,
+        parent_id,
+        sandbox,
+        egress_brokered: 0,
+        egress_denied:   0,
+    }
 }
 
 /// Read /agents/<id>/sandbox
 pub fn read_agent_sandbox(agents_dir: &Path, id: &str) -> Option<AgentSandbox> {
     read_json(&agents_dir.join(id).join("sandbox"))
+}
+
+/// Scan flight.jsonl and count `egress_brokered` and `egress_denied` events per
+/// agent. Returns a map of agent_id → (brokered_count, denied_count).
+///
+/// The FlightRecorder wraps every event payload under a "data" key, so the
+/// agent field lives at `data.agent`.
+pub fn count_egress_by_agent(log_path: &Path) -> HashMap<String, (u64, u64)> {
+    let file = match fs::File::open(log_path) {
+        Ok(f)  => f,
+        Err(_) => return HashMap::new(),
+    };
+    let mut counts: HashMap<String, (u64, u64)> = HashMap::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let is_brokered = line.contains("\"egress_brokered\"");
+        let is_denied   = line.contains("\"egress_denied\"");
+        if !is_brokered && !is_denied { continue; }
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+            let agent = val["data"]["agent"].as_str().unwrap_or("").to_string();
+            if agent.is_empty() { continue; }
+            let entry = counts.entry(agent).or_default();
+            if is_brokered { entry.0 += 1; }
+            if is_denied   { entry.1 += 1; }
+        }
+    }
+    counts
 }
 
 /// Read /agents/approvals and parse each JSON line into a PendingAction.

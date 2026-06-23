@@ -4,6 +4,8 @@ pub mod capability;
 pub mod checkpoint;
 pub mod config;
 pub mod control;
+pub mod egress;
+pub mod evidence;
 pub mod events;
 pub mod flight_recorder;
 pub mod inference;

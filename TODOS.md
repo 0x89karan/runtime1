@@ -51,6 +51,35 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   or increase `MAX_DIR_KEYS` and add a per-call budget. Document the limit prominently in RUNBOOK.md.
   (RUNBOOK.md already documents this; a sentinel file would be the runtime signal.) Deferred to p6+.
 
+## Phase 7 — Open (deferred from p7.5 autoplan, 2026-06-23)
+
+**p7.5-scope-01 — Universal-tier egress deferred to p7.5b**
+- Three unsolved architecture problems must be resolved before p7.5b:
+  - **E1** — Commit to FD-pass transport: `SandboxRule::EgressViaProxy { proxy_fd: RawFd }`,
+    `apply_compiled` clears close-on-exec; workload env gets `AGENTOS_EGRESS_ADDR=127.0.0.1:PORT`.
+  - **E2** — HTTP server: use hyper v1 directly (already transitive via reqwest); no axum.
+    Measure binary delta before any other work (`cargo bloat --release` on musl target).
+  - **E3** — Caller identity: per-workload unix socket at accept time; never trust `agent_id` header.
+- Plus prerequisites: `[[workloads]]` TOML schema (D1), fail-closed proxy invariant (D2),
+  and the p7.6 isolation floor (microVM/gVisor). Gate p7.5b behind all three.
+
+**p7.5-scope-03 — resume_chain does not re-verify existing receipts on restart**
+- On restart `EvidenceWriter::open()` re-opens an existing `evidence.jsonl` and anchors to the
+  last line without verifying its signature. An attacker with file write access before restart
+  can inject a poisoned anchor line; the verifier (`agentctl verify`) still catches this from
+  genesis, but future receipts chain from the poisoned anchor.
+- Fix in p7.5b: on open, call a lightweight `scan_last_verified_line()` that verifies the last
+  N lines (or reads the last signed seq from a sidecar `.chain-head` file). Low priority while
+  evidence.jsonl lives in the operator-controlled runtime dir (same threat model as the keyfile).
+
+**p7.5-scope-02 — Allowlisted host forwarder deferred (host policy hard problem)**
+- `Capability::Net.hosts` remains advisory in p7.5 (native tier used in-process EgressProxy
+  for receipt recording only; no HTTP hop, no host enforcement). Enforcing it at the proxy
+  requires: DNS rebinding mitigations, CNAME/IP canonicalization, IPv4/IPv6 literals, redirect
+  following policy, link-local/RFC-1918 denials, host suffix confusion guards.
+- Full proxy-enforced `Net.hosts` (with semantic change from advisory) is deferred to p7.5b.
+  Document semantic change in CONVENTIONS.md and CHANGELOG when proxy enforcement lands.
+
 ## Phase 7 — Open (deferred from p7.4 QA)
 
 **p7.4-qa-01 (LOW) — Silent no-op when approval item disappears between List→Confirm mode transitions**

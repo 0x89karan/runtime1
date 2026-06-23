@@ -17,36 +17,42 @@ pub enum InspectorFilter {
     Errors,
     Sandbox,
     CapDenied,
+    Egress,
 }
 
 impl InspectorFilter {
     pub fn label(&self) -> &'static str {
         match self {
-            InspectorFilter::All      => "All",
-            InspectorFilter::Errors   => "Errors",
-            InspectorFilter::Sandbox  => "Sandbox",
+            InspectorFilter::All       => "All",
+            InspectorFilter::Errors    => "Errors",
+            InspectorFilter::Sandbox   => "Sandbox",
             InspectorFilter::CapDenied => "CapDenied",
+            InspectorFilter::Egress    => "Egress",
         }
     }
 
     pub fn next(&self) -> InspectorFilter {
         match self {
-            InspectorFilter::All      => InspectorFilter::Errors,
-            InspectorFilter::Errors   => InspectorFilter::Sandbox,
-            InspectorFilter::Sandbox  => InspectorFilter::CapDenied,
-            InspectorFilter::CapDenied => InspectorFilter::All,
+            InspectorFilter::All       => InspectorFilter::Errors,
+            InspectorFilter::Errors    => InspectorFilter::Sandbox,
+            InspectorFilter::Sandbox   => InspectorFilter::CapDenied,
+            InspectorFilter::CapDenied => InspectorFilter::Egress,
+            InspectorFilter::Egress    => InspectorFilter::All,
         }
     }
 
     pub fn matches(&self, line: &str, search: &str) -> bool {
         let base = match self {
-            InspectorFilter::All      => true,
-            InspectorFilter::Errors   => line.contains("\"kind\":\"tool_error\"")
+            InspectorFilter::All       => true,
+            InspectorFilter::Errors    => line.contains("\"kind\":\"tool_error\"")
                 || line.contains("\"kind\":\"inference_error\"")
                 || line.contains("\"kind\":\"agent_failed\""),
-            InspectorFilter::Sandbox  => line.contains("\"kind\":\"sandbox_applied\"")
+            InspectorFilter::Sandbox   => line.contains("\"kind\":\"sandbox_applied\"")
                 || line.contains("\"kind\":\"sandbox_skipped\""),
             InspectorFilter::CapDenied => line.contains("\"kind\":\"capability_denied\""),
+            InspectorFilter::Egress    => line.contains("\"kind\":\"egress_brokered\"")
+                || line.contains("\"kind\":\"egress_denied\"")
+                || line.contains("\"kind\":\"action_receipt_emitted\""),
         };
         base && (search.is_empty() || line.contains(search))
     }
@@ -189,13 +195,28 @@ mod tests {
     }
 
     #[test]
+    fn inspector_filter_egress_matches_egress_events() {
+        let f = InspectorFilter::Egress;
+        assert!(f.matches(r#"{"kind":"egress_brokered","agent":"scout"}"#, ""));
+        assert!(f.matches(r#"{"kind":"egress_denied","agent":"scout"}"#, ""));
+        assert!(f.matches(r#"{"kind":"action_receipt_emitted","agent":"scout"}"#, ""));
+        assert!(!f.matches(r#"{"kind":"capability_denied"}"#, ""));
+        assert!(!f.matches(r#"{"kind":"tool_error"}"#, ""));
+    }
+
+    #[test]
     fn inspector_filter_cycles_all_to_errors() {
         assert_eq!(InspectorFilter::All.next(), InspectorFilter::Errors);
     }
 
     #[test]
-    fn inspector_filter_cycles_cap_denied_back_to_all() {
-        assert_eq!(InspectorFilter::CapDenied.next(), InspectorFilter::All);
+    fn inspector_filter_cycles_cap_denied_to_egress() {
+        assert_eq!(InspectorFilter::CapDenied.next(), InspectorFilter::Egress);
+    }
+
+    #[test]
+    fn inspector_filter_cycles_egress_back_to_all() {
+        assert_eq!(InspectorFilter::Egress.next(), InspectorFilter::All);
     }
 
     #[test]
@@ -204,6 +225,7 @@ mod tests {
         assert!(!InspectorFilter::Errors.label().is_empty());
         assert!(!InspectorFilter::Sandbox.label().is_empty());
         assert!(!InspectorFilter::CapDenied.label().is_empty());
+        assert!(!InspectorFilter::Egress.label().is_empty());
     }
 
     #[test]

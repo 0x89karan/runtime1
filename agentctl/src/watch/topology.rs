@@ -248,13 +248,15 @@ mod tests {
 
     fn make_agent(id: &str, parent: Option<&str>, status: &str) -> AgentInfo {
         AgentInfo {
-            id:             id.to_string(),
-            status:         status.to_string(),
-            context_tokens: 0,
-            budget:         BudgetKind::Unlimited,
-            tools:          vec![],
-            parent_id:      parent.map(str::to_string),
-            sandbox:        None,
+            id:              id.to_string(),
+            status:          status.to_string(),
+            context_tokens:  0,
+            budget:          BudgetKind::Unlimited,
+            tools:           vec![],
+            parent_id:       parent.map(str::to_string),
+            sandbox:         None,
+            egress_brokered: 0,
+            egress_denied:   0,
         }
     }
 

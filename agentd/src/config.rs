@@ -41,6 +41,9 @@ pub struct Config {
     /// Path for the flight log (JSONL). Defaults to "flight.jsonl" in the CWD.
     /// The --log-path CLI flag takes precedence over this field.
     pub log_path: Option<String>,
+    /// Egress mediator configuration (p7.5+).
+    #[serde(default)]
+    pub egress: EgressConfig,
 }
 
 /// Mutability class for a declared knowledge-base segment (p5.4+).
@@ -142,6 +145,46 @@ impl Default for MemoryConfig {
             max_entries_per_segment:  None,
             max_entry_age_days:       None,
             distill_on_complete:      false,
+        }
+    }
+}
+
+/// Configuration for the egress mediator and tamper-evident audit log (p7.5+).
+///
+/// ```toml
+/// [egress]
+/// evidence_path = "evidence.jsonl"   # default
+/// key_path      = "egress-key.pkcs8" # default; created on first run
+/// proxy_addr    = "127.0.0.1:8765"   # optional: bind HTTP stub (p7.5b readiness)
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressConfig {
+    /// Path to the tamper-evident action receipt log.
+    #[serde(default = "default_evidence_path")]
+    pub evidence_path: String,
+    /// Path to the Ed25519 private key (PKCS8 DER). Created automatically on first run.
+    #[serde(default = "default_egress_key_path")]
+    pub key_path: String,
+    /// If set, bind an HTTP stub server on this address (always returns 501).
+    /// Fail-closed: agentd exits non-zero if bind fails.
+    #[serde(default)]
+    pub proxy_addr: Option<String>,
+}
+
+fn default_evidence_path() -> String {
+    "evidence.jsonl".to_string()
+}
+fn default_egress_key_path() -> String {
+    "egress-key.pkcs8".to_string()
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self {
+        Self {
+            evidence_path: default_evidence_path(),
+            key_path:      default_egress_key_path(),
+            proxy_addr:    None,
         }
     }
 }

@@ -14,6 +14,7 @@ use crate::{
     capability::Capability,
     checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, ParkedApprovalEntry, SchedulerCheckpoint},
     config::{AgentConfig, ModelConfig, PendingActionRequest, SchedulerConfig, SpawnConfig},
+    egress::EgressProxy,
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse, Msg, Role},
     memory::MemoryStore,
@@ -116,6 +117,8 @@ struct SchedulerState {
     /// True when a control channel (FUSE /agents/control) was provided at startup.
     /// When false, request_approval is immediately rejected — no way to resolve it otherwise.
     has_control:      bool,
+    /// Optional egress proxy; when present, each inference emits a signed receipt.
+    egress:           Option<Arc<EgressProxy>>,
 }
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
@@ -148,6 +151,8 @@ pub struct Scheduler {
     /// Agent IDs for which at least one text chunk was streamed to stdout.
     /// Read by main.rs after run() to suppress the duplicate println!.
     streamed_agents:     Arc<Mutex<HashSet<String>>>,
+    /// Optional egress proxy; attached via with_egress().
+    egress:              Option<Arc<EgressProxy>>,
 }
 
 impl Scheduler {
@@ -255,6 +260,7 @@ impl Scheduler {
             default_model_cfg:   model_cfg.clone(),
             control_rx:          None,
             streamed_agents:     Arc::new(Mutex::new(HashSet::new())),
+            egress:              None,
         })
     }
 
@@ -282,6 +288,12 @@ impl Scheduler {
         self
     }
 
+    /// Attach an egress proxy. Each successful inference emits a signed receipt.
+    pub fn with_egress(mut self, egress: Arc<EgressProxy>) -> Self {
+        self.egress = Some(egress);
+        self
+    }
+
     /// Run all agents concurrently until every one reaches a terminal state.
     /// Returns a map from agent_id to Ok(answer) or Err.
     pub async fn run(self) -> HashMap<String, anyhow::Result<String>> {
@@ -299,6 +311,7 @@ impl Scheduler {
             default_model_cfg,
             mut control_rx,
             streamed_agents,
+            egress,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
@@ -323,6 +336,7 @@ impl Scheduler {
             pending_approvals:  HashMap::new(),
             approval_seq:       0,
             has_control:        control_rx.is_some(),
+            egress,
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -810,6 +824,7 @@ fn handle_agent_terminal(
 /// via `tokio::join!`, and records `InferenceStreamStarted`/`InferenceStreamCompleted`
 /// events. When false, calls `infer()` directly. Both paths produce an
 /// `EffectResult::Inference`.
+#[allow(clippy::too_many_arguments)]
 fn make_infer_future(
     req: InferenceRequest,
     id: String,
@@ -818,6 +833,7 @@ fn make_infer_future(
     recorder: Arc<FlightRecorder>,
     streamed_agents: Arc<Mutex<HashSet<String>>>,
     stdout_lock: Arc<tokio::sync::Mutex<()>>,
+    egress: Option<Arc<EgressProxy>>,
 ) -> PendingFut {
     if req.streaming {
         let model = gw.model_id().to_string();
@@ -885,13 +901,21 @@ fn make_infer_future(
                         "output_tokens": resp.output_tokens,
                     }),
                 );
+                if let Some(ref ep) = egress {
+                    ep.record_inference(&id, &model, resp.input_tokens, resp.output_tokens);
+                }
             }
 
             EffectResult::Inference { agent_id: id, result: infer_result }
         })
     } else {
+        let model = gw.model_id().to_string();
         Box::pin(async move {
-            EffectResult::Inference { agent_id: id, result: gw.infer(req).await }
+            let result = gw.infer(req).await;
+            if let (Some(ref ep), Ok(ref resp)) = (&egress, &result) {
+                ep.record_inference(&id, &model, resp.input_tokens, resp.output_tokens);
+            }
+            EffectResult::Inference { agent_id: id, result }
         })
     }
 }
@@ -967,8 +991,9 @@ fn drain_deferred(
         let rec = Arc::clone(recorder);
         let sa  = Arc::clone(&state.streamed_agents);
         let sl  = Arc::clone(&state.stdout_lock);
+        let eg  = state.egress.clone();
         let id  = d.agent_id;
-        state.pending.push(make_infer_future(d.request, id, is_multi, gw, rec, sa, sl));
+        state.pending.push(make_infer_future(d.request, id, is_multi, gw, rec, sa, sl, eg));
     }
 }
 
@@ -1004,9 +1029,10 @@ fn enqueue_or_defer(
                 let rec      = Arc::clone(recorder);
                 let sa       = Arc::clone(&state.streamed_agents);
                 let sl       = Arc::clone(&state.stdout_lock);
+                let eg       = state.egress.clone();
                 let is_multi = state.agents.len() > 1;
                 let id       = agent_id;
-                state.pending.push(make_infer_future(req, id, is_multi, gw, rec, sa, sl));
+                state.pending.push(make_infer_future(req, id, is_multi, gw, rec, sa, sl, eg));
             } else if !budget_ok {
                 recorder.record(
                     &agent_id,
@@ -2863,6 +2889,7 @@ mod tests {
             pending_approvals:  HashMap::new(),
             approval_seq:       0,
             has_control:        false,
+            egress:             None,
         }
     }
 
