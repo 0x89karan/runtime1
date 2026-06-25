@@ -119,6 +119,11 @@ struct SchedulerState {
     has_control:      bool,
     /// Optional egress proxy; when present, each inference emits a signed receipt.
     egress:           Option<Arc<EgressProxy>>,
+    /// Bound address of the HTTP egress proxy (set by p7.5b, used by p7.6 spawn path).
+    egress_addr:      Option<std::net::SocketAddr>,
+    /// Registry of registered universal-tier workloads (p7.5b). Read by p7.6 spawn path.
+    #[allow(dead_code)]
+    proxy_registry:   Option<Arc<crate::egress::ProxyRegistry>>,
 }
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
@@ -153,6 +158,10 @@ pub struct Scheduler {
     streamed_agents:     Arc<Mutex<HashSet<String>>>,
     /// Optional egress proxy; attached via with_egress().
     egress:              Option<Arc<EgressProxy>>,
+    /// Bound address of the HTTP egress proxy (p7.5b). Set via with_egress_addr().
+    egress_addr:         Option<std::net::SocketAddr>,
+    /// Registry of registered universal-tier workloads (p7.5b).
+    proxy_registry:      Option<Arc<crate::egress::ProxyRegistry>>,
 }
 
 impl Scheduler {
@@ -261,6 +270,8 @@ impl Scheduler {
             control_rx:          None,
             streamed_agents:     Arc::new(Mutex::new(HashSet::new())),
             egress:              None,
+            egress_addr:         None,
+            proxy_registry:      None,
         })
     }
 
@@ -294,6 +305,23 @@ impl Scheduler {
         self
     }
 
+    /// Store the bound address of the HTTP egress proxy for p7.6 spawn injection.
+    pub fn with_egress_addr(mut self, addr: Option<std::net::SocketAddr>) -> Self {
+        self.egress_addr = addr;
+        self
+    }
+
+    /// Store the proxy registry so p7.6 can register workloads before spawning.
+    pub fn with_proxy_registry(mut self, registry: Arc<crate::egress::ProxyRegistry>) -> Self {
+        self.proxy_registry = Some(registry);
+        self
+    }
+
+    /// Return the bound egress proxy address, if configured.
+    pub fn egress_addr(&self) -> Option<std::net::SocketAddr> {
+        self.egress_addr
+    }
+
     /// Run all agents concurrently until every one reaches a terminal state.
     /// Returns a map from agent_id to Ok(answer) or Err.
     pub async fn run(self) -> HashMap<String, anyhow::Result<String>> {
@@ -312,6 +340,8 @@ impl Scheduler {
             mut control_rx,
             streamed_agents,
             egress,
+            egress_addr,
+            proxy_registry,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
@@ -337,6 +367,8 @@ impl Scheduler {
             approval_seq:       0,
             has_control:        control_rx.is_some(),
             egress,
+            egress_addr,
+            proxy_registry,
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -902,7 +934,7 @@ fn make_infer_future(
                     }),
                 );
                 if let Some(ref ep) = egress {
-                    ep.record_inference(&id, &model, resp.input_tokens, resp.output_tokens);
+                    ep.record_inference(&id, &model, resp.input_tokens.into(), resp.output_tokens.into());
                 }
             }
 
@@ -913,7 +945,7 @@ fn make_infer_future(
         Box::pin(async move {
             let result = gw.infer(req).await;
             if let (Some(ref ep), Ok(ref resp)) = (&egress, &result) {
-                ep.record_inference(&id, &model, resp.input_tokens, resp.output_tokens);
+                ep.record_inference(&id, &model, resp.input_tokens.into(), resp.output_tokens.into());
             }
             EffectResult::Inference { agent_id: id, result }
         })
@@ -1782,6 +1814,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         s.in_flight           = state.in_flight;
         s.queue_depth         = state.deferred.len();
         s.pending_actions     = pending_actions;
+        s.egress_addr         = state.egress_addr.map(|a| format!("http://{a}"));
     }
 }
 
@@ -2890,6 +2923,8 @@ mod tests {
             approval_seq:       0,
             has_control:        false,
             egress:             None,
+            egress_addr:        None,
+            proxy_registry:     None,
         }
     }
 
@@ -3762,5 +3797,43 @@ mod tests {
         "#;
         let cfg: crate::config::ModelConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.streaming, "streaming must be parsed as true when set in config");
+    }
+
+    // ── p7.5b egress_addr ─────────────────────────────────────────────────────
+
+    #[test]
+    fn scheduler_exposes_egress_addr() {
+        let gw = MockGateway::new(vec![]);
+        let scheduler = make_scheduler(vec![], unlimited(), gw);
+        let addr: std::net::SocketAddr = "127.0.0.1:9111".parse().unwrap();
+        let scheduler = scheduler.with_egress_addr(Some(addr));
+        assert_eq!(scheduler.egress_addr(), Some(addr));
+    }
+
+    #[test]
+    fn scheduler_egress_addr_none_by_default() {
+        let gw = MockGateway::new(vec![]);
+        let scheduler = make_scheduler(vec![], unlimited(), gw);
+        assert!(scheduler.egress_addr().is_none());
+    }
+
+    #[test]
+    fn update_snapshot_writes_egress_addr() {
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot::default()));
+        let addr: std::net::SocketAddr = "127.0.0.1:9222".parse().unwrap();
+        let mut state = minimal_state("egress_snap_test");
+        state.egress_addr = Some(addr);
+        update_snapshot(&snap, &state);
+        let s = snap.read().unwrap();
+        assert_eq!(s.egress_addr.as_deref(), Some("http://127.0.0.1:9222"));
+    }
+
+    #[test]
+    fn update_snapshot_egress_addr_none_when_not_set() {
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot::default()));
+        let state = minimal_state("egress_snap_none_test");
+        update_snapshot(&snap, &state);
+        let s = snap.read().unwrap();
+        assert!(s.egress_addr.is_none());
     }
 }

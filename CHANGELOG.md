@@ -3,6 +3,46 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.5b] - 2026-06-24 (v0.40.0)
+
+Universal-tier HTTP forwarding proxy — real key-routing gateway replacing the 501 stub.
+
+- **`agentd/src/egress.rs`** — `ProxyRegistry` (`RwLock<HashMap<String, ProxyEntry>>`);
+  `ProxyPolicy { allowed_hosts, token_budget_remaining }`; `register()` / `deregister_by_key()`
+  / `entry_for_key()`; `start_http_proxy()` binds hyper v1 listener + routes requests via
+  `handle_proxy_request()`; ephemeral key identity via `x-api-key` header; real
+  `ANTHROPIC_API_KEY` lives only in proxy memory; hop-by-hop header stripping (Host,
+  Content-Length, Transfer-Encoding, Connection); 8 MB response cap → 502; 120 s upstream
+  timeout → 504; `Accept: text/event-stream` → 501 with structured `detail` field;
+  `json_error_response()` helper; `record_proxy_failed()` flight event; `start_http_stub()`
+  kept for backward compat; 12 new unit tests.
+- **`agentd/src/scheduler.rs`** — `egress_addr: Option<SocketAddr>` + `proxy_registry:
+  Option<Arc<ProxyRegistry>>` on `SchedulerState`; builder methods `with_egress_addr()` +
+  `with_proxy_registry()`; `egress_addr()` getter; `update_snapshot()` writes
+  `http://{addr}` string; 4 new tests.
+- **`surfaces/src/snapshot.rs`** — `egress_addr: Option<String>` on `SchedulerSnapshot`.
+- **`surfaces/src/agents_fs.rs`** — `INO_SYS_EGRESS_ADDR = 17`; `sys_file_content()` arm
+  returns address or `"not configured\n"`; `SystemDir` lookup + `getattr`/`open` range
+  checks + `readdir` entry; 2 new tests.
+- **`agentd/src/main.rs`** — captures `real_api_key` before env overwrite; constructs
+  `ProxyRegistry`; `start_http_proxy()` → `egress_bound_addr`; fail-closed on bind error;
+  passes `with_egress_addr()` + `with_proxy_registry()` to scheduler.
+- **RUNBOOK §9** — "HTTP egress proxy" section: enabling, discovering bound port, wiring a
+  workload, streaming limitation, verifying proxy started; `[egress]` example in config ref.
+- **`agentd/agent.toml`** — commented `[egress]` example block.
+- **QA hardening** — 5 CRITICAL/HIGH fixes from ship review: pre-forward budget check (429),
+  upstream error message sanitized (no `format!("{e}")`), buffer overflow check before extend,
+  `Ordering::AcqRel` on budget `fetch_update` to close TOCTOU race, accept loop `continue` on
+  transient errors; content-type allowlist (only `application/json` passes); float token parsing
+  (`as_f64()`) for robustness; test helpers DRY-ified via `start_test_proxy` + `register_workload`;
+  `proxy_strips_ephemeral_inserts_real_key` rewired to mock upstream (no real API calls in tests).
+- **Adversarial-review hardening** — H-2: `start_http_proxy_impl` visibility narrowed (was
+  `pub(crate)`, tests use `super::*`); loopback-only assertion added; M-2: `content-type` removed
+  from `PASSTHROUGH_HEADERS` — proxy always sets `application/json` upstream regardless of workload
+  value; two `unwrap()` in response builder paths changed to `expect()`; H-1 TOCTOU over-spend
+  and M-3 `anthropic-beta` passthrough deferred to p7.6 (see TODOS.md `p7.5b-ar-*`).
+- **968 workspace tests** (up from 945 in p7.5, +23 in p7.5b).
+
 ## [p7.5] - 2026-06-23 (v0.39.0)
 
 Native-tier egress governance — tamper-evident signed audit receipts, boundary

@@ -53,15 +53,14 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 
 ## Phase 7 — Open (deferred from p7.5 autoplan, 2026-06-23)
 
-**p7.5-scope-01 — Universal-tier egress deferred to p7.5b**
-- Three unsolved architecture problems must be resolved before p7.5b:
-  - **E1** — Commit to FD-pass transport: `SandboxRule::EgressViaProxy { proxy_fd: RawFd }`,
-    `apply_compiled` clears close-on-exec; workload env gets `AGENTOS_EGRESS_ADDR=127.0.0.1:PORT`.
-  - **E2** — HTTP server: use hyper v1 directly (already transitive via reqwest); no axum.
-    Measure binary delta before any other work (`cargo bloat --release` on musl target).
-  - **E3** — Caller identity: per-workload unix socket at accept time; never trust `agent_id` header.
-- Plus prerequisites: `[[workloads]]` TOML schema (D1), fail-closed proxy invariant (D2),
-  and the p7.6 isolation floor (microVM/gVisor). Gate p7.5b behind all three.
+**p7.5-scope-01 — Universal-tier egress deferred to p7.5b** ✅ *resolved in p7.5b (v0.40.0)*
+- All three architecture problems addressed: hyper v1 (E2 ✅), ephemeral per-workload API keys
+  for caller identity (E3 ✅, key-based vs. FD-pass — simpler and avoids exec boundary complications),
+  loopback-only bind + FUSE `egress_addr` surface (E1 ✅). FD-pass deferred to p7.6 when microVM
+  isolation requires it.
+- `[[workloads]]` TOML schema not needed: workloads register at runtime via `ProxyRegistry::register()`.
+- Fail-closed proxy invariant: `start_http_proxy()` → `anyhow::ensure!` on empty real key; returns
+  `Err` on bind failure; scheduler fails-closed if proxy start fails.
 
 **p7.5-scope-03 — resume_chain does not re-verify existing receipts on restart**
 - On restart `EvidenceWriter::open()` re-opens an existing `evidence.jsonl` and anchors to the
@@ -73,12 +72,30 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   evidence.jsonl lives in the operator-controlled runtime dir (same threat model as the keyfile).
 
 **p7.5-scope-02 — Allowlisted host forwarder deferred (host policy hard problem)**
-- `Capability::Net.hosts` remains advisory in p7.5 (native tier used in-process EgressProxy
-  for receipt recording only; no HTTP hop, no host enforcement). Enforcing it at the proxy
-  requires: DNS rebinding mitigations, CNAME/IP canonicalization, IPv4/IPv6 literals, redirect
-  following policy, link-local/RFC-1918 denials, host suffix confusion guards.
-- Full proxy-enforced `Net.hosts` (with semantic change from advisory) is deferred to p7.5b.
-  Document semantic change in CONVENTIONS.md and CHANGELOG when proxy enforcement lands.
+- `Capability::Net.hosts` remains advisory in p7.5 and p7.5b (proxy always forwards to one
+  hardcoded upstream `ANTHROPIC_MESSAGES_URL`; `allowed_hosts` field is scaffolding only).
+  Full per-workload host enforcement requires: DNS rebinding mitigations, CNAME/IP canonicalization,
+  IPv4/IPv6 literals, redirect following policy, link-local/RFC-1918 denials, host suffix
+  confusion guards.
+- Deferred to p7.6 alongside the isolation floor. Document semantic change in CONVENTIONS.md
+  and CHANGELOG when proxy enforcement lands.
+
+**p7.5b-ar-01 (HIGH) — Budget TOCTOU: concurrent requests can over-spend**
+- Pre-check `load() == 0` and post-response `fetch_update(AcqRel, ...)` are not atomic.
+  N concurrent requests can all pass the zero-check and collectively over-spend the budget
+  by up to N × request_cost before any decrement lands. Saturating arithmetic prevents wrap,
+  but the counter reaches zero only after over-spend.
+- Acceptable for p7.5b single-agent soft-budget. True fix: pre-reserve an estimated cost
+  via CAS before forwarding and refund the remainder post-response. Revisit in p7.6 when
+  microVM workloads can fire concurrent requests.
+
+**p7.5b-ar-02 (MEDIUM) — anthropic-beta passthrough allows workload-controlled feature flags**
+- `anthropic-beta` header is forwarded verbatim. A workload can opt into experimental
+  Anthropic API features (e.g. `files-api-2025-04-14`) that may have different cost profiles
+  or capability gates the operator did not intend to allow.
+- Low risk in current single-agent context (operator controls the workload config anyway).
+  Revisit in p7.6 when multi-workload operator may want to restrict beta feature usage.
+  Fix: validate against an operator-configured allowlist in `EgressConfig`.
 
 ## Phase 7 — Open (deferred from p7.4 QA)
 

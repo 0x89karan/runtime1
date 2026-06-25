@@ -38,6 +38,12 @@ native = ["all"]                      # built-in tools: "all" or a list like ["r
 # store_path = "memory.redb"   # path to the redb file (relative to CWD or absolute)
 # enabled    = true            # set to false to skip store open and kv tool registration
 
+# HTTP egress proxy (p7.5b+). Omit section to disable (default).
+# When enabled, agentd binds a forwarding proxy and exposes its address at
+# /agents/system/egress_addr. Workloads set ANTHROPIC_BASE_URL to that address.
+# [egress]
+# proxy_addr = "127.0.0.1:9100"   # ":0" → OS assigns a free port
+
 # To use kv / KB tools, list them explicitly (they are NOT included in "all"):
 #   [tools]
 #   native = ["read_file", "list_dir", "kv_get", "kv_set", "kb_put", "kb_get", "kb_search"]

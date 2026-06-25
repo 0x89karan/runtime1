@@ -794,6 +794,16 @@ hyper v1 HTTP stub (p7.5b readiness); 4 new flight events (`egress_brokered`,
 Universal-tier (netns proxy) deferred to p7.5b after p7.6 isolation floor. Full spec:
 `docs/plans/p7.5-egress-mediator.md`.
 
+**p7.5b — Universal-tier HTTP forwarding proxy** [CORE] ✅ *complete (v0.40.0)*
+Real HTTP forwarding proxy replacing the `start_http_stub()` 501 stub: `ProxyRegistry`
+(`RwLock<HashMap<ephemeral_key, ProxyEntry>>`); per-workload ephemeral key identity in
+`x-api-key` header; real `ANTHROPIC_API_KEY` lives only in proxy memory; hop-by-hop header
+stripping; 8 MB response cap; 120 s upstream timeout; SSE/streaming requests → 501
+(deferred to p7.5c); structured `detail` error field; signed action receipts + flight events;
+FUSE `/agents/system/egress_addr` (INO 17); `[egress] proxy_addr` TOML config; fail-closed
+bind; RUNBOOK §9 egress proxy section; 960 workspace tests. Full spec:
+`docs/plans/p7.5b-universal-tier-proxy.md`.
+
 **p7.6 — Isolation floor (microVM / gVisor) for the universal tier** [CORE] *(planned —
 prerequisite for hosting untrusted/foreign code)*
 The capability layer (Landlock/seccomp/namespaces) is least-privilege on a shared host kernel —

@@ -761,6 +761,19 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             return Err(e.context("initializing egress evidence writer (fail-closed)"));
         }
     };
+    // Capture the real API key before overwriting env with the placeholder.
+    // The proxy uses this key for upstream forwarding; the key never leaves agentd's
+    // memory and is never written to disk or logged.
+    let real_api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    // Fail fast: if the egress proxy is configured but ANTHROPIC_API_KEY is unset,
+    // there is no key to forward — reject clearly rather than silently proxying with
+    // an empty credential.
+    if cfg.egress.proxy_addr.is_some() && real_api_key.is_empty() {
+        anyhow::bail!(
+            "egress proxy configured but ANTHROPIC_API_KEY is unset — \
+             set the key or remove [egress] proxy_addr from config"
+        );
+    }
     // Overwrite ANTHROPIC_API_KEY with a placeholder after the gateway has
     // captured the real key into its field. Native agents never see real credentials.
     // Safety: called before scheduler.run() (i.e. before any agent tasks are spawned),
@@ -770,19 +783,29 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         Arc::clone(&evidence_writer),
         Arc::clone(&recorder),
     ));
-    if let Some(ref addr) = cfg.egress.proxy_addr {
-        match agentd::egress::start_http_stub(addr).await {
+    let proxy_registry = Arc::new(agentd::egress::ProxyRegistry::new());
+    let egress_bound_addr: Option<std::net::SocketAddr> = if let Some(ref addr) = cfg.egress.proxy_addr {
+        match agentd::egress::start_http_proxy(
+            addr,
+            real_api_key,
+            Arc::clone(&proxy_registry),
+            Arc::clone(&recorder),
+            Arc::clone(&evidence_writer),
+        ).await {
             Ok(bound) => {
-                tracing::info!(addr = %bound, "egress HTTP stub started");
+                tracing::info!(addr = %bound, "egress proxy started");
+                Some(bound)
             }
             Err(e) => {
                 for client in &mcp_backends {
                     client.shutdown().await;
                 }
-                return Err(e.context("egress HTTP stub failed to bind (fail-closed)"));
+                return Err(e.context("egress proxy failed to bind (fail-closed)"));
             }
         }
-    }
+    } else {
+        None
+    };
     // ─────────────────────────────────────────────────────────────────────────
 
     // Attempt to restore from a prior checkpoint. On corrupt file: rename and start fresh.
@@ -852,7 +875,10 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         scheduler
     };
 
-    let scheduler = scheduler.with_egress(egress_proxy);
+    let scheduler = scheduler
+        .with_egress(egress_proxy)
+        .with_egress_addr(egress_bound_addr)
+        .with_proxy_registry(proxy_registry);
 
     let streamed_agents = scheduler.streamed_agents();
     let outcomes = scheduler.run().await;

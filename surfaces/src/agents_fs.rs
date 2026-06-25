@@ -67,6 +67,9 @@ pub(crate) const INO_CONTROL: u64 = 15;
 /// Read-only approvals pseudofile: JSON lines of pending approval requests.
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const INO_APPROVALS: u64 = 16;
+/// /agents/system/egress_addr — bound HTTP proxy URL or "not configured" (p7.5b).
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYS_EGRESS_ADDR: u64 = 17;
 
 // Invariant: all per-agent file offsets must fit within DIR_STEP - 1 slots.
 #[cfg(any(test, target_os = "linux"))]
@@ -462,6 +465,12 @@ impl AgentsFs {
                 let escaped = json_escape_str(&snap.provider_model);
                 format!("{{\"model\":\"{escaped}\",\"backend\":\"anthropic\"}}\n")
             }
+            INO_SYS_EGRESS_ADDR => {
+                match &snap.egress_addr {
+                    Some(addr) => format!("{addr}\n"),
+                    None       => "not configured\n".to_string(),
+                }
+            }
             _ => return None,
         };
         Some(content.into_bytes())
@@ -766,10 +775,11 @@ impl fuser::Filesystem for AgentsFs {
 
             Some(ParentKind::SystemDir) => {
                 let ino = match name_str {
-                    "budget"   => INO_SYS_BUDGET,
-                    "queue"    => INO_SYS_QUEUE,
-                    "sandbox"  => INO_SYS_SANDBOX,
-                    "provider" => INO_SYS_PROVIDER,
+                    "budget"      => INO_SYS_BUDGET,
+                    "queue"       => INO_SYS_QUEUE,
+                    "sandbox"     => INO_SYS_SANDBOX,
+                    "provider"    => INO_SYS_PROVIDER,
+                    "egress_addr" => INO_SYS_EGRESS_ADDR,
                     _ => { reply.error(libc::ENOENT); return; }
                 };
                 let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
@@ -890,7 +900,7 @@ impl fuser::Filesystem for AgentsFs {
             reply.attr(&TTL, &make_file_attr(INO_SYSTEM, 0, fuser::FileType::Directory));
             return;
         }
-        if (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) {
+        if (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) || ino == INO_SYS_EGRESS_ADDR {
             let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
             reply.attr(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile));
             return;
@@ -1047,12 +1057,13 @@ impl fuser::Filesystem for AgentsFs {
 
             Some(ParentKind::SystemDir) => {
                 vec![
-                    (INO_SYSTEM,       fuser::FileType::Directory,   ".".to_string()),
-                    (ROOT_INO,         fuser::FileType::Directory,   "..".to_string()),
-                    (INO_SYS_BUDGET,   fuser::FileType::RegularFile, "budget".to_string()),
-                    (INO_SYS_QUEUE,    fuser::FileType::RegularFile, "queue".to_string()),
-                    (INO_SYS_SANDBOX,  fuser::FileType::RegularFile, "sandbox".to_string()),
-                    (INO_SYS_PROVIDER, fuser::FileType::RegularFile, "provider".to_string()),
+                    (INO_SYSTEM,           fuser::FileType::Directory,   ".".to_string()),
+                    (ROOT_INO,             fuser::FileType::Directory,   "..".to_string()),
+                    (INO_SYS_BUDGET,       fuser::FileType::RegularFile, "budget".to_string()),
+                    (INO_SYS_QUEUE,        fuser::FileType::RegularFile, "queue".to_string()),
+                    (INO_SYS_SANDBOX,      fuser::FileType::RegularFile, "sandbox".to_string()),
+                    (INO_SYS_PROVIDER,     fuser::FileType::RegularFile, "provider".to_string()),
+                    (INO_SYS_EGRESS_ADDR,  fuser::FileType::RegularFile, "egress_addr".to_string()),
                 ]
             }
 
@@ -1184,7 +1195,7 @@ impl fuser::Filesystem for AgentsFs {
         } else if let Some(kind) = self.dyn_ino_kind.get(&ino) {
             !matches!(kind, DynInoKind::KbSeg { .. })
         } else {
-            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
+            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) || ino == INO_SYS_EGRESS_ADDR
         };
         if is_file {
             reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
@@ -1305,6 +1316,7 @@ mod tests {
             provider_model:      String::new(),
             sandbox:             Default::default(),
             pending_actions:     vec![],
+            egress_addr:         None,
         }))
     }
 
@@ -1324,6 +1336,7 @@ mod tests {
             provider_model:      provider_model.to_string(),
             sandbox:             SandboxSummary { any_sandboxed, ..Default::default() },
             pending_actions:     vec![],
+            egress_addr:         None,
         }))
     }
 
@@ -2278,6 +2291,7 @@ mod tests {
                 degradations:   vec!["landlock_net_unavailable".to_string()],
             },
             pending_actions:     vec![],
+            egress_addr:         None,
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
@@ -2297,6 +2311,28 @@ mod tests {
         let s = String::from_utf8(content).unwrap();
         assert!(s.contains("\"any_sandboxed\""), "key must be any_sandboxed");
         assert!(!s.contains("\"applied\""), "old key must not appear");
+    }
+
+    #[test]
+    fn fuse_system_egress_addr_not_configured() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "");
+        let fs = AgentsFs::new(snap, None, None);
+        let content = fs.sys_file_content(INO_SYS_EGRESS_ADDR).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "not configured\n");
+    }
+
+    #[test]
+    fn fuse_system_egress_addr_set() {
+        let snap = make_snap_with_sys(vec![], 0, 0, false, "");
+        {
+            let mut w = snap.write().unwrap();
+            w.egress_addr = Some("http://127.0.0.1:9100".to_string());
+        }
+        let fs = AgentsFs::new(snap, None, None);
+        let content = fs.sys_file_content(INO_SYS_EGRESS_ADDR).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert_eq!(s, "http://127.0.0.1:9100\n");
     }
 
     #[test]
@@ -2363,6 +2399,7 @@ mod tests {
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
             pending_actions:     vec![],
+            egress_addr:         None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
@@ -2387,6 +2424,7 @@ mod tests {
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
             pending_actions:     vec![],
+            egress_addr:         None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a2");
@@ -2422,6 +2460,7 @@ mod tests {
             provider_model:      String::new(),
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
             pending_actions:     vec![],
+            egress_addr:         None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a3");

@@ -71,6 +71,9 @@ pub struct SchedulerSnapshot {
     pub sandbox:             SandboxSummary,
     /// Current approval queue (bounded to ≤100 entries).
     pub pending_actions:     Vec<PendingActionView>,
+    /// Bound address of the HTTP egress proxy, e.g. "http://127.0.0.1:9100".
+    /// None when the proxy is not configured.
+    pub egress_addr:         Option<String>,
 }
 
 #[derive(Clone)]
