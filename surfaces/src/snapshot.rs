@@ -99,6 +99,10 @@ pub struct AgentSnapshot {
     /// True when the agent's capabilities field is None (unrestricted access to all
     /// registered servers). Disambiguates from an empty accessible_server_names list.
     pub capabilities_unrestricted: bool,
+    /// Execution tier: "native" | "universal". None defaults to "native" for backward compat.
+    pub tier: Option<String>,
+    /// PID of the child process for universal-tier agents. None for native-tier agents.
+    pub pid: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

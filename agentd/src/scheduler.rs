@@ -13,12 +13,13 @@ use crate::{
     bus::{MailMessage, Mailboxes},
     capability::Capability,
     checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, ParkedApprovalEntry, SchedulerCheckpoint},
-    config::{AgentConfig, ModelConfig, PendingActionRequest, SchedulerConfig, SpawnConfig},
+    config::{AgentConfig, AgentTier, ModelConfig, PendingActionRequest, SchedulerConfig, SpawnConfig},
     egress::EgressProxy,
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse, Msg, Role},
     memory::MemoryStore,
     tools::ToolRegistry,
+    universal::UniversalAgent,
 };
 use surfaces::{AgentSnapshot, AgentStatus, PendingActionView, SchedulerSnapshot};
 
@@ -121,9 +122,10 @@ struct SchedulerState {
     egress:           Option<Arc<EgressProxy>>,
     /// Bound address of the HTTP egress proxy (set by p7.5b, used by p7.6 spawn path).
     egress_addr:      Option<std::net::SocketAddr>,
-    /// Registry of registered universal-tier workloads (p7.5b). Read by p7.6 spawn path.
-    #[allow(dead_code)]
+    /// Registry of registered universal-tier workloads. Used by p7.6 spawn path.
     proxy_registry:   Option<Arc<crate::egress::ProxyRegistry>>,
+    /// Universal-tier child processes (p7.6). Keyed by agent ID.
+    universal_agents: HashMap<String, UniversalAgent>,
 }
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
@@ -162,6 +164,8 @@ pub struct Scheduler {
     egress_addr:         Option<std::net::SocketAddr>,
     /// Registry of registered universal-tier workloads (p7.5b).
     proxy_registry:      Option<Arc<crate::egress::ProxyRegistry>>,
+    /// Universal-tier configs staged at construction; spawned in run() once egress_addr is known.
+    universal_pending:   Vec<AgentConfig>,
 }
 
 impl Scheduler {
@@ -185,6 +189,7 @@ impl Scheduler {
         let store = CheckpointStore::new(&cwd);
         let mut agents = HashMap::new();
         let mut restored: Option<SchedulerRestored> = None;
+        let mut universal_pending: Vec<AgentConfig> = Vec::new();
 
         if let Some(cp) = checkpoint {
             let SchedulerCheckpoint {
@@ -205,12 +210,23 @@ impl Scheduler {
                 .map(|a| (a.agent_id.clone(), a))
                 .collect();
 
+            let mut universal_ids_cp: std::collections::HashSet<String> = std::collections::HashSet::new();
             for cfg in agent_configs {
                 anyhow::ensure!(
-                    !agents.contains_key(&cfg.id),
+                    !agents.contains_key(&cfg.id) && !universal_ids_cp.contains(&cfg.id),
                     "duplicate agent id: {}",
                     cfg.id
                 );
+                if cfg.tier == AgentTier::Universal {
+                    anyhow::ensure!(
+                        cfg.command.is_some(),
+                        "universal-tier agent '{}' requires `command` to be set",
+                        cfg.id
+                    );
+                    universal_ids_cp.insert(cfg.id.clone());
+                    universal_pending.push(cfg);
+                    continue;
+                }
                 let specs = registry.filtered_specs(cfg.capabilities.as_deref());
                 let task = if let Some(cp_agent) = cp_map.remove(&cfg.id) {
                     AgentTask::from_checkpoint(cp_agent, specs)
@@ -242,17 +258,31 @@ impl Scheduler {
                 approval_seq:      cp_approval_seq,
             });
         } else {
+            let mut universal_pending_local: Vec<AgentConfig> = Vec::new();
+            let mut universal_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
             agents.reserve(agent_configs.len());
             for cfg in agent_configs {
                 anyhow::ensure!(
-                    !agents.contains_key(&cfg.id),
+                    !agents.contains_key(&cfg.id) && !universal_ids.contains(&cfg.id),
                     "duplicate agent id: {}",
                     cfg.id
                 );
-                let specs = registry.filtered_specs(cfg.capabilities.as_deref());
-                let task = AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs);
-                agents.insert(cfg.id.clone(), task);
+                if cfg.tier == AgentTier::Universal {
+                    // Validate early: command must be set.
+                    anyhow::ensure!(
+                        cfg.command.is_some(),
+                        "universal-tier agent '{}' requires `command` to be set",
+                        cfg.id
+                    );
+                    universal_ids.insert(cfg.id.clone());
+                    universal_pending_local.push(cfg);
+                } else {
+                    let specs = registry.filtered_specs(cfg.capabilities.as_deref());
+                    let task = AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs);
+                    agents.insert(cfg.id.clone(), task);
+                }
             }
+            universal_pending = universal_pending_local;
         }
 
         Ok(Self {
@@ -272,6 +302,7 @@ impl Scheduler {
             egress:              None,
             egress_addr:         None,
             proxy_registry:      None,
+            universal_pending,
         })
     }
 
@@ -342,6 +373,7 @@ impl Scheduler {
             egress,
             egress_addr,
             proxy_registry,
+            universal_pending,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
@@ -369,6 +401,7 @@ impl Scheduler {
             egress,
             egress_addr,
             proxy_registry,
+            universal_agents:   HashMap::new(),
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -396,6 +429,59 @@ impl Scheduler {
                 });
             }
         }
+
+        // Spawn universal-tier agents before the native seed loop.
+        for cfg in universal_pending {
+            match egress_addr {
+                Some(addr) => {
+                    // Generate a per-agent ephemeral key and register it so the
+                    // proxy can authenticate this child's inference requests.
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos() as u64;
+                    let ephemeral_key = format!("ua-{}-{:016x}", cfg.id, ts);
+                    if let Some(reg) = &state.proxy_registry {
+                        use std::sync::atomic::AtomicU64;
+                        reg.register(ephemeral_key.clone(), crate::egress::ProxyEntry {
+                            agent_id: cfg.id.clone(),
+                            policy:   crate::egress::ProxyPolicy {
+                                allowed_hosts:           vec![],
+                                token_budget_remaining:  Arc::new(AtomicU64::new(cfg.token_budget)),
+                            },
+                        });
+                    }
+                    match UniversalAgent::spawn(&cfg, addr, &ephemeral_key, &recorder) {
+                        Ok(ua) => { state.universal_agents.insert(cfg.id.clone(), ua); }
+                        Err(e) => {
+                            // Deregister the key since the agent never started.
+                            if let Some(reg) = &state.proxy_registry {
+                                reg.deregister_by_key(&ephemeral_key);
+                            }
+                            let msg = format!("universal spawn failed: {e}");
+                            recorder.record(
+                                &cfg.id,
+                                None,
+                                EventKind::AgentFailed,
+                                json!({ "reason": "universal_spawn_failed", "error": e.to_string() }),
+                            );
+                            state.outcomes.insert(cfg.id.clone(), Err(anyhow::anyhow!(msg)));
+                        }
+                    }
+                }
+                None => {
+                    let msg = "universal spawn failed: egress proxy not configured";
+                    recorder.record(
+                        &cfg.id,
+                        None,
+                        EventKind::AgentFailed,
+                        json!({ "reason": "universal_spawn_failed", "error": "egress proxy not configured" }),
+                    );
+                    state.outcomes.insert(cfg.id.clone(), Err(anyhow::anyhow!(msg)));
+                }
+            }
+        }
+        update_snapshot(&snapshot, &state);
 
         // Seed: step each agent once to kick off its first effect.
         // `or_insert` preserves restored spawn_depths; fresh agents get depth 0.
@@ -432,8 +518,11 @@ impl Scheduler {
         ).expect("failed to install SIGINT handler");
 
         'main: loop {
+            // Poll universal agents for exit on each iteration (non-blocking).
+            poll_universal_agents(&mut state, &recorder, &snapshot).await;
+
             // When all pending work is done, either wait for an operator command or exit.
-            if state.pending.is_empty() {
+            if state.pending.is_empty() && state.universal_agents.is_empty() {
                 match control_rx {
                     None => break 'main,
                     Some(ref mut rx) => {
@@ -467,6 +556,35 @@ impl Scheduler {
                         continue 'main;
                     }
                 }
+            }
+
+            // When native agents are done but universal agents are still running,
+            // yield briefly so the poll at the top of the loop can detect their exit.
+            if state.pending.is_empty() {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    _ = sigterm.recv() => {
+                        recorder.record(
+                            "agentd",
+                            None,
+                            EventKind::SystemShutdownRequested,
+                            json!({ "signal": "SIGTERM" }),
+                        );
+                        state.shutdown_requested = true;
+                        break 'main;
+                    }
+                    _ = sigint.recv() => {
+                        recorder.record(
+                            "agentd",
+                            None,
+                            EventKind::SystemShutdownRequested,
+                            json!({ "signal": "SIGINT" }),
+                        );
+                        state.shutdown_requested = true;
+                        break 'main;
+                    }
+                }
+                continue 'main;
             }
 
             tokio::select! {
@@ -764,6 +882,22 @@ impl Scheduler {
                     }
                 }
             }
+        }
+
+        // Kill any Universal agents still running at shutdown.
+        // Deregister ephemeral key BEFORE kill() so the child cannot authenticate
+        // further inference requests during the 5-second SIGTERM grace window.
+        let ua_ids: Vec<String> = state.universal_agents.keys().cloned().collect();
+        for id in ua_ids {
+            let ua = state.universal_agents.get_mut(&id).unwrap();
+            let ephemeral_key = ua.ephemeral_key.clone();
+            if let Some(reg) = &state.proxy_registry {
+                reg.deregister_by_key(&ephemeral_key);
+            }
+            ua.kill().await;
+            state.outcomes.entry(id.clone()).or_insert_with(|| {
+                Err(anyhow::anyhow!("universal agent killed at shutdown"))
+            });
         }
 
         state.outcomes
@@ -1337,15 +1471,20 @@ fn dispatch_spawn(
     let child_budget = config.token_budget.unwrap_or(parent_token_budget);
 
     let child_agent_cfg = crate::config::AgentConfig {
-        id:           child_id.clone(),
-        task:         config.task.clone(),
-        max_turns:    crate::config::default_max_turns(),
-        token_budget: child_budget,
-        priority:     config.priority,
-        capabilities: child_caps.clone(),
-        name:         None,
-        description:  String::new(),
-        skills:       vec![],
+        id:              child_id.clone(),
+        task:            config.task.clone(),
+        max_turns:       crate::config::default_max_turns(),
+        token_budget:    child_budget,
+        priority:        config.priority,
+        capabilities:    child_caps.clone(),
+        name:            None,
+        description:     String::new(),
+        skills:          vec![],
+        tier:            crate::config::AgentTier::Native,
+        command:         None,
+        args:            vec![],
+        isolation:       crate::config::IsolationMode::None,
+        max_wall_seconds: 0,
     };
 
     // 5. Build child AgentTask with filtered specs for the child's capabilities.
@@ -1606,15 +1745,20 @@ fn dispatch_operator_spawn_inner(
     let priority     = req.priority.unwrap_or(0);
 
     let agent_cfg = crate::config::AgentConfig {
-        id:           agent_id.clone(),
-        task:         req.task.clone(),
+        id:              agent_id.clone(),
+        task:            req.task.clone(),
         max_turns,
         token_budget,
         priority,
-        capabilities: req.capabilities.clone(),
-        name:         None,
-        description:  String::new(),
-        skills:       vec![],
+        capabilities:    req.capabilities.clone(),
+        name:            None,
+        description:     String::new(),
+        skills:          vec![],
+        tier:            crate::config::AgentTier::Native,
+        command:         None,
+        args:            vec![],
+        isolation:       crate::config::IsolationMode::None,
+        max_wall_seconds: 0,
     };
 
     let specs     = registry.filtered_specs(agent_cfg.capabilities.as_deref());
@@ -1670,6 +1814,27 @@ fn dispatch_send_message(
     registry: &Arc<ToolRegistry>,
     recorder: &Arc<FlightRecorder>,
 ) {
+    // Reject sends to universal-tier agents — they don't have mailboxes.
+    if state.universal_agents.contains_key(&to) {
+        let priority = state.agents[&sender_id].priority();
+        let caps = state.agents[&sender_id].cap_set_cloned();
+        let (effect, next_turn) = {
+            let sender = state.agents.get_mut(&sender_id).unwrap();
+            sender.provide_tool_results(
+                vec![Block::ToolResult {
+                    tool_use_id: call_id,
+                    content: format!("send_message failed: '{to}' is a universal-tier agent and does not accept messages"),
+                    is_error: true,
+                }],
+                recorder,
+            );
+            let t = sender.turn();
+            (sender.step(recorder), t)
+        };
+        enqueue_or_defer(effect, sender_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
+        return;
+    }
+
     // Validate recipient exists.
     let recipient_known = state.agents.contains_key(&to) || state.outcomes.contains_key(&to);
     if !recipient_known {
@@ -1788,9 +1953,41 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 parent_id: state.parent_map.get(id).cloned(),
                 accessible_server_names:   task.accessible_server_names(),
                 capabilities_unrestricted: task.is_capabilities_unrestricted(),
+                tier: None,
+                pid:  None,
             }
         })
         .collect();
+
+    // Also project universal-tier agents into the snapshot.
+    let universal_snapshots: Vec<AgentSnapshot> = state
+        .universal_agents
+        .iter()
+        .map(|(id, ua)| {
+            let iso_str = match ua.isolation {
+                crate::config::IsolationMode::Gvisor => "gvisor",
+                crate::config::IsolationMode::None   => "none",
+            };
+            AgentSnapshot {
+                id:             id.clone(),
+                status:         AgentStatus::Running,
+                turn:           0,
+                context_tokens: 0,
+                token_budget:   ua.cfg.token_budget,
+                task_preview:   ua.cfg.task.chars().take(80).collect(),
+                tools:          vec![],
+                short_term_previews: vec![],
+                parent_id:      None,
+                accessible_server_names:   vec![],
+                capabilities_unrestricted: true,
+                tier: Some(format!("universal:{iso_str}")),
+                pid:  ua.pid(),
+            }
+        })
+        .collect();
+
+    let mut agents = agents;
+    agents.extend(universal_snapshots);
 
     // Project pending approvals into the snapshot (bounded to ≤100 entries).
     let pending_actions: Vec<PendingActionView> = state
@@ -1815,6 +2012,85 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         s.queue_depth         = state.deferred.len();
         s.pending_actions     = pending_actions;
         s.egress_addr         = state.egress_addr.map(|a| format!("http://{a}"));
+    }
+}
+
+/// Poll all universal-tier agents for exit, remove finished ones, and record flight events.
+async fn poll_universal_agents(
+    state:    &mut SchedulerState,
+    recorder: &FlightRecorder,
+    snapshot: &Arc<RwLock<SchedulerSnapshot>>,
+) {
+    let ids: Vec<String> = state.universal_agents.keys().cloned().collect();
+    let mut any_exited = false;
+    for id in ids {
+        let ua = state.universal_agents.get_mut(&id).unwrap();
+
+        // Enforce max_wall_seconds before checking exit status.
+        let wall_seconds = ua.wall_seconds();
+        if ua.cfg.max_wall_seconds > 0 && wall_seconds > ua.cfg.max_wall_seconds {
+            recorder.record(
+                &id,
+                None,
+                EventKind::UniversalAgentExited,
+                json!({ "pid": ua.pid(), "exit_code": null, "wall_seconds": wall_seconds, "reason": "wall_timeout" }),
+            );
+            // Deregister BEFORE kill() so the child cannot authenticate further
+            // inference requests during the 5-second SIGTERM grace window.
+            let ephemeral_key = ua.ephemeral_key.clone();
+            if let Some(reg) = &state.proxy_registry {
+                reg.deregister_by_key(&ephemeral_key);
+            }
+            ua.kill().await;
+            state.universal_agents.remove(&id);
+            state.outcomes.insert(id.clone(), Err(anyhow::anyhow!("universal agent wall timeout exceeded")));
+            any_exited = true;
+            continue;
+        }
+
+        match ua.try_wait() {
+            Ok(Some(status)) => {
+                let exit_code = status.code();
+                recorder.record(
+                    &id,
+                    None,
+                    EventKind::UniversalAgentExited,
+                    json!({ "pid": ua.pid(), "exit_code": exit_code, "wall_seconds": wall_seconds }),
+                );
+                let ephemeral_key = ua.ephemeral_key.clone();
+                let outcome = match exit_code {
+                    Some(0) => Ok(String::new()),
+                    Some(n) => Err(anyhow::anyhow!("universal agent exited with code {n}")),
+                    None    => Err(anyhow::anyhow!("universal agent killed by signal")),
+                };
+                state.universal_agents.remove(&id);
+                if let Some(reg) = &state.proxy_registry {
+                    reg.deregister_by_key(&ephemeral_key);
+                }
+                state.outcomes.insert(id.clone(), outcome);
+                any_exited = true;
+            }
+            Ok(None) => {} // still running
+            Err(e) => {
+                recorder.record(
+                    &id,
+                    None,
+                    EventKind::Error,
+                    json!({ "stage": "universal_poll", "error": e.to_string() }),
+                );
+                let ephemeral_key = ua.ephemeral_key.clone();
+                let msg = e.to_string();
+                state.universal_agents.remove(&id);
+                if let Some(reg) = &state.proxy_registry {
+                    reg.deregister_by_key(&ephemeral_key);
+                }
+                state.outcomes.insert(id.clone(), Err(anyhow::anyhow!("universal agent poll error: {msg}")));
+                any_exited = true;
+            }
+        }
+    }
+    if any_exited {
+        update_snapshot(snapshot, state);
     }
 }
 
@@ -1989,15 +2265,20 @@ mod tests {
 
     fn agent_cfg(id: &str, task: &str) -> AgentConfig {
         AgentConfig {
-            id:           id.to_string(),
-            task:         task.to_string(),
-            max_turns:    5,
-            token_budget: 100_000,
-            priority:     0,
-            capabilities: None,
-            name:         None,
-            description:  String::new(),
-            skills:       vec![],
+            id:              id.to_string(),
+            task:            task.to_string(),
+            max_turns:       5,
+            token_budget:    100_000,
+            priority:        0,
+            capabilities:    None,
+            name:            None,
+            description:     String::new(),
+            skills:          vec![],
+            tier:            crate::config::AgentTier::Native,
+            command:         None,
+            args:            vec![],
+            isolation:       crate::config::IsolationMode::None,
+            max_wall_seconds: 0,
         }
     }
 
@@ -2925,6 +3206,7 @@ mod tests {
             egress:             None,
             egress_addr:        None,
             proxy_registry:     None,
+            universal_agents:   HashMap::new(),
         }
     }
 
@@ -3835,5 +4117,87 @@ mod tests {
         update_snapshot(&snap, &state);
         let s = snap.read().unwrap();
         assert!(s.egress_addr.is_none());
+    }
+
+    // ── p7.6 universal-tier tests ─────────────────────────────────────────────
+
+    #[test]
+    fn config_universal_requires_command() {
+        // Scheduler::new() must return Err when a universal agent has no `command`.
+        let (rec, _tmp) = recorder();
+        let bad_cfg = AgentConfig {
+            tier:    crate::config::AgentTier::Universal,
+            command: None,
+            ..agent_cfg("worker", "do stuff")
+        };
+        let result = Scheduler::new(
+            vec![bad_cfg],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(MockGateway::new(vec![])),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        );
+        let err = result.err().expect("expected Err").to_string();
+        assert!(err.contains("command"), "error must mention 'command', got: {err}");
+    }
+
+    #[tokio::test]
+    async fn universal_agent_in_fuse_snapshot() {
+        // A spawned universal agent must appear in the SchedulerSnapshot with
+        // the correct tier string, status=Running, and a non-None pid.
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot::default()));
+        let addr: std::net::SocketAddr = "127.0.0.1:19876".parse().unwrap();
+        let (rec, _tmp) = recorder();
+        let cfg = AgentConfig {
+            tier:    crate::config::AgentTier::Universal,
+            command: Some("sleep".to_string()),
+            args:    vec!["30".to_string()],
+            ..agent_cfg("univ_snap", "background")
+        };
+        let ua = UniversalAgent::spawn(&cfg, addr, "ua-snap-test-key", &rec).unwrap();
+        let mut state = minimal_state("host");
+        state.universal_agents.insert(cfg.id.clone(), ua);
+
+        update_snapshot(&snap, &state);
+        {
+            let s = snap.read().unwrap();
+            let agent = s.agents.iter().find(|a| a.id == "univ_snap")
+                .expect("universal agent must appear in snapshot");
+            assert_eq!(agent.tier.as_deref(), Some("universal:none"));
+            assert_eq!(agent.status, AgentStatus::Running);
+            assert!(agent.pid.is_some(), "pid must be set for running universal agent");
+        } // drop read guard before .await
+
+        // Cleanup.
+        state.universal_agents.get_mut("univ_snap").unwrap().kill().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_excludes_universal_agents() {
+        // Universal agents must never appear in the scheduler checkpoint —
+        // they are external processes that cannot be serialized or restored.
+        let addr: std::net::SocketAddr = "127.0.0.1:19877".parse().unwrap();
+        let (rec, _tmp) = recorder();
+        let cfg = AgentConfig {
+            tier:    crate::config::AgentTier::Universal,
+            command: Some("sleep".to_string()),
+            args:    vec!["30".to_string()],
+            ..agent_cfg("univ_ck", "work")
+        };
+        let ua = UniversalAgent::spawn(&cfg, addr, "ua-ck-test-key", &rec).unwrap();
+        let mut state = minimal_state("native");
+        state.universal_agents.insert(cfg.id.clone(), ua);
+
+        let cp = build_scheduler_checkpoint(&state);
+        assert!(
+            !cp.agents.iter().any(|a| a.agent_id == "univ_ck"),
+            "universal agent must NOT appear in checkpoint"
+        );
+
+        // Cleanup.
+        state.universal_agents.get_mut("univ_ck").unwrap().kill().await;
     }
 }

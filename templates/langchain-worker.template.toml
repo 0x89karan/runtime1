@@ -1,0 +1,46 @@
+# templates/langchain-worker.template.toml — Universal-tier LangChain agent wrapper
+# Runs a LangChain Python agent in an isolated gVisor sandbox with egress through
+# the agentd proxy. The `command` field points to the Python entrypoint; agentd
+# wraps it with `runsc do --network=host` when runsc is available.
+
+sample_tasks = [
+  "Summarize the last 10 entries in the knowledge base.",
+  "Run a web search and store the top 3 results.",
+]
+
+[template]
+name        = "langchain-worker"
+description = "Universal-tier LangChain agent running inside a gVisor sandbox."
+showcases   = "Universal tier, gVisor isolation, egress proxy, foreign-framework hosting."
+gated_requires = "gvisor"
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[capabilities]
+fs_read  = ["/workspace"]
+fs_write = ["/workspace/output"]
+
+[tools]
+native = ["read_file", "write_file", "list_dir"]
+
+[card]
+name           = "LangChain Worker"
+description    = "Universal-tier agent hosting a LangChain Python workload in gVisor."
+skills         = ["research", "data-processing", "tool-use"]
+suggested_caps = [
+  { FsRead  = { prefix = "/workspace" } },
+  { FsWrite = { prefix = "/workspace/output" } },
+]
+
+[agent]
+id               = "langchain-worker"
+task             = ""
+max_turns        = 20
+token_budget     = 100_000
+tier             = "universal"
+command          = "/workspace/agent_main.py"
+args             = []
+max_wall_seconds = 300

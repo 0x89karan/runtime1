@@ -104,6 +104,15 @@ pub enum EventKind {
     /// Egress proxy failed to initialise or write a receipt.
     /// data: { error }
     EgressProxyFailed,
+    /// Universal-tier agent child process started.
+    /// data: { isolation: "none"|"gvisor", pid, command }
+    UniversalAgentStarted,
+    /// Universal-tier agent child process exited.
+    /// data: { pid, exit_code: i32|null, wall_seconds: u64 }
+    UniversalAgentExited,
+    /// gVisor isolation requested but runsc not found; falling back to no isolation.
+    /// data: { agent_id }
+    UniversalAgentIsolationDegraded,
     Error,
 }
 
@@ -172,6 +181,9 @@ mod tests {
         assert_eq!(kind_str(EventKind::EgressDenied), "egress_denied");
         assert_eq!(kind_str(EventKind::ActionReceiptEmitted), "action_receipt_emitted");
         assert_eq!(kind_str(EventKind::EgressProxyFailed), "egress_proxy_failed");
+        assert_eq!(kind_str(EventKind::UniversalAgentStarted), "universal_agent_started");
+        assert_eq!(kind_str(EventKind::UniversalAgentExited), "universal_agent_exited");
+        assert_eq!(kind_str(EventKind::UniversalAgentIsolationDegraded), "universal_agent_isolation_degraded");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

@@ -185,6 +185,38 @@ tool-input cap, empty `input_json` → `{}`); `make_infer_future()` scheduler he
 `[agent-id]` prefix in multi-agent runs, BrokenPipe silenced; `Arc<Mutex<HashSet<String>>>
 streamed_agents` on `Scheduler` for double-print suppression; `InferenceStreamStarted` +
 `InferenceStreamCompleted` flight events; 889 workspace tests (up from 862).
+**p7.3 complete (v0.37.0).** FUSE write control surface + live agent injection: `/agents/control`
+write-only FUSE file; `ControlMsg` enum (`Inject { agent_id, text }` / `Kill { agent_id }`);
+`control_rx: Option<Receiver<ControlMsg>>` on `Scheduler`; inject writes a User turn into the
+live agent's `context` deque without consuming a tool call; `tokio::select!` arm drains
+`control_rx` each tick; `agentctl inject <id> <text>` CLI subcommand + FUSE write path;
+`OFF_CONTROL = 9` system file; `ControlInjected` + `ControlKilled` + `ControlWriteError` flight
+events; 902 workspace tests (up from 889). Revisit: `agentctl spawn` CLI should detect running
+agentd via `/agents/control` — filed as `p7.3-ar-01`.
+**p7.4 complete (v0.38.0).** Approval gate: `request_approval` native tool; `/agents/approvals`
+FUSE directory + per-approval JSON files; `approve` / `deny` write paths; `ApprovalStore` with
+pending/decided maps; `PendingActionView` in `SchedulerSnapshot`; `agentctl watch` Approvals pane
+(`[a]` key) with approve/deny key-bindings; `REQUEST_APPROVAL` / `APPROVAL_GRANTED` /
+`APPROVAL_DENIED` flight events; 932 workspace tests (up from 902).
+**p7.5 complete (v0.39.0).** Boundary secret rewriting + Ed25519 signed receipts: `SecretRewriter`
+strips `ANTHROPIC_API_KEY`-shaped tokens from native-tier tool outputs; `ReceiptSigner` signs
+every `ToolResult` with an Ed25519 key pair; `agentctl verify <flight.jsonl>` validates receipt
+chain; `BoundarySecretRedacted` + `ToolResultSigned` flight events; 945 workspace tests.
+**p7.5b complete (v0.40.0).** HTTP forwarding proxy (real key routing): `ProxyRegistry`
+(`RwLock<HashMap<String, ProxyEntry>>`); `ProxyPolicy { allowed_hosts, token_budget_remaining }`;
+`start_http_proxy()` binds hyper v1 listener + routes requests via `handle_proxy_request()`;
+ephemeral key identity via `x-api-key` header; real `ANTHROPIC_API_KEY` stored in `EgressProxy`,
+never in `ProxyEntry`; loopback-only bind; adversarial hardening (forced content-type, loopback
+assert, budget pre-check); `egress_brokered` + `egress_rejected` flight events; 968 workspace tests.
+**p7.6 complete (v0.41.0).** Isolation floor — gVisor/runsc universal-tier agent spawning:
+`agentd/src/universal.rs` (new) with `UniversalAgent::spawn()` (`env_clear()` + allowlist + ephemeral
+key injection), `kill()` (SIGTERM → 5 s → SIGKILL), `which_runsc()`; `AgentTier { Native, Universal }`
++ 5 new `AgentConfig` fields (all `#[serde(default)]`); `universal_agents: HashMap<String, UniversalAgent>`
+in `SchedulerState`; per-agent ephemeral key registered/deregistered in `ProxyRegistry`; `poll_universal_agents()`
+enforces `max_wall_seconds`; `dispatch_send_message` guard returns `is_error` for universal recipients;
+`build_scheduler_checkpoint` skips universal agents; FUSE `OFF_TIER=11` + `OFF_PID=12`; `agentctl watch`
+shows `TIER: universal | ISO: gvisor | PID: <n>` badge; `langchain-worker.template.toml`; 3 new flight
+event kinds; 978 workspace tests (up from 968).
 
 ## How to work here
 

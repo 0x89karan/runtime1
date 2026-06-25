@@ -311,6 +311,23 @@ pub struct AgentConfig {
     /// Free-form skill tags this agent advertises.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Execution tier. Default: native (in-process). Set to "universal" to run as
+    /// an external child process. Requires `command` to be set.
+    #[serde(default)]
+    pub tier: AgentTier,
+    /// Executable path for universal-tier agents. Ignored for native-tier agents.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Additional arguments passed to the command. Static only (no template substitution).
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Isolation mode for universal-tier agents. "none" (default) or "gvisor".
+    /// Requires `runsc` on PATH when set to "gvisor".
+    #[serde(default)]
+    pub isolation: IsolationMode,
+    /// Maximum wall-clock seconds before the universal agent is killed. 0 = no limit.
+    #[serde(default)]
+    pub max_wall_seconds: u64,
 }
 
 pub fn default_max_turns() -> u32 {
@@ -372,7 +389,19 @@ pub struct ToolsConfig {
     pub mcp_require_capabilities: bool,
 }
 
-/// Isolation mode for an MCP server subprocess.
+/// Execution tier for an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentTier {
+    /// In-process Rust agent (default). Uses the full inference loop.
+    #[default]
+    Native,
+    /// External process wrapped in optional gVisor isolation (p7.6).
+    /// Requires `command`, routes LLM traffic through the egress proxy.
+    Universal,
+}
+
+/// Isolation mode for an MCP server subprocess or a universal-tier agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IsolationMode {
@@ -1375,15 +1404,20 @@ task = "t"
     #[test]
     fn agent_card_name_defaults_to_id() {
         let cfg = AgentConfig {
-            id:           "scout".to_string(),
-            task:         String::new(),
-            max_turns:    20,
-            token_budget: 100_000,
-            priority:     0,
-            capabilities: None,
-            name:         None,
-            description:  String::new(),
-            skills:       vec![],
+            id:              "scout".to_string(),
+            task:            String::new(),
+            max_turns:       20,
+            token_budget:    100_000,
+            priority:        0,
+            capabilities:    None,
+            name:            None,
+            description:     String::new(),
+            skills:          vec![],
+            tier:            AgentTier::Native,
+            command:         None,
+            args:            vec![],
+            isolation:       IsolationMode::None,
+            max_wall_seconds: 0,
         };
         let card = AgentCard::from(&cfg);
         assert_eq!(card.id, "scout");
@@ -1395,15 +1429,20 @@ task = "t"
     #[test]
     fn agent_card_explicit_name_and_skills() {
         let cfg = AgentConfig {
-            id:           "reader".to_string(),
-            task:         String::new(),
-            max_turns:    20,
-            token_budget: 100_000,
-            priority:     0,
-            capabilities: None,
-            name:         Some("File Reader".to_string()),
-            description:  "Reads files".to_string(),
-            skills:       vec!["read".to_string(), "summarize".to_string()],
+            id:              "reader".to_string(),
+            task:            String::new(),
+            max_turns:       20,
+            token_budget:    100_000,
+            priority:        0,
+            capabilities:    None,
+            name:            Some("File Reader".to_string()),
+            description:     "Reads files".to_string(),
+            skills:          vec!["read".to_string(), "summarize".to_string()],
+            tier:            AgentTier::Native,
+            command:         None,
+            args:            vec![],
+            isolation:       IsolationMode::None,
+            max_wall_seconds: 0,
         };
         let card = AgentCard::from(&cfg);
         assert_eq!(card.name, "File Reader");

@@ -3,6 +3,24 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.6] - 2026-06-25 (v0.41.0)
+
+Universal-tier isolation floor — gVisor/runsc child process wrapping for agent workloads that host untrusted or foreign-framework code.
+
+- **`agentd/src/universal.rs`** (new) — `UniversalAgent` struct with `ephemeral_key` field; `spawn()` takes `ephemeral_key: &str`, clears child env, injects PATH/HOME/USER/LANG/TMPDIR + per-agent ephemeral key + `ANTHROPIC_BASE_URL`; `stdin(Stdio::null())` to avoid shared stdin fd; `kill()` (SIGTERM → 5 s → SIGKILL); `try_wait()`, `pid()`, `wall_seconds()`; `which_runsc()` probes PATH.
+- **`agentd/src/config.rs`** — `AgentTier` enum (`Native` | `Universal`); 5 new `AgentConfig` fields: `tier`, `command`, `args`, `isolation`, `max_wall_seconds` (all `#[serde(default)]`).
+- **`agentd/src/scheduler.rs`** — `universal_agents: HashMap<String, UniversalAgent>` on `SchedulerState`; spawn block generates per-agent ephemeral key and registers it in `proxy_registry`; deregisters on exit/timeout/shutdown; spawn/wall-timeout/nonzero-exit failures propagated to `state.outcomes`; duplicate ID check covers both native and universal agent maps; `poll_universal_agents()` enforces `max_wall_seconds` and inserts into `outcomes`; `update_snapshot()` encodes actual isolation as `"universal:gvisor"` or `"universal:none"` in the tier field.
+- **`agentd/src/events.rs`** — 3 new event kinds: `UniversalAgentStarted`, `UniversalAgentExited`, `UniversalAgentIsolationDegraded` (note: `UniversalOutputTruncated` removed — stdout is inherited, not buffered).
+- **`surfaces/src/snapshot.rs`** — `tier: Option<String>` + `pid: Option<u32>` on `AgentSnapshot`.
+- **`surfaces/src/agents_fs.rs`** — `OFF_TIER = 11`, `OFF_PID = 12`; 13 fixed inodes per agent dir; `tier`/`pid` virtual files.
+- **`agentctl/src/watch/reader.rs`** — reads `tier` file (parses `"universal:gvisor"` → `tier="universal"`, `isolation="gvisor"`); adds `isolation: String` to `AgentInfo`.
+- **`agentctl/src/watch/views.rs`** — universal agents show `N/A` for context tokens; AgentDetail badge shows actual isolation (`ISO: gvisor` or `ISO: none`) from snapshot; plain-mode output includes tier info.
+- **`distro/kernel-extras.config`** — gVisor/KVM comment block added.
+- **`docs/CONVENTIONS.md`** — 3 new event rows + 2 new FUSE path rows (`tier`, `pid`).
+- **`templates/langchain-worker.template.toml`** (new) — universal-tier template with `gated_requires = "gvisor"`.
+- **Security hardening (post-review)** — deregister ephemeral key before `kill()` in both shutdown and wall-timeout paths to close SIGTERM auth window; `egress_addr=None` with universal agents upgraded from `tracing::warn!` to `anyhow::bail!` (fail-fast at startup); native-tier `command` field now rejected at startup.
+- 979 workspace tests pass.
+
 ## [p7.5b] - 2026-06-24 (v0.40.0)
 
 Universal-tier HTTP forwarding proxy — real key-routing gateway replacing the 501 stub.

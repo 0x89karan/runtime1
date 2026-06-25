@@ -208,7 +208,14 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
             Span::styled("  Status:   ", Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(agent.status.clone(), status_style(&agent.status)),
         ]),
-        Line::from(format!("  Context:  {} tokens", agent.context_tokens)),
+        {
+            let ctx_str = if agent.tier == "universal" {
+                "N/A".to_string()
+            } else {
+                format!("{} tokens", agent.context_tokens)
+            };
+            Line::from(format!("  Context:  {ctx_str}"))
+        },
         Line::from(format!("  Budget:   {}", agent.budget.display())),
         Line::from(""),
         Line::from(vec![
@@ -226,6 +233,22 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
                 agent.egress_brokered, agent.egress_denied
             )),
         ]),
+        {
+            let tier = &agent.tier;
+            if tier == "universal" {
+                let pid_str = if agent.pid > 0 { format!("{}", agent.pid) } else { "?".to_string() };
+                let iso_str = if agent.isolation.is_empty() { "none" } else { &agent.isolation };
+                Line::from(vec![
+                    Span::styled("  Tier:     ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("TIER: universal | ISO: {iso_str} | PID: {pid_str}"),
+                        Style::default().fg(ratatui::style::Color::Cyan),
+                    ),
+                ])
+            } else {
+                Line::from("")
+            }
+        },
     ];
     f.render_widget(
         Paragraph::new(lines)
@@ -1011,13 +1034,20 @@ pub fn render_plain(app: &App) -> String {
     } else {
         out.push_str(&format!("agents: {}\n", app.agents.len()));
         for a in &app.agents {
+            let ctx_str = if a.tier == "universal" { "N/A".to_string() } else { a.context_tokens.to_string() };
+            let tier_str = if a.tier == "universal" {
+                format!(" tier=universal pid={}", a.pid)
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "  {} [{status}] ctx={ctx} budget={budget} tools={tools}\n",
+                "  {} [{status}] ctx={ctx} budget={budget} tools={tools}{tier}\n",
                 a.id,
                 status = a.status,
-                ctx    = a.context_tokens,
+                ctx    = ctx_str,
                 budget = a.budget.display(),
                 tools  = a.tools.len(),
+                tier   = tier_str,
             ));
         }
     }
@@ -1121,6 +1151,9 @@ mod tests {
             sandbox:         None,
             egress_brokered: 0,
             egress_denied:   0,
+            tier:            "native".to_string(),
+            isolation:       String::new(),
+            pid:             0,
         }
     }
 

@@ -101,6 +101,12 @@ pub struct AgentInfo {
     pub sandbox:          Option<AgentSandbox>,
     pub egress_brokered:  u64,
     pub egress_denied:    u64,
+    /// "native" | "universal" — parsed from /agents/<id>/tier
+    pub tier:             String,
+    /// Effective isolation mode for universal agents: "gvisor" | "none".
+    pub isolation:        String,
+    /// PID of the child process for universal-tier agents; 0 for native.
+    pub pid:              u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -165,6 +171,16 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
         Some(s)               => Some(s.to_string()),
     };
     let sandbox = read_agent_sandbox(agents_dir, id);
+    let tier_raw = read_trimmed(&dir.join("tier")).unwrap_or_else(|| "native".to_string());
+    // Tier file encodes isolation for universal agents as "universal:gvisor" or "universal:none".
+    let (tier, isolation) = if let Some((t, iso)) = tier_raw.split_once(':') {
+        (t.to_string(), iso.to_string())
+    } else {
+        (tier_raw, String::new())
+    };
+    let pid = read_trimmed(&dir.join("pid"))
+        .and_then(|s| if s == "(none)" { None } else { s.parse::<u32>().ok() })
+        .unwrap_or(0);
     AgentInfo {
         id: id.to_string(),
         status,
@@ -175,6 +191,9 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
         sandbox,
         egress_brokered: 0,
         egress_denied:   0,
+        tier,
+        isolation,
+        pid,
     }
 }
 

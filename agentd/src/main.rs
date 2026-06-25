@@ -131,9 +131,53 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         }
     }
 
+    // p7.6: startup validation for universal-tier agents.
+    {
+        use agentd::config::AgentTier;
+
+        // native-tier agents must not set `command`; that field belongs to universal-tier.
+        for c in &agent_cfgs {
+            if c.tier == AgentTier::Native && c.command.is_some() {
+                anyhow::bail!(
+                    "agent '{}': native tier does not use `command`; \
+                     remove it or set tier = \"universal\"",
+                    c.id
+                );
+            }
+        }
+
+        let universal_count = agent_cfgs.iter().filter(|c| c.tier == AgentTier::Universal).count();
+        if universal_count > 0 {
+            if cfg.egress.proxy_addr.is_none() {
+                anyhow::bail!(
+                    "{universal_count} universal-tier agent(s) configured but \
+                     [egress].proxy_addr is not set. \
+                     Add `proxy_addr = \"127.0.0.1:<port>\"` under `[egress]` in your config."
+                );
+            }
+            // Fail-fast on Linux if any universal+gvisor agent needs runsc but it is absent.
+            // Silently running without isolation defeats the purpose of requesting gVisor.
+            #[cfg(target_os = "linux")]
+            {
+                use agentd::config::IsolationMode;
+                let needs_gvisor = agent_cfgs.iter().any(|c| {
+                    c.tier == AgentTier::Universal && c.isolation == IsolationMode::Gvisor
+                });
+                if needs_gvisor && agentd::universal::which_runsc().is_none() {
+                    tracing::error!(
+                        "one or more agents require isolation = \"gvisor\" but 'runsc' is not found on PATH.\n\
+                         Install gVisor: https://gvisor.dev/docs/user_guide/install/\n\
+                         Then verify with: runsc --version"
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     // Build AgentCards from configs — static, used by list_agents tool.
-    let cards: Arc<Vec<crate::config::AgentCard>> = Arc::new(
-        agent_cfgs.iter().map(crate::config::AgentCard::from).collect()
+    let cards: Arc<Vec<agentd::config::AgentCard>> = Arc::new(
+        agent_cfgs.iter().map(agentd::config::AgentCard::from).collect()
     );
     for card in cards.iter() {
         recorder.record(

@@ -904,17 +904,17 @@ task = "t"
     }
 
     #[test]
-    fn catalogue_all_seven_templates_present() {
+    fn catalogue_all_templates_present() {
         let resolver = catalogue_resolver();
         let entries = resolver.list().unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian"] {
+        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian", "langchain-worker"] {
             assert!(
                 names.contains(expected),
                 "catalogue must contain template '{expected}'; found: {names:?}"
             );
         }
-        assert_eq!(entries.len(), 7, "catalogue must have exactly 7 templates; found: {names:?}");
+        assert_eq!(entries.len(), 8, "catalogue must have exactly 8 templates; found: {names:?}");
     }
 
     #[test]

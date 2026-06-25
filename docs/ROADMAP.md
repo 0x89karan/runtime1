@@ -804,7 +804,7 @@ FUSE `/agents/system/egress_addr` (INO 17); `[egress] proxy_addr` TOML config; f
 bind; RUNBOOK §9 egress proxy section; 960 workspace tests. Full spec:
 `docs/plans/p7.5b-universal-tier-proxy.md`.
 
-**p7.6 — Isolation floor (microVM / gVisor) for the universal tier** [CORE] *(planned —
+**▣ p7.6 — Isolation floor (microVM / gVisor) for the universal tier** [CORE] *(v0.41.0)*
 prerequisite for hosting untrusted/foreign code)*
 The capability layer (Landlock/seccomp/namespaces) is least-privilege on a shared host kernel —
 **not** an isolation boundary for untrusted, agent-generated, or foreign-framework code (one

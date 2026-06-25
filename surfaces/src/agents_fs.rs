@@ -49,6 +49,10 @@ pub(crate) const OFF_TOOLS:         u64 = 8;
 pub(crate) const OFF_PARENT:        u64 = 9;
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const OFF_SANDBOX:       u64 = 10;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const OFF_TIER:          u64 = 11;
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const OFF_PID:           u64 = 12;
 
 /// System directory and file inodes (not in inode_to_id; handled explicitly).
 #[cfg(any(test, target_os = "linux"))]
@@ -78,6 +82,10 @@ const _: () = assert!(OFF_TOOLS   < DIR_STEP - 1, "OFF_TOOLS must be < DIR_STEP 
 const _: () = assert!(OFF_PARENT  < DIR_STEP - 1, "OFF_PARENT must be < DIR_STEP - 1");
 #[cfg(any(test, target_os = "linux"))]
 const _: () = assert!(OFF_SANDBOX < DIR_STEP - 1, "OFF_SANDBOX must be < DIR_STEP - 1");
+#[cfg(any(test, target_os = "linux"))]
+const _: () = assert!(OFF_TIER    < DIR_STEP - 1, "OFF_TIER must be < DIR_STEP - 1");
+#[cfg(any(test, target_os = "linux"))]
+const _: () = assert!(OFF_PID     < DIR_STEP - 1, "OFF_PID must be < DIR_STEP - 1");
 
 /// Last 64 KB of flight.jsonl to scan for per-agent events.
 #[cfg(any(test, target_os = "linux"))]
@@ -250,11 +258,11 @@ impl AgentsFs {
         let ino = self.next_dir_inode;
         self.next_dir_inode += DIR_STEP;
         self.dir_inodes.insert(agent_id.to_string(), ino);
-        // Register all 11 fixed inodes so inode_to_id lookups work.
+        // Register all 13 fixed inodes so inode_to_id lookups work.
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
             OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
-            OFF_SANDBOX,
+            OFF_SANDBOX, OFF_TIER, OFF_PID,
         ] {
             self.inode_to_id.insert(ino + offset, agent_id.to_string());
         }
@@ -419,6 +427,16 @@ impl AgentsFs {
                 }).collect::<Vec<_>>().join(",");
                 format!("{{\"servers\":[{servers}]}}\n").into_bytes()
             }
+            OFF_TIER => {
+                let tier = agent.tier.as_deref().unwrap_or("native");
+                format!("{tier}\n").into_bytes()
+            }
+            OFF_PID => {
+                match agent.pid {
+                    Some(pid) => format!("{pid}\n").into_bytes(),
+                    None      => b"(none)\n".to_vec(),
+                }
+            }
             // OFF_MEMORY_DIR and OFF_LONG_TERM_DIR are directories — not served here.
             _ => return None,
         };
@@ -534,11 +552,11 @@ impl AgentsFs {
     /// into a `Vec<String>` before calling this (Rust borrow checker requires it).
     fn prune_dead_agent(&mut self, agent_id: &str) {
         if let Some(base) = self.dir_inodes.remove(agent_id) {
-            // Remove all 11 fixed per-agent inodes (dir + offsets 1–10).
+            // Remove all 13 fixed per-agent inodes (dir + offsets 1–12).
             for offset in [
                 0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
                 OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
-                OFF_SANDBOX,
+                OFF_SANDBOX, OFF_TIER, OFF_PID,
             ] {
                 self.inode_to_id.remove(&(base + offset));
             }
@@ -637,6 +655,8 @@ fn file_name_for_offset(offset: u64) -> Option<&'static str> {
         OFF_TOOLS         => Some("tools"),
         OFF_PARENT        => Some("parent"),
         OFF_SANDBOX       => Some("sandbox"),
+        OFF_TIER          => Some("tier"),
+        OFF_PID           => Some("pid"),
         _ => None,
     }
 }
@@ -833,6 +853,16 @@ impl fuser::Filesystem for AgentsFs {
                     }
                     "sandbox" => {
                         let ino = dir_ino + OFF_SANDBOX;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    "tier" => {
+                        let ino = dir_ino + OFF_TIER;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    "pid" => {
+                        let ino = dir_ino + OFF_PID;
                         let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
                         reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
                     }
@@ -1100,6 +1130,8 @@ impl fuser::Filesystem for AgentsFs {
                     (dir_ino + OFF_TOOLS,   fuser::FileType::RegularFile, "tools".to_string()),
                     (dir_ino + OFF_PARENT,  fuser::FileType::RegularFile, "parent".to_string()),
                     (dir_ino + OFF_SANDBOX, fuser::FileType::RegularFile, "sandbox".to_string()),
+                    (dir_ino + OFF_TIER,    fuser::FileType::RegularFile, "tier".to_string()),
+                    (dir_ino + OFF_PID,     fuser::FileType::RegularFile, "pid".to_string()),
                 ];
                 if self.memory.is_some() {
                     v.push((dir_ino + OFF_MEMORY_DIR, fuser::FileType::Directory, "memory".to_string()));
@@ -1353,6 +1385,8 @@ mod tests {
             parent_id:               None,
             accessible_server_names:   vec![],
             capabilities_unrestricted: false,
+            tier:                    None,
+            pid:                     None,
         }
     }
 
@@ -1517,6 +1551,7 @@ mod tests {
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
             OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
+            OFF_SANDBOX, OFF_TIER, OFF_PID,
         ] {
             assert!(
                 fs.inode_to_id.contains_key(&(dir_ino + offset)),
@@ -1956,7 +1991,8 @@ mod tests {
         // All agent-a entries must be gone from every map
         assert!(!fs.dir_inodes.contains_key("agent-a"), "dir_inodes must be cleared");
         for offset in [0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
-                       OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT] {
+                       OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
+                       OFF_SANDBOX, OFF_TIER, OFF_PID] {
             assert!(!fs.inode_to_id.contains_key(&(base + offset)),
                 "inode_to_id must not contain base+{offset} after prune");
         }

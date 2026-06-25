@@ -903,15 +903,20 @@ mod tests {
 
     fn agent_cfg(max_turns: u32, token_budget: u64) -> AgentConfig {
         AgentConfig {
-            id: "test-agent".to_string(),
-            task: String::new(),
+            id:              "test-agent".to_string(),
+            task:            String::new(),
             max_turns,
             token_budget,
-            priority: 0,
-            capabilities: None,
-            name: None,
-            description: String::new(),
-            skills: vec![],
+            priority:        0,
+            capabilities:    None,
+            name:            None,
+            description:     String::new(),
+            skills:          vec![],
+            tier:            crate::config::AgentTier::Native,
+            command:         None,
+            args:            vec![],
+            isolation:       crate::config::IsolationMode::None,
+            max_wall_seconds: 0,
         }
     }
 

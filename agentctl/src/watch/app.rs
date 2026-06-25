@@ -593,6 +593,9 @@ mod tests {
             sandbox:         None,
             egress_brokered: 0,
             egress_denied:   0,
+            tier:            "native".to_string(),
+            isolation:       String::new(),
+            pid:             0,
         }
     }
 

@@ -110,6 +110,9 @@ Phase 0 kinds (canonical — do not rename):
 | `egress_denied` | egress call denied by policy; receipt written (agent, attempted_dest) (p7.5+) |
 | `action_receipt_emitted` | action receipt appended to evidence.jsonl (agent, verdict, chain_seq) (p7.5+) |
 | `egress_proxy_failed` | egress proxy failed to initialise or write a receipt (error) (p7.5+) |
+| `universal_agent_started` | universal-tier child process spawned (id, command, pid, isolation) (p7.6+) |
+| `universal_agent_exited` | universal-tier child process exited (id, exit_code: Option<i32>, wall_seconds) (p7.6+) |
+| `universal_agent_isolation_degraded` | `runsc` missing; fell back to unsandboxed exec (id, reason) (p7.6+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it
@@ -186,6 +189,8 @@ Each agent appears as a directory; memory and KB surfaces appeared in p5.7.
 | `/agents/<id>/memory/long_term/<key>` | per-agent Tier-3 KB entry | raw JSON value + provenance | key is nanosecond timestamp; ≤100 keys shown |
 | `/agents/kb/<segment>/<key>` | shared KB segment entry | raw JSON value + provenance | agent-namespaced entries (`agent/…`) excluded; ≤100 keys per segment |
 | `/agents/approvals` | all pending approval requests (all agents) | JSONL one `PendingActionView` JSON per line; `[]\n` when empty (p7.4+) | read-only; write approvals/rejections via `/agents/control` |
+| `/agents/<id>/tier` | agent tier | `native` or `universal` (p7.6+) | |
+| `/agents/<id>/pid` | OS process ID of universal-tier child | integer, or `(none)` for native agents (p7.6+) | |
 
 Silent truncation: directories with more than 100 entries show the first 100 (no overflow marker). An ENTRIES index per segment (NAMESPACES table) is deferred to p5.8.
 

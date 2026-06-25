@@ -97,6 +97,31 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   Revisit in p7.6 when multi-workload operator may want to restrict beta feature usage.
   Fix: validate against an operator-configured allowlist in `EgressConfig`.
 
+## Phase 7 — Open (deferred from p7.6 review)
+
+**p7.6-ar-02 (P2) — Ephemeral key uses nanosecond timestamp, not CSPRNG**
+- `scheduler.rs:439`: `format!("ua-{}-{:016x}", cfg.id, ts_nanos)` — predictable from agent ID (visible at `/agents/<id>/`) + timestamp. A compromised child agent could reconstruct a sibling's key and make proxy requests billed to the sibling's budget.
+- Mitigated by: proxy listens on loopback-only (single-tenant, no remote attacker), and agent IDs differ between siblings.
+- Fix: replace timestamp with `rand::thread_rng().gen::<u64>()` (16 hex chars of CSPRNG). Requires adding `rand` to `agentd/Cargo.toml`.
+
+**p7.6-ar-03 (P2) — 11 of 17 plan-required tests absent, including env isolation tests**
+- Most security-relevant gaps: `universal_agent_env_injection` (child env contains ephemeral key, not real key) and `universal_agent_env_clear` (parent secrets e.g. GITHUB_TOKEN absent from child). These are integration-level tests that require spawning real processes and passing a secret through the allowlist. Also missing: `universal_agent_started_event`, `universal_agent_exit_event`, `universal_agent_sigterm_on_shutdown`, `universal_agent_gvisor_argv`, `universal_agent_send_message_is_error`, `scheduler_universal_only_does_not_exit_prematurely`, `checkpoint_compat_native_only_restores`, `egress_addr_threaded_to_universal_spawn`.
+- The env_clear() + allowlist behavior is verified by code inspection (Finding 1 PASS) but not by an automated test.
+- Fix: add `universal_agent_env_injection` and `universal_agent_env_clear` as integration tests that spawn a real `printenv`-style child and check the output. Then complete the remaining list.
+
+**p7.6-ar-04 (LOW) — `universal+isolation=none` silently allowed (plan says reject)**
+- `universal.rs:62–64`: the plan's validation matrix says `tier=universal + isolation=none → error`. The implementation accepts it and spawns without sandboxing. The `agent_config_universal_defaults` test explicitly asserts `isolation=none` is valid, confirming this is an intentional relaxation for development ergonomics.
+- Fix: decide whether `isolation=none` is the allowed dev mode (update plan + doc) or should be rejected (add validation + update test). Currently blocked on that design decision.
+
+**p7.6-ar-05 (LOW) — `UniversalOutputTruncated` event missing; stdout uses `Stdio::inherit()`**
+- Plan specifies `universal_output_truncated` event when stdout/stderr exceeds 4 MB, with stdout/stderr captured and forwarded to the flight log. `universal.rs:95–96` uses `Stdio::inherit()` instead, meaning output goes directly to agentd's fd without capture or truncation detection.
+- Acceptable scope reduction for v1 (operator sees output in terminal), but `universal_output_truncated` event kind should be added to `events.rs` as a stub so CONVENTIONS.md is internally consistent.
+
+**p7.6-ar-01 (P2) — `dispatch_spawn` collision guard misses `universal_agents` map**
+- `dispatch_spawn` checks `state.agents.contains_key(&child_id) || state.outcomes.contains_key(&child_id)` before inserting a dynamic child. Because universal agents live in the separate `state.universal_agents` map (not `state.agents`), a native agent that explicitly requests `child_id = "my-universal-agent"` would collide silently — two agents with the same ID in different maps, producing duplicate FUSE snapshots and confusing `send_message` routing.
+- Only triggered by an agent-supplied `child_id` that matches a static universal agent config ID. Auto-generated IDs (`{parent_id}-child-{seq}`) never collide. Single-tenant, operator-controlled config makes this low-probability in practice.
+- Fix: extend the collision guard: `|| state.universal_agents.contains_key(&child_id)`.
+
 ## Phase 7 — Open (deferred from p7.4 QA)
 
 **p7.4-qa-01 (LOW) — Silent no-op when approval item disappears between List→Confirm mode transitions**
