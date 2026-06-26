@@ -27,9 +27,12 @@ Graceful degradation:
 """
 import json, os, ssl, sys, urllib.error, urllib.parse, urllib.request
 
-BRAVE_API_URL = "https://api.search.brave.com/res/v1/web/search"
-MAX_COUNT     = 10
-DEFAULT_COUNT = 5
+BRAVE_API_URL    = "https://api.search.brave.com/res/v1/web/search"
+MAX_COUNT        = 10
+DEFAULT_COUNT    = 5
+REQUEST_TIMEOUT  = 15          # seconds
+RAW_RESPONSE_CAP = 2 * 1024 * 1024  # 2 MB cap on API response body
+ERROR_BODY_CAP   = 512         # bytes read from HTTP error body
 
 TOOLS = [{
     "name": "web_search",
@@ -81,13 +84,13 @@ def handle_web_search(args):
 
     ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
-            raw  = resp.read(2 * 1024 * 1024)  # 2 MB cap on API response
+        with urllib.request.urlopen(req, context=ctx, timeout=REQUEST_TIMEOUT) as resp:
+            raw  = resp.read(RAW_RESPONSE_CAP)
             data = json.loads(raw)
     except urllib.error.HTTPError as e:
         body = ""
         try:
-            body = e.read(512).decode("utf-8", errors="replace")
+            body = e.read(ERROR_BODY_CAP).decode("utf-8", errors="replace")
         except Exception:
             pass
         return None, f"Brave Search API error {e.code}: {body}"
