@@ -3,6 +3,31 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [obs.3] - 2026-06-26 (v0.44.0)
+
+OTLP sidecar gap remediation — copy-truncate fast-grow detection (content sentinel) + export-drop counting.
+
+- **Content sentinel** (`otel/src/tail.rs`) — `FileTailer` stores `last_sentinel: Vec<u8>` (last 64 bytes
+  at last-consumed offset). On each poll, when same inode and `cur_len >= offset`, the sentinel window is
+  re-read and compared; a mismatch means copy-truncate rotation occurred between polls. Three guards prevent
+  false positives: (1) skip check when `offset < SENTINEL_SIZE`; (2) skip check when `last_sentinel.len() !=
+  SENTINEL_SIZE` (not yet populated — prevents spurious rotation on first append after `from_beginning=false`
+  startup); (3) skip sentinel capture when `new_offset < SENTINEL_SIZE` (prevents u64 underflow). Fixes
+  obs.2-ar-01.
+- **Export-drop counting** (`otel/src/main.rs` + `otel/src/exporter.rs`) — `export_drops: u64` tracks
+  `force_flush()` error count. SIGTERM, SIGINT, and periodic stats paths all use
+  `tokio::task::spawn_blocking(move || p.force_flush())` (non-blocking; `SdkTracerProvider` wraps `Arc`,
+  `clone()` is O(1)). SIGTERM/SIGINT print a final stats line before break. Periodic stats path records
+  `export_drops` delta via new `export_drops_counter` OTLP metric (`agentos.otel.export_drops`, unit
+  "failures"), separate from channel-drop counter. Code comment: "export_drops counts flush-attempt
+  failures, not spans; one error may represent many lost spans." Fixes obs.2-ar-02.
+- **Stats line** — updated format: `exported=N open=M dropped=D export_drops=E flushed_on_rotation=R`.
+- **New tests** — 3 new `FileTailer` tests: `test_tail_copy_truncate_fast_grow` (sentinel detects
+  copy-truncate when new file grows past old offset); `test_tail_sentinel_no_false_positive` (normal append
+  does not trigger rotation); `test_tail_startup_no_false_positive` (first append after `from_beginning=false`
+  start does not trigger rotation).
+- 1009 workspace tests pass (up from 1006).
+
 ## [obs.2] - 2026-06-26 (v0.43.0)
 
 OTLP sidecar hardening — batch exporter, validation unit tests, log rotation flush.

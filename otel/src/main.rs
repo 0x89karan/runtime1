@@ -8,6 +8,7 @@ use span_builder::SpanBuilder;
 
 const DEFAULT_POLL_MS: u64 = 500;
 const DEFAULT_IDLE_SECS: u64 = 30;
+const DEFAULT_STATS_SECS: u64 = 60;
 const DEFAULT_BATCH_DELAY_MS: u64 = 5000;
 
 fn usage_and_exit() -> ! {
@@ -24,7 +25,7 @@ fn usage_and_exit() -> ! {
          OTEL_TAIL_FROM_BEGINNING     Set 'true' or '1' to replay entire file (default: false)\n\
          OTEL_POLL_INTERVAL_MS        File poll interval in ms (default: 500)\n\
          OTEL_IDLE_TIMEOUT_SECS       Watchdog: close open spans after N idle secs (default: 30)\n\
-         OTEL_REDACT_PREVIEWS         Set 'true' or '1' to strip *.preview span attrs (default: false)\n\
+         OTEL_REDACT_PREVIEWS         Set 'false' or '0' to include *.preview span attrs (default: true)\n\
          OTEL_SESSION_ID              Optional session label added to all spans\n\
          OTEL_EXPORT_PROTOCOL         'http/protobuf' or 'grpc' (default: http/protobuf)\n\
          OTEL_EXPORT_BATCH_DELAY_MS   Batch flush interval in ms (default: 5000)\n"
@@ -115,7 +116,11 @@ async fn main() -> anyhow::Result<()> {
     let from_beginning = env_bool("OTEL_TAIL_FROM_BEGINNING");
     let poll_ms = env_u64("OTEL_POLL_INTERVAL_MS", DEFAULT_POLL_MS);
     let idle_secs = env_u64("OTEL_IDLE_TIMEOUT_SECS", DEFAULT_IDLE_SECS);
-    let redact_previews = env_bool("OTEL_REDACT_PREVIEWS");
+    // Default true: tool output previews can contain secrets (e.g. read_file on a .env).
+    // Set OTEL_REDACT_PREVIEWS=false to opt in to exporting previews verbatim.
+    let redact_previews = std::env::var("OTEL_REDACT_PREVIEWS")
+        .map(|v| !v.eq_ignore_ascii_case("false") && v != "0")
+        .unwrap_or(true);
     let session_id = std::env::var("OTEL_SESSION_ID").ok();
     let use_grpc = std::env::var("OTEL_EXPORT_PROTOCOL")
         .map(|v| v.eq_ignore_ascii_case("grpc"))
@@ -145,12 +150,14 @@ async fn main() -> anyhow::Result<()> {
     let mut last_line_ts = std::time::Instant::now();
     let mut exported_count: u64 = 0;
     let mut flushed_on_rotation: u64 = 0;
+    // export_drops counts flush-attempt failures, not spans; one error may represent many lost spans.
+    let mut export_drops: u64 = 0;
     let mut last_stats_print = std::time::Instant::now();
     let mut last_reported_drops: u64 = 0;
 
     let poll_interval = tokio::time::Duration::from_millis(poll_ms);
     let idle_timeout = tokio::time::Duration::from_secs(idle_secs);
-    let stats_interval = tokio::time::Duration::from_secs(60);
+    let stats_interval = tokio::time::Duration::from_secs(DEFAULT_STATS_SECS);
 
     let mut sigterm = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::terminate()
@@ -167,14 +174,30 @@ async fn main() -> anyhow::Result<()> {
                 let mut n = 0;
                 for span in sb.drain_all(ts, "shutdown") {
                     n += 1;
+                    exported_count += 1;
                     exporter::try_send(&span_tx, span);
                 }
                 eprintln!("agentos-otel: shutdown — flushed {n} open spans");
-                for r in provider.force_flush() {
+                let p = provider.clone();
+                let flush_results = tokio::task::spawn_blocking(move || p.force_flush())
+                    .await
+                    .unwrap_or_else(|e| { eprintln!("agentos-otel: force_flush panic on shutdown: {e}"); vec![] });
+                let mut shutdown_drops: u64 = 0;
+                for r in flush_results {
                     if let Err(e) = r {
+                        export_drops += 1;
+                        shutdown_drops += 1;
                         eprintln!("agentos-otel: export error on shutdown: {e}");
                     }
                 }
+                if shutdown_drops > 0 {
+                    token_counter.record_export_drops(shutdown_drops);
+                }
+                let dropped = exporter::spans_dropped();
+                eprintln!(
+                    "agentos-otel: exported={exported_count} open={} dropped={dropped} export_drops={export_drops} flushed_on_rotation={flushed_on_rotation}",
+                    sb.open_span_count()
+                );
                 break;
             }
             _ = sigint.recv() => {
@@ -182,14 +205,30 @@ async fn main() -> anyhow::Result<()> {
                 let mut n = 0;
                 for span in sb.drain_all(ts, "shutdown") {
                     n += 1;
+                    exported_count += 1;
                     exporter::try_send(&span_tx, span);
                 }
                 eprintln!("agentos-otel: interrupt — flushed {n} open spans");
-                for r in provider.force_flush() {
+                let p = provider.clone();
+                let flush_results = tokio::task::spawn_blocking(move || p.force_flush())
+                    .await
+                    .unwrap_or_else(|e| { eprintln!("agentos-otel: force_flush panic on interrupt: {e}"); vec![] });
+                let mut interrupt_drops: u64 = 0;
+                for r in flush_results {
                     if let Err(e) = r {
+                        export_drops += 1;
+                        interrupt_drops += 1;
                         eprintln!("agentos-otel: export error on interrupt: {e}");
                     }
                 }
+                if interrupt_drops > 0 {
+                    token_counter.record_export_drops(interrupt_drops);
+                }
+                let dropped = exporter::spans_dropped();
+                eprintln!(
+                    "agentos-otel: exported={exported_count} open={} dropped={dropped} export_drops={export_drops} flushed_on_rotation={flushed_on_rotation}",
+                    sb.open_span_count()
+                );
                 break;
             }
         }
@@ -271,8 +310,24 @@ async fn main() -> anyhow::Result<()> {
                 token_counter.record_drops(new_drops);
                 last_reported_drops = dropped;
             }
+            // export_drops counts flush-attempt failures, not spans; one error may represent many lost spans.
+            let p = provider.clone();
+            let flush_results = tokio::task::spawn_blocking(move || p.force_flush())
+                .await
+                .unwrap_or_else(|e| { eprintln!("agentos-otel: force_flush panic: {e}"); vec![] });
+            let mut new_export_drops: u64 = 0;
+            for r in flush_results {
+                if let Err(e) = r {
+                    new_export_drops += 1;
+                    eprintln!("agentos-otel: export error: {e}");
+                }
+            }
+            if new_export_drops > 0 {
+                export_drops += new_export_drops;
+                token_counter.record_export_drops(new_export_drops);
+            }
             eprintln!(
-                "agentos-otel: exported={exported_count} open={} dropped={dropped} flushed_on_rotation={flushed_on_rotation}",
+                "agentos-otel: exported={exported_count} open={} dropped={dropped} export_drops={export_drops} flushed_on_rotation={flushed_on_rotation}",
                 sb.open_span_count()
             );
             last_stats_print = std::time::Instant::now();
@@ -344,5 +399,40 @@ mod tests {
     #[test]
     fn validate_endpoint_accepts_https() {
         assert!(validate_endpoint("https://otel.example.com/v1/traces").is_ok());
+    }
+
+    // --- OTEL_REDACT_PREVIEWS parsing ---
+    // Verifies that the env var inversion logic (default true, opt-out via "false"/"0") is correct.
+
+    fn parse_redact_previews(val: Option<&str>) -> bool {
+        match val {
+            Some(v) => !v.eq_ignore_ascii_case("false") && v != "0",
+            None => true,
+        }
+    }
+
+    #[test]
+    fn redact_previews_defaults_true_when_unset() {
+        assert!(parse_redact_previews(None), "unset must default to true (safe)");
+    }
+
+    #[test]
+    fn redact_previews_false_for_explicit_false() {
+        assert!(!parse_redact_previews(Some("false")));
+        assert!(!parse_redact_previews(Some("FALSE")));
+        assert!(!parse_redact_previews(Some("False")));
+    }
+
+    #[test]
+    fn redact_previews_false_for_zero() {
+        assert!(!parse_redact_previews(Some("0")));
+    }
+
+    #[test]
+    fn redact_previews_true_for_any_other_value() {
+        assert!(parse_redact_previews(Some("true")));
+        assert!(parse_redact_previews(Some("1")));
+        assert!(parse_redact_previews(Some("yes")));
+        assert!(parse_redact_previews(Some(""))); // empty string is truthy under this logic
     }
 }

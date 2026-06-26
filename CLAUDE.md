@@ -232,6 +232,17 @@ drains + resets trace context (trace_id/run_id/agent_span_ids/span_counter) prev
 cross-file span relationships; `flushed_on_rotation` counter in stats; 8 new validation unit
 tests for `validate_log_path` / `validate_endpoint` (incl. world-writable + `%40` credential
 bypass guards); 1006 workspace tests.
+**obs.3 complete (v0.44.0).** OTLP sidecar gap remediation — content sentinel + export-drop
+counting: `FileTailer` gains `last_sentinel: Vec<u8>` (64 bytes at last-consumed offset);
+sentinel window re-read on poll when same inode + `cur_len >= offset`; mismatch → rotation;
+three guards prevent false positives (small file, unpopulated sentinel, u64 underflow); 3 new
+tail tests (fast-grow, no-FP, startup-FP); `export_drops: u64` tracked in main loop; all three
+`force_flush()` call sites (SIGTERM, SIGINT, periodic stats) use
+`tokio::task::spawn_blocking(move || p.force_flush()).await`; final stats line emitted at
+shutdown; new `export_drops_counter` in `TokenCounter` (`agentos.otel.export_drops`, unit
+"failures") separate from channel-drops counter; stats line: `exported=N open=M dropped=D
+export_drops=E flushed_on_rotation=R`; obs.3-ar-01 (BSP internal queue uncounted) filed in
+TODOS.md; 1009 workspace tests.
 
 ## How to work here
 

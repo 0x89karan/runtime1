@@ -24,6 +24,7 @@ pub const AGENTOS_SESSION_ID: &str = "agentos.session_id";
 pub const METRIC_TOKEN_USAGE: &str = "gen_ai.client.token.usage";
 pub const METRIC_OPERATION_DURATION: &str = "gen_ai.client.operation.duration";
 pub const METRIC_SPANS_DROPPED: &str = "agentos.otel.spans_dropped";
+pub const METRIC_EXPORT_DROPS: &str = "agentos.otel.export_drops";
 
 // gen_ai.operation.name values
 pub const OP_CHAT: &str = "chat";

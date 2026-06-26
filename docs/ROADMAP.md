@@ -834,6 +834,16 @@ trace context; rotation spans tagged `forced_close=log_rotated`; `flushed_on_rot
 in stats. Known gaps deferred to obs.3: copy-truncate detection miss + backend-down drop
 invisibility.
 
+**obs.3 — OTLP sidecar gap remediation** [HARNESS] ✅ *(v0.44.0)*
+Closes obs.2-ar-01 (copy-truncate fast-grow false-negative) and obs.2-ar-02 (backend-down drop
+invisibility). Gap 1: content sentinel — `FileTailer` stores `last_sentinel: Vec<u8>` (64 bytes
+at last-consumed offset); on poll, sentinel window is re-read and compared; mismatch → rotation;
+three guards prevent false positives (small file, unpopulated sentinel, u64 underflow); 3 new
+unit tests. Gap 2: `export_drops: u64` + `spawn_blocking(move || p.force_flush())` at all three
+call sites; final stats line at shutdown; new `agentos.otel.export_drops` OTLP counter (unit
+"failures") separate from channel-drop counter. Known gap obs.3-ar-01: `BatchSpanProcessor`
+internal 2048-slot queue drops uncounted; mitigate via `OTEL_BSP_MAX_QUEUE_SIZE` env var.
+
 ---
 
 ## Phase 7 — Standard library (harness)

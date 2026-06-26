@@ -543,21 +543,27 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - `--no-fuse` CLI flag and `AGENTOS_NO_FUSE` env var added to `main.rs`. When either is set,
   the FUSE mount is skipped with `tracing::info!` instead of attempted (no warning on CI).
 
-## obs.2 — Open (deferred from obs.2)
+## obs.3 — Open (deferred from obs.3)
 
-**obs.2-ar-01 (P3) — Copy-truncate rotation undetected when new file length ≥ old offset**
-- `tail::FileTailer::poll` detects copy-truncate via `cur_len < self.offset`. If logrotate
-  copies the file and then re-opens it for appending before the next poll, and the new file
-  has grown past the old offset, `rotated` will be `false` and new lines will be missed.
-- Fix: add `mtime` as a secondary signal in `poll()` — if inode is the same but `mtime` has
-  changed and content changed, treat as rotation. Requires storing `mtime` in `FileTailer`.
+**obs.3-ar-01 (P3) — `BatchSpanProcessor` internal 2048-slot queue drops uncounted**
+- The `BatchSpanProcessor` maintains its own internal 2048-slot queue (separate from the
+  10,000-slot `mpsc` channel). When spans fill this queue, the SDK silently drops them.
+  This drop count is not exposed through any public API and is not reflected in
+  `agentos.otel.spans_dropped` (channel-level) or `agentos.otel.export_drops` (flush-level).
+- Mitigation: set `OTEL_BSP_MAX_QUEUE_SIZE` env var to a higher value (e.g. 8192) in
+  high-throughput deployments. Full fix requires an SDK fork or wrapper — deferred.
 
-**obs.2-ar-02 (P3) — OTLP backend-down export failures not surfaced in stats**
-- When the OTLP endpoint is unreachable, the `BatchSpanProcessor` retries internally and
-  eventually drops spans, but the `SPANS_DROPPED` counter only tracks channel backpressure.
-  Backend export failures are invisible to the operator in the periodic stats line.
-- Fix (obs.3): hook into SDK export callbacks or check the `force_flush()` result vector
-  to count export-level drops separately from channel-level drops.
+## Resolved — obs.2-ar-01 and obs.2-ar-02 (closed in obs.3 / v0.44.0)
+
+**~~obs.2-ar-01 (P3) — Copy-truncate rotation undetected when new file length ≥ old offset~~** ✓ Done in obs.3.
+- Fixed via content sentinel: `FileTailer` stores `last_sentinel: Vec<u8>` (last 64 bytes at
+  last-consumed offset). On poll, sentinel window is re-read and compared; mismatch → rotation.
+  Three guards prevent false positives. Three new unit tests cover the fix.
+
+**~~obs.2-ar-02 (P3) — OTLP backend-down export failures not surfaced in stats~~** ✓ Done in obs.3.
+- Fixed via `export_drops: u64` counter + `spawn_blocking(move || p.force_flush())` in all three
+  call sites (SIGTERM, SIGINT, periodic stats). New `agentos.otel.export_drops` OTLP metric
+  (unit "failures") separate from channel-drop counter. Final stats line now emitted at shutdown.
 
 ## Completed
 
