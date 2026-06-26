@@ -816,7 +816,7 @@ host eBPF is blind inside gVisor). A dual-backend (gVisor when nested-KVM is una
 Firecracker when hardware isolation is demanded) is the resilient posture. Design context:
 `docs/PRODUCT-THESIS.md` security model + `docs/OBSERVABILITY-PLAN.md`.
 
-**obs.1 — flight→OTLP sidecar + GenAI semconv** [HARNESS] *(planned — rides on p7.5)*
+**obs.1 — flight→OTLP sidecar + GenAI semconv** [HARNESS] ✅ *(v0.42.0)*
 Export the existing flight-event stream as OpenTelemetry: run=trace, agent=span, turn/inference/
 tool/egress=child spans, tokens/$=metrics, GenAI `gen_ai.*` semconv. Ships as the `agentos-otel`
 sidecar (tails `flight.jsonl`; keeps the heavy OTEL deps out of the ≤6 MB core); optional

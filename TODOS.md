@@ -543,6 +543,34 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - `--no-fuse` CLI flag and `AGENTOS_NO_FUSE` env var added to `main.rs`. When either is set,
   the FUSE mount is skipped with `tracing::info!` instead of attempted (no warning on CI).
 
+## obs.1 — Open (deferred from obs.1 adversarial review)
+
+**obs.1-ar-01 (P2) — `with_simple_exporter` blocks the export worker per-span**
+- `otel/src/exporter.rs:build_provider`: both gRPC and HTTP paths use `with_simple_exporter`.
+  Simple exporter does a synchronous network write per span inside the export worker task,
+  meaning the task blocks on each OTLP call. Under high span throughput the backpressure
+  channel (cap 10 000) will fill and `SPANS_DROPPED` will increment unnecessarily.
+- Fix: switch to `with_batch_exporter` + `BatchConfig` with a reasonable flush interval (e.g.
+  5 s) and batch size (e.g. 512). The channel then buffers intra-batch, and the worker
+  only blocks on OTLP once per batch. Pair with switching the worker from `try_send` to
+  a bounded `send().await` so backpressure is applied before the channel fills.
+
+**obs.1-ar-02 (P2) — `FLIGHT_LOG_PATH` / `OTEL_EXPORTER_OTLP_ENDPOINT` validation has no unit tests**
+- `otel/src/main.rs:validate_log_path` and `validate_endpoint` are tested only implicitly
+  via the binary; no unit tests cover the rejection paths (non-absolute path, wrong extension,
+  world-writable file, non-http(s) scheme, embedded `@` credentials).
+- Fix: add `#[cfg(test)] mod tests` in `main.rs` with at least: `validate_log_path_rejects_relative`,
+  `validate_log_path_rejects_non_jsonl`, `validate_endpoint_rejects_non_http`,
+  `validate_endpoint_rejects_embedded_credentials`.
+
+**obs.1-ar-03 (P3) — Log rotation (`_rotated = true`) is silently ignored**
+- `tail::FileTailer::poll` returns `(lines, rotated: bool)`; `otel/src/main.rs` destructures
+  as `(_rotated, _)` and discards the flag. On file rotation (log truncation or rename + recreate),
+  `SpanBuilder` retains stale open-span state from the previous file, producing phantom spans
+  with incorrect timestamps.
+- Fix: when `rotated == true`, call `sb.drain_all(now_ns, "log_rotated")` to flush stale open
+  spans before processing new lines. Also emit a `log_rotated` log line to stderr.
+
 ## Completed
 
 **p6.4 — Topology view (multi-agent graph)**

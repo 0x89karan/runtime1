@@ -1,5 +1,5 @@
 [workspace]
-members = ["agentd", "agentctl", "surfaces", "sandbox"]
+members = ["agentd", "agentctl", "surfaces", "sandbox", "otel"]
 resolver = "2"
 
 [profile.release]

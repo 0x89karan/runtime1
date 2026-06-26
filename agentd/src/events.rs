@@ -113,6 +113,12 @@ pub enum EventKind {
     /// gVisor isolation requested but runsc not found; falling back to no isolation.
     /// data: { agent_id }
     UniversalAgentIsolationDegraded,
+    /// Scheduler started; provides a stable run_id (UUID v4) used as the OTLP trace root.
+    /// data: { run_id, config_hash }
+    SchedulerStarted,
+    /// Scheduler stopped after graceful shutdown.
+    /// data: { run_id, agent_count }
+    SchedulerStopped,
     Error,
 }
 
@@ -184,6 +190,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::UniversalAgentStarted), "universal_agent_started");
         assert_eq!(kind_str(EventKind::UniversalAgentExited), "universal_agent_exited");
         assert_eq!(kind_str(EventKind::UniversalAgentIsolationDegraded), "universal_agent_isolation_degraded");
+        assert_eq!(kind_str(EventKind::SchedulerStarted), "scheduler_started");
+        assert_eq!(kind_str(EventKind::SchedulerStopped), "scheduler_stopped");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

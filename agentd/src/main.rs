@@ -97,6 +97,14 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     let cfg: config::Config =
         toml::from_str(&raw).with_context(|| format!("parsing config from {path:?}"))?;
 
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let config_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut h);
+        format!("{:016x}", h.finish())
+    };
+
     // Resolve flight log path: CLI flag > TOML field > default "flight.jsonl".
     let log_path = resolve_log_path(log_path_override, cfg.log_path.as_deref());
     let recorder = Arc::new(FlightRecorder::new(&log_path)?);
@@ -925,7 +933,19 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         .with_proxy_registry(proxy_registry);
 
     let streamed_agents = scheduler.streamed_agents();
+    recorder.record(
+        "agentd",
+        None,
+        EventKind::SchedulerStarted,
+        serde_json::json!({ "run_id": run_id, "config_hash": config_hash }),
+    );
     let outcomes = scheduler.run().await;
+    recorder.record(
+        "agentd",
+        None,
+        EventKind::SchedulerStopped,
+        serde_json::json!({ "run_id": run_id, "agent_count": outcomes.len() }),
+    );
 
     #[cfg(target_os = "linux")]
     if let Some(session) = maybe_session {

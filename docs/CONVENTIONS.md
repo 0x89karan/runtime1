@@ -113,6 +113,8 @@ Phase 0 kinds (canonical — do not rename):
 | `universal_agent_started` | universal-tier child process spawned (id, command, pid, isolation) (p7.6+) |
 | `universal_agent_exited` | universal-tier child process exited (id, exit_code: Option<i32>, wall_seconds) (p7.6+) |
 | `universal_agent_isolation_degraded` | `runsc` missing; fell back to unsandboxed exec (id, reason) (p7.6+) |
+| `scheduler_started` | agentd boot complete; emits `run_id` (UUID v4) used as the OTLP trace root + `config_hash` (obs.1+) |
+| `scheduler_stopped` | agentd graceful shutdown; emits `run_id` + `agent_count` (obs.1+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

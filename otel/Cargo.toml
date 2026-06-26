@@ -1,0 +1,26 @@
+[package]
+name = "agentos-otel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "agentos-otel"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync", "io-util"] }
+uuid = { version = "1", features = ["v4"] }
+
+opentelemetry = "=0.24.0"
+opentelemetry_sdk = { version = "=0.24.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "=0.17.0", features = ["grpc-tonic", "http-proto", "tls-roots"] }
+opentelemetry-semantic-conventions = "=0.16.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+agentd = { path = "../agentd" }
+tempfile = "3"

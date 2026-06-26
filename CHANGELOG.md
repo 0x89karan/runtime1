@@ -3,6 +3,22 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [obs.1] - 2026-06-26 (v0.42.0)
+
+OTLP observability sidecar — `agentos-otel` tails `flight.jsonl` and exports OpenTelemetry traces to any OTLP backend (Jaeger, Grafana Tempo, Honeycomb, etc.).
+
+- **`otel/`** (new workspace crate `agentos-otel`) — standalone binary; `tail.rs` with `(dev, ino, offset)` triple tracking for log rotation (rename + copy-truncate); `span_builder.rs` state machine that reconstructs spans from flight events (agent/turn/inference/tool hierarchy); `exporter.rs` using OTLP HTTP/protobuf via `opentelemetry-otlp 0.17.0` + `opentelemetry_sdk 0.24.0`; `semconv.rs` with GenAI semconv v1.29.0 attribute constants; `otel/tests/event_kind_coverage.rs` compile-time exhaustiveness guard over all 58 `EventKind` variants.
+- **Trace model** — `scheduler_started.run_id` (UUID v4, hyphens stripped → 32-hex) is the OTLP trace ID; agents are child spans; inference/tool calls are grandchild spans; orphan events synthesize missing parent spans.
+- **Policies** — duplicate open event force-closes existing span as `UNFINISHED (reason=duplicate_open)`; inactivity watchdog (default 30 s, `OTEL_IDLE_TIMEOUT_SECS`) drains open spans; backpressure channel capped at 10,000 spans (`agentos.otel.spans_dropped` counter).
+- **agentd changes** — 2 new `EventKind` variants: `SchedulerStarted` (emits `run_id` UUID v4 + `config_hash`) and `SchedulerStopped` (emits `run_id` + `agent_count`); `uuid 1.x` dep added to agentd; events emitted around `scheduler.run()` in `main.rs`.
+- **`docker/otel-compose.yml`** (new) — Jaeger all-in-one with OTLP ports 4317/4318 and UI at 16686; `OTEL_REDACT_PREVIEWS=true` guidance.
+- **`docs/CONVENTIONS.md`** — `scheduler_started` and `scheduler_stopped` rows added to event taxonomy table.
+- **Env vars** — `FLIGHT_LOG_PATH`, `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SERVICE_NAME` (default: `agentos`), `OTEL_TAIL_FROM_BEGINNING`, `OTEL_POLL_INTERVAL_MS`, `OTEL_IDLE_TIMEOUT_SECS`, `OTEL_REDACT_PREVIEWS`, `OTEL_SESSION_ID`, `OTEL_EXPORT_PROTOCOL`.
+- **Token metrics** — `gen_ai.client.token.usage` OTLP counter with labels `gen_ai.system`, `gen_ai.request.model`, `session_id`, `token.type` (input/output); extracted from closed `gen_ai.chat` spans and forwarded to the same OTLP endpoint via a separate `SdkMeterProvider`.
+- **Security** — `FLIGHT_LOG_PATH` validated (absolute, `.jsonl` extension, not world-writable); `OTEL_EXPORTER_OTLP_ENDPOINT` validated (`http://`/`https://` only, embedded credentials rejected); `otel/` is a separate workspace crate, keeping OTLP deps out of the 6 MB `agentd` binary; `parse_ts` uses saturating arithmetic to prevent u64 overflow on malformed far-future timestamps.
+- **Dockerfile** — `agentos-otel` added to the builder and runtime stages alongside `agentd` and `agentctl`.
+- 998 workspace tests pass.
+
 ## [p7.6] - 2026-06-25 (v0.41.0)
 
 Universal-tier isolation floor — gVisor/runsc child process wrapping for agent workloads that host untrusted or foreign-framework code.

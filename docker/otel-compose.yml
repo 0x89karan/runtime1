@@ -1,0 +1,31 @@
+# docker-compose for local OTLP observability stack
+# Usage:
+#   docker compose -f docker/otel-compose.yml up -d
+#   # Run agentd, then:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+#   OTEL_REDACT_PREVIEWS=true \
+#   agentos-otel /path/to/flight.jsonl
+#   # Open http://localhost:16686 to explore traces in Jaeger
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP/protobuf
+    restart: unless-stopped
+
+  # Optional: OpenTelemetry Collector for fan-out to multiple backends
+  # otel-collector:
+  #   image: otel/opentelemetry-collector-contrib:0.99.0
+  #   command: ["--config=/etc/otel-collector-config.yaml"]
+  #   volumes:
+  #     - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+  #   ports:
+  #     - "4317:4317"
+  #     - "4318:4318"
+  #   depends_on:
+  #     - jaeger
