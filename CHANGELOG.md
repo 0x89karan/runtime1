@@ -3,6 +3,37 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [obs.2] - 2026-06-26 (v0.43.0)
+
+OTLP sidecar hardening — batch exporter, validation unit tests, log rotation flush.
+
+- **`BatchSpanProcessor`** (`otel/src/exporter.rs`) — replaced `with_simple_exporter` with
+  `BatchSpanProcessor::builder` + `BatchConfigBuilder` (`max_export_batch_size=512`,
+  `max_export_timeout=30s`); `OTEL_EXPORT_BATCH_DELAY_MS` env var (default: 5000ms) wires into
+  `with_scheduled_delay`; startup banner now includes `batch_delay_ms`.
+- **SIGTERM flush** (`otel/src/main.rs`) — `tokio::signal::unix` SIGTERM handler calls
+  `sb.drain_all(now_ns, "shutdown")` + `provider.force_flush()` before exit; prints
+  `"agentos-otel: shutdown — flushed N open spans"`; handles short-run sessions (<30s) before
+  the idle watchdog fires.
+- **Log rotation flush** (`otel/src/main.rs` + `otel/src/span_builder.rs`) — `rotated` flag
+  from `tailer.poll()` now handled: calls `sb.reset_for_rotation(now_ns)` which drains all open
+  spans AND resets `trace_id`/`run_id`/`run_span_id`/`agent_span_ids`/`span_counter` to prevent
+  phantom span relationships across file rotations; rotation-flushed spans tagged with
+  `forced_close=log_rotated`; tracked separately as `flushed_on_rotation` (not counted in
+  `exported_count`); printed in periodic stats line.
+- **Validation error improvements** (`otel/src/main.rs`) — world-writable error now includes
+  `(fix: chmod o-w <path>)`; embedded-credentials error includes OTLP_HEADERS alternative;
+  absolute-path error includes example path; help text updated to `'true' or '1'` for all
+  boolean env vars.
+- **Validation unit tests** (8 new in `otel/src/main.rs`) — `validate_log_path_rejects_relative`,
+  `validate_log_path_rejects_non_jsonl`, `validate_log_path_accepts_valid_missing_file`,
+  `validate_log_path_rejects_world_writable` (unix-gated), `validate_endpoint_rejects_non_http`,
+  `validate_endpoint_rejects_embedded_credentials`, `validate_endpoint_accepts_http`,
+  `validate_endpoint_accepts_https`.
+- **TODOS.md** — obs.1-ar-01/02/03 resolved; copy-truncate detection gap and backend-down
+  invisibility added as obs.2-ar-01/02.
+- 1006 workspace tests pass (up from 998).
+
 ## [obs.1] - 2026-06-26 (v0.42.0)
 
 OTLP observability sidecar — `agentos-otel` tails `flight.jsonl` and exports OpenTelemetry traces to any OTLP backend (Jaeger, Grafana Tempo, Honeycomb, etc.).

@@ -824,6 +824,16 @@ cargo-feature in-core exporter later. W3C `traceparent` injected at the egress m
 hosted foreign workloads join the same trace. The value is interop with standard backends, not
 new signal. Full design: `docs/OBSERVABILITY-PLAN.md`.
 
+**obs.2 — OTLP sidecar hardening** [HARNESS] ✅ *(v0.43.0)*
+Three deferred items from obs.1 adversarial review: (1) `BatchSpanProcessor` migration —
+replaces `with_simple_exporter`; `OTEL_EXPORT_BATCH_DELAY_MS` tunable (default 5 s); SIGTERM
+flush via `provider.force_flush()` + `sb.drain_all`; (2) validation unit tests — 8 new tests
+for `validate_log_path` + `validate_endpoint` rejection paths; (3) log rotation flush —
+`rotated` flag wired to `SpanBuilder::reset_for_rotation()` which drains open spans AND resets
+trace context; rotation spans tagged `forced_close=log_rotated`; `flushed_on_rotation` counter
+in stats. Known gaps deferred to obs.3: copy-truncate detection miss + backend-down drop
+invisibility.
+
 ---
 
 ## Phase 7 — Standard library (harness)

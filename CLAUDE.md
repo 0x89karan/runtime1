@@ -217,6 +217,21 @@ enforces `max_wall_seconds`; `dispatch_send_message` guard returns `is_error` fo
 `build_scheduler_checkpoint` skips universal agents; FUSE `OFF_TIER=11` + `OFF_PID=12`; `agentctl watch`
 shows `TIER: universal | ISO: gvisor | PID: <n>` badge; `langchain-worker.template.toml`; 3 new flight
 event kinds; 978 workspace tests (up from 968).
+**obs.1 complete (v0.42.0).** OTLP observability sidecar (`agentos-otel` crate): `SpanBuilder`
+maps flight events → OpenTelemetry spans (run/agent/tool/inference hierarchy); `TokenCounter`
+emits per-model token metrics via OTLP metrics API; `FileTailer` tails `flight.jsonl` with
+copy-truncate rotation detection; `grpc` + `http/protobuf` OTLP export; credential guard
+(`ANTHROPIC_API_KEY`-shaped tokens scrubbed from span attrs); saturating `parse_ts` preventing
+u64 overflow; spans-dropped OTLP counter; 998 workspace tests.
+**obs.2 complete (v0.43.0).** OTLP sidecar hardening — batch exporter, SIGTERM/SIGINT flush,
+log rotation reset, validation unit tests: `BatchSpanProcessor::builder` + `BatchConfigBuilder`
+replaces `with_simple_exporter` (`max_export_batch_size=512`, `max_export_timeout=30s`);
+`OTEL_EXPORT_BATCH_DELAY_MS` env var (default 5000ms, min 100ms); SIGTERM + SIGINT handlers
+drain open spans + call `provider.force_flush()` with error logging; `SpanBuilder::reset_for_rotation()`
+drains + resets trace context (trace_id/run_id/agent_span_ids/span_counter) preventing phantom
+cross-file span relationships; `flushed_on_rotation` counter in stats; 8 new validation unit
+tests for `validate_log_path` / `validate_endpoint` (incl. world-writable + `%40` credential
+bypass guards); 1006 workspace tests.
 
 ## How to work here
 

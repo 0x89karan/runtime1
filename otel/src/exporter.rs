@@ -12,7 +12,7 @@ use opentelemetry::{
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     metrics::SdkMeterProvider,
-    trace::{Tracer as SdkTracer, TracerProvider as SdkTracerProvider},
+    trace::{BatchConfigBuilder, BatchSpanProcessor, Tracer as SdkTracer, TracerProvider as SdkTracerProvider},
 };
 
 use crate::span_builder::{FinishedSpan, SpanAttr};
@@ -61,11 +61,16 @@ fn ns_to_systime(ns: u64) -> std::time::SystemTime {
     std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ns)
 }
 
-pub fn build_provider(endpoint: &str, service_name: &str, use_grpc: bool) -> anyhow::Result<SdkTracerProvider> {
+pub fn build_provider(endpoint: &str, service_name: &str, use_grpc: bool, batch_delay_ms: u64) -> anyhow::Result<SdkTracerProvider> {
     let resource = opentelemetry_sdk::Resource::new(vec![
         KeyValue::new("service.name", service_name.to_owned()),
     ]);
     let config = opentelemetry_sdk::trace::Config::default().with_resource(resource);
+    let batch_cfg = BatchConfigBuilder::default()
+        .with_max_export_batch_size(512)
+        .with_scheduled_delay(std::time::Duration::from_millis(batch_delay_ms))
+        .with_max_export_timeout(std::time::Duration::from_secs(30))
+        .build();
 
     // grpc-tonic and http-proto are both compiled in; select at runtime.
     if use_grpc {
@@ -74,8 +79,11 @@ pub fn build_provider(endpoint: &str, service_name: &str, use_grpc: bool) -> any
             .with_endpoint(endpoint)
             .build_span_exporter()
             .map_err(|e| anyhow::anyhow!("OTLP gRPC exporter init: {e}"))?;
+        let batch = BatchSpanProcessor::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_batch_config(batch_cfg)
+            .build();
         return Ok(SdkTracerProvider::builder()
-            .with_simple_exporter(exporter)
+            .with_span_processor(batch)
             .with_config(config)
             .build());
     }
@@ -85,9 +93,11 @@ pub fn build_provider(endpoint: &str, service_name: &str, use_grpc: bool) -> any
         .with_endpoint(endpoint)
         .build_span_exporter()
         .map_err(|e| anyhow::anyhow!("OTLP HTTP exporter init: {e}"))?;
-
+    let batch = BatchSpanProcessor::builder(exporter, opentelemetry_sdk::runtime::Tokio)
+        .with_batch_config(batch_cfg)
+        .build();
     Ok(SdkTracerProvider::builder()
-        .with_simple_exporter(exporter)
+        .with_span_processor(batch)
         .with_config(config)
         .build())
 }

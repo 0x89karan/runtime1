@@ -415,6 +415,19 @@ impl SpanBuilder {
         }
     }
 
+    /// Flush open spans and reset all trace context for log rotation.
+    /// Clears trace_id/run_id/run_span_id/agent_span_ids/span_counter so that
+    /// new-file events start a fresh trace rather than attaching to the old file's context.
+    pub fn reset_for_rotation(&mut self, end_ts_ns: u64) -> Vec<FinishedSpan> {
+        let spans = self.drain_all(end_ts_ns, "log_rotated");
+        self.trace_id = None;
+        self.run_id = None;
+        self.run_span_id = None;
+        self.agent_span_ids.clear();
+        self.span_counter = 0;
+        spans
+    }
+
     /// Force-close all open spans (watchdog timeout or end-of-file).
     pub fn drain_all(&mut self, end_ts_ns: u64, reason: &str) -> Vec<FinishedSpan> {
         let keys: Vec<SpanKey> = self.open.keys().cloned().collect();
