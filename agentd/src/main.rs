@@ -7,7 +7,7 @@ use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
 use agentd::memory::store::RedbStore;
 use agentd::tools::{
-    mcp::{McpBackend, McpClient, McpHttpClient, McpTool},
+    mcp::{McpBackend, McpClient, McpHttpClient, McpTool, PASSENV_BLOCKLIST},
     native::register_native,
     ToolRegistry,
 };
@@ -498,9 +498,37 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             &effective_args,
             effective_compiled,
             &server.env,
+            &server.passenv,
         )
         .await
         .with_context(|| format!("spawning MCP server '{}'", server.name))?;
+
+        // Audit which passenv names were forwarded, blocked, or absent.
+        if !server.passenv.is_empty() {
+            let mut forwarded = Vec::new();
+            let mut blocked = Vec::new();
+            let mut absent = Vec::new();
+            for name in &server.passenv {
+                if PASSENV_BLOCKLIST.contains(&name.as_str()) {
+                    blocked.push(name.as_str());
+                } else if std::env::var(name).is_ok() {
+                    forwarded.push(name.as_str());
+                } else {
+                    absent.push(name.as_str());
+                }
+            }
+            recorder.record(
+                "agentd",
+                None,
+                EventKind::McpPassenvForwarded,
+                serde_json::json!({
+                    "server":    server.name,
+                    "forwarded": forwarded,
+                    "blocked":   blocked,
+                    "absent":    absent,
+                }),
+            );
+        }
 
         // Record SandboxApplied after spawn succeeds.
         // On Linux: emit full enforcement detail.
@@ -1054,7 +1082,7 @@ fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
 
 fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRule> {
     let mut rules = Vec::new();
-    let has_spawn = caps.iter().any(|c| matches!(c, Capability::Spawn));
+    let has_spawn = caps.iter().any(|c| matches!(c, Capability::Spawn | Capability::ShellExec));
     let has_net   = caps.iter().any(|c| matches!(c, Capability::Net { .. }));
     if !has_spawn {
         rules.push(SandboxRule::DenySpawn);
@@ -1097,8 +1125,12 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
                     rules.push(SandboxRule::AllowNetConnect { port });
                 }
             }
-            // Mcp/KbRead/KbWrite are agent-level only; no sandbox rule maps to them.
-            Capability::Mcp { .. } | Capability::Spawn | Capability::KbRead { .. } | Capability::KbWrite { .. } => {}
+            // Mcp/KbRead/KbWrite/ShellExec are agent-level or handled via has_spawn; no direct rule.
+            Capability::Mcp { .. }
+            | Capability::Spawn
+            | Capability::ShellExec
+            | Capability::KbRead { .. }
+            | Capability::KbWrite { .. } => {}
         }
     }
     rules
@@ -1311,6 +1343,38 @@ mod tests {
             !rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { .. })),
             "empty ports → no AllowNetConnect rules"
         );
+    }
+
+    // ── ShellExec sandbox tests ───────────────────────────────────────────────
+
+    #[test]
+    fn caps_to_rules_shell_exec_removes_deny_spawn() {
+        let rules = caps_to_rules(&[Capability::ShellExec]);
+        assert!(!rules.contains(&SandboxRule::DenySpawn), "ShellExec → no DenySpawn");
+        assert!(rules.contains(&SandboxRule::IsolateNetwork), "ShellExec alone → still IsolateNetwork");
+    }
+
+    #[test]
+    fn caps_to_rules_shell_exec_with_fs_grants() {
+        let rules = caps_to_rules(&[
+            Capability::ShellExec,
+            Capability::FsRead { prefix: "/workspace".into() },
+            Capability::FsWrite { prefix: "/tmp".into() },
+        ]);
+        assert!(!rules.contains(&SandboxRule::DenySpawn), "ShellExec → no DenySpawn");
+        assert!(rules.contains(&SandboxRule::AllowFsRead { prefix: "/workspace".into() }));
+        assert!(rules.contains(&SandboxRule::AllowFsWrite { prefix: "/tmp".into() }));
+        assert!(rules.contains(&SandboxRule::IsolateNetwork), "no Net cap → still IsolateNetwork");
+    }
+
+    #[test]
+    fn caps_to_rules_shell_exec_with_net_lifts_isolation() {
+        let rules = caps_to_rules(&[
+            Capability::ShellExec,
+            Capability::Net { hosts: vec![], ports: vec![] },
+        ]);
+        assert!(!rules.contains(&SandboxRule::DenySpawn), "ShellExec → no DenySpawn");
+        assert!(!rules.contains(&SandboxRule::IsolateNetwork), "Net → no IsolateNetwork");
     }
 
     // ── G1: parse_log_path ────────────────────────────────────────────────────

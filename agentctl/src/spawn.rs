@@ -239,6 +239,9 @@ pub fn parse_cap_alias(s: &str) -> anyhow::Result<Capability> {
     if s == "spawn" {
         return Ok(Capability::Spawn);
     }
+    if s == "shell-exec" || s == "shellexec" {
+        return Ok(Capability::ShellExec);
+    }
     if s.starts_with("mcp") {
         anyhow::bail!(
             "mcp cannot be added via --cap-add; specify it in [agent].capabilities in the template"
@@ -317,8 +320,9 @@ pub fn cap_add_allowed_by_suggestion(cap: &Capability, suggested: &[Capability])
                     return true;
                 }
             }
-            // Spawn: exact match.
+            // Spawn / ShellExec: exact match.
             (Capability::Spawn, Capability::Spawn) => return true,
+            (Capability::ShellExec, Capability::ShellExec) => return true,
             _ => {}
         }
     }
@@ -337,6 +341,7 @@ pub(crate) fn format_cap(cap: &Capability) -> String {
             format!("net:{}", p.join(","))
         }
         Capability::Spawn => "spawn".to_string(),
+        Capability::ShellExec => "shell-exec".to_string(),
         Capability::Mcp { server, .. } => format!("mcp:{server}"),
     }
 }
@@ -506,6 +511,14 @@ mod tests {
     }
 
     #[test]
+    fn alias_shell_exec_valid() {
+        let cap = parse_cap_alias("shell-exec").unwrap();
+        assert_eq!(cap, Capability::ShellExec);
+        let cap2 = parse_cap_alias("shellexec").unwrap();
+        assert_eq!(cap2, Capability::ShellExec);
+    }
+
+    #[test]
     fn alias_net_empty_after_colon_rejected() {
         assert!(parse_cap_alias("net:").is_err(), "empty port string must be rejected");
     }
@@ -513,6 +526,11 @@ mod tests {
     #[test]
     fn alias_net_trailing_comma_rejected() {
         assert!(parse_cap_alias("net:443,").is_err(), "trailing comma must be rejected");
+    }
+
+    #[test]
+    fn format_cap_shell_exec() {
+        assert_eq!(format_cap(&Capability::ShellExec), "shell-exec");
     }
 
     // ── cap_add_allowed_by_suggestion ─────────────────────────────────────────
@@ -687,6 +705,22 @@ task = ""
         let cap = Capability::FsRead { prefix: "/tmp".into() };
         let suggested = vec![Capability::FsRead { prefix: "/workspace".into() }];
         assert!(!cap_add_allowed_by_suggestion(&cap, &suggested));
+    }
+
+    #[test]
+    fn spawn_shell_exec_cap_allowed_when_suggested() {
+        let cap = Capability::ShellExec;
+        let suggested = vec![Capability::ShellExec];
+        assert!(cap_add_allowed_by_suggestion(&cap, &suggested),
+            "ShellExec must be allowed when template suggests it");
+    }
+
+    #[test]
+    fn spawn_shell_exec_cap_rejected_when_not_suggested() {
+        let cap = Capability::ShellExec;
+        let suggested = vec![Capability::Spawn];
+        assert!(!cap_add_allowed_by_suggestion(&cap, &suggested),
+            "ShellExec must be rejected when not in suggested_caps");
     }
 
     #[test]

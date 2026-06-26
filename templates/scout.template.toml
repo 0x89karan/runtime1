@@ -5,6 +5,8 @@
 sample_tasks = [
   "List the project directory and summarize Cargo.toml.",
   "Find all .rs files under src/ and count lines of code.",
+  "Search the web for 'Rust async runtime 2025' and summarize the top 3 results.",
+  "Fetch https://example.com and summarize the page content.",
 ]
 
 [template]
@@ -18,10 +20,32 @@ model      = "claude-haiku-4-5-20251001"
 max_tokens = 2048
 
 [capabilities]
-fs_read = ["/workspace"]
+fs_read  = ["/workspace"]
+# Mcp grants required for the model to see tools served by each MCP server.
+mcp      = [
+    { server = "http_fetch", tools = [] },
+    { server = "web_search", tools = [] },
+]
 
 [tools]
 native = ["read_file", "list_dir"]
+
+# http_fetch — fetch any HTTPS URL and return status/headers/body.
+# Path relative to agentd/ (where cargo run is invoked).
+[[tools.mcp_servers]]
+name    = "http_fetch"
+command = "python3"
+args    = ["../docker/http_mcp.py"]
+capabilities = [{ Net = { hosts = [], ports = [443] } }]
+
+# web_search — search the web via Brave Search API.
+# Requires BRAVE_SEARCH_API_KEY env var. Free tier: brave.com/search/api
+[[tools.mcp_servers]]
+name     = "web_search"
+command  = "python3"
+args     = ["../docker/search_mcp.py"]
+passenv  = ["BRAVE_SEARCH_API_KEY"]
+capabilities = [{ Net = { hosts = ["api.search.brave.com"], ports = [443] } }]
 
 [card]
 name           = "Scout"

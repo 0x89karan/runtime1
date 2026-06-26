@@ -63,6 +63,7 @@ pub fn display_cap(cap: &Capability) -> String {
             if p.is_empty() { "Net".to_string() } else { format!("Net     {{ports: {}}}", p.join(",")) }
         }
         Capability::Spawn => "Spawn".to_string(),
+        Capability::ShellExec => "ShellExec".to_string(),
         Capability::Mcp { server, .. } => format!("Mcp     {{server: {server}}}"),
     }
 }
@@ -125,5 +126,10 @@ mod tests {
         let s = display_cap(&Capability::Mcp { server: "fs".into(), tools: vec![] });
         assert!(s.contains("Mcp"));
         assert!(s.contains("fs"));
+    }
+
+    #[test]
+    fn display_cap_shell_exec() {
+        assert_eq!(display_cap(&Capability::ShellExec), "ShellExec");
     }
 }

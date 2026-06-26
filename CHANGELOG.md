@@ -3,6 +3,54 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [h7.1] - 2026-06-26 (v0.45.0)
+
+Standard MCP Servers (harness increment) — three first-party Python MCP servers in `docker/`,
+a new `ShellExec` subprocess-sandbox capability, and template updates for scout, code-aware, and librarian.
+
+- **`docker/shell_mcp.py`** — `run_command` tool: `shell=True` subprocess, 30 s default/120 s max timeout,
+  stdout/stderr capped at 64 KB, `--test` self-test mode. Exit code, stdout, and stderr returned as JSON.
+- **`docker/http_mcp.py`** — `fetch_url` tool: HTTPS-only, no redirect following (returns `is_redirect: true`
+  + Location header for 3xx), response body capped at 4 MB. `--test` self-test mode.
+- **`docker/search_mcp.py`** — `web_search` tool: Brave Search API, `count` param (1–10), graceful
+  `isError: true` with setup instructions when `BRAVE_SEARCH_API_KEY` is absent. `--test` mode.
+- **`ShellExec` capability** (`agentd/src/capability.rs`) — subprocess sandbox capability; when present in
+  an MCP server's `capabilities`, suppresses `DenySpawn` so the server subprocess can fork/exec shell
+  commands. `agentctl spawn` parses alias `shell-exec`; `display_cap()` renders `"ShellExec"` in the TUI.
+- **Template updates** — scout gains `http_fetch` + `web_search` MCP blocks + 2 new sample tasks;
+  code-aware gains `shell_exec` + `http_fetch` (both with `isolation = "gvisor"`); librarian gains
+  `http_fetch` + `web_search` + `net_ports = [443]` capability.
+- **`docs/MCP_SERVERS.md`** — new "Standard servers (bundled)" section with per-server table, self-test
+  commands, and copy-paste TOML snippets.
+- **`agentd/agent.toml`** — commented examples for all 3 standard servers.
+- **`Makefile`** `test-harness` target runs `--test` self-tests for all 3 servers.
+- **`passenv` field on `McpServerConfig`** — forward named env vars from the parent process into stdio
+  MCP server subprocesses. Required for `BRAVE_SEARCH_API_KEY` since `env_clear()` strips the env.
+  Templates updated: `passenv = ["BRAVE_SEARCH_API_KEY"]` on `web_search` servers.
+- **search_mcp.py fixes** — removed `Accept-Encoding: gzip` (urllib cannot decode gzip; caused silent
+  failure on every live query); non-integer `count` now caught with try/except instead of crashing the server.
+- **shell_mcp.py fixes** — non-integer `timeout_s` now caught; `start_new_session=True` + `os.killpg`
+  for proper process group cleanup on timeout (eliminates orphan grandchild processes).
+- **JSON parse error responses** — all three Python servers now return a JSON-RPC `-32700` Parse error
+  response on `json.JSONDecodeError` instead of silently returning (which caused Rust MCP client to wait
+  30 s then mark the connection broken for the rest of the session).
+- **Post-SIGKILL communicate timeout** (`shell_mcp.py`) — after `os.killpg`, `communicate()` is called
+  with `timeout=5` to prevent indefinite blocking when a grandchild escapes the process group.
+- **HTTP method allowlist** (`http_mcp.py`) — only `GET POST PUT DELETE PATCH HEAD OPTIONS` accepted;
+  CONNECT and TRACE rejected to prevent port-scanning and request-smuggling vectors.
+- **SSRF loopback/RFC1918 block** (`http_mcp.py`) — DNS-resolved IP of the target host is checked
+  against `ipaddress.ip_address.is_loopback / .is_private / .is_link_local` before any connection.
+  Blocks `127.x`, `::1`, `169.254.x`, `10.x`, `172.16-31.x`, `192.168.x`.
+- **LD_PRELOAD/linker var stripping** (`shell_mcp.py`) — `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`,
+  `LD_DEBUG`, `DYLD_INSERT_LIBRARIES`, `DYLD_LIBRARY_PATH` are stripped from any agent-supplied `env`
+  dict before merging with the process environment.
+- **`PASSENV_BLOCKLIST`** (`agentd/src/tools/mcp.rs`) — `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN`
+  are blocked from passenv forwarding; scheduler overwrites the key with an ephemeral scoped key after
+  spawn, so forwarding it here would expose the production key to an untrusted subprocess.
+- **`McpPassenvForwarded` flight event** — emitted after each MCP server spawn when `passenv` is
+  non-empty; records `forwarded`, `blocked`, and `absent` name lists (never values).
+- 1025 workspace tests pass (up from 1009).
+
 ## [obs.3] - 2026-06-26 (v0.44.0)
 
 OTLP sidecar gap remediation — copy-truncate fast-grow detection (content sentinel) + export-drop counting.

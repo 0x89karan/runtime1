@@ -71,6 +71,9 @@ pub enum EventKind {
     /// HTTP MCP server returned a non-2xx status or JSON-RPC error during a tool call.
     /// data: { server_name, http_status: u16, method }
     McpHttpError,
+    /// MCP server spawned with passenv; lists which names were forwarded, blocked, or absent.
+    /// data: { server, forwarded: [str], blocked: [str], absent: [str] }
+    McpPassenvForwarded,
     /// SSE streaming inference started for an agent turn.
     /// data: { agent_id, model }
     InferenceStreamStarted,
@@ -176,6 +179,7 @@ mod tests {
         assert_eq!(kind_str(EventKind::MemoryEvicted), "memory_evicted");
         assert_eq!(kind_str(EventKind::McpHttpConnected), "mcp_http_connected");
         assert_eq!(kind_str(EventKind::McpHttpError), "mcp_http_error");
+        assert_eq!(kind_str(EventKind::McpPassenvForwarded), "mcp_passenv_forwarded");
         assert_eq!(kind_str(EventKind::InferenceStreamStarted), "inference_stream_started");
         assert_eq!(kind_str(EventKind::InferenceStreamCompleted), "inference_stream_completed");
         assert_eq!(kind_str(EventKind::FuseControlReceived), "fuse_control_received");

@@ -50,6 +50,11 @@ pub enum Capability {
     KbRead { segment: String },
     /// Write access to a memory namespace segment (same prefix semantics as KbRead).
     KbWrite { segment: String },
+    /// Subprocess sandbox capability: when listed in an MCP server's `capabilities`,
+    /// suppresses `DenySpawn` so the server subprocess can fork/exec shell commands.
+    /// Identical to `Spawn` in `caps_to_rules_inner`; distinct so config is self-documenting.
+    /// Not used for agent-level gating — use `Mcp { server = "shell_exec" }` for that.
+    ShellExec,
 }
 
 /// Normalize a path by resolving `.` and `..` components without filesystem
@@ -181,6 +186,7 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
                 }
             })
         }
+        Capability::ShellExec => granted.iter().any(|g| matches!(g, Capability::ShellExec)),
     }
 }
 
@@ -548,5 +554,37 @@ mod tests {
             !satisfies(&caps, &Capability::KbWrite { segment: "agent:scratch".to_string() }),
             "KbRead grant must not satisfy KbWrite requirement"
         );
+    }
+
+    // ── ShellExec capability tests ───────────────────────────────────────────
+
+    #[test]
+    fn satisfies_shell_exec_requires_shell_exec_grant() {
+        let caps = vec![Capability::ShellExec];
+        assert!(satisfies(&caps, &Capability::ShellExec));
+    }
+
+    #[test]
+    fn satisfies_shell_exec_denied_without_grant() {
+        assert!(!satisfies(&[], &Capability::ShellExec));
+        let other = vec![Capability::Spawn];
+        assert!(!satisfies(&other, &Capability::ShellExec), "Spawn must not satisfy ShellExec");
+    }
+
+    #[test]
+    fn shell_exec_deserializes_from_toml() {
+        // Confirm unit variant round-trip. toml requires a table root, so wrap in a struct.
+        // Unit variants with #[serde(rename_all = "PascalCase")] serialize as string "ShellExec".
+        let toml_str = r#"capabilities = ["ShellExec"]"#;
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrapper { capabilities: Vec<Capability> }
+        let w: Wrapper = toml::from_str(toml_str).expect("ShellExec must deserialize from 'capabilities = [\"ShellExec\"]'");
+        assert_eq!(w.capabilities[0], Capability::ShellExec);
+        // Serialize the wrapper back and confirm the round-trip produces "ShellExec".
+        let ser = toml::to_string(&w).expect("Wrapper with ShellExec must serialize");
+        assert!(ser.contains("ShellExec"), "serialized TOML must contain 'ShellExec', got: {ser}");
+        // Re-parse to confirm full round-trip.
+        let w2: Wrapper = toml::from_str(&ser).expect("re-parse must succeed");
+        assert_eq!(w2, w, "round-trip must be identical");
     }
 }

@@ -34,6 +34,10 @@ const MAX_NAME_LEN: usize = 64;
 /// Maximum pages fetched during tools/list pagination; prevents infinite loops
 /// with buggy or malicious servers that always return nextCursor.
 const MCP_MAX_TOOL_PAGES: usize = 100;
+/// Env var names that must never be forwarded to MCP subprocesses via `passenv`.
+/// The scheduler replaces ANTHROPIC_API_KEY with an ephemeral scoped key after
+/// spawn; forwarding it here exposes the live production key before that swap fires.
+pub const PASSENV_BLOCKLIST: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 
 use super::{Tool, ToolContext};
 use crate::capability::Capability;
@@ -94,6 +98,7 @@ impl McpClient {
         args: &[String],
         sandbox: Option<sandbox::CompiledSandbox>,
         extra_env: &std::collections::HashMap<String, String>,
+        passenv: &[String],
     ) -> Result<(Arc<Self>, Vec<ToolSpec>)> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -116,6 +121,21 @@ impl McpClient {
         // Per-server env overrides from config (mcp_server.env map).
         for (k, v) in extra_env {
             cmd.env(k, v);
+        }
+        // Forward named vars from the parent env (mcp_server.passenv list).
+        // Used for API keys that must not be hardcoded in config.
+        // PASSENV_BLOCKLIST prevents forwarding Anthropic credentials — the scheduler
+        // overwrites ANTHROPIC_API_KEY with an ephemeral key after spawn, so forwarding
+        // the live key here would hand the production secret to an untrusted subprocess
+        // before the placeholder overwrite fires.
+        for name in passenv {
+            if PASSENV_BLOCKLIST.contains(&name.as_str()) {
+                tracing::warn!(name = %name, "passenv: blocked credential var (use ephemeral key instead)");
+                continue;
+            }
+            if let Ok(val) = std::env::var(name) {
+                cmd.env(name, val);
+            }
         }
 
         // Apply pre-compiled sandbox in the child process before exec().

@@ -243,6 +243,14 @@ shutdown; new `export_drops_counter` in `TokenCounter` (`agentos.otel.export_dro
 "failures") separate from channel-drops counter; stats line: `exported=N open=M dropped=D
 export_drops=E flushed_on_rotation=R`; obs.3-ar-01 (BSP internal queue uncounted) filed in
 TODOS.md; 1009 workspace tests.
+**h7.1 complete (v0.45.0).** Standard MCP servers: `docker/shell_mcp.py` (`run_command` tool,
+`shell=True`, 30 s / 120 s timeout, 64 KB cap), `docker/http_mcp.py` (`fetch_url`, HTTPS-only,
+4 MB cap, no redirects), `docker/search_mcp.py` (`web_search`, Brave API, graceful missing-key
+message); `Capability::ShellExec` — subprocess sandbox capability that suppresses `DenySpawn`;
+`agentctl spawn` `shell-exec` alias + `display_cap()` arm; templates updated: scout gains
+`http_fetch`+`web_search` + 2 sample tasks, code-aware gains `shell_exec`+`http_fetch` (both
+`isolation = "gvisor"`), librarian gains `http_fetch`+`web_search`+`net_ports`; `docs/MCP_SERVERS.md`
+"Standard servers" section; `Makefile` `test-harness` target; 1025 workspace tests.
 
 ## How to work here
 

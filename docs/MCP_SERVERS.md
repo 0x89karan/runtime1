@@ -27,6 +27,75 @@ headers_env = { Authorization = "MY_API_KEY_ENV_VAR" }
 HTTP servers are externally isolated — no `command`, `args`, `isolation`, or
 `capabilities` fields apply.
 
+## Standard servers (bundled)
+
+These servers ship in `docker/` and require only Python 3 (no additional
+package installs). Use paths relative to the directory where agentd is invoked
+(typically `agentd/`).
+
+| Server | Tool | Capability needed | Env var |
+|--------|------|-------------------|---------|
+| `docker/shell_mcp.py` | `run_command` | `ShellExec` in subprocess caps | none |
+| `docker/http_mcp.py`  | `fetch_url`   | `Net { ports = [443] }` in subprocess caps | none |
+| `docker/search_mcp.py` | `web_search` | `Net { ports = [443] }` in subprocess caps | `BRAVE_SEARCH_API_KEY` |
+
+Self-test (no API key required):
+```bash
+python3 docker/shell_mcp.py --test
+python3 docker/http_mcp.py  --test
+python3 docker/search_mcp.py --test
+```
+
+### shell_exec
+
+```toml
+[[tools.mcp_servers]]
+name    = "shell_exec"
+command = "python3"
+# Path relative to agentd/ (where cargo run is invoked)
+args    = ["../docker/shell_mcp.py"]
+capabilities = [
+  { ShellExec = {} },
+  { FsRead  = { prefix = "/workspace" } },
+  { FsWrite = { prefix = "/tmp" } },
+]
+```
+
+Note: `ShellExec` in the subprocess capabilities suppresses `DenySpawn` so
+the server can fork/exec shell commands. The agent also needs
+`mcp = [{ server = "shell_exec", tools = [] }]` in its `[capabilities]` section.
+
+### http_fetch
+
+```toml
+[[tools.mcp_servers]]
+name    = "http_fetch"
+command = "python3"
+args    = ["../docker/http_mcp.py"]
+capabilities = [{ Net = { hosts = [], ports = [443] } }]
+```
+
+Only HTTPS URLs are accepted. Response body is capped at 4 MB. Redirects are
+not followed — the Location header is returned so the agent can decide.
+
+### web_search
+
+```toml
+[[tools.mcp_servers]]
+name     = "web_search"
+command  = "python3"
+args     = ["../docker/search_mcp.py"]
+passenv  = ["BRAVE_SEARCH_API_KEY"]   # forward the key into the subprocess
+capabilities = [{ Net = { hosts = ["api.search.brave.com"], ports = [443] } }]
+```
+
+Set `BRAVE_SEARCH_API_KEY` before starting agentd. The `passenv` field
+forwards it into the subprocess (MCP servers run with a restricted environment
+that does not inherit the full parent env). Returns `isError: true` with a
+setup message if the key is absent.
+
+---
+
 ## Known servers
 
 | Service | URL | Auth header | Env var (example) | Notes |

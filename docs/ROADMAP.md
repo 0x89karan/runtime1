@@ -853,7 +853,7 @@ Docker image. None of them touch `agentd`. Operators attach them via
 `[[tools.mcp_servers]]` with explicit capability grants. Each is a small, independently-
 versioned process in any language.
 
-**h7.1 — Standard MCP servers** [HARNESS]
+**h7.1 — Standard MCP servers** [HARNESS] ✅ v0.45.0
 Three first-party MCP servers that make the existing template catalogue useful without
 operator setup:
 - `shell_exec` — runs shell commands, returns stdout/stderr/exit code; requires a new

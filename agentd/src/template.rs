@@ -882,7 +882,7 @@ task = "t"
         let cfg: TemplateConfig =
             toml::from_str(raw).expect("templates/scout.template.toml must parse");
         assert_eq!(cfg.template.name, "scout");
-        assert_eq!(cfg.sample_tasks.len(), 2, "scout must have 2 sample tasks");
+        assert_eq!(cfg.sample_tasks.len(), 4, "scout must have 4 sample tasks");
         assert!(cfg.capabilities.is_some(), "scout must declare [capabilities]");
         assert!(cfg.agent.is_some(), "scout must have [agent] section");
     }

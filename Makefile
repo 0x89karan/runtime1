@@ -22,3 +22,11 @@ test-linux:
 	  -w /work/agentd \
 	  $(RUST_IMAGE) \
 	  sh -c "apt-get update -qq && apt-get install -y -qq libfuse-dev pkg-config && rustup component add clippy && cargo test"
+
+# Run self-tests for the bundled standard MCP servers (no API key required).
+# Assumes python3 is on PATH.
+.PHONY: test-harness
+test-harness:
+	python3 docker/shell_mcp.py --test
+	python3 docker/http_mcp.py  --test
+	python3 docker/search_mcp.py --test

@@ -138,6 +138,16 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   (11 lines) but has no coverage for: empty/`[]\n` sentinel, multi-item path, malformed-line skip.
 - Fix path: add 3 unit tests to `reader.rs` covering these paths.
 
+## Phase 7 / Harness — Open (from h7.1)
+
+**h7.1-ar-01 (P3) — MCP server script paths are hardcoded relative to agentd/ CWD**
+- `args = ["../docker/shell_mcp.py"]` in template TOML files works only when agentd is
+  invoked from `agentd/` (the CWD assumed by `cargo run`). If agentd is run from the repo
+  root or an installed path, the relative path breaks.
+- Future fix: support a `${AGENTOS_SCRIPTS_DIR}` interpolation token in `args` that resolves
+  to the directory of the running agentd binary, or an env var the operator sets at install
+  time. Deferred — relative paths work for the common `cargo run` development case.
+
 ## Phase 7 — Open (deferred from p7.3 review)
 
 **p7.3-ar-01 (LOW) — `child_seq` consumed on auto-ID collision with existing named agents**
@@ -195,11 +205,10 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   require `httpmock` or `wiremock` infrastructure that wasn't added in p7.1.
 - Deferred from plan: `docs/plans/p7.1-http-sse-mcp-transport.md`. Fix in p7.2.
 
-**p7.1-ar-02 (P3) — SSRF to RFC-1918 / link-local addresses not blocked**
-- `validate()` checks `starts_with("https://")` only. `https://169.254.169.254/...` passes.
-- Single-tenant threat model: the operator controls config, so risk is low.
-- Fix: document the absence of RFC-1918 blocking in `THREAT_MODEL.md §p7.1` and add a note
-  in `docs/MCP_SERVERS.md`. Structural blocking is a p7.2+ hardening item.
+**p7.1-ar-02 (P3) — SSRF to RFC-1918 / link-local addresses not blocked** ✅ FIXED in h7.1
+- `docker/http_mcp.py` now resolves the target hostname via `socket.getaddrinfo` and checks
+  `ipaddress.ip_address.is_loopback / .is_private / .is_link_local` before opening any connection.
+  Blocks loopback, `169.254.x`, `10.x`, `172.16-31.x`, `192.168.x`.
 
 ## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
 

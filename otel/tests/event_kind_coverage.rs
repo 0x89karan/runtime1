@@ -62,6 +62,7 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::MemoryEvicted => false,
         EventKind::McpHttpConnected => false,
         EventKind::McpHttpError => false,
+        EventKind::McpPassenvForwarded => false,
         EventKind::FuseControlReceived => false,
         EventKind::FuseControlError => false,
         EventKind::ApprovalRequested => false,

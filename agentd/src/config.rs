@@ -454,6 +454,12 @@ pub struct McpServerConfig {
     /// Ignored for HTTP servers (use `headers_env` for HTTP auth headers).
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    /// Names of environment variables from the parent process to forward to this MCP server.
+    /// Use this for API keys the subprocess needs (e.g. `BRAVE_SEARCH_API_KEY`).
+    /// Each name is looked up in the parent env at startup; missing vars are silently skipped.
+    /// Ignored for HTTP servers (use `headers_env` instead).
+    #[serde(default)]
+    pub passenv: Vec<String>,
 }
 
 impl McpServerConfig {
