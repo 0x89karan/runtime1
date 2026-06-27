@@ -33,11 +33,12 @@ These servers ship in `docker/` and require only Python 3 (no additional
 package installs). Use paths relative to the directory where agentd is invoked
 (typically `agentd/`).
 
-| Server | Tool | Capability needed | Env var |
-|--------|------|-------------------|---------|
-| `docker/shell_mcp.py` | `run_command` | `ShellExec` in subprocess caps | none |
-| `docker/http_mcp.py`  | `fetch_url`   | `Net { ports = [443] }` in subprocess caps | none |
-| `docker/search_mcp.py` | `web_search` | `Net { ports = [443] }` in subprocess caps | `BRAVE_SEARCH_API_KEY` |
+| Server | Tool(s) | Capability needed | Env var |
+|--------|---------|-------------------|---------|
+| `docker/shell_mcp.py`  | `run_command` | `ShellExec` in subprocess caps | none |
+| `docker/http_mcp.py`   | `fetch_url`   | `Net { ports = [443] }` in subprocess caps | none |
+| `docker/search_mcp.py` | `web_search`  | `Net { ports = [443] }` in subprocess caps | `BRAVE_SEARCH_API_KEY` |
+| `docker/oauth_mcp.py`  | `oauth_start_auth`, `oauth_check_auth`, `oauth_call_api` | `Net { hosts = [...], ports = [443] }` | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` |
 
 Self-test (no API key required):
 ```bash
@@ -94,6 +95,104 @@ forwards it into the subprocess (MCP servers run with a restricted environment
 that does not inherit the full parent env). Returns `isError: true` with a
 setup message if the key is absent.
 
+### oauth_mcp (Google Gmail + Drive)
+
+`docker/oauth_mcp.py` handles the full OAuth2 authorization-code + PKCE flow so an agent can
+call any OAuth-protected API without storing credentials in config files. Google is the
+first example; other providers (Slack, GitHub, Notion) work by changing the env vars.
+
+#### Google Cloud Console setup
+
+> **Required once per project.** Skip if you already have a client ID and secret.
+
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) and select or create a project.
+2. **APIs & Services → Library** → enable "Gmail API" and "Google Drive API".
+3. **APIs & Services → OAuth consent screen** → choose **External** → fill in App name and your email.
+   Add your email as a **Test user** if the app is in testing mode.
+4. **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
+5. Application type: **Desktop app** ← required for the localhost callback to work.
+6. Copy the **Client ID** and **Client Secret**.
+
+#### Environment variables
+
+Export these before starting agentd:
+
+```bash
+# Required (2 vars):
+export OAUTH_CLIENT_ID="<your-client-id>.apps.googleusercontent.com"
+export OAUTH_CLIENT_SECRET="<your-client-secret>"
+
+# Pre-set for Google (copy these exactly — no need to change):
+export OAUTH_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
+export OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
+export OAUTH_SCOPES="https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.readonly"
+export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
+export OAUTH_PROVIDER_NAME="google"
+
+# Optional — skip the browser dance if you already have a refresh token:
+# export OAUTH_REFRESH_TOKEN="<your-refresh-token>"
+```
+
+#### Agent TOML config
+
+```toml
+[[tools.mcp_servers]]
+name    = "google_oauth"
+command = "python3"
+args    = ["../docker/oauth_mcp.py"]
+passenv = [
+  "OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET",
+  "OAUTH_AUTH_URL",  "OAUTH_TOKEN_URL",
+  "OAUTH_SCOPES",    "OAUTH_ALLOWED_HOSTS",
+  "OAUTH_PROVIDER_NAME",
+  "OAUTH_REFRESH_TOKEN",   # optional: skip the dance
+]
+capabilities = [
+  { Net = { hosts = [
+    "accounts.google.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "gmail.googleapis.com",
+  ], ports = [443] } },
+]
+```
+
+Agent capabilities section:
+```toml
+[capabilities]
+mcp = [{ server = "google_oauth", tools = [] }]
+```
+
+#### Approval dance (3 steps)
+
+The agent handles authorization automatically — no `agentctl oauth login` command needed:
+
+1. **Agent calls `oauth_start_auth`** → receives an authorization URL.
+2. **Agent surfaces the URL via `request_approval`** → you see it in the Approvals pane of
+   `agentctl watch` (press `[a]`). Click the URL, sign in with Google, and grant the
+   requested permissions in your browser.
+3. **Agent calls `oauth_check_auth`** → if the browser flow completed, returns
+   `{ ready: true, scopes: [...] }`. The agent can now call `oauth_call_api` to read Gmail,
+   list Drive files, etc.
+
+The refresh token is saved to `~/.agentos-oauth/google.json` (mode 0600). On subsequent runs,
+the agent picks up the saved token — no browser flow required unless the token is revoked.
+
+#### Error reference
+
+| Error | Meaning | Fix |
+|-------|---------|-----|
+| `oauth_mcp: missing required env OAUTH_CLIENT_ID` | Server exited at startup | Export `OAUTH_CLIENT_ID` before starting agentd |
+| `oauth_mcp: missing required env OAUTH_CLIENT_SECRET` | Server exited at startup | Export `OAUTH_CLIENT_SECRET` before starting agentd |
+| `{"error": "auth_not_ready"}` | Agent called `oauth_call_api` before auth completed | Call `oauth_start_auth` first, complete browser flow, then `oauth_check_auth` |
+| `{"error": "host_not_allowed", "host": "..."}` | URL hostname not in `OAUTH_ALLOWED_HOSTS` | Add hostname to `OAUTH_ALLOWED_HOSTS` env var |
+| `{"error": "timeout"}` from `oauth_check_auth` | 10-minute browser flow window expired | Call `oauth_start_auth` again to get a fresh URL |
+
+Self-test (no credentials required):
+```bash
+python3 docker/oauth_mcp.py --test
+```
+
 ---
 
 ## Known servers
@@ -103,8 +202,8 @@ setup message if the key is absent.
 | Linear  | `https://mcp.linear.app/mcp` | `Authorization` | `LINEAR_MCP_TOKEN` | Bearer token from Linear API settings |
 | GitHub  | `https://api.githubcopilot.com/mcp/` | `Authorization` | `GITHUB_MCP_TOKEN` | Bearer token (PAT with `repo` scope) |
 
-> Note: OAuth-based services (Gmail, Google Drive, etc.) require a future
-> `auth_provider` field that is not yet implemented. Deferred to a future increment.
+> Note: OAuth-based services (Gmail, Google Drive, etc.) use `docker/oauth_mcp.py` — see
+> the **oauth_mcp** section in Standard servers above for setup instructions.
 
 ## Security notes
 

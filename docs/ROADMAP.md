@@ -866,7 +866,7 @@ operator setup:
 These servers follow the pattern established by `docker/weather_mcp.py`: small, stdlib-
 only implementations of the MCP JSON-RPC protocol over stdio.
 
-**h7.2 — OAuth MCP sidecar** [HARNESS]
+**h7.2 — OAuth MCP sidecar** [HARNESS] ✓ done (v0.46.0)
 Handles OAuth2 authorization-code flow with a local callback server; stores tokens in
 the system keychain (read from env at agent startup, preserving the secrets-from-env
 invariant); presents authenticated HTTP calls as MCP tools. Unlocks Gmail, Google Drive,

@@ -3,6 +3,29 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [h7.2] - 2026-06-27 (v0.46.0)
+
+OAuth MCP Sidecar (harness increment) — generic OAuth2 authorization-code + PKCE Python MCP server,
+Google agent template, and full operator quickstart docs.
+
+- **`docker/oauth_mcp.py`** — new Python MCP server with three tools:
+  - `oauth_start_auth()` → starts local `127.0.0.1:<random>/callback` server, returns PKCE auth URL
+  - `oauth_check_auth()` → exchanges code for tokens after browser flow; returns `{ready: bool, scopes: [...]}`
+  - `oauth_call_api(url, method?, headers?, body?)` → authenticated HTTPS call, auto-refresh on 401, host allowlist enforced
+- **PKCE (RFC 7636 S256)** — `secrets.token_urlsafe(64)` → 86-char verifier (safe below 128-char hard ceiling)
+- **Tool state machine** — `idle → pending → authorized`; `oauth_call_api` before auth returns `{error: "auth_not_ready"}`
+- **Threading** — callback server runs on daemon thread; all token state protected by `threading.Lock`
+- **AuthSession dataclass** — explicit session object (state, code_verifier, redirect_uri, expires_at, server, thread, result, lock)
+- **CSRF protection** — `state` nonce validated exactly in callback (RFC 6749 §10.12); path must be `GET /callback`
+- **SSRF dual-layer** — hostname allowlist (`OAUTH_ALLOWED_HOSTS`) + IP block (`_is_ssrf_blocked`) rejects loopback/RFC1918/link-local
+- **Token file** — refresh token atomic-written to `~/.agentos-oauth/<OAUTH_PROVIDER_NAME>.json` (mode 0600, dir 0700)
+- **`OAUTH_REFRESH_TOKEN` bypass** — env var skips the dance entirely; `oauth_check_auth` returns ready immediately
+- **Startup validation** — server prints `oauth_mcp: missing required env OAUTH_CLIENT_ID` and exits 1 if required vars absent
+- **`host_not_allowed` error body** — `{"error": "host_not_allowed", "host": "<rejected>"}` for actionable diagnosis
+- **`--test` self-test** — 10-case matrix (no real credentials required); `python3 docker/oauth_mcp.py --test`
+- **`templates/google-agent.template.toml`** — new template; pre-sets 5 of 7 env vars for Google (AUTH_URL, TOKEN_URL, SCOPES, ALLOWED_HOSTS, PROVIDER_NAME); operator sets only `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET`; `gated_requires` warning with GCP Console note; includes `gmail.googleapis.com` in allowed hosts
+- **`docs/MCP_SERVERS.md`** — new `oauth_mcp` section: full TOML snippet, GCP console setup checklist (incl. "Desktop app" callout), 2-var export list, approval dance sequence (3 steps), error reference table; updated Known servers note to remove "deferred to future increment" caveat
+
 ## [h7.1] - 2026-06-26 (v0.45.0)
 
 Standard MCP Servers (harness increment) — three first-party Python MCP servers in `docker/`,
