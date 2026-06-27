@@ -5,6 +5,7 @@ cron_mcp — fires wait_for_trigger() on a cron schedule or interval.
 Tool: wait_for_trigger
   Input:  { timeout_s?: int (default 25, max 25) }
   Output: { status: "fired"|"waiting"|"timeout",
+            fired_utc: str   (only present when status == "fired"),
             next_fire_utc: str,
             event_id: str,
             message: str }
@@ -295,13 +296,15 @@ def handle_wait_for_trigger(args: dict) -> dict:
             _advance_next_fire()
         except RuntimeError as _e:
             return {
-                "status":   "timeout",
-                "event_id": eid,
-                "message":  f"No future fire time after trigger: {_e}",
+                "status":        "timeout",
+                "next_fire_utc": None,  # no future fire time exists
+                "event_id":      eid,
+                "message":       f"No future fire time after trigger: {_e}",
             }
         _WAIT_START = None  # reset for next wait cycle
         return {
             "status":        "fired",
+            "fired_utc":     fired_at,
             "next_fire_utc": _format_utc(_NEXT_FIRE_TS),
             "event_id":      eid,
             "message":       f"Trigger fired at {fired_at} UTC",
@@ -378,6 +381,7 @@ def _self_test():
     _init()
     r = handle_wait_for_trigger({"timeout_s": 3})
     assert r["status"] == "fired", f"interval fire failed: {r}"
+    assert "fired_utc" in r, f"fired_utc missing from fired response: {r}"
     print("  [1/5] interval fire: PASS", file=sys.stderr)
 
     # Cron: a past minute should compute to next occurrence
@@ -389,6 +393,7 @@ def _self_test():
     _MAX_WAIT_S = None
     r2 = handle_wait_for_trigger({"timeout_s": 5})
     assert r2["status"] == "fired", f"every-minute cron failed: {r2}"
+    assert "fired_utc" in r2, f"fired_utc missing from cron fired response: {r2}"
     print("  [2/5] every-minute cron fire: PASS", file=sys.stderr)
 
     # POSIX DOW test: verify (weekday+1)%7 mapping
@@ -418,7 +423,19 @@ def _self_test():
     assert r3["status"] == "timeout", f"max_wait_s should return timeout: {r3}"
     print("  [5/5] max_wait_s timeout: PASS", file=sys.stderr)
 
-    print("cron_mcp.py: self-test PASSED (5/5)", file=sys.stderr)
+    # Waiting: fire is far in the future — should return "waiting" immediately
+    _MODE         = "interval"
+    _INTERVAL_S   = 3600
+    _NEXT_FIRE_TS = _now() + 3600
+    _WAIT_START   = None
+    _MAX_WAIT_S   = None
+    r4 = handle_wait_for_trigger({"timeout_s": 0})
+    assert r4["status"] == "waiting", f"waiting status expected: {r4}"
+    assert "fired_utc" not in r4, f"fired_utc must not appear in waiting response: {r4}"
+    assert "next_fire_utc" in r4, f"next_fire_utc must appear in waiting response: {r4}"
+    print("  [6/6] waiting status: PASS", file=sys.stderr)
+
+    print("cron_mcp.py: self-test PASSED (6/6)", file=sys.stderr)
     sys.exit(0)
 
 

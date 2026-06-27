@@ -628,6 +628,178 @@ ss -tlnp | grep 9100          # Linux; use lsof -i :9100 on macOS
 
 ---
 
+## 11. Chief of Staff — Daily Operating Brief (cos.1)
+
+An always-on agent that reads Gmail every day and writes a structured Operating Brief.
+Autonomy L0 (read-only). All five trust properties are live and verifiable.
+
+### 11.1 Overview
+
+| Property | How it works |
+|---|---|
+| Wake on schedule | `cron_mcp.py` `wait_for_trigger` (daily 08:00 UTC default) |
+| Read Gmail without holding the token | `oauth_mcp.py` sidecar — token lives in the process, never in the agent context |
+| Multi-agent | Orchestrator spawns Inbox + Curator each cycle via `spawn_agent` |
+| Brief persistence | KB `ops:briefs` (log) + `ops:entities` (scratch) |
+| Tamper-evident | Ed25519-signed receipt chain in `evidence.jsonl` |
+
+**Cost:** ~50 k tokens/day × $3/1M = ~$0.15/day (Sonnet for both orchestrator and inbox).
+
+### 11.2 Prerequisites
+
+```bash
+# Check required tools
+cargo --version           # Rust stable
+python3 --version         # Python 3.8+
+which fusermount3          # for agentctl watch (or run agentd with --no-fuse)
+```
+
+Google Cloud Console setup (one-time):
+1. Create/select a project → **APIs & Services → Library** → enable **Gmail API**.
+2. **OAuth consent screen** → External → add your email as a Test user.
+3. **Credentials → Create → OAuth client ID** → Application type: **Desktop app**.
+4. Copy the **Client ID** and **Client Secret**.
+
+### 11.3 Environment variables
+
+```bash
+# Required:
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OAUTH_CLIENT_ID="<client-id>.apps.googleusercontent.com"
+export OAUTH_CLIENT_SECRET="<client-secret>"
+
+# Pre-set for Google — copy exactly, no changes needed:
+export OAUTH_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
+export OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
+export OAUTH_SCOPES="https://www.googleapis.com/auth/gmail.readonly"
+export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
+export OAUTH_PROVIDER_NAME="google"
+
+# Schedule (default: daily 08:00 UTC):
+export TRIGGER_CRON="0 8 * * *"
+# Weekdays only: export TRIGGER_CRON="0 9 * * 1-5"
+
+# After first run — skip the OAuth dance:
+export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
+```
+
+### 11.4 First run (OAuth browser dance — required once)
+
+The first run requires a browser to authorize Gmail access. You need two terminals.
+
+**Terminal 1 — start agentd:**
+```bash
+cd agentd
+cargo run -- cos.agents.toml
+```
+
+**Terminal 2 — watch for the auth prompt:**
+```bash
+cargo run --bin agentctl -- watch
+# Press [a] to open the Approvals pane
+```
+
+What happens:
+1. The Inbox agent calls `oauth_start_auth` → gets a Google authorization URL.
+2. The URL appears in the `agentctl watch` Approvals pane.
+3. Click the URL (or copy it to your browser), sign in with Google, grant Gmail read access.
+4. The Inbox agent calls `oauth_check_auth` → `ready: true`.
+5. The refresh token is saved to `~/.agentos-oauth/google.json` (mode 0600).
+
+After the first run, add to your shell profile:
+```bash
+export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
+```
+
+### 11.5 Subsequent runs
+
+```bash
+# Set OAUTH_REFRESH_TOKEN (no browser needed):
+export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
+cargo run -- agentd/cos.agents.toml
+```
+
+The orchestrator parks on `wait_for_trigger` between runs. Ctrl-C checkpoints state;
+restart picks up from where it left off.
+
+### 11.6 Where the brief lands
+
+**Dev mode (cargo run):**
+```bash
+ls ./output/brief-*.md          # written by the orchestrator
+cat ./output/brief-$(date +%Y-%m-%d).md
+```
+
+**QEMU/distro mode:**
+The `output0` 9p mount at `/run/output` is readable from the host at `distro/build/output/images/run/`.
+
+### 11.7 Verifying the trust story
+
+```bash
+# 1. Agent never holds the Gmail token (no ya29.* in any flight event):
+grep -E "ya29\.|access_token|refresh_token" flight.jsonl && echo "FAIL" || echo "PASS"
+
+# 2. Egress confined (any off-domain attempt logged as denied):
+jq 'select(.kind=="egress_rejected")' flight.jsonl
+
+# 3. Signed receipt chain (exit 0 = chain intact):
+cargo run --bin agentctl -- verify evidence.jsonl
+
+# 4. Cost bounded (total tokens per run):
+jq -r 'select(.kind=="inference_response") | .data | (.input_tokens + .output_tokens)' flight.jsonl \
+  | paste -sd+ | bc
+
+# 5. Approval gate (L1 mode only — confirms no send without Approve):
+jq 'select(.kind=="REQUEST_APPROVAL" or .kind=="APPROVAL_GRANTED" or .kind=="APPROVAL_DENIED")' flight.jsonl
+```
+
+### 11.8 Monitoring with agentctl watch
+
+```bash
+cargo run --bin agentctl -- watch
+```
+
+Key views:
+- **Dashboard** (default): shows orchestrator + spawned inbox/curator agents, budget, status.
+- **Topology** (`[t]`): spawn tree — orchestrator → inbox-YYYY-MM-DD + curator-YYYY-MM-DD.
+- **Approvals** (`[a]`): approve/deny pending requests (OAuth URL on first run; L1 send drafts).
+- **Inspector** (`[i]`): flight log with filter for Sandbox/CapDenied events.
+- **Memory** (`[m]`): browse `ops:briefs` and `ops:entities` KB content.
+
+### 11.9 Known limits and operational notes
+
+**max_turns = 200,000** — cron polling at 25 s/turn burns ~3,456 turns/day just waiting.
+The default (20) would kill the orchestrator in under 8 minutes before the first brief.
+`cos.agents.toml` sets 200,000 (≈58 days of continuous polling).
+
+**token_budget = 5,000,000,000** — `tokens_spent` persists in checkpoint and never resets.
+5B tokens ≈ 50k/day × 365 days × 274× margin. When you see `budget_exceeded`:
+```bash
+rm agentd/checkpoint.json   # clears the accumulated spend counter
+# then restart agentd normally — KB and brief files are preserved
+```
+
+**Child ID collision** — the orchestrator spawns `inbox-YYYY-MM-DD` and `curator-YYYY-MM-DD`
+on each cycle. These date-stamped IDs are required; a static ID like `inbox-agent` would
+collide on the second cron cycle (terminated children stay in the scheduler's outcome map).
+
+**cron_mcp restarts** — on agentd restart, `cron_mcp.py` recomputes the next fire time.
+Events that would have fired during downtime are not replayed.
+
+### 11.10 Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No brief after 24h; `max_turns_reached` in flight.jsonl | max_turns too low | Check cos.agents.toml has `max_turns = 200_000` |
+| `{"error":"host_not_allowed"}` from Gmail | `OAUTH_ALLOWED_HOSTS` not in env or not in passenv | Export the var and check cos.agents.toml `passenv` |
+| OAuth URL never appears | agentctl watch not running | Open second terminal, run `agentctl watch`, press `[a]` |
+| Orchestrator dies after one brief | Task prompt missing re-trigger instruction | Check orchestrator task ends with explicit `wait_for_trigger` loop |
+| Second cron cycle spawns no children | Child ID collision | Verify orchestrator uses date-stamped child IDs |
+| `budget_exceeded` in flight.jsonl | Lifetime token budget exhausted | `rm checkpoint.json` and restart |
+| `agent_admission_denied` in flight.jsonl | Child ID collision guard fired | Child ID is already in outcomes map; confirm date-stamping |
+
+---
+
 ## 10. The phase ahead (Phase 5 / Phase 6 preview)
 
 What's landed vs coming, with operational implications. Design: `DESIGN-memory.md`,

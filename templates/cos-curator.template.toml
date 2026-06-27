@@ -1,0 +1,81 @@
+sample_tasks = [
+    "Given a brief JSON [paste the JSON here], persist its key entities to the ops KB.",
+    "Search the ops:briefs segment for entries about open items from last week.",
+]
+
+[template]
+name        = "cos-curator"
+description = "KB curator for the Chief of Staff system: persists daily briefs and named entities to the ops:* segments."
+showcases   = "Phase-5 shared KB + log segment (append-only briefs) + scratch segment (entities) + provenance stamping"
+gated_requires = "Phase-5 memory configured: memory.store_path must point to a running redb volume. ops:briefs (log) and ops:entities (scratch) segments must be declared."
+
+# This template can be used standalone to query or seed the ops KB.
+# In the Chief of Staff system, the orchestrator spawns the curator dynamically.
+# See agentd/cos.agents.toml for the full system.
+#
+# STANDALONE vs ORCHESTRATOR-SPAWNED USAGE:
+#   Standalone (agentctl spawn):  pass the brief JSON directly in the task.
+#   Orchestrator-spawned:         the orchestrator pre-loads the brief into
+#     ops:entities/inbox-{TODAY} via kb_put; the curator retrieves it via
+#     kb_get before calling kb_put(segment='ops:briefs', ...).
+#     sync-with: agentd/cos.agents.toml "Curator Agent task prompt"
+
+[capabilities]
+kb_read  = ["ops:briefs", "ops:entities"]
+kb_write = ["ops:briefs", "ops:entities"]
+
+[card]
+name        = "Ops Curator"
+description = "Persists daily briefs and extracted entities (people, open items) to the ops:* KB with runtime provenance."
+skills      = ["memory", "knowledge-base", "ops", "curator"]
+suggested_caps = [
+    { KbRead  = { segment = "ops:briefs"   } },
+    { KbWrite = { segment = "ops:briefs"   } },
+    { KbRead  = { segment = "ops:entities" } },
+    { KbWrite = { segment = "ops:entities" } },
+]
+
+[tools]
+native = ["kb_get", "kb_put", "kb_search"]
+
+[memory]
+enabled    = true
+store_path = "memory.redb"
+
+[[memory.segments]]
+name  = "ops:briefs"
+class = "log"
+
+[[memory.segments]]
+name  = "ops:entities"
+class = "scratch"
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[agent]
+id = "cos-curator"
+task = """
+You are a KB curator for the Chief of Staff system. Given a Daily Operating Brief JSON,
+persist its contents to the ops:* KB segments.
+
+STEP 1 — Store the brief:
+Call kb_put(segment='ops:briefs', key='{DATE}', value=<the full brief JSON as a string>)
+The segment class is 'log' (append-only). Each date maps to one brief.
+
+STEP 2 — Persist named entities:
+For each person in response_needed and important:
+  kb_put(segment='ops:entities', key='person:{first_last_lowercase}',
+    value='{"name":"...","last_contact":"DATE","threads":["subject1","subject2"],"notes":"..."}')
+
+For each open item:
+  kb_put(segment='ops:entities', key='open:{DATE}:{N}',
+    value=<item text>)
+
+STEP 3 — Report:
+Output a summary of how many KB entries you wrote.
+"""
+max_turns    = 20
+token_budget = 200_000

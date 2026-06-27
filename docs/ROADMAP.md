@@ -890,7 +890,7 @@ The substrate is complete (core + observability + full h7.x harness) but unprove
 real workload, and the wedge is still n=1 conviction. The Chief of Staff is the flagship that
 proves both. Build the thin vertical slice, get it *used* on a real inbox, **then** Phase 8.
 
-**cos.1 — Daily Operating Brief (vertical slice)** [HARNESS / flagship] *(planned — NEXT)*
+**cos.1 — Daily Operating Brief (vertical slice)** [HARNESS / flagship] *(done — v0.48.0)*
 An always-on, cron-triggered Chief of Staff that produces a Daily Operating Brief from Gmail,
 read-only (autonomy L0), with the full trust story *demonstrable*: the agent never holds the
 OAuth token (it lives in the `google_oauth` sidecar), egress is confined to Gmail + the model

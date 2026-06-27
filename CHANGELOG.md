@@ -3,6 +3,33 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cos.1] - 2026-06-27 (v0.48.0)
+
+### Added
+- `agentd/cos.agents.toml` — three-agent Chief of Staff system: Executive Orchestrator
+  (cron-triggered, always-on, `max_turns=200_000`, `token_budget=5_000_000_000`), Inbox Agent
+  (read-only Gmail via OAuth2 sidecar), Curator (KB persistence to `ops:briefs`/`ops:entities`).
+- `templates/cos-orchestrator.template.toml` — orchestrator template with lifetime-correct defaults;
+  `gated_requires` warning for OAuth + cron env vars.
+- `templates/cos-inbox.template.toml` — read-only Gmail analyst; explicit capability scoping
+  (no Spawn, no FsWrite, MCP-only); `memory.enabled=false`.
+- `templates/cos-curator.template.toml` — KB curator (Haiku model, mechanical writes); scoped to
+  `ops:briefs` (log) + `ops:entities` (scratch) only.
+- `docs/RUNBOOK.md §11` — Chief of Staff runbook: prerequisites, env-var block, first-run OAuth
+  dance, brief location, 7 verification commands, agentctl watch keys, known limits, troubleshooting.
+- Template catalogue test updated to expect 13 templates (was 10).
+
+### Architecture
+- Composes 8 shipped primitives without new core code: cron (h7.3) + OAuth (h7.2) +
+  scheduler/spawn (p1) + KB (p5) + approval gate (p7.4) + egress/receipts (p7.5) +
+  gVisor floor (p7.6) + OTLP (obs.1–3).
+- Child agents use date-stamped IDs (`inbox-YYYY-MM-DD`, `curator-YYYY-MM-DD`) to avoid
+  outcome-map collision across daily cycles.
+- Orchestrator prompt has explicit LOOP_BACK step instructing the model to call
+  `wait_for_trigger` again after writing the brief (prevents premature FinalAnswer).
+- Trust story demonstrable: token-absence, egress-denial, OTLP+signed-receipts,
+  approval-gated send, bounded cost.
+
 ## [h7.3] - 2026-06-27 (v0.47.0)
 
 ### Added

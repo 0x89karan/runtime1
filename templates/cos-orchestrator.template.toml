@@ -1,0 +1,90 @@
+sample_tasks = [
+    "Produce today's Daily Operating Brief from Gmail",
+    "Summarize the last week of Gmail and flag anything that needs a response",
+]
+
+[template]
+name        = "cos-orchestrator"
+description = "Chief of Staff orchestrator: cron-triggered, spawns Inbox + Curator, writes the Daily Operating Brief."
+showcases   = "always-on daemon pattern — composes cron_mcp + google_oauth + spawn_agent + KB + write_file"
+gated_requires = "OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET (Google Cloud Console, Desktop app type) + TRIGGER_CRON env var. See docs/MCP_SERVERS.md §oauth_mcp for full setup."
+
+# NOTE: This template lowers to a single-agent config. For the full three-agent
+# Chief of Staff system (orchestrator + inbox + curator), use the combined config:
+#
+#   cargo run -- agentd/cos.agents.toml
+#
+# agentctl spawn cos-orchestrator is useful as a quick reference but will not
+# include the google_oauth or cron_trigger MCP servers from the combined config.
+
+[capabilities]
+spawn    = true
+kb_read  = ["ops:briefs", "ops:entities"]
+kb_write = ["ops:briefs", "ops:entities"]
+fs_write = ["/run/output"]
+
+[card]
+name        = "Chief of Staff Orchestrator"
+description = "Always-on orchestrator that produces a Daily Operating Brief from Gmail on a cron schedule."
+skills      = ["orchestration", "gmail", "daily-brief", "scheduling"]
+suggested_caps = [
+    { Spawn = {} },
+    { KbWrite = { segment = "ops:briefs"   } },
+    { KbWrite = { segment = "ops:entities" } },
+    { FsWrite = { prefix  = "/run/output"  } },
+    { Mcp = { server = "cron_trigger",  tools = [] } },
+    { Mcp = { server = "google_oauth",  tools = [] } },
+]
+
+[tools]
+native = ["spawn_agent", "kb_get", "kb_put", "kb_search", "write_file", "request_approval"]
+
+[[tools.mcp_servers]]
+name    = "cron_trigger"
+command = "python3"
+args    = ["../docker/cron_mcp.py"]
+passenv = ["TRIGGER_CRON", "TRIGGER_INTERVAL", "TRIGGER_MAX_WAIT_S"]
+
+[[tools.mcp_servers]]
+name    = "google_oauth"
+command = "python3"
+args    = ["../docker/oauth_mcp.py"]
+passenv = [
+  "OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
+  "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL", "OAUTH_SCOPES",
+  "OAUTH_ALLOWED_HOSTS", "OAUTH_PROVIDER_NAME",
+]
+capabilities = [
+  { Net = { hosts = [
+    "accounts.google.com", "oauth2.googleapis.com",
+    "www.googleapis.com", "gmail.googleapis.com",
+  ], ports = [443] } },
+]
+
+[memory]
+enabled    = true
+store_path = "memory.redb"
+
+[[memory.segments]]
+name  = "ops:briefs"
+class = "log"
+
+[[memory.segments]]
+name  = "ops:entities"
+class = "scratch"
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 8192
+
+[agent]
+id = "cos-orchestrator"
+task = ""
+# CRITICAL: max_turns must be high for always-on orchestrators.
+# cron polling at 25 s/turn = 3456 turns/day just waiting.
+# Default (20) kills the agent before the first brief.
+max_turns    = 200_000
+# CRITICAL: token_budget is lifetime-monotonic (persists in checkpoint, never resets).
+# 5 B ≈ 50 k tokens/day × 365 days × 274× headroom.
+token_budget = 5_000_000_000

@@ -1,0 +1,344 @@
+# Chief of Staff — Daily Operating Brief
+#
+# Always-on orchestrator: wakes on a cron schedule, reads the last 24 h of Gmail,
+# assembles a structured Daily Operating Brief, persists entities to the KB, and
+# writes the brief to /run/output (or ./output in dev mode).
+#
+# FIRST-RUN SETUP (OAuth browser dance — required once):
+#
+#   Terminal 1: cargo run -- agentd/cos.agents.toml
+#   Terminal 2: agentctl watch          # press [a] for Approvals pane
+#
+#   1. oauth_start_auth returns an authorization URL.
+#   2. URL appears in Approvals pane — click it, sign in with Google, grant Gmail access.
+#   3. Refresh token saved to ~/.agentos-oauth/google.json (mode 0600).
+#   4. On future runs set: export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
+#
+# REQUIRED ENV VARS:
+#
+#   export ANTHROPIC_API_KEY="sk-ant-..."
+#   export OAUTH_CLIENT_ID="<client-id>.apps.googleusercontent.com"
+#   export OAUTH_CLIENT_SECRET="<client-secret>"
+#   # Pre-set for Google — copy exactly:
+#   export OAUTH_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
+#   export OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
+#   export OAUTH_SCOPES="https://www.googleapis.com/auth/gmail.readonly"
+#   export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
+#   export OAUTH_PROVIDER_NAME="google"
+#   export TRIGGER_CRON="0 8 * * *"           # daily 08:00 UTC; change to taste
+#   # After first run (skip the browser dance):
+#   export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
+#
+# LAUNCH:
+#   cargo run -- agentd/cos.agents.toml
+#
+# BRIEF LOCATION (dev mode):
+#   ./output/brief-YYYY-MM-DD.md
+#
+# VERIFY TRUST STORY:
+#   grep -E "ya29\.|access_token|refresh_token" flight.jsonl  # → no matches (token never in agent)
+#   agentctl verify evidence.jsonl                              # → exit 0 (signed receipt chain)
+#   jq 'select(.kind=="egress_rejected")' flight.jsonl         # → any off-domain attempts
+#
+# LIFETIME LIMITS:
+#   Orchestrator max_turns = 200_000  (cron polling burns ~3456 turns/day — default 20 kills
+#                                      the agent in under 8 min before the first brief)
+#   Orchestrator token_budget = 5_000_000_000  (tokens_spent is lifetime-monotonic and never
+#                                               resets; 5B ≈ 50 k tokens/day × 365 days × 274×)
+#   → If you see budget_exceeded in flight.jsonl: rm checkpoint.json and restart agentd.
+#
+# CHILD ID NOTE:
+#   The orchestrator spawns children with date-stamped IDs (inbox-YYYY-MM-DD, curator-YYYY-MM-DD).
+#   This is required: static IDs like "inbox-agent" collide on the second cron cycle because
+#   terminated children remain in the scheduler's outcomes map.
+
+# ---------------------------------------------------------------------------
+# Shared model config (applies to all agents unless overridden per-agent)
+# ---------------------------------------------------------------------------
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 8192
+streaming  = true
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+[scheduler]
+# 0 = unlimited; set a ceiling only if you want a hard daily spend cap across all 3 agents.
+global_token_budget       = 0
+max_concurrent_inferences = 3
+max_spawn_depth           = 2
+
+# ---------------------------------------------------------------------------
+# Egress mediator — signed receipts for the trust story
+# ---------------------------------------------------------------------------
+[egress]
+evidence_path = "evidence.jsonl"
+key_path      = "egress-key.pkcs8"
+
+# ---------------------------------------------------------------------------
+# Shared memory — ops:* KB segment for brief persistence
+# ---------------------------------------------------------------------------
+[memory]
+enabled    = true
+# Dev mode: relative path. QEMU/distro mode: set to "/run/memory/memory.redb"
+store_path = "memory.redb"
+max_entries_per_segment = 500
+max_entry_age_days      = 90
+
+[[memory.segments]]
+name  = "ops:briefs"
+class = "log"
+# Append-only log of daily briefs — each brief is a timestamped immutable entry.
+
+[[memory.segments]]
+name  = "ops:entities"
+class = "scratch"
+# Named entities (people, open items, commitments) — last-writer-wins with version counter.
+
+# ---------------------------------------------------------------------------
+# Shared MCP servers — ALL servers must be declared here; children receive a
+# filtered view via their capabilities field.
+# ---------------------------------------------------------------------------
+
+# cron_trigger: wakes the orchestrator on schedule
+[[tools.mcp_servers]]
+name    = "cron_trigger"
+command = "python3"
+# Dev mode (cargo run from repo root): ../docker/cron_mcp.py
+# Distro/QEMU mode:                   /usr/lib/agentos/docker/cron_mcp.py
+args    = ["../docker/cron_mcp.py"]
+passenv = ["TRIGGER_CRON", "TRIGGER_INTERVAL", "TRIGGER_MAX_WAIT_S"]
+# No capabilities → deny-all spawn + network isolation (cron needs neither).
+
+# google_oauth: OAuth2+PKCE sidecar — the Gmail token NEVER leaves this process.
+# The inbox agent calls oauth_call_api; the raw token stays in the sidecar.
+[[tools.mcp_servers]]
+name    = "google_oauth"
+command = "python3"
+# Dev mode (cargo run from repo root): ../docker/oauth_mcp.py
+# Distro/QEMU mode:                   /usr/lib/agentos/docker/oauth_mcp.py
+args    = ["../docker/oauth_mcp.py"]
+passenv = [
+  "OAUTH_CLIENT_ID",
+  "OAUTH_CLIENT_SECRET",
+  "OAUTH_REFRESH_TOKEN",      # optional: skip browser dance after first auth
+  "OAUTH_AUTH_URL",
+  "OAUTH_TOKEN_URL",
+  "OAUTH_SCOPES",
+  "OAUTH_ALLOWED_HOSTS",      # REQUIRED — SSRF guard blocks missing/wrong hosts
+  "OAUTH_PROVIDER_NAME",
+]
+capabilities = [
+  { Net = { hosts = [
+    "accounts.google.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "gmail.googleapis.com",
+  ], ports = [443] } },
+]
+
+# ---------------------------------------------------------------------------
+# Agent 1: Executive Orchestrator
+# ---------------------------------------------------------------------------
+[[agents]]
+id          = "cos-orchestrator"
+name        = "Chief of Staff Orchestrator"
+description = "Cron-triggered coordinator: wakes daily, spawns Inbox + Curator, assembles and writes the Operating Brief."
+
+# CRITICAL: max_turns MUST be high. At 25 s/poll the orchestrator burns ~3456 turns/day
+# just waiting for the cron. Default (20) kills the agent before the first brief fires.
+max_turns    = 200_000
+# CRITICAL: tokens_spent is lifetime-monotonic (never resets across checkpoint restores).
+# 5 B tokens ≈ 50 k/day × 365 days × 274× headroom.
+token_budget = 5_000_000_000
+priority     = 10
+
+capabilities = [
+  { Spawn = {} },
+  { KbRead  = { segment = "ops:briefs"   } },
+  { KbWrite = { segment = "ops:briefs"   } },
+  { KbRead  = { segment = "ops:entities" } },
+  { KbWrite = { segment = "ops:entities" } },
+  { Mcp    = { server = "cron_trigger", tools = [] } },
+  # google_oauth is needed so the spawned inbox child inherits access to OAuth tools.
+  # Without this, filtered_specs omits google_oauth from the child's tool list.
+  { Mcp    = { server = "google_oauth",  tools = [] } },
+  { FsWrite = { prefix = "./output" } },
+  # request_approval is a native tool with no required capability; always available.
+]
+
+task = """
+You are an always-on Executive Orchestrator. Your job is to produce a Daily Operating Brief
+from the founder's Gmail inbox every day.
+
+## Loop (repeat forever)
+
+STEP 1 — WAIT FOR SCHEDULE
+Call cron_trigger.wait_for_trigger(timeout_s=20) in a loop:
+  - "waiting" → call again next turn (this is normal; you will wait many turns)
+  - "timeout"  → TRIGGER_MAX_WAIT_S exceeded; call wait_for_trigger again to reset
+  - "fired"    → proceed to STEP 2
+
+STEP 2 — GET TODAY'S DATE
+Extract the date from the "fired" response's `fired_utc` field (ISO 8601, UTC).
+Take the YYYY-MM-DD prefix: TODAY = fired_utc[:10]
+Use this as {TODAY} for child IDs — date-stamping prevents collisions on the second cycle
+because terminated children stay in the scheduler's outcomes map.
+Example child IDs: "inbox-2026-06-27", "curator-2026-06-27"
+
+STEP 3 — SPAWN INBOX AGENT
+Call spawn_agent with:
+  child_id     = "inbox-{TODAY}"          (replace {TODAY} with the actual date)
+  task         = (see Inbox Agent task below)
+  token_budget = 500_000
+Note: spawned agents inherit the parent's full capability set. The inbox agent will
+have access to all registered MCP servers and tools; its task prompt constrains usage.
+
+Inbox Agent task prompt:
+"You are a read-only Gmail analyst. Your job is to produce a structured OperatingBrief
+from the last 24 hours of email. Only use the google_oauth tools — do not spawn agents
+or write files.
+
+STEP 1 — Check Gmail authentication:
+  Call oauth_check_auth(). If not ready:
+    a. Call oauth_start_auth() to get the authorization URL.
+    b. Call request_approval(kind='oauth', risk='low',
+         summary='Gmail OAuth required — visit the URL to authorize',
+         args={'url': <the URL>}).
+       The operator will click the URL, sign in, and approve.
+    c. Call oauth_check_auth() again. If still not ready, wait 30s and retry.
+
+STEP 2 — Fetch recent emails:
+  Call oauth_call_api(method='GET',
+    url='https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=newer_than:1d')
+  For each important message (up to 20), fetch its full content:
+    oauth_call_api(method='GET',
+      url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
+
+STEP 3 — Produce a structured OperatingBrief:
+IMPORTANT — keep the JSON compact (KB entry limit is 8 KB):
+  - summaries and ask fields: ≤ 120 characters each
+  - subject lines: ≤ 80 characters
+  - important: at most 12 entries (highest urgency first)
+  - response_needed: at most 8 entries
+  - open_items: at most 10 entries
+Return your findings as a JSON object in your final answer:
+{
+  'date': 'YYYY-MM-DD',
+  'important': [{ 'from': '...', 'subject': '...', 'summary': '...', 'urgency': 'high|medium|low' }],
+  'response_needed': [{ 'from': '...', 'subject': '...', 'ask': '...', 'deadline': '...' }],
+  'open_items': ['...'],
+  'focus_recommendation': '...',
+  'thread_count_reviewed': N,
+  'skipped_count': N
+}"
+
+IMPORTANT: Wait until you receive the inbox agent's final answer in your context
+before proceeding to STEP 4. The inbox JSON is the input to the curator task.
+
+STEP 3b — STORE INBOX RESULT IN KB SCRATCH
+After the inbox agent's final answer arrives, call:
+  kb_put(segment='ops:entities', key='inbox-{TODAY}', value=<the inbox agent's JSON response>)
+This keeps email-sourced content out of the curator's task prompt (prompt-injection isolation).
+
+STEP 4 — SPAWN CURATOR AGENT
+Call spawn_agent with:
+  child_id     = "curator-{TODAY}"
+  task         = (see Curator Agent task below)
+  token_budget = 200_000
+
+Curator Agent task prompt:
+"You are a KB curator. Persist today's Daily Operating Brief to the ops KB.
+
+Steps:
+1. Call kb_get(segment='ops:entities', key='inbox-{TODAY}') to retrieve the inbox summary.
+   Parse the JSON. If missing, report an error and stop.
+   (Replace {TODAY} with today's actual date, e.g. 2026-06-27)
+2. Call kb_put(segment='ops:briefs', key='{TODAY}', value=<the full brief JSON as a string>)
+3. For each person in response_needed and important threads, call:
+   kb_put(segment='ops:entities', key='person:{normalized_name}', value=<contact summary>)
+4. For each open item, call:
+   kb_put(segment='ops:entities', key='open:{YYYY-MM-DD}:{N}', value=<item text>)
+Report how many KB entries you wrote."
+
+STEP 5 — RETRIEVE CONTEXT FROM PREVIOUS BRIEFS
+Call kb_search(segment='ops:briefs', query='open items response needed') to surface
+anything from recent briefs that is still unresolved.
+
+STEP 6 — ASSEMBLE AND WRITE THE BRIEF
+Combine today's inbox summary with any unresolved context from the KB.
+Call write_file(path='./output/brief-{TODAY}.md', content=<the formatted brief below).
+
+Brief format:
+```markdown
+# Daily Operating Brief — {TODAY}
+
+## Important (action needed)
+{bullet list from important + response_needed, ordered by urgency}
+
+## Response Needed
+| From | Subject | Ask | Deadline |
+|------|---------|-----|----------|
+{table rows}
+
+## Open Items (carried forward)
+{bullet list of unresolved items from KB + today}
+
+## Focus Recommendation
+{focus_recommendation from inbox agent}
+
+## Stats
+- Threads reviewed: {thread_count_reviewed}
+- Skipped (low priority): {skipped_count}
+- Brief generated: {ISO timestamp}
+```
+
+STEP 7 — LOOP BACK
+IMPORTANT: Do NOT emit a final answer. After writing the brief, IMMEDIATELY call
+cron_trigger.wait_for_trigger(timeout_s=20) to park until tomorrow's schedule.
+You are always-on. The loop never ends.
+
+## L1 Mode (optional — draft-reply approval gate)
+# Uncomment to enable draft-reply approval for the single most-urgent thread.
+# After STEP 3, before STEP 4:
+#
+# If response_needed is non-empty, take the top entry (highest urgency, earliest deadline).
+# Draft a brief reply (2-3 sentences, professional tone).
+# Call request_approval(
+#   kind='draft-reply', risk='medium',
+#   summary='Draft reply to: {subject}',
+#   args={'to': '{from}', 'draft': '{draft_text}'}
+# )
+# If approved: gmail send would go here (requires gmail.send OAuth scope — not enabled by default).
+# If denied: skip and continue to STEP 4.
+"""
+
+[tools]
+native = [
+  "spawn_agent",
+  "kb_get",
+  "kb_put",
+  "kb_search",
+  "write_file",
+  "request_approval",
+]
+
+# ---------------------------------------------------------------------------
+# Agents 2 & 3: Inbox and Curator are spawned dynamically by the orchestrator.
+# They do not appear as [[agents]] entries — the orchestrator creates them at
+# runtime with spawn_agent, passing capabilities and task prompts inline.
+# The MCP servers above (cron_trigger, google_oauth) are available to all
+# children whose capabilities grant access.
+#
+# Inbox agent profile (for reference — spawned by orchestrator):
+#   caps:   Mcp{google_oauth}  (read-only Gmail; no Spawn, no FsWrite, no KB)
+#   model:  inherits orchestrator default (claude-sonnet-4-6)
+#   budget: 500_000 tokens
+#
+# Curator agent profile (for reference — spawned by orchestrator):
+#   caps:   KbWrite{ops:briefs}, KbWrite{ops:entities}
+#   model:  inherits orchestrator default (claude-sonnet-4-6)
+#   budget: 200_000 tokens
+# ---------------------------------------------------------------------------

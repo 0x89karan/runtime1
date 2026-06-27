@@ -9,6 +9,11 @@ flight.jsonl
 checkpoint.json
 checkpoint.json.corrupt
 
+# cos.1 Chief of Staff runtime artifacts (never commit)
+egress-key.pkcs8
+evidence.jsonl
+output/
+
 # OS + tooling cruft
 .DS_Store
 .gstack/

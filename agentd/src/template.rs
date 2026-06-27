@@ -908,13 +908,13 @@ task = "t"
         let resolver = catalogue_resolver();
         let entries = resolver.list().unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian", "langchain-worker", "cron-agent", "webhook-agent"] {
+        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian", "langchain-worker", "cron-agent", "webhook-agent", "cos-orchestrator", "cos-inbox", "cos-curator"] {
             assert!(
                 names.contains(expected),
                 "catalogue must contain template '{expected}'; found: {names:?}"
             );
         }
-        assert_eq!(entries.len(), 10, "catalogue must have exactly 10 templates; found: {names:?}");
+        assert_eq!(entries.len(), 13, "catalogue must have exactly 13 templates; found: {names:?}");
     }
 
     #[test]
@@ -941,7 +941,7 @@ task = "t"
     #[test]
     fn catalogue_gated_templates_lower_to_valid_config() {
         let resolver = catalogue_resolver();
-        for name in &["journaler", "memory-custodian"] {
+        for name in &["journaler", "memory-custodian", "cos-orchestrator", "cos-inbox", "cos-curator"] {
             let (cfg, _) = resolver.resolve(name).unwrap();
             let config = cfg
                 .to_agent_config(Some("test task"), vec![])
@@ -997,7 +997,8 @@ task = "t"
         let resolver = catalogue_resolver();
         let entries = resolver.list().unwrap();
         for entry in &entries {
-            if ["journaler", "memory-custodian", "watcher", "cron-agent", "webhook-agent"].contains(&entry.name.as_str()) {
+            if ["journaler", "memory-custodian", "watcher", "cron-agent", "webhook-agent",
+                "cos-orchestrator", "cos-inbox", "cos-curator"].contains(&entry.name.as_str()) {
                 assert!(
                     !entry.sample_tasks.is_empty(),
                     "gated template '{}' must have at least one sample_task",

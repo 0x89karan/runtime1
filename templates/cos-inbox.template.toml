@@ -1,0 +1,106 @@
+sample_tasks = [
+    "Summarize the last 24 hours of Gmail activity",
+    "Find all emails requiring a response today and list them by urgency",
+    "Search my Gmail for emails about project deadlines and extract the key dates",
+]
+
+[template]
+name        = "cos-inbox"
+description = "Read-only Gmail analyst: fetches recent mail, triages by priority, extracts asks and commitments."
+showcases   = "gmail read-only pattern — oauth_call_api with no send scope, boundary-secret construction"
+gated_requires = "OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET (Google Cloud Console). See docs/MCP_SERVERS.md §oauth_mcp."
+
+# This template can be used standalone for one-shot Gmail analysis.
+# In the Chief of Staff system, the orchestrator spawns this agent dynamically
+# (not via agentctl spawn). See agentd/cos.agents.toml for the full system.
+
+[capabilities]
+# SECURITY: inbox agent has ONLY gmail read access.
+# No Spawn, no FsRead, no FsWrite, no KbWrite — explicitly scoped.
+mcp = [{ server = "google_oauth", tools = [] }]
+
+[card]
+name        = "Inbox Agent"
+description = "Reads Gmail (last 24 h), triages by priority, extracts asks/deadlines/commitments. No send capability."
+skills      = ["gmail", "email-triage", "read-only", "summarization"]
+suggested_caps = [
+    { Mcp = { server = "google_oauth", tools = [] } },
+]
+
+[tools]
+native = ["request_approval"]
+
+[[tools.mcp_servers]]
+name    = "google_oauth"
+command = "python3"
+args    = ["../docker/oauth_mcp.py"]
+passenv = [
+  "OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
+  "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL", "OAUTH_SCOPES",
+  "OAUTH_ALLOWED_HOSTS",       # REQUIRED — SSRF guard needs this
+  "OAUTH_PROVIDER_NAME",
+]
+capabilities = [
+  { Net = { hosts = [
+    "accounts.google.com",
+    "oauth2.googleapis.com",
+    "www.googleapis.com",
+    "gmail.googleapis.com",
+  ], ports = [443] } },
+]
+
+[memory]
+enabled = false
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 8192
+
+[agent]
+id = "cos-inbox"
+task = """
+You are a read-only Gmail analyst. Produce a structured summary of the last 24 hours of email.
+
+STEP 1 — Check authentication:
+Call oauth_check_auth(). If not ready:
+  a. Call oauth_start_auth() to get the authorization URL.
+  b. Call request_approval(kind='oauth', risk='low',
+       summary='Gmail OAuth required — visit the URL to authorize',
+       args={'url': <the URL>}).
+  c. Wait for the operator to approve, then call oauth_check_auth() again.
+
+STEP 2 — Fetch recent messages (last 24 h):
+Call oauth_call_api(method='GET',
+  url='https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=newer_than:1d')
+
+For each message ID (up to 20 most relevant), fetch full content:
+  oauth_call_api(method='GET',
+    url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
+
+STEP 3 — Return a structured OperatingBrief as your final answer:
+Keep the JSON compact (total must be under 8 KB — it will be stored in a KB entry):
+  - summaries and ask fields: ≤ 120 characters each
+  - subject lines: ≤ 80 characters
+  - important: at most 12 entries (highest urgency first)
+  - response_needed: at most 8 entries
+  - open_items: at most 10 entries
+
+{
+  "date": "YYYY-MM-DD",
+  "important": [
+    { "from": "...", "subject": "...", "summary": "...", "urgency": "high|medium|low" }
+  ],
+  "response_needed": [
+    { "from": "...", "subject": "...", "ask": "...", "deadline": "YYYY-MM-DD or 'none'" }
+  ],
+  "open_items": ["..."],
+  "focus_recommendation": "...",
+  "thread_count_reviewed": N,
+  "skipped_count": N
+}
+
+Return only valid JSON. Do not include markdown fences.
+"""
+max_turns    = 30
+token_budget = 500_000

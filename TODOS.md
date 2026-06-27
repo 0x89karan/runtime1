@@ -576,6 +576,16 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 
 ## Completed
 
+**cos.1 — Daily Operating Brief (Chief of Staff flagship)**
+- `agentd/cos.agents.toml`: three-agent system (orchestrator + inbox + curator). Orchestrator:
+  `max_turns=200_000`, `token_budget=5_000_000_000`, cron-triggered via `cron_mcp.py`. Inbox agent:
+  read-only Gmail via `oauth_mcp.py` (no Spawn/FsWrite). Curator: Haiku model, KB-only.
+- All 4 critical eng constraints resolved: max_turns set, budget set to 5B, child IDs date-stamped
+  in orchestrator task prompt, `cos.1-eng-04` (mock testing) left as a deferred integration note.
+- 3 new templates: `cos-orchestrator`, `cos-inbox`, `cos-curator`.
+- `docs/RUNBOOK.md §11` with full first-run OAuth dance and 7 verification commands.
+- Template test updated: 10 → 13 expected templates. All 503+ tests pass.
+
 **p6.4 — Topology view (multi-agent graph)**
 - `parent_id: Option<String>` on `AgentSnapshot`; insert-only `parent_map` in `SchedulerState` + checkpoint (`#[serde(default)]` for compat).
 - `OFF_PARENT = 9`: new FUSE virtual file `/agents/<id>/parent`; `reader.rs` reads it into `AgentInfo.parent_id`.

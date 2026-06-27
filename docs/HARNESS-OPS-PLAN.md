@@ -336,8 +336,7 @@ Each workflow is: **trigger → orchestrator → subagent(s) → structured outp
   · h7.1 generic MCP servers · h7.3 trigger mechanism · h8.1 HelixDB (context-graph
   substrate) · h7.2 OAuth (for Gmail/Calendar).
 
-**Phase O1 — Vertical slice (Daily Operating Brief, read-only): → NOW SPEC'd AS `cos.1`,
-the NEXT increment.** Full, substrate-grounded spec: `docs/plans/cos.1-chief-of-staff-slice.md`.
+**Phase O1 — Vertical slice (Daily Operating Brief, read-only): → DONE as `cos.1` (v0.48.0).** Full, substrate-grounded spec: `docs/plans/cos.1-chief-of-staff-slice.md`.
 Orchestrator + GBrain-Curator + Inbox (read) over Gmail (`google_oauth` h7.2) + cron trigger
 (h7.3), with the approval gate (p7.4), egress + signed receipts (p7.5), gVisor floor (p7.6),
 and OTLP (obs.1–3) all live. Output to `/run/output`; `agentctl ops` view deferred. Autonomy
