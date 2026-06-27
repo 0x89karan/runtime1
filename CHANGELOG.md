@@ -3,6 +3,48 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [h7.3] - 2026-06-27 (v0.47.0)
+
+### Added
+- `docker/cron_mcp.py` — cron/interval trigger MCP server; `wait_for_trigger()` poll-and-retry
+  design (MCP_TIMEOUT=30s constraint); supports 5-field cron (UTC) and `every N(s|m|h)` intervals;
+  bounded grammar (exit 1 on unsupported tokens); POSIX DOW mapping `(weekday+1)%7`; debounce via
+  `_wait_start`; `TRIGGER_MAX_WAIT_S` global abort; 5 self-tests.
+- `docker/fs_watch_mcp.py` — filesystem watch trigger MCP server; polls via `os.scandir` every
+  `TRIGGER_POLL_INTERVAL_S` (default 2s); tracks mtime_ns + size + inode (detects delete+recreate);
+  `TRIGGER_IGNORE_PATTERNS` (fnmatch globs); `TRIGGER_QUIET_PERIOD_S` debounce; 6 self-tests.
+- `docker/webhook_mcp.py` — HTTP webhook trigger MCP server; `ThreadingHTTPServer` (no HOL
+  blocking); Content-Length cap before read (64 KB); `hmac.compare_digest` HMAC-SHA256; timestamp
+  tolerance ±5 min always applied; queue full → 429; `rejected_count` in waiting response; 6
+  self-tests.
+- `templates/cron-agent.template.toml` — scheduled agent template (cron or interval trigger).
+- `templates/webhook-agent.template.toml` — webhook-driven agent template.
+- `templates/watcher.template.toml` — updated: `gated_requires` removed (now fully operational),
+  wired to `fs_watch_mcp.py`, sample tasks added.
+- `docs/MCP_SERVERS.md` — Trigger Servers section with "How trigger agents work" explanation,
+  per-server TOML snippets, webhook security notes, and curl example.
+- 2 new Rust template tests: `catalogue_watcher_no_longer_gated`,
+  `catalogue_trigger_templates_lower_to_valid_config`.
+- `Makefile test-harness` — extended to self-test all 6 MCP servers (3 existing + 3 trigger).
+- Plan: `docs/plans/h7.3-event-trigger-mcp-servers.md` (26 autoplan decisions, all mechanical).
+
+### Changed
+- `docs/ROADMAP.md` — h7.3 marked complete (v0.47.0).
+- `docs/MCP_SERVERS.md` — webhook "replay protection" note clarified: timestamp window is ±5 min
+  (not nonce-based; sub-window replays require HMAC + application-level dedup).
+- `templates/webhook-agent.template.toml` — added comment that changing `TRIGGER_WEBHOOK_PORT`
+  requires updating `net_ports` in both capability sections; noted `TRIGGER_WEBHOOK_SECRET`
+  strongly recommended when `write_file` is enabled.
+- Workspace tests: 1025 → 1027.
+
+### Fixed
+- `docker/cron_mcp.py` — `_advance_next_fire()` wrapped in try/except `RuntimeError`; a
+  non-repeating cron schedule no longer crashes the server after the first trigger fires.
+  Returns `{status: "timeout", message: "No future fire time..."}` instead.
+- `docker/cron_mcp.py` — moved `import os` to top-level imports (was inadvertently at module bottom).
+- `docker/webhook_mcp.py` — `OSError` on port bind is now caught in `_init()` with a clean
+  error message + `sys.exit(1)` instead of a raw Python traceback.
+
 ## [h7.2] - 2026-06-27 (v0.46.0)
 
 OAuth MCP Sidecar (harness increment) — generic OAuth2 authorization-code + PKCE Python MCP server,

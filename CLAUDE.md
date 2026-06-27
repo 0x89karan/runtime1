@@ -251,6 +251,18 @@ message); `Capability::ShellExec` — subprocess sandbox capability that suppres
 `http_fetch`+`web_search` + 2 sample tasks, code-aware gains `shell_exec`+`http_fetch` (both
 `isolation = "gvisor"`), librarian gains `http_fetch`+`web_search`+`net_ports`; `docs/MCP_SERVERS.md`
 "Standard servers" section; `Makefile` `test-harness` target; 1025 workspace tests.
+**h7.2 complete (v0.46.0).** Generic OAuth2 + PKCE MCP sidecar (`docker/oauth_mcp.py`): three
+tools (`oauth_start_auth`, `oauth_check_auth`, `oauth_call_api`); PKCE RFC 7636 S256; CSRF state
+nonce; SSRF dual-layer (allowlist + IP block); token file atomic-write (mode 0600); state machine
+`idle→pending→authorized`; OAUTH_REFRESH_TOKEN bypass; `templates/google-agent.template.toml`;
+`docs/MCP_SERVERS.md` oauth_mcp section; 1025 workspace tests.
+**h7.3 complete (v0.47.0).** Event-trigger MCP servers — poll-and-retry design fits MCP_TIMEOUT=30s:
+`docker/cron_mcp.py` (5-field cron UTC + interval; POSIX DOW; 5 self-tests),
+`docker/fs_watch_mcp.py` (mtime+size+inode; fnmatch ignore; quiet-period debounce; 6 self-tests),
+`docker/webhook_mcp.py` (ThreadingHTTPServer; Content-Length bomb guard; HMAC-SHA256; ±5 min
+timestamp; 6 self-tests); `templates/cron-agent.template.toml` + `templates/webhook-agent.template.toml`
+(new); `templates/watcher.template.toml` — `gated_requires` removed (now fully operational);
+`Makefile test-harness` extended to all 6 servers; 2 new Rust template tests; 1027 workspace tests.
 
 ## How to work here
 

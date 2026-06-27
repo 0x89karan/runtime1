@@ -1,19 +1,21 @@
 sample_tasks = [
-    "List /workspace/src recursively and report all .rs files, grouped by subdirectory.",
+    "Watch /workspace for any file changes and report what changed.",
+    "Monitor /workspace/src for new or modified Rust files and summarize the changes.",
 ]
 
 [template]
-name           = "watcher"
-description    = "Filesystem observer: scans a directory and reports changes on demand."
-showcases      = "closest thing to a daemon in AgentOS — REQUIRES event-trigger surface (not yet implemented; see post-Phase-6 roadmap)"
-gated_requires = "event-trigger surface (not yet implemented — spawning this template starts a one-shot scan agent, not a persistent daemon)"
+name        = "watcher"
+description = "Filesystem watcher: wakes on file changes in a watched directory."
+showcases   = "event-driven daemon pattern — waits for filesystem events via fs_watch_mcp.py"
+
+# Requires: export TRIGGER_WATCH_PATH=/path/to/watch before spawning
 
 [capabilities]
 fs_read = ["/workspace"]
 
 [card]
 name        = "Watcher"
-description = "Scans /workspace for changes and reports them. Runs as a one-shot scan until event-trigger support lands."
+description = "Sleeps until a file in TRIGGER_WATCH_PATH changes, then reports what changed."
 skills      = ["monitoring", "filesystem"]
 suggested_caps = [
     { FsRead = { prefix = "/workspace" } },
@@ -22,14 +24,41 @@ suggested_caps = [
 [tools]
 native = ["read_file", "list_dir"]
 
+[[tools.mcp_servers]]
+name    = "fs_watch"
+command = "python3"
+# Adjust path to match where agentd is invoked from.
+args    = ["/usr/lib/agentos/docker/fs_watch_mcp.py"]
+passenv = [
+    "TRIGGER_WATCH_PATH",
+    "TRIGGER_POLL_INTERVAL_S",
+    "TRIGGER_IGNORE_PATTERNS",
+    "TRIGGER_QUIET_PERIOD_S",
+    "TRIGGER_MAX_WAIT_S",
+]
+capabilities = [
+    { FsRead = { prefix = "/" } },
+]
+
 [model]
 provider   = "anthropic"
 model      = "claude-haiku-4-5-20251001"
 max_tokens = 2048
 
 [agent]
-# Note: static ID — rename before spawning a second copy in the same session.
 id           = "watcher"
-task         = ""
-max_turns    = 10
-token_budget = 50000
+task         = """
+You are a filesystem watcher agent. On each turn:
+1. Call wait_for_trigger() in a loop until status == "fired".
+2. When fired, read and summarize the changed files.
+3. Report your findings concisely.
+
+Loop example:
+  while True:
+    result = wait_for_trigger(timeout_s=25)
+    if result.status == "fired":
+      break
+    # status == "waiting" — call again next turn
+"""
+max_turns    = 50
+token_budget = 100000

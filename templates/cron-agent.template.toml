@@ -1,0 +1,64 @@
+sample_tasks = [
+    "At the scheduled time, summarize the contents of /workspace/README.md.",
+    "When the cron fires, check /workspace/src for any TODO comments and report them.",
+]
+
+[template]
+name        = "cron-agent"
+description = "Scheduled agent: wakes on a cron schedule or fixed interval and runs a task."
+showcases   = "cron-driven daemon pattern — waits for the schedule via cron_mcp.py"
+
+# Configure via env vars before spawning:
+#   TRIGGER_CRON="0 9 * * 1-5"  (weekdays at 09:00 UTC)
+#   TRIGGER_INTERVAL="every 1h"  (every hour; mutually exclusive with TRIGGER_CRON)
+#   TRIGGER_MAX_WAIT_S=86400     (optional: abort after 24 hours of waiting)
+
+[capabilities]
+fs_read = ["/workspace"]
+
+[card]
+name        = "Cron Agent"
+description = "Sleeps until a cron schedule fires, then runs the configured task."
+skills      = ["scheduling", "automation"]
+suggested_caps = [
+    { FsRead = { prefix = "/workspace" } },
+]
+
+[tools]
+native = ["read_file", "list_dir"]
+
+[[tools.mcp_servers]]
+name    = "cron_trigger"
+command = "python3"
+# Adjust path to match where agentd is invoked from.
+args    = ["/usr/lib/agentos/docker/cron_mcp.py"]
+passenv = [
+    "TRIGGER_CRON",
+    "TRIGGER_INTERVAL",
+    "TRIGGER_MAX_WAIT_S",
+]
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 2048
+
+[agent]
+id           = "cron-agent"
+task         = """
+You are a scheduled agent. On each turn:
+1. Call wait_for_trigger() in a loop until status == "fired".
+2. When fired, perform the requested task.
+3. Report your findings concisely.
+
+Loop example:
+  while True:
+    result = wait_for_trigger(timeout_s=25)
+    if result.status == "fired":
+      break
+    if result.status == "timeout":
+      stop  # TRIGGER_MAX_WAIT_S exceeded
+    # status == "waiting" — call again next turn
+"""
+max_turns    = 50
+token_budget = 100000

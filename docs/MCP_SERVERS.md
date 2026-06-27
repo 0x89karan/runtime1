@@ -35,16 +35,22 @@ package installs). Use paths relative to the directory where agentd is invoked
 
 | Server | Tool(s) | Capability needed | Env var |
 |--------|---------|-------------------|---------|
-| `docker/shell_mcp.py`  | `run_command` | `ShellExec` in subprocess caps | none |
-| `docker/http_mcp.py`   | `fetch_url`   | `Net { ports = [443] }` in subprocess caps | none |
-| `docker/search_mcp.py` | `web_search`  | `Net { ports = [443] }` in subprocess caps | `BRAVE_SEARCH_API_KEY` |
-| `docker/oauth_mcp.py`  | `oauth_start_auth`, `oauth_check_auth`, `oauth_call_api` | `Net { hosts = [...], ports = [443] }` | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` |
+| `docker/shell_mcp.py`    | `run_command` | `ShellExec` in subprocess caps | none |
+| `docker/http_mcp.py`     | `fetch_url`   | `Net { ports = [443] }` in subprocess caps | none |
+| `docker/search_mcp.py`   | `web_search`  | `Net { ports = [443] }` in subprocess caps | `BRAVE_SEARCH_API_KEY` |
+| `docker/oauth_mcp.py`    | `oauth_start_auth`, `oauth_check_auth`, `oauth_call_api` | `Net { hosts = [...], ports = [443] }` | `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET` |
+| `docker/cron_mcp.py`     | `wait_for_trigger` | none | `TRIGGER_CRON` or `TRIGGER_INTERVAL` |
+| `docker/fs_watch_mcp.py` | `wait_for_trigger` | `FsRead { prefix = "/..." }` | `TRIGGER_WATCH_PATH` |
+| `docker/webhook_mcp.py`  | `wait_for_trigger` | `Net { ports = [PORT] }` | `TRIGGER_WEBHOOK_PORT` (optional) |
 
 Self-test (no API key required):
 ```bash
 python3 docker/shell_mcp.py --test
 python3 docker/http_mcp.py  --test
 python3 docker/search_mcp.py --test
+python3 docker/cron_mcp.py  --test
+python3 docker/fs_watch_mcp.py --test
+python3 docker/webhook_mcp.py  --test
 ```
 
 ### shell_exec
@@ -191,6 +197,139 @@ the agent picks up the saved token — no browser flow required unless the token
 Self-test (no credentials required):
 ```bash
 python3 docker/oauth_mcp.py --test
+```
+
+---
+
+## Trigger servers (event-driven agents)
+
+These three servers expose a single `wait_for_trigger()` tool that makes an
+agent event-driven. Because `agentd`'s `MCP_TIMEOUT` is 30 s, the servers use
+a **poll-and-retry** pattern: the tool returns within 25 s with
+`{"status":"waiting"|"fired"|"timeout"}`. The agent's task instructs it to call
+`wait_for_trigger()` in a loop until `status == "fired"`.
+
+### How trigger agents work
+
+1. Agent calls `wait_for_trigger(timeout_s=25)` as its first action.
+2. If `status == "waiting"`, the condition hasn't fired yet — call again next turn.
+3. If `status == "fired"`, the event occurred — proceed with the task.
+4. If `status == "timeout"`, `TRIGGER_MAX_WAIT_S` was exceeded — the agent stops.
+
+The MCP server process is **long-running** (not restarted per call), so server
+state (cron schedule, filesystem snapshot, webhook queue) persists across calls.
+
+**On checkpoint:** agentd sends SIGTERM to MCP subprocesses. `cron_mcp.py`
+recomputes the next fire time on restart. `fs_watch_mcp.py` rebuilds the
+directory snapshot (changes during the downtime window become the new baseline
+and are NOT reported). `webhook_mcp.py` loses its in-memory queue — events
+that arrived during downtime are permanently lost; for reliability requirements,
+write events to durable storage before POSTing.
+
+### cron_mcp
+
+Fires on a cron schedule (UTC) or fixed interval.
+
+```bash
+# Requires: export TRIGGER_CRON or TRIGGER_INTERVAL
+export TRIGGER_CRON="0 9 * * 1-5"   # weekdays at 09:00 UTC
+# or:
+export TRIGGER_INTERVAL="every 1h"   # every hour (mutually exclusive)
+export TRIGGER_MAX_WAIT_S=86400      # optional: abort after 24 hours
+```
+
+```toml
+[[tools.mcp_servers]]
+name    = "cron_trigger"
+command = "python3"
+# Adjust path to repo location:
+args    = ["/usr/lib/agentos/docker/cron_mcp.py"]
+passenv = ["TRIGGER_CRON", "TRIGGER_INTERVAL", "TRIGGER_MAX_WAIT_S"]
+```
+
+Cron grammar: `*`, `*/N`, integer, comma-list. Only UTC timezone.
+DOW field: 0=Sunday (POSIX), 7=Sunday alias. Day-of-week range: `1-5` (Mon–Fri).
+Interval units: `s` (seconds), `m` (minutes), `h` (hours).
+Unsupported tokens cause `exit 1` at startup with a clear error message.
+
+### fs_watch_mcp
+
+Fires when files in a watched directory change (create / modify / delete).
+
+```bash
+# Requires: export TRIGGER_WATCH_PATH
+export TRIGGER_WATCH_PATH=/workspace/src
+export TRIGGER_POLL_INTERVAL_S=2       # polling granularity (default 2s)
+export TRIGGER_IGNORE_PATTERNS="*.pyc,__pycache__,*.swp"
+export TRIGGER_QUIET_PERIOD_S=1        # debounce window (default 1s)
+export TRIGGER_MAX_WAIT_S=3600         # optional
+```
+
+```toml
+# Requires: export TRIGGER_WATCH_PATH=/path/to/watch
+[[tools.mcp_servers]]
+name    = "fs_watch"
+command = "python3"
+args    = ["/usr/lib/agentos/docker/fs_watch_mcp.py"]
+passenv = [
+    "TRIGGER_WATCH_PATH",
+    "TRIGGER_POLL_INTERVAL_S",
+    "TRIGGER_IGNORE_PATTERNS",
+    "TRIGGER_QUIET_PERIOD_S",
+    "TRIGGER_MAX_WAIT_S",
+]
+capabilities = [{ FsRead = { prefix = "/" } }]
+```
+
+Change detection tracks mtime, file size, and inode — delete+recreate at the
+same size is correctly detected. Ignore patterns use `fnmatch` and are applied
+to filenames. Debounce coalesces rapid writes into a single fire event.
+
+### webhook_mcp
+
+Fires when an HTTP POST arrives at the configured port.
+
+```bash
+export TRIGGER_WEBHOOK_PORT=9000         # default
+export TRIGGER_WEBHOOK_HOST=127.0.0.1   # default — loopback only
+export TRIGGER_WEBHOOK_SECRET=my-secret # optional HMAC-SHA256 key
+export TRIGGER_MAX_WAIT_S=3600           # optional
+```
+
+```toml
+[[tools.mcp_servers]]
+name    = "webhook_trigger"
+command = "python3"
+args    = ["/usr/lib/agentos/docker/webhook_mcp.py"]
+passenv = [
+    "TRIGGER_WEBHOOK_PORT",
+    "TRIGGER_WEBHOOK_HOST",
+    "TRIGGER_WEBHOOK_SECRET",
+    "TRIGGER_MAX_WAIT_S",
+]
+capabilities = [{ Net = { ports = [9000] } }]
+```
+
+**Webhook security:**
+- `X-Timestamp` header (Unix epoch integer) is always validated — rejects
+  requests outside ±5 minutes even without HMAC (limits replay window to ±5 min; no nonce/dedup for sub-window replays).
+- When `TRIGGER_WEBHOOK_SECRET` is set, validates `X-Hub-Signature-256: sha256=<hex>`
+  using `hmac.compare_digest` (timing-safe).
+- Body capped at 64 KB (checked from `Content-Length` header before reading).
+- Queue full (> 10 pending events) returns HTTP 429.
+- `rejected_count` is included in every `wait_for_trigger` response so the
+  agent knows how many requests were rejected while it was waiting.
+
+**Sending a webhook (example):**
+```bash
+BODY='{"event": "push", "branch": "main"}'
+TS=$(date +%s)
+SIG=$(echo -n "$BODY" | openssl dgst -sha256 -hmac "$TRIGGER_WEBHOOK_SECRET" | awk '{print $2}')
+curl -X POST http://127.0.0.1:9000/ \
+  -H "Content-Type: application/json" \
+  -H "X-Timestamp: $TS" \
+  -H "X-Hub-Signature-256: sha256=$SIG" \
+  -d "$BODY"
 ```
 
 ---

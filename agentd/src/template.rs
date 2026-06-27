@@ -908,13 +908,13 @@ task = "t"
         let resolver = catalogue_resolver();
         let entries = resolver.list().unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian", "langchain-worker"] {
+        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian", "langchain-worker", "cron-agent", "webhook-agent"] {
             assert!(
                 names.contains(expected),
                 "catalogue must contain template '{expected}'; found: {names:?}"
             );
         }
-        assert_eq!(entries.len(), 8, "catalogue must have exactly 8 templates; found: {names:?}");
+        assert_eq!(entries.len(), 10, "catalogue must have exactly 10 templates; found: {names:?}");
     }
 
     #[test]
@@ -941,7 +941,7 @@ task = "t"
     #[test]
     fn catalogue_gated_templates_lower_to_valid_config() {
         let resolver = catalogue_resolver();
-        for name in &["journaler", "memory-custodian", "watcher"] {
+        for name in &["journaler", "memory-custodian"] {
             let (cfg, _) = resolver.resolve(name).unwrap();
             let config = cfg
                 .to_agent_config(Some("test task"), vec![])
@@ -997,13 +997,49 @@ task = "t"
         let resolver = catalogue_resolver();
         let entries = resolver.list().unwrap();
         for entry in &entries {
-            if ["journaler", "watcher", "memory-custodian"].contains(&entry.name.as_str()) {
+            if ["journaler", "memory-custodian", "watcher", "cron-agent", "webhook-agent"].contains(&entry.name.as_str()) {
                 assert!(
                     !entry.sample_tasks.is_empty(),
                     "gated template '{}' must have at least one sample_task",
                     entry.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn catalogue_watcher_no_longer_gated() {
+        let resolver = catalogue_resolver();
+        let (cfg, _) = resolver.resolve("watcher").unwrap();
+        assert!(
+            cfg.template.gated_requires.is_none(),
+            "watcher must not have gated_requires after h7.3 (event-trigger now implemented)"
+        );
+        let config = cfg.to_agent_config(Some("watch /workspace"), vec![]).unwrap();
+        assert!(config.agent.is_some(), "watcher must lower to valid Config");
+        assert!(
+            !config.tools.mcp_servers.is_empty(),
+            "watcher must have at least one mcp_server (fs_watch_mcp.py)"
+        );
+    }
+
+    #[test]
+    fn catalogue_trigger_templates_lower_to_valid_config() {
+        let resolver = catalogue_resolver();
+        for name in &["cron-agent", "webhook-agent", "watcher"] {
+            let (cfg, _) = resolver.resolve(name).unwrap();
+            let config = cfg
+                .to_agent_config(Some("test task"), vec![])
+                .unwrap_or_else(|e| panic!("template '{name}' must lower without error: {e:#}"));
+            assert!(config.agent.is_some(), "template '{name}' must produce a Config with [agent]");
+            assert!(
+                cfg.template.gated_requires.is_none(),
+                "trigger template '{name}' must not be gated"
+            );
+            assert!(
+                !config.tools.mcp_servers.is_empty(),
+                "trigger template '{name}' must have at least one mcp_server"
+            );
         }
     }
 

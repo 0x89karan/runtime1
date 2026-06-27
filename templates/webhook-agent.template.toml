@@ -1,0 +1,73 @@
+sample_tasks = [
+    "When a webhook arrives, parse the JSON payload and summarize what event occurred.",
+    "On each webhook, check if the payload contains an 'action' field and log it.",
+]
+
+[template]
+name        = "webhook-agent"
+description = "Webhook-driven agent: wakes when an HTTP POST arrives at the configured port."
+showcases   = "event-driven pattern — waits for webhooks via webhook_mcp.py"
+
+# Configure via env vars before spawning:
+#   TRIGGER_WEBHOOK_PORT=9000     (default; if changed, update net_ports below too)
+#   TRIGGER_WEBHOOK_HOST=127.0.0.1 (default — loopback only)
+#   TRIGGER_WEBHOOK_SECRET=<key>  (strongly recommended when write_file is enabled)
+#   TRIGGER_MAX_WAIT_S=3600       (optional: abort after 1 hour)
+
+[capabilities]
+net_ports = [9000]
+
+[card]
+name        = "Webhook Agent"
+description = "Sleeps until an HTTP POST arrives at TRIGGER_WEBHOOK_PORT, then processes the payload."
+skills      = ["webhooks", "automation", "integration"]
+suggested_caps = [
+    { Net = { hosts = [], ports = [9000] } },
+]
+
+[tools]
+native = ["read_file", "write_file"]
+
+[[tools.mcp_servers]]
+name    = "webhook_trigger"
+command = "python3"
+# Adjust path to match where agentd is invoked from.
+args    = ["/usr/lib/agentos/docker/webhook_mcp.py"]
+passenv = [
+    "TRIGGER_WEBHOOK_PORT",
+    "TRIGGER_WEBHOOK_HOST",
+    "TRIGGER_WEBHOOK_SECRET",
+    "TRIGGER_MAX_WAIT_S",
+]
+capabilities = [
+    { Net = { hosts = [], ports = [9000] } },
+]
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 2048
+
+[agent]
+id           = "webhook-agent"
+task         = """
+You are a webhook-driven agent. On each turn:
+1. Call wait_for_trigger() in a loop until status == "fired".
+2. When fired, parse and process the received payload.
+3. Summarize what you received and any action taken.
+
+Loop example:
+  while True:
+    result = wait_for_trigger(timeout_s=25)
+    if result.status == "fired":
+      process(result.payload)
+      break
+    if result.status == "timeout":
+      stop  # TRIGGER_MAX_WAIT_S exceeded
+    # status == "waiting" — call again
+
+Note: if result.rejected_count > 0, some webhook requests were rejected
+(bad HMAC, timestamp out of range, or queue full).
+"""
+max_turns    = 50
+token_budget = 100000

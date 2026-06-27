@@ -873,15 +873,14 @@ invariant); presents authenticated HTTP calls as MCP tools. Unlocks Gmail, Googl
 Calendar, and other OAuth-gated services. `agentd` sees it as any other MCP server — no
 core changes.
 
-**h7.3 — Event trigger MCP servers** [HARNESS]
-Makes the `watcher` template (currently `gated_requires = "event-triggers"`) fully
-operational. Trigger sources (cron expression, filesystem watch, HTTP webhook) are MCP
-servers that expose a single blocking tool: `wait_for_trigger()`. The agent calls it as
-its first action; the server does not return until the condition fires. `agentd`'s
-existing "agent waiting for a tool result" mechanism handles the rest — no scheduler
-changes needed. The agent wakes from a checkpoint, runs its loop to completion, and is
-re-checkpointed by the scheduler to sleep again. The agent itself is never aware it is
-being triggered; it wakes as if from a fresh prompt.
+**h7.3 — Event trigger MCP servers** [HARNESS] ✅ v0.47.0
+Makes the `watcher` template (previously `gated_requires = "event-triggers"`) fully
+operational. Three poll-and-retry MCP servers (`cron_mcp.py`, `fs_watch_mcp.py`,
+`webhook_mcp.py`) each expose `wait_for_trigger()`. Agent loops calling it until
+`status == "fired"`. Constraint: MCP_TIMEOUT=30s prevents true blocking; servers return
+within 25s with "waiting"|"fired"|"timeout". Two new templates (`cron-agent`,
+`webhook-agent`); watcher `gated_requires` removed. 26 autoplan decisions (all
+mechanical), 18 self-tests (6 per server), 1027 workspace tests.
 
 ---
 

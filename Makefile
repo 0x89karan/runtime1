@@ -30,3 +30,6 @@ test-harness:
 	python3 docker/shell_mcp.py --test
 	python3 docker/http_mcp.py  --test
 	python3 docker/search_mcp.py --test
+	python3 docker/cron_mcp.py   --test
+	python3 docker/fs_watch_mcp.py --test
+	python3 docker/webhook_mcp.py  --test
