@@ -884,9 +884,30 @@ mechanical), 18 self-tests (6 per server), 1027 workspace tests.
 
 ---
 
+## Chief of Staff — the flagship workload  ← **NEXT (gate before Phase 8)**
+
+The substrate is complete (core + observability + full h7.x harness) but unproven against a
+real workload, and the wedge is still n=1 conviction. The Chief of Staff is the flagship that
+proves both. Build the thin vertical slice, get it *used* on a real inbox, **then** Phase 8.
+
+**cos.1 — Daily Operating Brief (vertical slice)** [HARNESS / flagship] *(planned — NEXT)*
+An always-on, cron-triggered Chief of Staff that produces a Daily Operating Brief from Gmail,
+read-only (autonomy L0), with the full trust story *demonstrable*: the agent never holds the
+OAuth token (it lives in the `google_oauth` sidecar), egress is confined to Gmail + the model
+gateway (off-domain → `egress_denied`), every step is in OTLP + the signed `evidence.jsonl`
+(verifies offline), and any send (opt-in L1) routes through `request_approval`. It is a
+**composition** of shipped pieces — cron (h7.3) + OAuth (h7.2) + scheduler/spawn (P1) + KB
+(P5) + approval gate (p7.4) + egress/receipts (p7.5) + gVisor floor (p7.6) + OTLP (obs.1–3) —
+not new infrastructure: 3 subagents (orchestrator/inbox/curator), one workflow, one system.
+**Real acceptance: customer-zero runs it on their own inbox and it's useful.** Full spec:
+`docs/plans/cos.1-chief-of-staff-slice.md` (= `HARNESS-OPS-PLAN.md` Phase O1).
+
+---
+
 ## Phase 8 — Harness extensions
 
-**h8.1 — Layer 2 semantic memory** [HARNESS]
+**h8.1 — Layer 2 semantic memory** [HARNESS] *(depends on: cos.1 tested + working — a smarter
+memory under a product that doesn't exist proves nothing)*
 Attach a HelixDB instance (Rust, graph + vector, provenance links — best ethos fit) as
 an MCP sidecar, reachable via the HTTP/SSE transport shipped in p7.1. Embeddings from a
 remote API (Voyage AI canonical; Cohere/OpenAI viable), preserving the cognition-is-

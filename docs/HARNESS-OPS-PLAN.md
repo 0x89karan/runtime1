@@ -336,11 +336,14 @@ Each workflow is: **trigger → orchestrator → subagent(s) → structured outp
   · h7.1 generic MCP servers · h7.3 trigger mechanism · h8.1 HelixDB (context-graph
   substrate) · h7.2 OAuth (for Gmail/Calendar).
 
-**Phase O1 — Vertical slice (Daily Operating Brief, read-only):**
-Orchestrator + Search/Retrieval + GBrain-Curator + Inbox (read) + Approval/Safety
-(queue only) + 1 reused adapter (Gmail) + cron trigger + `agentctl ops` brief view.
-Autonomy L0/L1. **DoD:** a real morning brief renders from live Gmail+KB, fully
-recorded, zero external writes.
+**Phase O1 — Vertical slice (Daily Operating Brief, read-only): → NOW SPEC'd AS `cos.1`,
+the NEXT increment.** Full, substrate-grounded spec: `docs/plans/cos.1-chief-of-staff-slice.md`.
+Orchestrator + GBrain-Curator + Inbox (read) over Gmail (`google_oauth` h7.2) + cron trigger
+(h7.3), with the approval gate (p7.4), egress + signed receipts (p7.5), gVisor floor (p7.6),
+and OTLP (obs.1–3) all live. Output to `/run/output`; `agentctl ops` view deferred. Autonomy
+L0 (L1 send opt-in). **DoD:** a real morning brief from live Gmail+KB, fully recorded +
+receipt-verifiable, zero external writes — and customer-zero actually uses it. **Gate before
+h8.1.**
 
 **Phase O2 — First approved write:** add Linear (reused) + Linear-Ops + Open-Items
 agents + the approval queue end-to-end (W6 / a single Linear update). Proves the gate.
