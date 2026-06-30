@@ -1078,8 +1078,22 @@ fn make_infer_future(
         let model = gw.model_id().to_string();
         Box::pin(async move {
             let result = gw.infer(req).await;
-            if let (Some(ref ep), Ok(ref resp)) = (&egress, &result) {
-                ep.record_inference(&id, &model, resp.input_tokens.into(), resp.output_tokens.into());
+            if let Ok(ref resp) = result {
+                if resp.transport_retries > 0 {
+                    recorder.record(
+                        &id,
+                        None,
+                        EventKind::InferenceTransportRetried,
+                        json!({
+                            "agent_id": &id,
+                            "model":    &model,
+                            "retries":  resp.transport_retries,
+                        }),
+                    );
+                }
+                if let Some(ref ep) = egress {
+                    ep.record_inference(&id, &model, resp.input_tokens.into(), resp.output_tokens.into());
+                }
             }
             EffectResult::Inference { agent_id: id, result }
         })
@@ -2243,10 +2257,11 @@ mod tests {
 
     fn end_turn(text: &str, input_tok: u32, output_tok: u32) -> InferenceResponse {
         InferenceResponse {
-            blocks:        vec![Block::Text { text: text.to_string() }],
-            stop_reason:   StopReason::EndTurn,
-            input_tokens:  input_tok,
-            output_tokens: output_tok,
+            blocks:            vec![Block::Text { text: text.to_string() }],
+            stop_reason:       StopReason::EndTurn,
+            input_tokens:      input_tok,
+            output_tokens:     output_tok,
+            transport_retries: 0,
         }
     }
 
@@ -2257,9 +2272,10 @@ mod tests {
                 name:  "spawn_agent".to_string(),
                 input: serde_json::json!({ "task": task }),
             }],
-            stop_reason:   StopReason::ToolUse,
-            input_tokens:  10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         }
     }
 
@@ -2592,9 +2608,10 @@ mod tests {
                     name:  "write_file".to_string(),
                     input: serde_json::json!({"path": "/etc/passwd", "content": "evil"}),
                 }],
-                stop_reason:   StopReason::ToolUse,
-                input_tokens:  10,
-                output_tokens: 5,
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      10,
+                output_tokens:     5,
+                transport_retries: 0,
             },
             end_turn("capability denied, I'll stop", 10, 5),
         ]);
@@ -2886,9 +2903,10 @@ mod tests {
                     "child_id": "named-child"
                 }),
             }],
-            stop_reason:   StopReason::ToolUse,
-            input_tokens:  10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         };
 
         let gw = MockGateway::new(vec![
@@ -2948,9 +2966,10 @@ mod tests {
                     "child_id": "../evil"
                 }),
             }],
-            stop_reason:   StopReason::ToolUse,
-            input_tokens:  10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         };
 
         let gw = MockGateway::new(vec![
@@ -2998,9 +3017,10 @@ mod tests {
                     "token_budget": 999999
                 }),
             }],
-            stop_reason:   StopReason::ToolUse,
-            input_tokens:  10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         };
 
         let gw = MockGateway::new(vec![
@@ -3052,9 +3072,10 @@ mod tests {
                     name:  "send_message".to_string(),
                     input: serde_json::json!({"to": "beta", "content": "ping"}),
                 }],
-                stop_reason:   StopReason::ToolUse,
-                input_tokens:  10,
-                output_tokens: 5,
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      10,
+                output_tokens:     5,
+                transport_retries: 0,
             },
             // Agent alpha: complete after delivery
             end_turn("sent", 5, 3),
@@ -3097,9 +3118,10 @@ mod tests {
                     name:  "send_message".to_string(),
                     input: serde_json::json!({"to": "ghost", "content": "hello?"}),
                 }],
-                stop_reason:   StopReason::ToolUse,
-                input_tokens:  10,
-                output_tokens: 5,
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      10,
+                output_tokens:     5,
+                transport_retries: 0,
             },
             // Agent receives error, completes gracefully
             end_turn("no such agent", 5, 3),
@@ -3705,6 +3727,7 @@ mod tests {
             InferenceResponse {
                 blocks: vec![Block::ToolUse { id: "c1".to_string(), name: "no_tool".to_string(), input: serde_json::json!({}) }],
                 stop_reason: StopReason::ToolUse, input_tokens: 10, output_tokens: 5,
+                transport_retries: 0,
             },
             end_turn("done", 10, 5),
         ]);
@@ -4199,5 +4222,47 @@ mod tests {
 
         // Cleanup.
         state.universal_agents.get_mut("univ_ck").unwrap().kill().await;
+    }
+
+    // ── con.1 regression guard ────────────────────────────────────────────────
+
+    /// A non-streaming response with transport_retries = 1 must emit
+    /// InferenceTransportRetried in the flight log.
+    #[tokio::test]
+    async fn transport_retried_event_emitted_when_retries_nonzero() {
+        let resp = InferenceResponse {
+            blocks:            vec![Block::Text { text: "ok".to_string() }],
+            stop_reason:       StopReason::EndTurn,
+            input_tokens:      5,
+            output_tokens:     2,
+            transport_retries: 1,
+        };
+        let gw = MockGateway::new(vec![resp]);
+        let mut cfg = agent_cfg("retry-agent", "retry task");
+        cfg.max_turns = 1;
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let outcomes = sched.run().await;
+        assert!(outcomes["retry-agent"].is_ok(), "agent must succeed");
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            log.contains("\"inference_transport_retried\""),
+            "InferenceTransportRetried event must appear when transport_retries > 0"
+        );
+        assert!(
+            log.contains("\"retries\":1"),
+            "retries field must be 1 in the event payload"
+        );
     }
 }

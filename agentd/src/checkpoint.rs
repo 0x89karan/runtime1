@@ -276,10 +276,11 @@ mod tests {
     fn stored_response_roundtrip() {
         let mut cp = minimal_agent_checkpoint("r");
         cp.stored_response = Some(InferenceResponse {
-            blocks:        vec![Block::Text { text: "answer".to_string() }],
-            stop_reason:   StopReason::EndTurn,
-            input_tokens:  20,
-            output_tokens: 10,
+            blocks:            vec![Block::Text { text: "answer".to_string() }],
+            stop_reason:       StopReason::EndTurn,
+            input_tokens:      20,
+            output_tokens:     10,
+            transport_retries: 0,
         });
         let json = serde_json::to_string(&cp).unwrap();
         let back: AgentCheckpoint = serde_json::from_str(&json).unwrap();

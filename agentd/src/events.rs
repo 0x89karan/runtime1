@@ -122,6 +122,9 @@ pub enum EventKind {
     /// Scheduler stopped after graceful shutdown.
     /// data: { run_id, agent_count }
     SchedulerStopped,
+    /// A stale pooled connection caused a connect error; the request was retried once and succeeded.
+    /// data: { agent_id, model, retries: u32 }
+    InferenceTransportRetried,
     Error,
 }
 
@@ -196,6 +199,7 @@ mod tests {
         assert_eq!(kind_str(EventKind::UniversalAgentIsolationDegraded), "universal_agent_isolation_degraded");
         assert_eq!(kind_str(EventKind::SchedulerStarted), "scheduler_started");
         assert_eq!(kind_str(EventKind::SchedulerStopped), "scheduler_stopped");
+        assert_eq!(kind_str(EventKind::InferenceTransportRetried), "inference_transport_retried");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

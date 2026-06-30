@@ -1660,6 +1660,7 @@ mod tests {
             "egress_denied",
             "action_receipt_emitted",
             "egress_proxy_failed",
+            "inference_transport_retried",
         ];
         for kind in &required_kinds {
             assert!(

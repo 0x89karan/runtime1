@@ -902,6 +902,14 @@ not new infrastructure: 3 subagents (orchestrator/inbox/curator), one workflow, 
 **Real acceptance: customer-zero runs it on their own inbox and it's useful.** Full spec:
 `docs/plans/cos.1-chief-of-staff-slice.md` (= `HARNESS-OPS-PLAN.md` Phase O1).
 
+**con.1 — TCP keepalive + transport retry** [CORE] *(done — v0.49.0)*
+Fixes Docker NAT conntrack silently dropping idle Anthropic API connections during long MCP
+waits in multi-turn cos.1 runs. `tcp_keepalive(15s)` on the reqwest client keeps conntrack
+alive; `send_once()` + `is_connect()` retry retries once on stale-pool connect errors
+(non-streaming only — streaming retry is unsafe). `InferenceTransportRetried` flight event.
+OTEL coverage guard (`otel/tests/event_kind_coverage.rs`) updated. Removes the `streaming =
+false` stopgap previously patched into the cos Docker entrypoint.
+
 ---
 
 ## Phase 8 — Harness extensions

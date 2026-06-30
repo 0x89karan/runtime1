@@ -1227,7 +1227,7 @@ impl fuser::Filesystem for AgentsFs {
         } else if let Some(kind) = self.dyn_ino_kind.get(&ino) {
             !matches!(kind, DynInoKind::KbSeg { .. })
         } else {
-            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) || ino == INO_SYS_EGRESS_ADDR
+            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) || ino == INO_SYS_EGRESS_ADDR || ino == INO_APPROVALS
         };
         if is_file {
             reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
@@ -2677,5 +2677,27 @@ mod tests {
         assert_eq!(fs.process_control_flush(fh), 0);
         // Release after flush — buffer already gone, must be a no-op
         assert_eq!(fs.process_control_flush(fh), 0, "release after flush must be noop");
+    }
+
+    // ── INO_APPROVALS coverage (con.1 regression guard) ──────────────────────
+
+    #[test]
+    fn approvals_content_empty_returns_bracket_newline() {
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None, None);
+        let content = fs.approvals_content();
+        assert_eq!(content, b"[]\n");
+    }
+
+    #[test]
+    fn approvals_ino_is_pseudofile() {
+        // Regression guard: INO_APPROVALS must satisfy the open() is_file predicate.
+        // Before con.1 the || ino == INO_APPROVALS arm was missing, causing open()
+        // to return ENOENT for /agents/approvals.
+        let ino = INO_APPROVALS;
+        let is_pseudofile = (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
+            || ino == INO_SYS_EGRESS_ADDR
+            || ino == INO_APPROVALS;
+        assert!(is_pseudofile, "INO_APPROVALS must be in the open() is_file predicate");
     }
 }

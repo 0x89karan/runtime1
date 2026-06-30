@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentctl"
-version = "0.39.0"
+version = "0.49.0"
 dependencies = [
  "agentd",
  "anyhow",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "agentd"
-version = "0.48.0"
+version = "0.49.0"
 dependencies = [
  "anyhow",
  "async-trait",

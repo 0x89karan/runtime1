@@ -210,6 +210,22 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   `ipaddress.ip_address.is_loopback / .is_private / .is_link_local` before opening any connection.
   Blocks loopback, `169.254.x`, `10.x`, `172.16-31.x`, `192.168.x`.
 
+## cos.1 / Live Testing — Open
+
+**cos-ux-01 — TUI lacks per-agent progress and error visibility**
+- During long-running agent turns (e.g. inbox agent fetching 20 Gmail messages), `agentctl watch`
+  shows only `running` status and a growing context-size counter. There is no indication of
+  what tool the agent last called, what it returned, or whether errors occurred.
+- Needed: a live activity pane (or per-agent detail view) showing:
+  - Last tool call + result summary (tool name, truncated args/result, timestamp)
+  - Last error, if any (`is_error` tool result or `capability_denied` event)
+  - Turn count and last-inference timestamp so the operator can distinguish "busy" from "hung"
+- Implementation path: tail `/data/flight.jsonl` per-agent (the Inspector view at `[i]` already
+  does this globally); expose a filtered single-agent stream in the AgentDetail view; add a
+  `last_tool` field to `AgentSnapshot` so the Dashboard table can show it without opening Detail.
+- Precedent: `View::Inspector` (`[i]`) already tails the full log with filter/search — extend
+  it with an agent-scoped filter that auto-selects when entering from the Dashboard row.
+
 ## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
 
 **p5.5-ar-01 (P3) — Posting list loading is O(n) RAM at query time**

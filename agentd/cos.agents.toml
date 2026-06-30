@@ -129,6 +129,7 @@ passenv = [
   "OAUTH_SCOPES",
   "OAUTH_ALLOWED_HOSTS",      # REQUIRED — SSRF guard blocks missing/wrong hosts
   "OAUTH_PROVIDER_NAME",
+  "OAUTH_CALLBACK_PORT",      # REQUIRED in Docker — fixes callback port binding
 ]
 capabilities = [
   { Net = { hosts = [

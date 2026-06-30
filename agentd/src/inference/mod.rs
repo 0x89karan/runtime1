@@ -84,6 +84,11 @@ pub struct InferenceResponse {
     pub stop_reason: StopReason,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Number of times the transport layer retried a stale-connection error before
+    /// succeeding. 0 on clean first-attempt success; non-zero surfaces in the
+    /// `inference_transport_retried` flight event for observability.
+    #[serde(default)]
+    pub transport_retries: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

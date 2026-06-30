@@ -882,9 +882,10 @@ mod tests {
             blocks: vec![Block::Text {
                 text: text.to_string(),
             }],
-            stop_reason: StopReason::EndTurn,
-            input_tokens: 10,
-            output_tokens: 5,
+            stop_reason:       StopReason::EndTurn,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         }
     }
 
@@ -895,9 +896,10 @@ mod tests {
                 name: name.to_string(),
                 input,
             }],
-            stop_reason: StopReason::ToolUse,
-            input_tokens: 10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         }
     }
 
@@ -1325,9 +1327,10 @@ mod tests {
                 name: "spawn_agent".to_string(),
                 input: serde_json::json!({ "task": task }),
             }],
-            stop_reason: StopReason::ToolUse,
-            input_tokens: 10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         }
     }
 
@@ -1381,9 +1384,10 @@ mod tests {
                         input: serde_json::json!({ "path": "/tmp/x" }),
                     },
                 ],
-                stop_reason: StopReason::ToolUse,
-                input_tokens: 10,
-                output_tokens: 5,
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      10,
+                output_tokens:     5,
+                transport_retries: 0,
             },
             &rec,
         );
@@ -1424,9 +1428,10 @@ mod tests {
                     // Missing required `task` field — deserialization will fail.
                     input: serde_json::json!({ "child_id": "orphan" }),
                 }],
-                stop_reason:   StopReason::ToolUse,
-                input_tokens:  10,
-                output_tokens: 5,
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      10,
+                output_tokens:     5,
+                transport_retries: 0,
             },
             &rec,
         );
@@ -1460,9 +1465,10 @@ mod tests {
                         name:  "spawn_agent".to_string(),
                         input: serde_json::json!({ "task": "sub-task" }),
                     }],
-                    stop_reason:   StopReason::ToolUse,
-                    input_tokens:  5,
-                    output_tokens: 3,
+                    stop_reason:       StopReason::ToolUse,
+                    input_tokens:      5,
+                    output_tokens:     3,
+                    transport_retries: 0,
                 })
             }
             fn model_id(&self) -> &str { "spawn-gw" }
@@ -1571,9 +1577,10 @@ mod tests {
                     input: serde_json::json!({"path": "/tmp/x"}),
                 },
             ],
-            stop_reason:   StopReason::ToolUse,
-            input_tokens:  10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         };
         task.provide_inference(response, &rec);
         let effect = task.step(&rec);
@@ -1596,9 +1603,10 @@ mod tests {
                 name:  "send_message".to_string(),
                 input: serde_json::json!({"content": "no recipient"}),
             }],
-            stop_reason:   StopReason::ToolUse,
-            input_tokens:  10,
-            output_tokens: 5,
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         };
         task.provide_inference(response, &rec);
         let effect = task.step(&rec);
@@ -1613,10 +1621,11 @@ mod tests {
 
         // MaxTokens with no Text block — the truncated-generation bug case.
         let response = InferenceResponse {
-            blocks: vec![],
-            stop_reason: StopReason::MaxTokens,
-            input_tokens: 10,
-            output_tokens: 5,
+            blocks:            vec![],
+            stop_reason:       StopReason::MaxTokens,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         };
         task.provide_inference(response, &rec);
         let effect = task.step(&rec);
@@ -1639,10 +1648,11 @@ mod tests {
 
         // MaxTokens WITH a partial Text block — partial text must be discarded (D1).
         let response = InferenceResponse {
-            blocks: vec![Block::Text { text: "partial answer cut".to_string() }],
-            stop_reason: StopReason::MaxTokens,
-            input_tokens: 10,
-            output_tokens: 5,
+            blocks:            vec![Block::Text { text: "partial answer cut".to_string() }],
+            stop_reason:       StopReason::MaxTokens,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
         };
         task.provide_inference(response, &rec);
         let effect = task.step(&rec);
@@ -1658,10 +1668,11 @@ mod tests {
         let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
         assert_eq!(task.context_tokens(), 0, "starts at zero before any inference");
         let response = InferenceResponse {
-            blocks: vec![],
-            stop_reason: StopReason::EndTurn,
-            input_tokens: 100,
-            output_tokens: 50,
+            blocks:            vec![],
+            stop_reason:       StopReason::EndTurn,
+            input_tokens:      100,
+            output_tokens:     50,
+            transport_retries: 0,
         };
         task.provide_inference(response, &rec);
         assert_eq!(task.context_tokens(), 150);
@@ -1785,14 +1796,15 @@ mod tests {
             let _ = sm.step(&rec); // → Infer
             sm.provide_inference(
                 InferenceResponse {
-                    blocks:        vec![Block::ToolUse {
+                    blocks:            vec![Block::ToolUse {
                         id:    format!("c{i}"),
                         name:  "no_tool".to_string(),
                         input: serde_json::json!({}),
                     }],
-                    stop_reason:   StopReason::ToolUse,
-                    input_tokens:  5,
-                    output_tokens: 5,
+                    stop_reason:       StopReason::ToolUse,
+                    input_tokens:      5,
+                    output_tokens:     5,
+                    transport_retries: 0,
                 },
                 &rec,
             );
@@ -1842,14 +1854,15 @@ mod tests {
         let _ = sm.step(&rec);
         sm.provide_inference(
             InferenceResponse {
-                blocks:        vec![Block::ToolUse {
+                blocks:            vec![Block::ToolUse {
                     id:    "c0".to_string(),
                     name:  "no_tool".to_string(),
                     input: serde_json::json!({}),
                 }],
-                stop_reason:   StopReason::ToolUse,
-                input_tokens:  37,
-                output_tokens: 38,
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      37,
+                output_tokens:     38,
+                transport_retries: 0,
             },
             &rec,
         );

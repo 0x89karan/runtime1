@@ -78,6 +78,23 @@ case "${1:-shell}" in
     exec bash
     ;;
 
+  cos)
+    # Chief of Staff — fully self-contained, no repo mount needed.
+    # Runtime state (checkpoint, memory, briefs) goes to /data (named volume).
+    check_api_key
+    mkdir -p /data /data/output
+    # Patch the baked config: rewrite dev-mode relative paths to absolute paths.
+    sed \
+      -e 's|"\.\./docker/|"/etc/agentd/|g' \
+      -e 's|store_path = "memory\.redb"|store_path = "/data/memory.redb"|' \
+      -e 's|evidence_path = "evidence\.jsonl"|evidence_path = "/data/evidence.jsonl"|' \
+      -e 's|key_path      = "egress-key\.pkcs8"|key_path      = "/data/egress-key.pkcs8"|' \
+      -e 's|prefix = "\./output"|prefix = "/data/output"|' \
+      /etc/agentd/cos.agents.toml > /data/cos.agents.toml
+    cd /data
+    exec agentd /data/cos.agents.toml
+    ;;
+
   *)
     exec "$@"
     ;;

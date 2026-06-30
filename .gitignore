@@ -11,6 +11,7 @@ checkpoint.json.corrupt
 
 # cos.1 Chief of Staff runtime artifacts (never commit)
 egress-key.pkcs8
+egress-key.pub
 evidence.jsonl
 output/
 

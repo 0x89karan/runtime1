@@ -393,8 +393,28 @@ def handle_oauth_start_auth(_args: dict) -> tuple:
 
     csrf_state = secrets.token_urlsafe(16)
 
-    # Bind callback server on a random ephemeral port
-    srv = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+    # Parse OAUTH_CALLBACK_PORT safely — non-numeric value must not crash the server.
+    try:
+        callback_port = int(os.environ.get("OAUTH_CALLBACK_PORT", "") or "0")
+    except ValueError:
+        return None, "OAUTH_CALLBACK_PORT must be an integer (e.g. 8585)"
+
+    # Close any pending session BEFORE binding the new server so a fixed port
+    # (set via OAUTH_CALLBACK_PORT) is not already in use.
+    with _session_lock:
+        old = _session
+        if old is not None:
+            try:
+                old.server.server_close()
+            except Exception:
+                pass
+        _session = None
+
+    # When a fixed port is requested (Docker mode), bind on all interfaces so
+    # Docker's port-mapping (which forwards to the container's eth0, not loopback)
+    # can reach the server.  Ephemeral-port path keeps loopback for safety.
+    bind_host = "0.0.0.0" if callback_port else "127.0.0.1"
+    srv = HTTPServer((bind_host, callback_port), _CallbackHandler)
     port = srv.server_address[1]
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
@@ -408,13 +428,6 @@ def handle_oauth_start_auth(_args: dict) -> tuple:
     )
 
     with _session_lock:
-        old = _session
-        if old is not None:
-            # Cancel previous session
-            try:
-                old.server.server_close()
-            except Exception:
-                pass
         _session = new_sess
 
     _auth_state = "pending"
@@ -624,7 +637,14 @@ def process_line(line: str):
             }})
             return
 
-        result, err = handler(args)
+        try:
+            result, err = handler(args)
+        except Exception as exc:
+            send({"jsonrpc": "2.0", "id": req_id, "result": {
+                "content": [{"type": "text", "text": f"Internal error: {exc}"}],
+                "isError": True,
+            }})
+            return
         if err:
             send({"jsonrpc": "2.0", "id": req_id, "result": {
                 "content": [{"type": "text", "text": err}],
@@ -883,9 +903,34 @@ def _self_test():
     else:
         fail("10", f"result={result10} err={err10}")
 
+    # --- Test 11: OAUTH_CALLBACK_PORT env var is parsed correctly ---
+    _reset_state()
+    import os as _os
+    _os.environ["OAUTH_CALLBACK_PORT"] = "9090"
+    try:
+        parsed_port = int(_os.environ.get("OAUTH_CALLBACK_PORT", "") or "0")
+        if parsed_port == 9090:
+            ok("11: OAUTH_CALLBACK_PORT=9090 parsed as 9090")
+        else:
+            fail("11", f"expected 9090, got {parsed_port}")
+    finally:
+        _os.environ.pop("OAUTH_CALLBACK_PORT", None)
+
+    # --- Test 12: non-numeric OAUTH_CALLBACK_PORT returns error, doesn't crash ---
+    _reset_state()
+    _os.environ["OAUTH_CALLBACK_PORT"] = "auto"
+    try:
+        result12, err12 = handle_oauth_start_auth({})
+        if result12 is None and err12 and "integer" in err12.lower():
+            ok("12: OAUTH_CALLBACK_PORT=auto → error message, no crash")
+        else:
+            fail("12", f"expected error message, got result={result12} err={err12}")
+    finally:
+        _os.environ.pop("OAUTH_CALLBACK_PORT", None)
+
     print(file=sys.stderr)
     if not failures:
-        print("oauth_mcp.py: self-test PASSED (10/10)", file=sys.stderr)
+        print("oauth_mcp.py: self-test PASSED (12/12)", file=sys.stderr)
         sys.exit(0)
     else:
         print(f"oauth_mcp.py: self-test FAILED ({len(failures)} failures: {failures})", file=sys.stderr)

@@ -56,10 +56,11 @@ COPY --from=builder /src/target/release/agentos-otel /usr/local/bin/agentos-otel
 COPY docker/agent.toml         /etc/agentd/agent.toml
 COPY docker/agents.toml        /etc/agentd/agents.toml
 COPY docker/weather-agent.toml /etc/agentd/weather-agent.toml
-COPY docker/weather_mcp.py     /etc/agentd/weather_mcp.py
+COPY docker/*.py               /etc/agentd/
+COPY agentd/cos.agents.toml    /etc/agentd/cos.agents.toml
 COPY templates/                /etc/agentd/templates/
 
-RUN mkdir -p /agents /workspace /run/memory
+RUN mkdir -p /agents /workspace /run/memory /data
 
 WORKDIR /workspace
 

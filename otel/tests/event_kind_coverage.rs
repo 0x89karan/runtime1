@@ -71,6 +71,7 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::EgressDenied => false,
         EventKind::ActionReceiptEmitted => false,
         EventKind::EgressProxyFailed => false,
+        EventKind::InferenceTransportRetried => false,
         EventKind::UniversalAgentStarted => false,
         EventKind::UniversalAgentExited => false,
         EventKind::UniversalAgentIsolationDegraded => false,

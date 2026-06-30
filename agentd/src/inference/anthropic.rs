@@ -29,6 +29,9 @@ impl AnthropicGateway {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::none())
+            // Keep TCP connections alive through Docker NAT conntrack's idle timeout.
+            // Without this, connections silently die during long MCP wait periods.
+            .tcp_keepalive(std::time::Duration::from_secs(15))
             .build()
             .context("building HTTP client")?;
         Ok(Self {
@@ -204,6 +207,20 @@ fn json_to_block(v: &serde_json::Value) -> Option<Block> {
 
 // ── InferenceGateway impl ─────────────────────────────────────────────────────
 
+impl AnthropicGateway {
+    /// Single HTTP attempt. Returns the raw reqwest error so callers can inspect
+    /// `is_connect()` before wrapping with anyhow context.
+    async fn send_once(&self, body: &AnthropicReq<'_>) -> reqwest::Result<reqwest::Response> {
+        self.client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .json(body)
+            .send()
+            .await
+    }
+}
+
 #[async_trait]
 impl InferenceGateway for AnthropicGateway {
     async fn infer(&self, request: InferenceRequest) -> Result<InferenceResponse> {
@@ -220,15 +237,17 @@ impl InferenceGateway for AnthropicGateway {
             stream: false,
         };
 
-        let resp = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .context("sending request to Anthropic API")?;
+        // Retry once on connect errors — a stale pooled connection was reused.
+        // Only `send()` failures are retried; HTTP 4xx/5xx are not retried.
+        let mut transport_retries: u32 = 0;
+        let resp = match self.send_once(&body).await {
+            Ok(r) => r,
+            Err(e) if e.is_connect() => {
+                transport_retries = 1;
+                self.send_once(&body).await.context("sending request to Anthropic API")?
+            }
+            Err(e) => return Err(e).context("sending request to Anthropic API"),
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -250,10 +269,11 @@ impl InferenceGateway for AnthropicGateway {
             .context("parsing Anthropic response body")?;
 
         Ok(InferenceResponse {
-            blocks:       resp.content.iter().filter_map(json_to_block).collect(),
-            stop_reason:  StopReason::from_api_str(&resp.stop_reason),
-            input_tokens: resp.usage.input_tokens,
-            output_tokens: resp.usage.output_tokens,
+            blocks:            resp.content.iter().filter_map(json_to_block).collect(),
+            stop_reason:       StopReason::from_api_str(&resp.stop_reason),
+            input_tokens:      resp.usage.input_tokens,
+            output_tokens:     resp.usage.output_tokens,
+            transport_retries,
         })
     }
 
@@ -411,10 +431,11 @@ async fn parse_sse_stream(
                                 })
                                 .collect::<Result<Vec<_>>>()?;
                             return Ok(InferenceResponse {
-                                blocks:       result_blocks,
-                                stop_reason:  StopReason::from_api_str(&stop_reason),
+                                blocks:            result_blocks,
+                                stop_reason:       StopReason::from_api_str(&stop_reason),
                                 input_tokens,
                                 output_tokens,
+                                transport_retries: 0,
                             });
                         }
                         Some(SseAction::ApiError(msg)) => {

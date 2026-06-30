@@ -3,6 +3,26 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [con.1] - 2026-06-30 (v0.49.0)
+
+### Fixed
+- TCP keepalive (`SO_KEEPALIVE`, 15 s probe interval) on the Anthropic reqwest client keeps
+  Docker NAT conntrack entries alive through long MCP wait periods — fixes silent connection
+  drops on the third inference call in multi-turn cos.1 runs.
+- Retry once on `is_connect()` errors (stale pooled connection reuse); non-streaming path only.
+  Streaming retry is intentionally omitted (would cause duplicate stdout + double billing).
+- Removed `streaming = false` stopgap that was previously sed-patched into the Docker cos
+  entrypoint; native TCP keepalive makes the workaround unnecessary.
+
+### Added
+- `InferenceTransportRetried` flight event emitted when a stale-connection retry succeeds
+  (`agent_id`, `model`, `retries: u32` in payload).
+- `InferenceResponse.transport_retries: u32` field (`#[serde(default)]` for checkpoint compat).
+- OTEL exhaustiveness guard (`otel/tests/event_kind_coverage.rs`) updated for the new event.
+- Docker `cos` mode in `entrypoint.sh` — fully self-contained CoS launch with `/data` volume
+  and absolute-path rewriting (replaces ad-hoc dev workflow).
+- OAUTH_CALLBACK_PORT support in `oauth_mcp.py` — fixes callback port binding inside Docker.
+
 ## [cos.1] - 2026-06-27 (v0.48.0)
 
 ### Added
