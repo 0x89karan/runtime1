@@ -86,6 +86,9 @@ services:
       #
       # ── Web search (scout, librarian) ───────────────────────────────────────
       - BRAVE_SEARCH_API_KEY
+      # ── Debug ───────────────────────────────────────────────────────────────
+      # DRY_RUN_ONLY=1: print rendered config and exit without running agentd
+      - DRY_RUN_ONLY
     command: agent
     stdin_open: true
     tty: true
