@@ -10,6 +10,12 @@ sample_tasks = [
   "Search my Gmail for emails about project deadlines",
 ]
 
+[card]
+name           = "Google Agent"
+description    = "Gmail + Drive reader via OAuth2."
+skills         = ["email", "drive", "oauth"]
+suggested_caps = []
+
 [capabilities]
 # The agent can call the 3 OAuth tools: oauth_start_auth, oauth_check_auth, oauth_call_api
 mcp = [
@@ -18,8 +24,6 @@ mcp = [
 # Optional: allow reading/writing output files
 # fs_read  = [{ prefix = "/workspace" }]
 # fs_write = [{ prefix = "/workspace/output" }]
-
-suggested_caps = []
 
 [[tools.mcp_servers]]
 name    = "google_oauth"
