@@ -138,6 +138,15 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   (11 lines) but has no coverage for: empty/`[]\n` sentinel, multi-item path, malformed-line skip.
 - Fix path: add 3 unit tests to `reader.rs` covering these paths.
 
+## Phase 7 / Harness — Open (from h7.2)
+
+**~~h7.2-ar-01~~ (resolved v0.50.0) — generic `agent` entrypoint mode**
+- Resolved by adding `agent)` mode to `docker/entrypoint.sh`: `agentctl spawn --dry-run` + sed
+  path rewrite (`../docker/` → `/etc/agentd/`) covers all standalone templates.
+- `docker-compose.yml` now has `agent` service with `HOME=/data`, `AGENTOS_REPO_TEMPLATES_DIR`,
+  OAuth env, and `agent-data` named volume. `DRY_RUN_ONLY=1` env enables smoke testing without
+  a live API key.
+
 ## Phase 7 / Harness — Open (from h7.1)
 
 **h7.1-ar-01 (P3) — MCP server script paths are hardcoded relative to agentd/ CWD**

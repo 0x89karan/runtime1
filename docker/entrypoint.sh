@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -e
+set -o pipefail
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -93,6 +94,64 @@ case "${1:-shell}" in
       /etc/agentd/cos.agents.toml > /data/cos.agents.toml
     cd /data
     exec agentd /data/cos.agents.toml
+    ;;
+
+  agent)
+    # Generic single-agent mode: lower any template to TOML, rewrite paths, run agentd.
+    # Usage: TEMPLATE_NAME=scout AGENT_TASK="..." docker compose run --rm agent
+    check_api_key
+    TEMPLATE="${TEMPLATE_NAME:?TEMPLATE_NAME must be set (e.g. TEMPLATE_NAME=scout)}"
+    TASK="${AGENT_TASK:?AGENT_TASK must be set (e.g. AGENT_TASK=\"Summarize my last 5 emails\")}"
+    case "$TEMPLATE" in
+      code-aware|langchain-worker)
+        echo "ERROR: $TEMPLATE requires runsc (gVisor) and is not supported in the standard Docker image." >&2
+        exit 1
+        ;;
+      journaler|memory-custodian)
+        echo "ERROR: $TEMPLATE requires a persistent /run/memory volume (Phase-5 memory store)." >&2
+        echo "  Run it in the QEMU-based environment where /run/memory is a persistent 9p mount." >&2
+        exit 1
+        ;;
+    esac
+    mkdir -p /data
+    # Warn when OAuth callback port is configured — port forwarding requires --service-ports
+    if [ -n "${OAUTH_CALLBACK_PORT:-}" ]; then
+      echo ""
+      echo "  IMPORTANT: OAuth mode — port $OAUTH_CALLBACK_PORT must be forwarded to receive the callback."
+      echo "  Run with: docker compose run --service-ports --rm agent"
+      echo ""
+    fi
+    # Lower template → TOML, rewrite MCP script paths to /etc/agentd/ (Docker path layout).
+    # Sed is scoped to 'args' lines to avoid rewriting task text that happens to match.
+    # Both path conventions used across the catalogue are handled:
+    #   ../docker/        — dev-mode relative path (scout, librarian, google-agent, …)
+    #   /usr/lib/agentos/docker/ — installed absolute path (cron-agent, watcher, webhook-agent)
+    _raw=$(agentctl spawn "$TEMPLATE" --task "$TASK" --dry-run) || {
+      echo "ERROR: agentctl spawn failed for template '$TEMPLATE'" >&2
+      echo "" >&2
+      echo "Valid templates:" >&2
+      agentctl list-templates 2>/dev/null | awk 'NR>1 {print "  " $1}' >&2 || true
+      exit 1
+    }
+    printf '%s\n' "$_raw" | sed \
+      -e '/args/s|"\.\./docker/|"/etc/agentd/|g' \
+      -e '/args/s|"/usr/lib/agentos/docker/|"/etc/agentd/|g' \
+      > /data/agent.toml
+    [ -s /data/agent.toml ] || {
+      echo "ERROR: rendered config is empty for template '$TEMPLATE'" >&2
+      exit 1
+    }
+    # Remove any stale checkpoint — each 'docker compose run' is a fresh invocation.
+    # Without this, switching TEMPLATE_NAME on a reused volume would restore the wrong agent.
+    rm -f /data/checkpoint.json
+    # DRY_RUN_ONLY=1|true|yes: print rendered config and exit (smoke-test path rewriting)
+    case "${DRY_RUN_ONLY:-}" in 1|true|yes)
+      cat /data/agent.toml
+      exit 0
+      ;;
+    esac
+    cd /data
+    exec agentd /data/agent.toml
     ;;
 
   *)

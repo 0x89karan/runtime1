@@ -1,0 +1,99 @@
+services:
+  cos:
+    build: .
+    # FUSE requires privileged mode (needed for agentctl watch + /agents filesystem)
+    privileged: true
+    volumes:
+      # Named volume for all runtime state — no repo bind mount, no checkpoint bleed-through
+      - cos-data:/data
+    # No static port binding — OAuth callback requires --service-ports:
+    #   docker compose run --service-ports --rm cos
+    environment:
+      - ANTHROPIC_API_KEY
+      - OAUTH_CLIENT_ID
+      - OAUTH_CLIENT_SECRET
+      - OAUTH_REFRESH_TOKEN
+      - OAUTH_AUTH_URL=https://accounts.google.com/o/oauth2/v2/auth
+      - OAUTH_TOKEN_URL=https://oauth2.googleapis.com/token
+      - OAUTH_SCOPES=https://www.googleapis.com/auth/gmail.readonly
+      - OAUTH_ALLOWED_HOSTS=accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com
+      - OAUTH_PROVIDER_NAME=google
+      - OAUTH_CALLBACK_PORT=8585
+      - TRIGGER_INTERVAL=${TRIGGER_INTERVAL:-every 2m}
+    command: cos
+    stdin_open: true
+    tty: true
+    sysctls:
+      # Send TCP keepalives every 15 s — prevents Docker NAT from silently
+      # dropping idle Anthropic API connections during cron wait periods.
+      net.ipv4.tcp_keepalive_time: 15
+      net.ipv4.tcp_keepalive_intvl: 5
+      net.ipv4.tcp_keepalive_probes: 3
+
+  agent:
+    build: .
+    # FUSE requires privileged mode (needed for /agents filesystem + agentctl watch)
+    privileged: true
+    volumes:
+      - agent-data:/data
+      # For templates that read files from the host (scout, librarian — uncomment if needed):
+      # - ./my-files:/workspace:ro
+    # No static port binding — OAuth callback requires --service-ports:
+    #   docker compose run --service-ports --rm agent
+    environment:
+      - ANTHROPIC_API_KEY
+      #
+      # TEMPLATE_NAME: which template to run. Try "scout" first — no OAuth setup required.
+      # Valid values: scout  librarian  coordinator  google-agent
+      #               cron-agent  watcher  webhook-agent
+      # (journaler and memory-custodian require a persistent /run/memory volume — not supported here)
+      # (code-aware and langchain-worker require runsc/gVisor — not in this image)
+      - TEMPLATE_NAME
+      #
+      # AGENT_TASK: the task string passed to the agent. Examples by template:
+      #   scout:        "Research the latest Rust async runtimes and write a summary"
+      #   librarian:    "Organize the notes in /workspace into topics"
+      #   google-agent: "Summarize my last 5 unread emails"
+      #   journaler:    "Write a brief journal entry about today"
+      - AGENT_TASK
+      #
+      # HOME=/data: token files (e.g. ~/.agentos-oauth/google.json) persist on the
+      # named volume across --rm runs so OAuth re-auth is not required every time.
+      - HOME=/data
+      # Makes template resolution explicit; avoids the 8-level binary-walk heuristic.
+      - AGENTOS_REPO_TEMPLATES_DIR=/etc/agentd/templates
+      #
+      # ── OAuth (google-agent and any OAuth-gated template) ───────────────────
+      # Google OAuth one-time setup:
+      #   1. Go to console.cloud.google.com → APIs & Services → Credentials
+      #   2. Edit your OAuth 2.0 Client (Desktop app type recommended)
+      #   3. Add http://127.0.0.1:8585 to Authorized redirect URIs
+      #   4. Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET in your environment
+      - OAUTH_CLIENT_ID
+      - OAUTH_CLIENT_SECRET
+      # Optional: skip the OAuth dance on re-runs.
+      # Extract with: docker compose run --rm agent cat /data/.agentos-oauth/google.json | jq -r .refresh_token
+      - OAUTH_REFRESH_TOKEN
+      - OAUTH_AUTH_URL=https://accounts.google.com/o/oauth2/v2/auth
+      - OAUTH_TOKEN_URL=https://oauth2.googleapis.com/token
+      - OAUTH_SCOPES=https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.readonly
+      - OAUTH_ALLOWED_HOSTS=accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com
+      - OAUTH_PROVIDER_NAME=google
+      # OAUTH_CALLBACK_PORT: set to 8585 when using google-agent (or any OAuth template).
+      # Leave unset for scout, librarian, coordinator, and other non-OAuth templates.
+      # When set, the entrypoint prints a --service-ports reminder; port must be forwarded.
+      - OAUTH_CALLBACK_PORT
+      #
+      # ── Web search (scout, librarian) ───────────────────────────────────────
+      - BRAVE_SEARCH_API_KEY
+    command: agent
+    stdin_open: true
+    tty: true
+    sysctls:
+      net.ipv4.tcp_keepalive_time: 15
+      net.ipv4.tcp_keepalive_intvl: 5
+      net.ipv4.tcp_keepalive_probes: 3
+
+volumes:
+  cos-data:
+  agent-data:

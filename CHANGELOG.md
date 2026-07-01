@@ -3,6 +3,29 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [h7.2-ar-01] - 2026-07-01 (v0.50.0)
+
+### Added
+- Generic `agent` Docker entrypoint mode: `TEMPLATE_NAME=<name> AGENT_TASK="..." docker compose run --rm agent`
+  lowers any single-agent template to a valid TOML config via `agentctl spawn --dry-run`, rewrites
+  `../docker/` paths to `/etc/agentd/` (Docker layout), and execs `agentd`. Covers `scout`,
+  `librarian`, `google-agent`, and all future templates without per-template entrypoint cases.
+- `DRY_RUN_ONLY=1` env var exits before `exec agentd` and prints the rendered `/data/agent.toml`
+  — enables smoke testing path rewriting without a live API key.
+- `docker-compose.yml` `agent` service: named `agent-data` volume, `HOME=/data` for OAuth token
+  persistence, `AGENTOS_REPO_TEMPLATES_DIR` for explicit template resolution, full OAuth + web-search
+  env wiring, per-template task examples as inline comments, Google Cloud Console setup instructions.
+- `set -o pipefail` added to `docker/entrypoint.sh` — catches `agentctl` failures that `set -e`
+  alone misses in pipeline context.
+
+### Fixed
+- Removed static `8585:8585` port binding from both `cos` and `agent` compose services — eliminates
+  the port conflict when both services are configured. OAuth callback now requires `--service-ports`.
+- `agentctl list-templates` printed on template-not-found error so the valid template names are
+  immediately visible without reading docs.
+- `code-aware` template exits with a clear error (requires `runsc`/gVisor not in standard image)
+  instead of failing silently mid-run when `runsc` is not found.
+
 ## [con.1] - 2026-06-30 (v0.49.0)
 
 ### Fixed
