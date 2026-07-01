@@ -914,7 +914,7 @@ task = "t"
                 "catalogue must contain template '{expected}'; found: {names:?}"
             );
         }
-        assert_eq!(entries.len(), 13, "catalogue must have exactly 13 templates; found: {names:?}");
+        assert_eq!(entries.len(), 14, "catalogue must have exactly 14 templates; found: {names:?}");
     }
 
     #[test]

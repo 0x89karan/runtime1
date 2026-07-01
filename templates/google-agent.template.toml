@@ -1,42 +1,39 @@
-[meta]
-name        = "google-agent"
-version     = "0.1.0"
-description = "Agent connected to Gmail and Google Drive via OAuth2. Reads mail, lists Drive files, and can search across both."
-showcases   = "OAuth2 + PKCE authorization flow, authenticated API calls, Gmail/Drive read access"
-gated_requires = "OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET from Google Cloud Console (see docs/MCP_SERVERS.md)"
 sample_tasks = [
   "Summarize my last 10 unread emails",
   "Find all Google Drive files modified in the past week",
   "Search my Gmail for emails about project deadlines",
 ]
 
-[card]
-name           = "Google Agent"
-description    = "Gmail + Drive reader via OAuth2."
-skills         = ["email", "drive", "oauth"]
-suggested_caps = []
+[template]
+name           = "google-agent"
+description    = "Agent connected to Gmail and Google Drive via OAuth2. Reads mail, lists Drive files, and can search across both."
+showcases      = "OAuth2 + PKCE authorization flow, authenticated API calls, Gmail/Drive read access"
+gated_requires = "OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET from Google Cloud Console"
+
+[model]
+provider   = "anthropic"
+model      = "claude-sonnet-4-6"
+max_tokens = 4096
 
 [capabilities]
-# The agent can call the 3 OAuth tools: oauth_start_auth, oauth_check_auth, oauth_call_api
 mcp = [
   { server = "google_oauth", tools = [] },
 ]
-# Optional: allow reading/writing output files
-# fs_read  = [{ prefix = "/workspace" }]
-# fs_write = [{ prefix = "/workspace/output" }]
+
+[card]
+name           = "Google Agent"
+description    = "Gmail + Google Drive reader via OAuth2 + PKCE."
+skills         = ["email", "drive", "oauth"]
+suggested_caps = []
 
 [[tools.mcp_servers]]
 name    = "google_oauth"
 command = "python3"
-# Path relative to agentd/ (where cargo run is invoked)
 args    = ["../docker/oauth_mcp.py"]
 passenv = [
-  # Required: set these before starting agentd
   "OAUTH_CLIENT_ID",
   "OAUTH_CLIENT_SECRET",
-  # Optional: skip the OAuth dance if you already have a refresh token
   "OAUTH_REFRESH_TOKEN",
-  # Pre-set for Google — change only if you need different scopes/hosts
   "OAUTH_AUTH_URL",
   "OAUTH_TOKEN_URL",
   "OAUTH_SCOPES",
@@ -52,20 +49,24 @@ capabilities = [
   ], ports = [443] } },
 ]
 
+[agent]
+id           = "google-agent"
+task         = ""
+max_turns    = 20
+token_budget = 100000
+
 # ---------------------------------------------------------------------------
-# Google OAuth environment variables (set before starting agentd)
-# ---------------------------------------------------------------------------
+# Required env vars (set before running):
+#   export OAUTH_CLIENT_ID="<id>.apps.googleusercontent.com"
+#   export OAUTH_CLIENT_SECRET="GOCSPX-..."
 #
-# Required (2 vars) — get from Google Cloud Console:
-#   export OAUTH_CLIENT_ID="<your-google-client-id>.apps.googleusercontent.com"
-#   export OAUTH_CLIENT_SECRET="<your-google-client-secret>"
-#
-# Pre-set defaults for Google (no need to change these):
+# Pre-set defaults for Google (no need to change):
 #   export OAUTH_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
 #   export OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
 #   export OAUTH_SCOPES="https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.readonly"
 #   export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
 #   export OAUTH_PROVIDER_NAME="google"
 #
-# Optional — skip the dance if you already have a refresh token:
-#   export OAUTH_REFRESH_TOKEN="<your-refresh-token>"
+# Optional (skip OAuth on re-runs):
+#   export OAUTH_REFRESH_TOKEN="1//0g..."
+# ---------------------------------------------------------------------------
