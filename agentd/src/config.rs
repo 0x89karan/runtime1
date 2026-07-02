@@ -348,9 +348,13 @@ pub struct ModelConfig {
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
     /// When true, use SSE streaming and print text chunks progressively to stdout.
-    /// Applies to all agents in this config file. Default: false.
-    #[serde(default)]
+    /// Applies to all agents in this config file. Default: true.
+    #[serde(default = "default_streaming")]
     pub streaming: bool,
+}
+
+fn default_streaming() -> bool {
+    true
 }
 
 fn default_provider() -> String {
@@ -371,7 +375,7 @@ impl Default for ModelConfig {
             provider: default_provider(),
             model: default_model(),
             max_tokens: default_max_tokens(),
-            streaming: false,
+            streaming: true,
         }
     }
 }

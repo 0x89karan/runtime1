@@ -263,6 +263,12 @@ nonce; SSRF dual-layer (allowlist + IP block); token file atomic-write (mode 060
 timestamp; 6 self-tests); `templates/cron-agent.template.toml` + `templates/webhook-agent.template.toml`
 (new); `templates/watcher.template.toml` — `gated_requires` removed (now fully operational);
 `Makefile test-harness` extended to all 6 servers; 2 new Rust template tests; 1027 workspace tests.
+**h7.4 complete (v0.51.0).** Streaming-by-default + connect timeout: `ModelConfig.streaming`
+default flipped to `true` via `fn default_streaming() -> bool { true }` +
+`#[serde(default = "default_streaming")]`; `Default` impl updated; `connect_timeout(10s)` added
+to `AnthropicGateway` reqwest client; 4 streaming-default tests (defaults_to_true, can_be_disabled,
+can_be_enabled, default_impl_streaming_is_true); fixes Docker agent silent hang and google-agent
+OAuth URL invisibility; 1030 workspace tests.
 
 ## How to work here
 

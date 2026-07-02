@@ -147,6 +147,14 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   OAuth env, and `agent-data` named volume. `DRY_RUN_ONLY=1` env enables smoke testing without
   a live API key.
 
+**~~h7.4~~ (resolved v0.51.0) — Docker agent hang (streaming default + connect timeout)**
+- Root cause: `ModelConfig.streaming` defaulted to `false` (serde `bool::default()`), causing
+  all agents to run silently until `AgentEffect::Completed`. For `google-agent`, the OAuth URL
+  emitted in Turn 2 was never printed before `oauth_check_auth` started blocking on port 8585.
+- Resolved by flipping default to `true` (`fn default_streaming() -> bool { true }` +
+  `#[serde(default = "default_streaming")]`) and adding `connect_timeout(10s)` to the
+  `AnthropicGateway` reqwest client.
+
 ## Phase 7 / Harness — Open (from h7.1)
 
 **h7.1-ar-01 (P3) — MCP server script paths are hardcoded relative to agentd/ CWD**

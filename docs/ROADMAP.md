@@ -910,6 +910,16 @@ alive; `send_once()` + `is_connect()` retry retries once on stale-pool connect e
 OTEL coverage guard (`otel/tests/event_kind_coverage.rs`) updated. Removes the `streaming =
 false` stopgap previously patched into the cos Docker entrypoint.
 
+**h7.4 — Streaming-by-default + connect timeout** [HARNESS] *(done — v0.51.0)*
+Fixes Docker agent silent hang and `google-agent` OAuth URL invisibility. `ModelConfig.streaming`
+default flipped to `true` (`fn default_streaming() -> bool { true }` +
+`#[serde(default = "default_streaming")]`); `Default` impl updated. `connect_timeout(10s)` added
+to the `AnthropicGateway` reqwest client. `infer_with_stream` gains `is_connect` retry on stale-
+pool connect errors (streaming path, parallel to the non-streaming retry in con.1).
+`InferenceTransportRetried` emitted from the streaming path. 4 new streaming-default tests
+(defaults_to_true, can_be_disabled, can_be_enabled, default_impl_streaming_is_true);
+1030 workspace tests.
+
 ---
 
 ## Phase 8 — Harness extensions

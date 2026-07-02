@@ -1065,8 +1065,21 @@ fn make_infer_future(
                         "text_chunks_emitted": chunks_emitted,
                         "input_tokens": resp.input_tokens,
                         "output_tokens": resp.output_tokens,
+                        "transport_retries": resp.transport_retries,
                     }),
                 );
+                if resp.transport_retries > 0 {
+                    recorder.record(
+                        &id,
+                        None,
+                        EventKind::InferenceTransportRetried,
+                        json!({
+                            "agent_id": &id,
+                            "model":    &model,
+                            "retries":  resp.transport_retries,
+                        }),
+                    );
+                }
                 if let Some(ref ep) = egress {
                     ep.record_inference(&id, &model, resp.input_tokens.into(), resp.output_tokens.into());
                 }
@@ -4078,17 +4091,30 @@ mod tests {
         assert!(set.contains("stream-b"), "stream-b should be in streamed_agents");
     }
 
-    /// ModelConfig streaming field defaults to false via #[serde(default)].
+    /// ModelConfig streaming field defaults to true via #[serde(default = "default_streaming")].
     #[test]
-    fn model_config_streaming_defaults_to_false() {
-        // Verify that omitting `streaming` from a TOML snippet deserializes as false.
+    fn model_config_streaming_defaults_to_true() {
+        // Verify that omitting `streaming` from a TOML snippet deserializes as true.
         let toml_str = r#"
             provider = "anthropic"
             model = "claude-sonnet-4-6"
             max_tokens = 4096
         "#;
         let cfg: crate::config::ModelConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.streaming, "streaming must default to false when omitted from config");
+        assert!(cfg.streaming, "streaming must default to true when omitted from config");
+    }
+
+    /// ModelConfig streaming field can be explicitly disabled for headless/script use cases.
+    #[test]
+    fn model_config_streaming_can_be_disabled() {
+        let toml_str = r#"
+            provider = "anthropic"
+            model = "claude-sonnet-4-6"
+            max_tokens = 4096
+            streaming = false
+        "#;
+        let cfg: crate::config::ModelConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.streaming, "streaming = false must be honoured when explicit");
     }
 
     /// ModelConfig streaming field can be set to true in TOML.
@@ -4102,6 +4128,13 @@ mod tests {
         "#;
         let cfg: crate::config::ModelConfig = toml::from_str(toml_str).unwrap();
         assert!(cfg.streaming, "streaming must be parsed as true when set in config");
+    }
+
+    /// ModelConfig::default() must also return streaming = true so Default and serde cannot drift.
+    #[test]
+    fn model_config_default_impl_streaming_is_true() {
+        let cfg = crate::config::ModelConfig::default();
+        assert!(cfg.streaming, "Default impl must return streaming = true after h7.4");
     }
 
     // ── p7.5b egress_addr ─────────────────────────────────────────────────────

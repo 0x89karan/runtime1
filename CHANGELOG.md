@@ -3,6 +3,29 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [h7.4] - 2026-07-03 (v0.51.0)
+
+### Changed
+- `ModelConfig.streaming` now defaults to `true` (was `false`). All agents stream text
+  progressively to stdout by default. Configs that omit `streaming` silently gain streaming;
+  set `streaming = false` to opt out for headless/batch use cases.
+- `AnthropicGateway` reqwest client now sets `connect_timeout(10s)` in addition to the
+  existing `timeout(120s)`. TCP handshake failures now surface in 10 s instead of 120 s.
+
+### Fixed
+- Agents running in Docker (including `google-agent`) appeared to hang indefinitely with
+  zero terminal output. Root cause: `streaming = false` default blocked all stdout until
+  `AgentEffect::Completed`. With the OAuth flow, Turn 2's URL was silently consumed before
+  `oauth_check_auth` started blocking on port 8585, making the flow impossible to complete.
+- `infer_with_stream` (streaming path, now the default) was missing the `is_connect()` retry
+  that `infer()` (non-streaming) already had. With `connect_timeout(10s)` now active, TCP
+  handshake failures on the streaming path would fast-fail without retry. Fixed: `send_once`
+  now used for both paths with identical one-retry-on-`is_connect()` semantics.
+- `make_infer_future`'s streaming branch never emitted `InferenceTransportRetried` even when
+  `transport_retries = 1` was correctly computed and returned. The non-streaming branch already
+  emitted this event. Fixed: added the `transport_retries > 0` guard to the streaming arm;
+  also added `transport_retries` to the `InferenceStreamCompleted` payload for consistency.
+
 ## [h7.2-ar-01] - 2026-07-01 (v0.50.0)
 
 ### Added

@@ -28,6 +28,7 @@ impl AnthropicGateway {
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             // Keep TCP connections alive through Docker NAT conntrack's idle timeout.
             // Without this, connections silently die during long MCP wait periods.
@@ -295,15 +296,18 @@ impl InferenceGateway for AnthropicGateway {
             stream: true,
         };
 
-        let resp = self
-            .client
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .json(&body)
-            .send()
-            .await
-            .context("sending streaming request to Anthropic API")?;
+        // Mirror the is_connect() retry from infer(). A connect error means the
+        // TCP handshake failed before the server received any bytes, so replaying
+        // the streaming request is safe.
+        let mut transport_retries: u32 = 0;
+        let resp = match self.send_once(&body).await {
+            Ok(r) => r,
+            Err(e) if e.is_connect() => {
+                transport_retries = 1;
+                self.send_once(&body).await.context("sending streaming request to Anthropic API")?
+            }
+            Err(e) => return Err(e).context("sending streaming request to Anthropic API"),
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -319,7 +323,9 @@ impl InferenceGateway for AnthropicGateway {
             bail!("Anthropic API {status}: {msg}");
         }
 
-        parse_sse_stream(resp, chunk_tx).await
+        let mut result = parse_sse_stream(resp, chunk_tx).await?;
+        result.transport_retries = transport_retries;
+        Ok(result)
     }
 
     fn model_id(&self) -> &str {
