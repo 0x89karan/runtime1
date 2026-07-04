@@ -92,6 +92,8 @@ fn run_plain(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>,
     loop {
         let snap = source.load_snapshot();
         app.apply_snapshot(snap);
+        let approvals = source.load_approvals();
+        app.update_approvals(approvals);
         let text = views::render_plain(&app);
         print!("{text}");
         println!("---");
@@ -141,6 +143,8 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, s
         // Refresh state on every frame.
         let snap = source.load_snapshot();
         app.apply_snapshot(snap);
+        let approvals = source.load_approvals();
+        app.update_approvals(approvals);
 
         term.draw(|f| views::render(f, &app))?;
 
@@ -183,7 +187,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, s
                         View::Memory    => handle_memory_key(key.code, &mut app),
                         View::Spawn     => handle_spawn_key(key.code, &mut app),
                         View::Inspector => handle_inspector_key(key.code, &mut app),
-                        View::Approvals => handle_approvals_key(key.code, &mut app),
+                        View::Approvals => handle_approvals_key(key.code, &mut app, source.as_ref()),
                     }
                     if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
                         break;
@@ -260,7 +264,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, s
                                     View::Memory    => handle_memory_key(key.code, &mut app2),
                                     View::Spawn     => handle_spawn_key(key.code, &mut app2),
                                     View::Inspector => handle_inspector_key(key.code, &mut app2),
-                                    View::Approvals => handle_approvals_key(key.code, &mut app2),
+                                    View::Approvals => handle_approvals_key(key.code, &mut app2, source.as_ref()),
                                 }
                                 if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
                                     break;
@@ -481,52 +485,25 @@ fn handle_inspector_key(code: KeyCode, app: &mut App) {
     }
 }
 
-/// Write `payload` bytes to `/agents/control`, using an explicit `close(2)` so FUSE
-/// flush errors are visible rather than silently swallowed by Rust's `File::drop`.
-fn write_control_command(agents_dir: &std::path::Path, payload: &str) -> Result<(), String> {
-    use std::io::Write as _;
-    use std::os::unix::io::IntoRawFd as _;
-
-    let control = agents_dir.join("control");
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&control)
-        .map_err(|e| format!("open /agents/control: {e}"))?;
-    f.write_all(payload.as_bytes())
-        .map_err(|e| format!("write error: {e}"))?;
-    let fd = f.into_raw_fd();
-    // SAFETY: fd is valid and exclusively owned (into_raw_fd consumed the File).
-    let rc = unsafe { libc::close(fd) };
-    if rc != 0 {
-        return Err(format!(
-            "scheduler rejected command ({})",
-            std::io::Error::last_os_error()
-        ));
-    }
-    Ok(())
-}
-
-fn handle_approvals_key(code: KeyCode, app: &mut App) {
+fn handle_approvals_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
     match app.approvals_view.mode {
         // ── Typing a reject reason ────────────────────────────────────────────
         ApprovalsMode::RejectReason => {
             match code {
                 KeyCode::Enter => {
-                    let id_opt = app.approvals_view.confirmed_id.clone();
-                    let found  = id_opt.as_deref().and_then(|id| {
-                        app.approvals_items.iter().find(|i| i.id == id)
+                    let id_opt   = app.approvals_view.confirmed_id.clone();
+                    let found_id = id_opt.as_deref().and_then(|id| {
+                        app.approvals_items.iter().find(|i| i.id == id).map(|i| i.id.clone())
                     });
-                    app.approvals_view.result_msg = if let Some(item) = found {
+                    app.approvals_view.result_msg = if let Some(found_id) = found_id {
                         let reason = app.approvals_view.reject_reason.clone();
-                        let payload = if reason.is_empty() {
-                            serde_json::json!({ "reject": { "id": &item.id } })
-                        } else {
-                            serde_json::json!({ "reject": { "id": &item.id, "reason": reason } })
-                        };
-                        let json_str = serde_json::to_string(&payload).unwrap_or_default();
-                        match write_control_command(&app.agents_dir, &json_str) {
-                            Ok(())  => Some(format!("Rejected {}", item.id)),
-                            Err(e)  => Some(format!("Error: {e}")),
+                        let reason_opt = if reason.is_empty() { None } else { Some(reason.as_str()) };
+                        match source.deny(&found_id, reason_opt) {
+                            Ok(()) => {
+                                app.approvals_items.retain(|i| i.id != found_id);
+                                Some(format!("Rejected {found_id}"))
+                            }
+                            Err(e) => Some(format!("Error: {e}")),
                         }
                     } else {
                         Some("Approval already resolved — refreshed list.".to_string())
@@ -553,16 +530,17 @@ fn handle_approvals_key(code: KeyCode, app: &mut App) {
         ApprovalsMode::Confirm => {
             match code {
                 KeyCode::Char('a') => {
-                    let id_opt = app.approvals_view.confirmed_id.clone();
-                    let found  = id_opt.as_deref().and_then(|id| {
-                        app.approvals_items.iter().find(|i| i.id == id)
+                    let id_opt   = app.approvals_view.confirmed_id.clone();
+                    let found_id = id_opt.as_deref().and_then(|id| {
+                        app.approvals_items.iter().find(|i| i.id == id).map(|i| i.id.clone())
                     });
-                    app.approvals_view.result_msg = if let Some(item) = found {
-                        let payload  = serde_json::json!({ "approve": { "id": &item.id } });
-                        let json_str = serde_json::to_string(&payload).unwrap_or_default();
-                        match write_control_command(&app.agents_dir, &json_str) {
-                            Ok(())  => Some(format!("Approved {}", item.id)),
-                            Err(e)  => Some(format!("Error: {e}")),
+                    app.approvals_view.result_msg = if let Some(found_id) = found_id {
+                        match source.approve(&found_id) {
+                            Ok(()) => {
+                                app.approvals_items.retain(|i| i.id != found_id);
+                                Some(format!("Approved {found_id}"))
+                            }
+                            Err(e) => Some(format!("Error: {e}")),
                         }
                     } else {
                         Some("Approval already resolved — refreshed list.".to_string())
@@ -570,19 +548,20 @@ fn handle_approvals_key(code: KeyCode, app: &mut App) {
                     app.approvals_view.mode = ApprovalsMode::List;
                 }
                 KeyCode::Char('d') => {
-                    let id_opt = app.approvals_view.confirmed_id.clone();
-                    let found  = id_opt.as_deref().and_then(|id| {
+                    // "Don't ask again for this kind" — sends auto_approve_kind via FUSE;
+                    // HTTP path inherits the default which falls back to plain approve.
+                    let id_opt  = app.approvals_view.confirmed_id.clone();
+                    let found   = id_opt.as_deref().and_then(|id| {
                         app.approvals_items.iter().find(|i| i.id == id)
+                            .map(|i| (i.id.clone(), i.kind.clone()))
                     });
-                    app.approvals_view.result_msg = if let Some(item) = found {
-                        let kind     = item.kind.clone();
-                        let payload  = serde_json::json!({
-                            "approve": { "id": &item.id, "auto_approve_kind": kind }
-                        });
-                        let json_str = serde_json::to_string(&payload).unwrap_or_default();
-                        match write_control_command(&app.agents_dir, &json_str) {
-                            Ok(())  => Some(format!("Approved {} (auto for '{}')", item.id, item.kind)),
-                            Err(e)  => Some(format!("Error: {e}")),
+                    app.approvals_view.result_msg = if let Some((found_id, found_kind)) = found {
+                        match source.approve_with_kind(&found_id, &found_kind) {
+                            Ok(()) => {
+                                app.approvals_items.retain(|i| i.id != found_id);
+                                Some(format!("Approved {found_id} (auto for '{found_kind}')"))
+                            }
+                            Err(e) => Some(format!("Error: {e}")),
                         }
                     } else {
                         Some("Approval already resolved — refreshed list.".to_string())
@@ -713,12 +692,24 @@ mod tests {
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
     use crate::watch::reader::{AgentInfo, BudgetKind, PendingAction, Snapshot};
+    use crate::watch::source::DataSource;
+
+    struct TestSource;
+    impl DataSource for TestSource {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("mock: no control".into()) }
+        fn deny(&self, _id: &str, _reason: Option<&str>) -> Result<(), String> { Err("mock: no control".into()) }
+    }
 
     fn make_snapshot(ids: &[&str]) -> Snapshot {
         Snapshot {
             agents: ids.iter().map(|id| AgentInfo {
                 id:              id.to_string(),
                 status:          "running".to_string(),
+                status_detail:   None,
                 context_tokens:  0,
                 budget:          BudgetKind::Unlimited,
                 tools:           vec![],
@@ -1178,7 +1169,7 @@ mod tests {
     #[test]
     fn approvals_key_q_returns_to_dashboard_from_list() {
         let mut app = app_with_approvals(&[]);
-        handle_approvals_key(KeyCode::Char('q'), &mut app);
+        handle_approvals_key(KeyCode::Char('q'), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard,
             "'q' in Approvals list mode must return to Dashboard");
     }
@@ -1186,7 +1177,7 @@ mod tests {
     #[test]
     fn approvals_key_esc_returns_to_dashboard_from_list() {
         let mut app = app_with_approvals(&[]);
-        handle_approvals_key(KeyCode::Esc, &mut app);
+        handle_approvals_key(KeyCode::Esc, &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard,
             "Esc in Approvals list mode must return to Dashboard");
     }
@@ -1194,7 +1185,7 @@ mod tests {
     #[test]
     fn approvals_key_enter_enters_confirm_when_items_present() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
-        handle_approvals_key(KeyCode::Enter, &mut app);
+        handle_approvals_key(KeyCode::Enter, &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::Confirm,
             "Enter with pending items must enter Confirm mode");
         assert_eq!(app.view, View::Approvals,
@@ -1204,7 +1195,7 @@ mod tests {
     #[test]
     fn approvals_key_enter_is_noop_when_no_items() {
         let mut app = app_with_approvals(&[]);
-        handle_approvals_key(KeyCode::Enter, &mut app);
+        handle_approvals_key(KeyCode::Enter, &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "Enter with no items must stay in List mode");
     }
@@ -1212,7 +1203,7 @@ mod tests {
     #[test]
     fn approvals_key_j_advances_selection() {
         let mut app = app_with_approvals(&[("act_0", "w"), ("act_1", "w")]);
-        handle_approvals_key(KeyCode::Char('j'), &mut app);
+        handle_approvals_key(KeyCode::Char('j'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 1, "'j' must advance selection");
     }
 
@@ -1220,7 +1211,7 @@ mod tests {
     fn approvals_key_k_decrements_selection() {
         let mut app = app_with_approvals(&[("act_0", "w"), ("act_1", "w")]);
         app.approvals_view.selected_idx = 1;
-        handle_approvals_key(KeyCode::Char('k'), &mut app);
+        handle_approvals_key(KeyCode::Char('k'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 0, "'k' must decrement selection");
     }
 
@@ -1228,14 +1219,14 @@ mod tests {
     fn approvals_key_k_saturates_at_zero() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.selected_idx = 0;
-        handle_approvals_key(KeyCode::Char('k'), &mut app);
+        handle_approvals_key(KeyCode::Char('k'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 0, "k at 0 must not underflow");
     }
 
     #[test]
     fn approvals_key_j_saturates_at_last() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
-        handle_approvals_key(KeyCode::Char('j'), &mut app);
+        handle_approvals_key(KeyCode::Char('j'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 0, "j at last must not overflow");
     }
 
@@ -1243,7 +1234,7 @@ mod tests {
     fn approvals_confirm_r_enters_reject_reason_mode() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Char('r'), &mut app);
+        handle_approvals_key(KeyCode::Char('r'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::RejectReason,
             "'r' in Confirm mode must switch to RejectReason mode");
         assert!(app.approvals_view.reject_reason.is_empty(),
@@ -1254,7 +1245,7 @@ mod tests {
     fn approvals_confirm_esc_returns_to_list() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Esc, &mut app);
+        handle_approvals_key(KeyCode::Esc, &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "Esc in Confirm mode must return to List mode (not Dashboard)");
         assert_eq!(app.view, View::Approvals);
@@ -1264,7 +1255,7 @@ mod tests {
     fn approvals_reject_reason_char_appends_to_reason() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
-        handle_approvals_key(KeyCode::Char('x'), &mut app);
+        handle_approvals_key(KeyCode::Char('x'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.reject_reason, "x");
     }
 
@@ -1273,7 +1264,7 @@ mod tests {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
         app.approvals_view.reject_reason = "foo".to_string();
-        handle_approvals_key(KeyCode::Backspace, &mut app);
+        handle_approvals_key(KeyCode::Backspace, &mut app, &TestSource);
         assert_eq!(app.approvals_view.reject_reason, "fo");
     }
 
@@ -1282,7 +1273,7 @@ mod tests {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
         app.approvals_view.reject_reason = "partial".to_string();
-        handle_approvals_key(KeyCode::Esc, &mut app);
+        handle_approvals_key(KeyCode::Esc, &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::Confirm,
             "Esc in RejectReason mode must return to Confirm (not List)");
         assert!(app.approvals_view.reject_reason.is_empty(),
@@ -1291,11 +1282,11 @@ mod tests {
 
     #[test]
     fn approvals_reject_reason_enter_with_no_control_file_sets_error_msg() {
-        // /nonexistent/control doesn't exist → write_control_command fails.
+        // TestSource.deny() returns Err("mock: no control") → result_msg is set.
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
         app.approvals_view.reject_reason = "too risky".to_string();
-        handle_approvals_key(KeyCode::Enter, &mut app);
+        handle_approvals_key(KeyCode::Enter, &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after Enter in RejectReason mode must return to List");
         // result_msg is set (either success or error — we're testing the error path here).
@@ -1307,7 +1298,7 @@ mod tests {
     fn approvals_confirm_approve_with_no_control_file_sets_error_msg() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Char('a'), &mut app);
+        handle_approvals_key(KeyCode::Char('a'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after Approve must return to List mode");
         assert!(app.approvals_view.result_msg.is_some(),
@@ -1318,7 +1309,7 @@ mod tests {
     fn approvals_confirm_dont_ask_again_with_no_control_file_sets_error_msg() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Char('d'), &mut app);
+        handle_approvals_key(KeyCode::Char('d'), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after 'don't ask again' must return to List mode");
         assert!(app.approvals_view.result_msg.is_some(),

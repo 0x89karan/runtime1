@@ -513,9 +513,8 @@ impl App {
             self.inspector_view.load(self.log_path.as_deref());
         }
 
-        // Refresh the approval queue on every tick (small pseudofile, always relevant).
-        self.approvals_items = reader::read_approvals(&self.agents_dir);
         // Clamp selection to stay in-bounds if items were resolved since last tick.
+        // (Approval items are refreshed by run_tui/run_plain via update_approvals().)
         if !self.approvals_items.is_empty()
             && self.approvals_view.selected_idx >= self.approvals_items.len()
         {
@@ -538,6 +537,17 @@ impl App {
             } else {
                 None
             };
+        }
+    }
+
+    /// Update the pending approvals list. Called every tick from run_tui/run_plain
+    /// via `source.load_approvals()`, replacing the old FUSE-direct call in apply_snapshot.
+    pub fn update_approvals(&mut self, items: Vec<PendingAction>) {
+        self.approvals_items = items;
+        if !self.approvals_items.is_empty()
+            && self.approvals_view.selected_idx >= self.approvals_items.len()
+        {
+            self.approvals_view.selected_idx = self.approvals_items.len() - 1;
         }
     }
 
@@ -586,6 +596,7 @@ mod tests {
         AgentInfo {
             id:              id.to_string(),
             status:          "running".to_string(),
+            status_detail:   None,
             context_tokens:  0,
             budget:          BudgetKind::Unlimited,
             tools:           vec![],

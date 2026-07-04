@@ -94,6 +94,9 @@ pub struct PendingAction {
 pub struct AgentInfo {
     pub id:               String,
     pub status:           String,
+    /// Extra context for tuple-variant statuses: child ID for awaiting_child,
+    /// approval ID for awaiting_approval. None for all other statuses.
+    pub status_detail:    Option<String>,
     pub context_tokens:   u64,
     pub budget:           BudgetKind,
     pub tools:            Vec<String>,
@@ -184,6 +187,7 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
     AgentInfo {
         id: id.to_string(),
         status,
+        status_detail: None,
         context_tokens,
         budget,
         tools,

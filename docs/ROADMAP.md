@@ -994,32 +994,13 @@ Acceptance:
   a `[warn] management API unreachable, using FUSE` message.
 - Binary stays ≤ 6 MB (hyper already present; no new heavy deps).
 
-**dx.2 — HTTP approval surface** *(next — depends on: p7.7)*
-Makes `request_approval()` reachable from outside the container or VM — resolves the
-core headless/unattended operation problem identified in `docs/plans/pure-os-ux-alignment.md`.
-
-Scope:
-- `agentd/src/approval_http.rs` (new): when `request_approval()` fires, agentd serves
-  a minimal HTML page on `:8080` (`GET /` → pending approvals list; `POST /approve/:id`
-  + `POST /deny/:id` → write decision to `ApprovalStore`, return 200). HTML is
-  self-contained (no external CSS/JS). Page auto-refreshes every 5 s when idle.
-- `request_approval()` tool gains optional `timeout_s: u64` + `default: "approve" |
-  "deny"` parameters. When timeout fires with a pending decision, the default is
-  applied and `ApprovalAutoResolved { id, default, timeout_s }` flight event emitted.
-  Omitting timeout = blocking indefinitely (current behavior, backward compat).
-- `docker-compose.yml` port `8080:8080` already added in dx.1.
-- Convention: `kind="data-access"` in approval description → safe to set
-  `default="approve"` + long timeout. `kind="send"` / `kind="modify"` → always
-  omit default (block indefinitely).
-
-Acceptance:
-- Agent calls `request_approval(description="...", kind="data-access", timeout_s=3600,
-  default="approve")` → browser at `http://localhost:8080` shows the pending action.
-- Clicking Approve → agent continues; clicking Deny → agent receives denial.
-- Timeout fires after `timeout_s` with no human action → auto-approved per default;
-  `ApprovalAutoResolved` event in `flight.jsonl`.
-- Port 8080 on Mac host (Docker port bind) reaches the same approval page as
-  `localhost:8080` inside the container.
+**~~dx.2~~ — HTTP approval surface** *(done — v0.54.0)*
+POST approve/deny routes on the management API (:7999); fail-closed (503+Retry-After on
+channel full); 404 on unknown ID; `ApprovalHttpApproved`/`ApprovalHttpDenied` flight events;
+`DataSource` trait extended with `load_approvals()`/`approve()`/`deny()`; `HttpSource` with
+500 ms mutation timeout; `agentctl approve`/`agentctl deny` CLI subcommands; optimistic local
+removal in TUI; `status_detail` parsed from HTTP snapshot JSON; FUSE control channel always
+wired on Linux. Resolved p7.7-ar-01, p7.7-ar-02, p7.7-ar-04. 1096 workspace tests.
 
 **dx.3 — Linux QEMU production** *(depends on: dx.2)*
 Closes the loop: the pure OS vision running on a Linux server with hardware-accelerated

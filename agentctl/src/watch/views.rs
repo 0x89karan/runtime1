@@ -204,10 +204,16 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
         }
     };
     let lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled("  Status:   ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(agent.status.clone(), status_style(&agent.status)),
-        ]),
+        {
+            let mut spans = vec![
+                Span::styled("  Status:   ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(agent.status.clone(), status_style(&agent.status)),
+            ];
+            if let Some(detail) = &agent.status_detail {
+                spans.push(Span::raw(format!(" [{detail}]")));
+            }
+            Line::from(spans)
+        },
         {
             let ctx_str = if agent.tier == "universal" {
                 "N/A".to_string()
@@ -1144,6 +1150,7 @@ mod tests {
         AgentInfo {
             id:              id.to_string(),
             status:          status.to_string(),
+            status_detail:   None,
             context_tokens:  ctx,
             budget:          BudgetKind::Unlimited,
             tools,

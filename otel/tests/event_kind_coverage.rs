@@ -77,6 +77,8 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::UniversalAgentStarted => false,
         EventKind::UniversalAgentExited => false,
         EventKind::UniversalAgentIsolationDegraded => false,
+        EventKind::ApprovalHttpApproved => false,
+        EventKind::ApprovalHttpDenied => false,
         EventKind::Error => false,
     }
 }

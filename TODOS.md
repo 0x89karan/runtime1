@@ -140,15 +140,14 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 
 ## Phase 7 — Open (deferred from p7.7)
 
-**p7.7-ar-01 (LOW) — SSE `/api/v1/events` endpoint has no unit test**
-- `management.rs` `route()` for `/api/v1/events` returns a `text/event-stream` response via
-  `async_stream::stream!`, but there is no unit test verifying the content-type header or the
-  `data: {...}\n\n` framing. Manual testing confirms SSE works; test gap deferred to dx.2.
+**~~p7.7-ar-01~~ (resolved dx.2) — SSE `/api/v1/events` endpoint has no unit test**
+- Fixed: `sse_content_type_and_framing` test in `management.rs` verifies the `text/event-stream`
+  content-type header and `cache-control: no-cache` header. (Stream framing is not unit-testable
+  without a live broadcaster; header correctness is the achievable invariant.)
 
-**p7.7-ar-02 (LOW) — `detect_source()` fallback logic untested**
-- `agentctl/src/watch/source.rs::detect_source()` has three branches: explicit URL → FUSE
-  `system/` dir → HTTP healthcheck on `:7999` → error. Only the JSON-deserialization path
-  has unit tests; the FUSE→HTTP→error chain is untested. Deferred to dx.2.
+**~~p7.7-ar-02~~ (resolved dx.2) — `detect_source()` fallback logic untested**
+- Fixed: `detect_source_fuse_path_returns_fuse_source` and `detect_source_fallback_to_http_when_no_fuse`
+  unit tests added in `source.rs`.
 
 **p7.7-ar-03 (LOW) — `egress_brokered`/`egress_rejected` hardcoded to 0 in `HttpSource`**
 - `HttpSource::load_snapshot()` maps `/api/v1/snapshot` JSON to `SchedulerSnapshot` but
@@ -156,11 +155,9 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   endpoint). The FUSE path reads them from live files. Align in dx.2 when the HTTP endpoint
   exposes egress counters.
 
-**p7.7-ar-04 (LOW) — `status_detail` not threaded through `agent_info_from_json`**
-- `HttpSource` parses `AgentInfo` from the `/api/v1/snapshot` JSON but ignores the
-  `status_detail` field emitted by `AgentSnapshot::serialize` for `Awaiting(child_id)` variants.
-  Approval IDs and child IDs visible in the FUSE path are dropped by the HTTP path.
-  Fix in dx.2: parse `status_detail` alongside `status` in `agent_info_from_json`.
+**~~p7.7-ar-04~~ (resolved dx.2) — `status_detail` not threaded through `agent_info_from_json`**
+- Fixed: `agent_info_from_json` now parses `status_detail` from the JSON response;
+  `AgentInfo.status_detail` is populated for `Awaiting*` variants; detail shown in AgentDetail view.
 
 **p7.7-ar-05 (INFO) — management server loopback guard is post-bind**
 - `management.rs::start()` binds the TCP listener first, then asserts the bound address is

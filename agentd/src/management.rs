@@ -4,11 +4,13 @@
 //! so `agentctl watch` can run on the Mac/Linux host without FUSE filesystem access.
 //!
 //! Routes:
-//!   GET  /healthz                        → 200 {"ok": true}
-//!   GET  /api/v1/snapshot                → 200 SchedulerSnapshot JSON
-//!   GET  /api/v1/approvals               → 200 [PendingActionView, ...]
-//!   GET  /api/v1/memory/:ns?limit=&offset= → 200 [{key, value}, ...] paginated
-//!   GET  /api/v1/events                  → 200 text/event-stream (SSE)
+//!   GET  /healthz                                → 200 {"ok": true}
+//!   GET  /api/v1/snapshot                        → 200 SchedulerSnapshot JSON
+//!   GET  /api/v1/approvals                       → 200 [PendingActionView, ...]
+//!   POST /api/v1/approvals/:id/approve           → 200 | 400 | 404 | 503
+//!   POST /api/v1/approvals/:id/deny              → 200 | 400 | 404 | 503
+//!   GET  /api/v1/memory/:ns?limit=&offset=       → 200 [{key, value}, ...] paginated
+//!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -24,6 +26,9 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+use tokio::sync::mpsc;
+
+use crate::control::ControlCommand;
 use crate::events::EventKind;
 use crate::flight_recorder::FlightRecorder;
 use crate::memory::MemoryStore;
@@ -37,6 +42,8 @@ struct ApiState {
     memory_store:  Option<Arc<dyn MemoryStore>>,
     broadcast_tx:  broadcast::Sender<String>,
     recorder:      Arc<FlightRecorder>,
+    /// Sender half of the scheduler control channel. None when not wired (non-Linux or test).
+    control_tx:    Option<mpsc::Sender<ControlCommand>>,
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -54,6 +61,16 @@ fn error_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     json_response(status, json!({"error": message}))
 }
 
+fn error_response_with_retry(status: StatusCode, message: &str) -> Response<BoxBody> {
+    let bytes = serde_json::to_vec(&json!({"error": message})).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("retry-after", "1")
+        .body(Full::new(Bytes::from(bytes)).map_err(|e| match e {}).boxed())
+        .unwrap()
+}
+
 async fn handle(
     state: Arc<ApiState>,
     req: Request<hyper::body::Incoming>,
@@ -62,7 +79,19 @@ async fn handle(
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
 
-    let resp = route(Arc::clone(&state), method.clone(), &path, &query).await;
+    // Read body bytes for POST requests, bounded at 64 KiB; other methods ignore body.
+    const MAX_BODY_BYTES: usize = 64 * 1024;
+    let body_bytes = if method == Method::POST {
+        use http_body_util::Limited;
+        match Limited::new(req.into_body(), MAX_BODY_BYTES).collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(_) => Bytes::new(), // body too large or read error → treat as empty
+        }
+    } else {
+        Bytes::new()
+    };
+
+    let resp = route(Arc::clone(&state), method.clone(), &path, &query, &body_bytes).await;
     let status = resp.status().as_u16();
 
     state.recorder.record(
@@ -80,6 +109,7 @@ async fn route(
     method: Method,
     path: &str,
     query: &str,
+    body: &[u8],
 ) -> Response<BoxBody> {
     match (method.clone(), path) {
         (Method::GET, "/healthz") => {
@@ -112,6 +142,92 @@ async fn route(
             match serde_json::to_value(&actions) {
                 Ok(v) => json_response(StatusCode::OK, v),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        (Method::POST, path) if path.ends_with("/approve") && path.starts_with("/api/v1/approvals/") => {
+            let id = path
+                .strip_prefix("/api/v1/approvals/")
+                .and_then(|s| s.strip_suffix("/approve"))
+                .unwrap_or("")
+                .trim();
+            if id.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "approval id must not be empty");
+            }
+            // 404 if not in current pending_actions
+            let agent_id = {
+                let guard = match state.snapshot.read() {
+                    Ok(g) => g,
+                    Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "snapshot lock poisoned"),
+                };
+                guard.pending_actions.iter().find(|a| a.id == id).map(|a| a.agent_id.clone())
+            };
+            let Some(agent_id) = agent_id else {
+                return error_response(StatusCode::NOT_FOUND, "approval id not found or already resolved");
+            };
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let cmd = ControlCommand::Approve { id: id.to_string(), edits: None, auto_approve_kind: None };
+            match tx.try_send(cmd) {
+                Ok(()) => {
+                    state.recorder.record("management", None, EventKind::ApprovalHttpApproved,
+                        json!({"id": id, "agent_id": agent_id}));
+                    json_response(StatusCode::OK, json!({"approved": id}))
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry")
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running")
+                }
+            }
+        }
+
+        (Method::POST, path) if path.ends_with("/deny") && path.starts_with("/api/v1/approvals/") => {
+            let id = path
+                .strip_prefix("/api/v1/approvals/")
+                .and_then(|s| s.strip_suffix("/deny"))
+                .unwrap_or("")
+                .trim();
+            if id.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "approval id must not be empty");
+            }
+            // 404 if not in current pending_actions
+            let agent_id = {
+                let guard = match state.snapshot.read() {
+                    Ok(g) => g,
+                    Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "snapshot lock poisoned"),
+                };
+                guard.pending_actions.iter().find(|a| a.id == id).map(|a| a.agent_id.clone())
+            };
+            let Some(agent_id) = agent_id else {
+                return error_response(StatusCode::NOT_FOUND, "approval id not found or already resolved");
+            };
+            // Parse optional {"reason": "..."} from body.
+            let reason = if !body.is_empty() {
+                serde_json::from_slice::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+            } else {
+                None
+            };
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let cmd = ControlCommand::Reject { id: id.to_string(), reason: reason.clone() };
+            match tx.try_send(cmd) {
+                Ok(()) => {
+                    state.recorder.record("management", None, EventKind::ApprovalHttpDenied,
+                        json!({"id": id, "agent_id": agent_id, "reason": reason}));
+                    json_response(StatusCode::OK, json!({"denied": id}))
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry")
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running")
+                }
             }
         }
 
@@ -202,6 +318,7 @@ pub async fn start(
     memory_store: Option<Arc<dyn MemoryStore>>,
     broadcast_tx: broadcast::Sender<String>,
     recorder: Arc<FlightRecorder>,
+    control_tx: Option<mpsc::Sender<ControlCommand>>,
 ) -> anyhow::Result<SocketAddr> {
     let addr = format!("{bind_addr}:{port}");
     let listener = TcpListener::bind(&addr)
@@ -226,6 +343,7 @@ pub async fn start(
         memory_store,
         broadcast_tx,
         recorder,
+        control_tx,
     });
 
     tracing::info!("management API listening on {bound}");
@@ -263,6 +381,13 @@ mod tests {
     use surfaces::{SchedulerSnapshot, AgentSnapshot, AgentStatus};
 
     fn make_state(snap: SchedulerSnapshot) -> Arc<ApiState> {
+        make_state_with_control(snap, None)
+    }
+
+    fn make_state_with_control(
+        snap: SchedulerSnapshot,
+        control_tx: Option<mpsc::Sender<ControlCommand>>,
+    ) -> Arc<ApiState> {
         let (tx, _) = broadcast::channel(16);
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let recorder = Arc::new(
@@ -273,13 +398,14 @@ mod tests {
             memory_store: None,
             broadcast_tx: tx,
             recorder,
+            control_tx,
         })
     }
 
     #[tokio::test]
     async fn healthz_returns_ok() {
         let state = make_state(SchedulerSnapshot::default());
-        let resp = route(state, Method::GET, "/healthz", "").await;
+        let resp = route(state, Method::GET, "/healthz", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = collect_body(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -305,7 +431,7 @@ mod tests {
             pid: None,
         });
         let state = make_state(snap);
-        let resp = route(state, Method::GET, "/api/v1/snapshot", "").await;
+        let resp = route(state, Method::GET, "/api/v1/snapshot", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = collect_body(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -332,7 +458,7 @@ mod tests {
             pid: None,
         });
         let state = make_state(snap);
-        let resp = route(state, Method::GET, "/api/v1/snapshot", "").await;
+        let resp = route(state, Method::GET, "/api/v1/snapshot", "", &[]).await;
         let body = collect_body(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["agents"][0]["status"], "awaiting_child");
@@ -342,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_route_returns_404() {
         let state = make_state(SchedulerSnapshot::default());
-        let resp = route(state, Method::GET, "/nonexistent", "").await;
+        let resp = route(state, Method::GET, "/nonexistent", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = collect_body(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -352,21 +478,21 @@ mod tests {
     #[tokio::test]
     async fn memory_route_without_store_returns_503() {
         let state = make_state(SchedulerSnapshot::default());
-        let resp = route(state, Method::GET, "/api/v1/memory/myns", "").await;
+        let resp = route(state, Method::GET, "/api/v1/memory/myns", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn memory_route_nested_namespace_returns_400() {
         let state = make_state(SchedulerSnapshot::default());
-        let resp = route(state, Method::GET, "/api/v1/memory/agent/key1", "").await;
+        let resp = route(state, Method::GET, "/api/v1/memory/agent/key1", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn approvals_returns_empty_list() {
         let state = make_state(SchedulerSnapshot::default());
-        let resp = route(state, Method::GET, "/api/v1/approvals", "").await;
+        let resp = route(state, Method::GET, "/api/v1/approvals", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = collect_body(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -408,6 +534,7 @@ mod tests {
             None,
             tx,
             recorder,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -434,7 +561,7 @@ mod tests {
             pid: None,
         });
         let state = make_state(snap);
-        let resp = route(state, Method::GET, "/api/v1/snapshot", "").await;
+        let resp = route(state, Method::GET, "/api/v1/snapshot", "", &[]).await;
         let body = collect_body(resp).await;
         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v["agents"][0]["status"], "done");
@@ -445,7 +572,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_content_type_is_json() {
         let state = make_state(SchedulerSnapshot::default());
-        let resp = route(state, Method::GET, "/healthz", "").await;
+        let resp = route(state, Method::GET, "/healthz", "", &[]).await;
         let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
         assert!(ct.contains("application/json"), "expected json content-type, got: {ct}");
     }
@@ -453,8 +580,105 @@ mod tests {
     #[tokio::test]
     async fn post_to_snapshot_returns_404() {
         let state = make_state(SchedulerSnapshot::default());
-        let resp = route(state, Method::POST, "/api/v1/snapshot", "").await;
+        let resp = route(state, Method::POST, "/api/v1/snapshot", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    fn make_snap_with_action(id: &str, agent_id: &str) -> SchedulerSnapshot {
+        use surfaces::PendingActionView;
+        let mut snap = SchedulerSnapshot::default();
+        snap.pending_actions.push(PendingActionView {
+            id: id.to_string(),
+            agent_id: agent_id.to_string(),
+            kind: "write_file".to_string(),
+            risk: "medium".to_string(),
+            summary: "test action".to_string(),
+            args_json: "{}".to_string(),
+            age_secs: 0,
+        });
+        snap
+    }
+
+    #[tokio::test]
+    async fn approve_returns_503_without_control_tx() {
+        let snap = make_snap_with_action("act_0", "agent-1");
+        let state = make_state(snap);
+        let resp = route(state, Method::POST, "/api/v1/approvals/act_0/approve", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ct = resp.headers().get("retry-after").map(|v| v.to_str().unwrap_or(""));
+        assert_eq!(ct, Some("1"));
+    }
+
+    #[tokio::test]
+    async fn deny_returns_503_without_control_tx() {
+        let snap = make_snap_with_action("act_0", "agent-1");
+        let state = make_state(snap);
+        let resp = route(state, Method::POST, "/api/v1/approvals/act_0/deny", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let ra = resp.headers().get("retry-after").map(|v| v.to_str().unwrap_or(""));
+        assert_eq!(ra, Some("1"), "deny 503 must carry Retry-After: 1");
+    }
+
+    #[tokio::test]
+    async fn approve_empty_id_returns_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        // Path that strips to empty: "/api/v1/approvals//approve"
+        let resp = route(state, Method::POST, "/api/v1/approvals//approve", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn approve_unknown_id_returns_404() {
+        let state = make_state(SchedulerSnapshot::default()); // no pending actions
+        let resp = route(state, Method::POST, "/api/v1/approvals/act_999/approve", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn approve_happy_path_sends_command() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        let snap = make_snap_with_action("act_0", "agent-1");
+        let state = make_state_with_control(snap, Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/approvals/act_0/approve", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cmd = rx.try_recv().expect("command should have been sent");
+        match cmd {
+            ControlCommand::Approve { id, .. } => assert_eq!(id, "act_0"),
+            _ => panic!("expected Approve command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deny_with_reason_sends_command() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        let snap = make_snap_with_action("act_0", "agent-1");
+        let state = make_state_with_control(snap, Some(tx));
+        let body = br#"{"reason":"too risky"}"#;
+        let resp = route(state, Method::POST, "/api/v1/approvals/act_0/deny", "", body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cmd = rx.try_recv().expect("command should have been sent");
+        match cmd {
+            ControlCommand::Reject { id, reason } => {
+                assert_eq!(id, "act_0");
+                assert_eq!(reason, Some("too risky".to_string()));
+            }
+            _ => panic!("expected Reject command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_content_type_and_framing() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::GET, "/api/v1/events", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/event-stream"), "expected event-stream, got: {ct}");
+        assert_eq!(
+            resp.headers().get("cache-control").unwrap().to_str().unwrap(),
+            "no-cache"
+        );
     }
 
     async fn collect_body(resp: Response<BoxBody>) -> Bytes {

@@ -1,12 +1,12 @@
-//! DataSource abstraction: FUSE filesystem vs. management HTTP API (p7.7).
+//! DataSource abstraction: FUSE filesystem vs. management HTTP API (p7.7/dx.2).
 //!
-//! The trait has one method: `load_snapshot()` returns the same `Snapshot` type
-//! that the FUSE reader always produced, so callers don't change.
+//! The trait provides snapshot loading plus approval read/write, so all callers
+//! work identically whether agentd is local (FUSE) or remote (HTTP).
 
 use serde_json::Value;
 
 use super::reader::{
-    self, AgentInfo, AgentSandbox, BudgetKind, ServerEnforcement,
+    self, AgentInfo, AgentSandbox, BudgetKind, PendingAction, ServerEnforcement,
     Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox,
 };
 
@@ -14,6 +14,17 @@ use super::reader::{
 pub trait DataSource: Send + Sync {
     /// Load the current scheduler snapshot, including all agent info and system stats.
     fn load_snapshot(&self) -> Snapshot;
+    /// Load the current list of pending operator approvals.
+    fn load_approvals(&self) -> Vec<PendingAction>;
+    /// Approve the pending action with the given id. Fail-closed: any error returns Err.
+    fn approve(&self, id: &str) -> Result<(), String>;
+    /// Deny the pending action with the given id and an optional reason. Fail-closed.
+    fn deny(&self, id: &str, reason: Option<&str>) -> Result<(), String>;
+    /// Approve and set an auto-approval rule for all future actions of the same kind.
+    /// Falls back to plain approve on implementations that don't support it (HTTP path).
+    fn approve_with_kind(&self, id: &str, _kind: &str) -> Result<(), String> {
+        self.approve(id)
+    }
 }
 
 // ── FuseSource ─────────────────────────────────────────────────────────────
@@ -27,14 +38,38 @@ impl DataSource for FuseSource {
     fn load_snapshot(&self) -> Snapshot {
         reader::load_snapshot(&self.agents_dir)
     }
+
+    fn load_approvals(&self) -> Vec<PendingAction> {
+        reader::read_approvals(&self.agents_dir)
+    }
+
+    fn approve(&self, id: &str) -> Result<(), String> {
+        let payload = serde_json::json!({"approve": {"id": id}});
+        write_control_command(&self.agents_dir, &payload.to_string())
+    }
+
+    fn approve_with_kind(&self, id: &str, kind: &str) -> Result<(), String> {
+        let payload = serde_json::json!({"approve": {"id": id, "auto_approve_kind": kind}});
+        write_control_command(&self.agents_dir, &payload.to_string())
+    }
+
+    fn deny(&self, id: &str, reason: Option<&str>) -> Result<(), String> {
+        let payload = if let Some(r) = reason {
+            serde_json::json!({"reject": {"id": id, "reason": r}})
+        } else {
+            serde_json::json!({"reject": {"id": id}})
+        };
+        write_control_command(&self.agents_dir, &payload.to_string())
+    }
 }
 
 // ── HttpSource ──────────────────────────────────────────────────────────────
 
 /// DataSource backed by the management HTTP API (p7.7).
 pub struct HttpSource {
-    pub base_url: String,
-    client: reqwest::blocking::Client,
+    pub base_url:    String,
+    client:          reqwest::blocking::Client,
+    mutation_client: reqwest::blocking::Client,
 }
 
 impl HttpSource {
@@ -43,13 +78,32 @@ impl HttpSource {
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap_or_default();
-        Self { base_url, client }
+        // Shorter timeout for mutations: approve/deny block the TUI event loop.
+        let mutation_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(500))
+            .build()
+            .unwrap_or_default();
+        Self { base_url, client, mutation_client }
     }
 
     fn get_json(&self, path: &str) -> anyhow::Result<Value> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let resp = self.client.get(&url).send()?;
         Ok(resp.json()?)
+    }
+
+    fn post_mutation(&self, path: &str, body: Option<&Value>) -> Result<(), String> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let mut req = self.mutation_client.post(&url);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().map_err(|e| format!("HTTP error: {e}"))?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("HTTP {} — action stays pending", resp.status().as_u16()))
+        }
     }
 }
 
@@ -92,13 +146,42 @@ impl DataSource for HttpSource {
 
         Snapshot { agents, budget, queue, sandbox, provider, error: None }
     }
+
+    fn load_approvals(&self) -> Vec<PendingAction> {
+        match self.get_json("/api/v1/approvals") {
+            Ok(v) => v.as_array().unwrap_or(&vec![]).iter().map(pending_action_from_json).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    fn approve(&self, id: &str) -> Result<(), String> {
+        self.post_mutation(&format!("/api/v1/approvals/{id}/approve"), None)
+    }
+
+    fn deny(&self, id: &str, reason: Option<&str>) -> Result<(), String> {
+        let body = reason.map(|r| serde_json::json!({"reason": r}));
+        self.post_mutation(&format!("/api/v1/approvals/{id}/deny"), body.as_ref())
+    }
 }
 
 // ── JSON → reader type conversions ─────────────────────────────────────────
 
+pub(crate) fn pending_action_from_json(v: &Value) -> PendingAction {
+    PendingAction {
+        id:       v["id"].as_str().unwrap_or("").to_string(),
+        agent_id: v["agent_id"].as_str().unwrap_or("").to_string(),
+        kind:     v["kind"].as_str().unwrap_or("").to_string(),
+        risk:     v["risk"].as_str().unwrap_or("low").to_string(),
+        summary:  v["summary"].as_str().unwrap_or("").to_string(),
+        args:     v["args"].clone(),
+        age_secs: v["age_secs"].as_u64().unwrap_or(0),
+    }
+}
+
 fn agent_info_from_json(v: &Value) -> AgentInfo {
     let id = v["id"].as_str().unwrap_or("").to_string();
     let status = v["status"].as_str().unwrap_or("unknown").to_string();
+    let status_detail = v["status_detail"].as_str().map(str::to_string);
     let context_tokens = v["context_tokens"].as_u64().unwrap_or(0);
 
     let budget = match v["token_budget"].as_u64() {
@@ -131,6 +214,7 @@ fn agent_info_from_json(v: &Value) -> AgentInfo {
     AgentInfo {
         id,
         status,
+        status_detail,
         context_tokens,
         budget,
         tools,
@@ -192,6 +276,47 @@ fn server_enforcement_from_json(v: &Value) -> ServerEnforcement {
         namespace_mount:   v["namespace_mount"].as_bool().unwrap_or(false),
         landlock_net:      v["landlock_net"].as_bool().unwrap_or(false),
     }
+}
+
+// ── FUSE control channel write ──────────────────────────────────────────────
+
+/// Write `payload` bytes to `/agents/control` using an explicit `close(2)` so FUSE
+/// flush errors are visible rather than silently swallowed by Rust's `File::drop`.
+///
+/// Moved here from `mod.rs` (dx.2) so `FuseSource` can implement `approve`/`deny`.
+#[cfg(not(unix))]
+pub(crate) fn write_control_command(
+    _agents_dir: &std::path::Path,
+    _payload: &str,
+) -> Result<(), String> {
+    Err("write_control_command not supported on this platform".to_string())
+}
+
+#[cfg(unix)]
+pub(crate) fn write_control_command(
+    agents_dir: &std::path::Path,
+    payload: &str,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::io::IntoRawFd as _;
+
+    let control = agents_dir.join("control");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&control)
+        .map_err(|e| format!("open /agents/control: {e}"))?;
+    f.write_all(payload.as_bytes())
+        .map_err(|e| format!("write error: {e}"))?;
+    let fd = f.into_raw_fd();
+    // SAFETY: fd is valid and exclusively owned (into_raw_fd consumed the File).
+    let rc = unsafe { libc::close(fd) };
+    if rc != 0 {
+        return Err(format!(
+            "scheduler rejected command ({})",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 /// Auto-detect the correct data source.
@@ -260,6 +385,7 @@ mod tests {
         assert!(matches!(info.budget, BudgetKind::Tokens(50000)));
         assert_eq!(info.tools, vec!["read_file"]);
         assert_eq!(info.tier, "native");
+        assert!(info.status_detail.is_none());
     }
 
     #[test]
@@ -274,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_info_awaiting_child() {
+    fn agent_info_awaiting_child_with_status_detail() {
         let v = serde_json::json!({
             "id": "a",
             "status": "awaiting_child",
@@ -283,6 +409,7 @@ mod tests {
         });
         let info = agent_info_from_json(&v);
         assert_eq!(info.status, "awaiting_child");
+        assert_eq!(info.status_detail.as_deref(), Some("child-1"));
     }
 
     #[test]
@@ -303,4 +430,47 @@ mod tests {
         assert!(se.landlock);
     }
 
+    #[test]
+    fn pending_action_from_json_basic() {
+        let v = serde_json::json!({
+            "id": "act_0",
+            "agent_id": "agent-1",
+            "kind": "write_file",
+            "risk": "medium",
+            "summary": "Write config file",
+            "age_secs": 5,
+        });
+        let a = pending_action_from_json(&v);
+        assert_eq!(a.id, "act_0");
+        assert_eq!(a.agent_id, "agent-1");
+        assert_eq!(a.risk, "medium");
+        assert_eq!(a.age_secs, 5);
+    }
+
+    #[test]
+    fn http_source_approve_fails_without_server() {
+        let src = HttpSource::new("http://127.0.0.1:19999".to_string());
+        let result = src.approve("act_0");
+        assert!(result.is_err(), "approve should fail when server is unreachable");
+        let result = src.deny("act_0", Some("reason"));
+        assert!(result.is_err(), "deny should fail when server is unreachable");
+    }
+
+    #[test]
+    fn detect_source_fuse_path_returns_fuse_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create system/ subdir to simulate a mounted FUSE filesystem.
+        std::fs::create_dir(tmp.path().join("system")).unwrap();
+        let src = detect_source(None, tmp.path()).unwrap();
+        // FuseSource::load_snapshot should at least not panic on an empty dir.
+        let _ = src.load_approvals();
+    }
+
+    #[test]
+    fn detect_source_fallback_to_http_when_no_fuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No system/ dir, no real HTTP server → should bail.
+        let result = detect_source(None, tmp.path());
+        assert!(result.is_err(), "should fail when neither FUSE nor HTTP is reachable");
+    }
 }

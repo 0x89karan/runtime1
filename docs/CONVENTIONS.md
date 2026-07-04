@@ -118,6 +118,8 @@ Phase 0 kinds (canonical — do not rename):
 | `scheduler_stopped` | agentd graceful shutdown; emits `run_id` + `agent_count` (obs.1+) |
 | `management_started` | management HTTP API bound and ready (addr) (p7.7+) |
 | `management_request` | management HTTP API received a request (method, path, status: u16) (p7.7+) |
+| `approval_http_approved` | operator approved a pending action via the HTTP management API (id, agent_id) (dx.2+) |
+| `approval_http_denied` | operator denied a pending action via the HTTP management API (id, agent_id, reason: Option<String>) (dx.2+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

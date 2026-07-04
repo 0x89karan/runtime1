@@ -3,6 +3,34 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [dx.2] - 2026-07-04 (v0.54.0)
+
+### Added
+- HTTP approval surface: `POST /api/v1/approvals/:id/approve` and `POST /api/v1/approvals/:id/deny`
+  routes on the management API, allowing operators to approve/deny pending agent actions without a
+  FUSE mount.
+- `control_tx: Option<mpsc::Sender<ControlCommand>>` on `ApiState`; HTTP approve/deny routes send
+  `ControlCommand::Approve`/`Reject` to the scheduler's control channel.
+- Fail-closed: 503 + `Retry-After: 1` if channel is full or unavailable; 404 on unknown ID; 400 on
+  empty ID. No silent grant under any error condition.
+- `ApprovalHttpApproved` and `ApprovalHttpDenied` flight events with `{id, agent_id}` data.
+- `DataSource` trait extended with `load_approvals()`, `approve()`, `deny()` — both `FuseSource`
+  and `HttpSource` implement all four methods.
+- `HttpSource` uses a separate `mutation_client` (500 ms timeout) to prevent TUI freeze on approve/deny.
+- Optimistic local removal: on `Ok(())` from `approve()`/`deny()`, the item is immediately removed
+  from `approvals_items` to prevent stale-entry flicker for one tick.
+- `agentctl approve <id>` and `agentctl deny <id> [--reason "..."]` CLI subcommands
+  (`agentctl/src/approve.rs`), both auto-detecting FUSE vs. HTTP.
+- `run_plain()` now calls `source.load_approvals()` so HTTP+plain mode shows pending approvals.
+- `AgentInfo.status_detail: Option<String>` field parsed from HTTP snapshot JSON; shown in the
+  AgentDetail view (e.g. approval ID while agent is `awaiting_approval`).
+- FUSE control channel always wired on Linux (removed `maybe_session.is_some()` gate).
+- 3 resolver-chain tests for `detect_source()`, 7 HTTP route tests (403/404/503 guards, happy paths,
+  SSE framing), integration test `approve_happy_path_sends_command`.
+
+### Fixed
+- Resolved p7.7-ar-01 (SSE test), p7.7-ar-02 (detect_source tests), p7.7-ar-04 (status_detail).
+
 ## [p7.7] - 2026-07-04 (v0.53.0)
 
 ### Added

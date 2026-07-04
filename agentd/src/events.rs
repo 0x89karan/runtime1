@@ -131,6 +131,12 @@ pub enum EventKind {
     /// Management HTTP API received a request.
     /// data: { method, path, status: u16 }
     ManagementRequest,
+    /// Operator approved a pending action via the HTTP management API.
+    /// data: { id, agent_id }
+    ApprovalHttpApproved,
+    /// Operator denied a pending action via the HTTP management API.
+    /// data: { id, agent_id, reason? }
+    ApprovalHttpDenied,
     Error,
 }
 
@@ -208,6 +214,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::InferenceTransportRetried), "inference_transport_retried");
         assert_eq!(kind_str(EventKind::ManagementStarted), "management_started");
         assert_eq!(kind_str(EventKind::ManagementRequest), "management_request");
+        assert_eq!(kind_str(EventKind::ApprovalHttpApproved), "approval_http_approved");
+        assert_eq!(kind_str(EventKind::ApprovalHttpDenied), "approval_http_denied");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

@@ -250,6 +250,7 @@ mod tests {
         AgentInfo {
             id:              id.to_string(),
             status:          status.to_string(),
+            status_detail:   None,
             context_tokens:  0,
             budget:          BudgetKind::Unlimited,
             tools:           vec![],

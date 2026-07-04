@@ -291,6 +291,15 @@ optional `status_detail` for tuple variants); `ManagementStarted`/`ManagementReq
 events; `agentctl/src/watch/source.rs` — `DataSource` trait + `FuseSource` + `HttpSource`
 (with JSON→`AgentInfo` mapping) + `detect_source()` auto-detection; `--url`/`AGENTCTL_URL`
 flag on `agentctl watch`; `tokio-stream` (sync feature) + `async-stream` deps; 1081 workspace tests.
+**dx.2 complete (v0.54.0).** HTTP approval surface (fail-closed): `POST /api/v1/approvals/:id/approve`
++ `POST /api/v1/approvals/:id/deny` on the management API; 503+`Retry-After: 1` on full channel;
+404 on unknown ID; 400 on empty ID; `ApprovalHttpApproved`/`ApprovalHttpDenied` flight events;
+`DataSource` trait extended with `load_approvals()`/`approve()`/`deny()` — `FuseSource` +
+`HttpSource` both implement; `HttpSource.mutation_client` (500 ms timeout); FUSE control channel
+always wired on Linux (removed `maybe_session` gate); optimistic TUI removal on `Ok(())`; plain-mode
+`source.load_approvals()` fix; `AgentInfo.status_detail` parsed + shown in AgentDetail view;
+`agentctl approve <id>` + `agentctl deny <id> [--reason ...]` CLI subcommands; resolved
+p7.7-ar-01/02/04; 1096 workspace tests.
 
 ## How to work here
 

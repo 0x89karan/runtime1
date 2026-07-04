@@ -896,6 +896,11 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
 
     // ── p7.7 management HTTP API ─────────────────────────────────────────────
     if cfg.management.enabled {
+        #[cfg(target_os = "linux")]
+        let mgmt_control_tx = Some(control_tx.clone());
+        #[cfg(not(target_os = "linux"))]
+        let mgmt_control_tx: Option<tokio::sync::mpsc::Sender<agentd::control::ControlCommand>> = None;
+
         match agentd::management::start(
             &cfg.management.bind_addr,
             cfg.management.port,
@@ -903,6 +908,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             memory_store_for_management,
             broadcast_tx.clone(),
             Arc::clone(&recorder),
+            mgmt_control_tx,
         ).await {
             Ok(bound) => {
                 tracing::info!(addr = %bound, "management API started");
@@ -974,13 +980,13 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         scheduler
     };
 
-    // Only wire when FUSE is mounted: if no_fuse or mount failed, control_tx stays
-    // alive and rx.recv() would block forever once pending is empty.
+    // Wire the control receiver when at least one consumer is active: FUSE writes
+    // /agents/control, and the management API routes HTTP approve/deny commands.
+    // Without a consumer the scheduler would hang waiting for commands after all agents finish.
     #[cfg(target_os = "linux")]
-    let scheduler = if maybe_session.is_some() {
+    let scheduler = if maybe_session.is_some() || cfg.management.enabled {
         scheduler.with_control(control_rx)
     } else {
-        drop(control_rx);
         scheduler
     };
 
