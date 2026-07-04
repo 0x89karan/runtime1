@@ -122,6 +122,12 @@ decision, not two. See `docs/OBSERVABILITY-PLAN.md`.
 - **Fleet / multi-tenant control plane = a separate, later bet.** If pursued, an independent
   cold read says run it control-plane-first (govern existing containers), not guest-image-first.
   Do not conflate it with the appliance; win the appliance first.
+- **Owned means owned *hardware* → multi-arch is load-bearing, not dilution.** The wedge is "an
+  OS you own, not a cloud you rent." The hardware people own is increasingly ARM (Apple Silicon,
+  a Raspberry Pi, an ARM home server) — a $60 owned box running your chief of staff 24/7 is the
+  wedge made physical, and it needs aarch64. Multi-arch reach + the multi-instance orchestration
+  that follows are planned in `docs/DEPLOYMENT-TOPOLOGY.md` (guardrail: arch never leaks into the
+  agent model; state the isolation tier per device so breadth doesn't outrun trust).
 
 ## Load-bearing build priorities
 

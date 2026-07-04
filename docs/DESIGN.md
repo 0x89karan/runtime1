@@ -167,6 +167,8 @@ Concrete levers, roughly in order of impact:
 
 A useful framing: report your footprint as *idle RAM*, *image size*, *boot-to-first-agent time*, and *agents-per-GB* — these make "light" measurable rather than rhetorical (see Part 10).
 
+**Light is *for* reach.** The payoff of "super light + remote cognition" is that agentd runs on the devices people own — an Apple-Silicon Mac (fast via HVF), a Raspberry Pi or ARM home server (an owned, always-on host), ARM cloud — not just x86 cloud VMs. That is what makes this an *OS you own* rather than *a cloud you rent*, and it is a precondition for the vision, not a dilution of it. Realizing it means **multi-arch** (x86_64 + aarch64) and, above one instance, **multi-instance orchestration** (a mesh of instances coordinating through a shared memory sidecar). Both are planned in `docs/DEPLOYMENT-TOPOLOGY.md`. Guardrail: arch and hypervisor are build-target details — *"agentd is PID 1 of whatever userspace it inhabits"* — and never leak into the agent model.
+
 ---
 
 ## Part 7 — Recommended tech stack

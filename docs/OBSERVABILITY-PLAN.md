@@ -80,6 +80,13 @@ This is the correction the deep-research pass surfaced: **picking the isolation 
 picking the observability mechanism is one decision, not two.** Phase 9 below is therefore
 conditional on the floor, not "eBPF everywhere."
 
+**And it varies by arch + kernel, not just by floor.** seccomp/Landlock/eBPF availability differs
+across x86_64 vs. aarch64 and across kernel versions (we already carry an aarch64 `DenySpawn`
+no-op). On thin/stock ARM kernels (a Pi, an edge box) the floor degrades to the capability layer,
+so both isolation *and* syscall-observability drop to a lower tier. Multi-arch reach therefore
+requires **stating the active isolation/observability tier per device** (planned as `ma.4` in
+`docs/DEPLOYMENT-TOPOLOGY.md`) — breadth must not silently outrun the trust/audit guarantees.
+
 **The lift (why it's a phase, not an increment):**
 - `aya` (pure-Rust eBPF, ethos fit) or libbpf; kernel **BTF/CO-RE** + `CONFIG_BPF*`; elevated
   privilege (`CAP_BPF`/`CAP_SYS_ADMIN` — a deliberate trust boundary: the observer outranks the

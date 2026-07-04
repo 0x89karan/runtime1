@@ -61,6 +61,14 @@ run fast inside it.
 
 **Conclusion:** QEMU is not the right Mac story. Docker is.
 
+> **⚠️ Superseded conclusion — this holds only because `distro/` is x86_64-only.** With an
+> **aarch64 distro target + `qemu-system-aarch64 -accel hvf`** (planned as `ma.1`/`ma.2` in
+> `docs/DEPLOYMENT-TOPOLOGY.md`), QEMU runs the pure-OS boot **near-native on Apple Silicon** —
+> so "Mac = Docker only" is no longer forced; the Mac can be a first-class *OS-boot* host. This
+> matters for the OS identity (don't let the boot path become vestigial). **Decide multi-arch
+> before dx.3/dx.4 freeze x86-only assumptions**, and build the deployment arch-parameterized
+> from the start rather than retrofitting.
+
 ---
 
 ## The decision: Option D

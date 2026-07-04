@@ -1049,6 +1049,25 @@ Acceptance:
 
 ---
 
+## Planned — multi-arch reach + multi-instance orchestration
+
+Design + `/autoplan`-ready increments live in **`docs/DEPLOYMENT-TOPOLOGY.md`**; fold them in here
+when picked up. Two tracks — substrate reach, not the flagship (the CoS harness stays that):
+
+- **Track MA (multi-arch):** `ma.1` aarch64 binary target · `ma.2` arm64 distro + `qemu-system-aarch64
+  -accel hvf` boot (fast pure-OS on Apple Silicon) · `ma.3` multi-arch container images · `ma.4`
+  isolation-tier detection + honest per-device reporting. **Decide multi-arch before dx.3/dx.4 freeze
+  x86-only** — parameterize the deployment by `$ARCH` from the start rather than retrofit.
+- **Track ORCH (orchestration):** `orch.1` instance registry (on p7.7) · `orch.2` federated A2A across
+  instances · `orch.3` shared memory sidecar (on h8.1 — compute/memory separation) · `orch.4`
+  `agentctl fleet` (lightweight "my-mesh" coordinator) · `orch.5` agent migration (= h8.3) · `orch.6`
+  multi-tenant control plane (deferred/enterprise).
+
+Guardrails (from `DEPLOYMENT-TOPOLOGY.md` §3): arch/hypervisor never leak into the core; state the
+isolation tier per device (breadth must not outrun trust); every arch's boot is CI-tested or it rots.
+
+---
+
 ## Phase 8 — Harness extensions
 
 **h8.1 — Layer 2 semantic memory** [HARNESS] *(depends on: cos.1 tested + working — a smarter
