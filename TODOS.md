@@ -138,6 +138,37 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   (11 lines) but has no coverage for: empty/`[]\n` sentinel, multi-item path, malformed-line skip.
 - Fix path: add 3 unit tests to `reader.rs` covering these paths.
 
+## Phase 7 — Open (deferred from p7.7)
+
+**p7.7-ar-01 (LOW) — SSE `/api/v1/events` endpoint has no unit test**
+- `management.rs` `route()` for `/api/v1/events` returns a `text/event-stream` response via
+  `async_stream::stream!`, but there is no unit test verifying the content-type header or the
+  `data: {...}\n\n` framing. Manual testing confirms SSE works; test gap deferred to dx.2.
+
+**p7.7-ar-02 (LOW) — `detect_source()` fallback logic untested**
+- `agentctl/src/watch/source.rs::detect_source()` has three branches: explicit URL → FUSE
+  `system/` dir → HTTP healthcheck on `:7999` → error. Only the JSON-deserialization path
+  has unit tests; the FUSE→HTTP→error chain is untested. Deferred to dx.2.
+
+**p7.7-ar-03 (LOW) — `egress_brokered`/`egress_rejected` hardcoded to 0 in `HttpSource`**
+- `HttpSource::load_snapshot()` maps `/api/v1/snapshot` JSON to `SchedulerSnapshot` but
+  leaves `egress_brokered` and `egress_rejected` as 0 (fields not yet emitted by the HTTP
+  endpoint). The FUSE path reads them from live files. Align in dx.2 when the HTTP endpoint
+  exposes egress counters.
+
+**p7.7-ar-04 (LOW) — `status_detail` not threaded through `agent_info_from_json`**
+- `HttpSource` parses `AgentInfo` from the `/api/v1/snapshot` JSON but ignores the
+  `status_detail` field emitted by `AgentSnapshot::serialize` for `Awaiting(child_id)` variants.
+  Approval IDs and child IDs visible in the FUSE path are dropped by the HTTP path.
+  Fix in dx.2: parse `status_detail` alongside `status` in `agent_info_from_json`.
+
+**p7.7-ar-05 (INFO) — management server loopback guard is post-bind**
+- `management.rs::start()` binds the TCP listener first, then asserts the bound address is
+  loopback. A misconfigured `bind_addr` (e.g. `"0.0.0.0"`) would briefly accept on all
+  interfaces before the assert panics. Defense-in-depth improvement: validate `bind_addr`
+  before `TcpListener::bind()` and reject non-loopback values at config parse time.
+  Not exploitable in practice (the panic closes the socket immediately); deferred.
+
 ## Phase 7 / Harness — Open (from h7.2)
 
 **~~h7.2-ar-01~~ (resolved v0.50.0) — generic `agent` entrypoint mode**

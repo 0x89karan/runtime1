@@ -280,6 +280,17 @@ agentctl; 14 unit tests (PKCE primitives + RFC test vector + callback + secrets 
 fixes (redirect_uri timing, CSRF bail→Ok(None), HTML XSS escape, double lock-gap race, empty
 refresh_token validation, dead code removal); 5 `exchange_code()` httpmock tests; 6 oauth_mcp
 self-tests (21/21 — 5× `_is_ssrf_blocked()` + 401 auto-retry); 1062 workspace tests.
+**p7.7 complete (v0.53.0).** Management HTTP API: `agentd/src/management.rs` loopback-only
+server (`:7999`) with `GET /healthz`, `/api/v1/snapshot`, `/api/v1/approvals`,
+`/api/v1/memory/:ns?limit=&offset=` (paginated, max 100), `/api/v1/events` (SSE fan-out);
+`broadcast::Sender<String>` added to `FlightRecorder` via `with_broadcast()` consuming builder;
+`ManagementConfig { enabled, port, bind_addr }` in `agentd/src/config.rs`; `Serialize` added to
+`surfaces` snapshot types (`ServerEnforcement`, `SandboxSummary`, `PendingActionView`,
+`SchedulerSnapshot`, manual impl on `AgentSnapshot` emitting `status` as flat string +
+optional `status_detail` for tuple variants); `ManagementStarted`/`ManagementRequest` flight
+events; `agentctl/src/watch/source.rs` — `DataSource` trait + `FuseSource` + `HttpSource`
+(with JSON→`AgentInfo` mapping) + `detect_source()` auto-detection; `--url`/`AGENTCTL_URL`
+flag on `agentctl watch`; `tokio-stream` (sync feature) + `async-stream` deps; 1081 workspace tests.
 
 ## How to work here
 

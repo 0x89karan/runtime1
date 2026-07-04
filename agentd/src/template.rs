@@ -232,6 +232,7 @@ impl TemplateConfig {
             memory: self.memory.clone(),
             log_path: None,
             egress: Default::default(),
+            management: Default::default(),
         })
     }
 }

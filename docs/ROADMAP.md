@@ -961,7 +961,7 @@ Acceptance:
 - `docker compose logs -f cos` shows the cron agent waking and running the brief.
 - Existing `OAUTH_REFRESH_TOKEN` env var bypass still works (backward compat).
 
-**p7.7 — Management HTTP API** *(next — depends on: dx.1)*
+**p7.7 — Management HTTP API** *(done — v0.53.0)*
 The structural change that makes `agentctl watch` work identically on Mac and Linux,
 and surfaces deep observability without filesystem access.
 
@@ -994,7 +994,7 @@ Acceptance:
   a `[warn] management API unreachable, using FUSE` message.
 - Binary stays ≤ 6 MB (hyper already present; no new heavy deps).
 
-**dx.2 — HTTP approval surface** *(depends on: p7.7)*
+**dx.2 — HTTP approval surface** *(next — depends on: p7.7)*
 Makes `request_approval()` reachable from outside the container or VM — resolves the
 core headless/unattended operation problem identified in `docs/plans/pure-os-ux-alignment.md`.
 

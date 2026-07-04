@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::Context;
 use serde::Serialize;
+use tokio::sync::broadcast;
 
 pub use crate::events::EventKind;
 
@@ -14,6 +15,8 @@ const FLIGHT_LOG: &str = "flight.jsonl";
 
 pub struct FlightRecorder {
     file: Mutex<File>,
+    /// Optional SSE fan-out channel; each subscriber gets a clone of every JSON line.
+    broadcast_tx: Option<broadcast::Sender<String>>,
 }
 
 impl FlightRecorder {
@@ -25,11 +28,19 @@ impl FlightRecorder {
             .with_context(|| format!("opening flight log at {path:?}"))?;
         Ok(Self {
             file: Mutex::new(file),
+            broadcast_tx: None,
         })
     }
 
     pub fn open() -> anyhow::Result<Self> {
         Self::new(Path::new(FLIGHT_LOG))
+    }
+
+    /// Attach an SSE broadcast sender. Every recorded event line is also sent
+    /// to this channel. Call before wiring up the management server.
+    pub fn with_broadcast(mut self, tx: broadcast::Sender<String>) -> Self {
+        self.broadcast_tx = Some(tx);
+        self
     }
 
     pub fn record(
@@ -71,6 +82,11 @@ impl FlightRecorder {
 
         if let Err(e) = writeln!(file, "{line}") {
             tracing::warn!("flight record write failed: {e}");
+        }
+
+        // Best-effort broadcast; lagged subscribers are handled at the receiver.
+        if let Some(tx) = &self.broadcast_tx {
+            let _ = tx.send(line);
         }
     }
 }
@@ -182,6 +198,19 @@ mod tests {
             .collect();
         assert_eq!(lines[0]["kind"], "sandbox_applied");
         assert_eq!(lines[1]["kind"], "sandbox_skipped");
+    }
+
+    #[test]
+    fn broadcast_receives_recorded_events() {
+        let tmp = NamedTempFile::new().unwrap();
+        let (tx, mut rx) = broadcast::channel(16);
+        let recorder = FlightRecorder::new(tmp.path()).unwrap().with_broadcast(tx);
+
+        recorder.record("a", None, EventKind::AgentSpawned, serde_json::json!({}));
+
+        let line = rx.try_recv().expect("broadcast should have one message");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["kind"], "agent_spawned");
     }
 
     #[test]

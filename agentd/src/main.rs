@@ -107,7 +107,12 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
 
     // Resolve flight log path: CLI flag > TOML field > default "flight.jsonl".
     let log_path = resolve_log_path(log_path_override, cfg.log_path.as_deref());
-    let recorder = Arc::new(FlightRecorder::new(&log_path)?);
+    // Broadcast channel for SSE fan-out (p7.7). Always created; only subscribed when
+    // management is enabled. Overhead is negligible when no subscribers are present.
+    let (broadcast_tx, _broadcast_rx_guard) = tokio::sync::broadcast::channel::<String>(1024);
+    let recorder = Arc::new(
+        FlightRecorder::new(&log_path)?.with_broadcast(broadcast_tx.clone()),
+    );
 
     let mut agent_cfgs = cfg.agent_configs()?;
 
@@ -315,8 +320,9 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         }
     }
 
-    // Keep a clone for distillation wiring (p5.6) before moving into the registry.
+    // Keep clones for distillation wiring (p5.6) and management API (p7.7) before moving into registry.
     let memory_store_for_distillation = memory_store.clone();
+    let memory_store_for_management = memory_store.clone();
     register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store)?;
 
     // Pass 1: validate capabilities and isolation settings before spawning any process.
@@ -886,6 +892,29 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     } else {
         None
     };
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── p7.7 management HTTP API ─────────────────────────────────────────────
+    if cfg.management.enabled {
+        match agentd::management::start(
+            &cfg.management.bind_addr,
+            cfg.management.port,
+            Arc::clone(&snapshot),
+            memory_store_for_management,
+            broadcast_tx.clone(),
+            Arc::clone(&recorder),
+        ).await {
+            Ok(bound) => {
+                tracing::info!(addr = %bound, "management API started");
+            }
+            Err(e) => {
+                for client in &mcp_backends {
+                    client.shutdown().await;
+                }
+                return Err(e.context("management API failed to bind (fail-closed)"));
+            }
+        }
+    }
     // ─────────────────────────────────────────────────────────────────────────
 
     // Attempt to restore from a prior checkpoint. On corrupt file: rename and start fresh.
@@ -1661,6 +1690,8 @@ mod tests {
             "action_receipt_emitted",
             "egress_proxy_failed",
             "inference_transport_retried",
+            "management_started",
+            "management_request",
         ];
         for kind in &required_kinds {
             assert!(

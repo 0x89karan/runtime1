@@ -9,6 +9,7 @@ pub mod evidence;
 pub mod events;
 pub mod flight_recorder;
 pub mod inference;
+pub mod management;
 pub mod memory;
 pub mod scheduler;
 pub mod template;

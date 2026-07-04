@@ -1,12 +1,14 @@
 use std::sync::{Arc, RwLock};
 
+use serde::Serialize;
+
 /// A point-in-time snapshot of all running agents, written by the scheduler
 /// and read by the FUSE handler. Uses std::sync::RwLock (not tokio) because
 /// the FUSE handler runs on a plain OS thread, not inside a tokio runtime.
 pub type SharedSnapshot = Arc<RwLock<SchedulerSnapshot>>;
 
 /// Per-MCP-server sandbox enforcement record, populated at startup.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize)]
 pub struct ServerEnforcement {
     pub name:             String,
     /// "stdio" | "http" — populated from McpBackend::transport_kind().
@@ -25,7 +27,7 @@ pub struct ServerEnforcement {
 /// Startup-time sandbox posture summary for the whole system.
 /// Reflects what was compiled and applied when MCP servers were spawned;
 /// not a live runtime probe of current kernel enforcement state.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize)]
 pub struct SandboxSummary {
     /// True when at least one MCP server had sandbox rules applied.
     pub any_sandboxed:  bool,
@@ -39,7 +41,7 @@ pub struct SandboxSummary {
 
 /// A pending operator approval, projected from the scheduler into the snapshot.
 /// Used by the FUSE `/agents/approvals` file and the `agentctl` Approvals view.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PendingActionView {
     /// Unique approval ID: "act_{seq}".
     pub id:        String,
@@ -57,7 +59,7 @@ pub struct PendingActionView {
     pub age_secs:  u64,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize)]
 pub struct SchedulerSnapshot {
     pub agents:              Vec<AgentSnapshot>,
     pub global_tokens_spent: u64,
@@ -103,6 +105,37 @@ pub struct AgentSnapshot {
     pub tier: Option<String>,
     /// PID of the child process for universal-tier agents. None for native-tier agents.
     pub pid: Option<u32>,
+}
+
+/// Manual Serialize: emits `status` as the flat string from `as_str()` (matching the FUSE
+/// text format) plus an optional `status_detail` field for tuple variants.
+impl Serialize for AgentSnapshot {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let detail: Option<&str> = match &self.status {
+            AgentStatus::AwaitingChild(s) | AgentStatus::AwaitingApproval(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let field_count = 13 + usize::from(detail.is_some());
+        let mut s = ser.serialize_struct("AgentSnapshot", field_count)?;
+        s.serialize_field("id", &self.id)?;
+        s.serialize_field("status", self.status.as_str())?;
+        if let Some(d) = detail {
+            s.serialize_field("status_detail", d)?;
+        }
+        s.serialize_field("turn", &self.turn)?;
+        s.serialize_field("context_tokens", &self.context_tokens)?;
+        s.serialize_field("token_budget", &self.token_budget)?;
+        s.serialize_field("task_preview", &self.task_preview)?;
+        s.serialize_field("tools", &self.tools)?;
+        s.serialize_field("short_term_previews", &self.short_term_previews)?;
+        s.serialize_field("parent_id", &self.parent_id)?;
+        s.serialize_field("accessible_server_names", &self.accessible_server_names)?;
+        s.serialize_field("capabilities_unrestricted", &self.capabilities_unrestricted)?;
+        s.serialize_field("tier", &self.tier)?;
+        s.serialize_field("pid", &self.pid)?;
+        s.end()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

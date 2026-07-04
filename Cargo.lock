@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agentctl"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "agentd",
  "anyhow",
@@ -24,9 +24,10 @@ dependencies = [
 
 [[package]]
 name = "agentd"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "bytes",
  "chrono",
@@ -46,6 +47,7 @@ dependencies = [
  "surfaces",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -2711,6 +2713,7 @@ dependencies = [
  "anyhow",
  "fuser",
  "libc",
+ "serde",
  "tempfile",
 ]
 
@@ -2909,6 +2912,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

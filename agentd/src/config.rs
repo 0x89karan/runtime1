@@ -44,6 +44,9 @@ pub struct Config {
     /// Egress mediator configuration (p7.5+).
     #[serde(default)]
     pub egress: EgressConfig,
+    /// Management HTTP API configuration (p7.7+).
+    #[serde(default)]
+    pub management: ManagementConfig,
 }
 
 /// Mutability class for a declared knowledge-base segment (p5.4+).
@@ -185,6 +188,40 @@ impl Default for EgressConfig {
             evidence_path: default_evidence_path(),
             key_path:      default_egress_key_path(),
             proxy_addr:    None,
+        }
+    }
+}
+
+/// Management HTTP API configuration (p7.7+).
+///
+/// Exposes scheduler state as JSON + SSE so agentctl can run on the Mac/Linux
+/// host without FUSE access. Off by default; enable via `[management] enabled = true`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagementConfig {
+    /// Enable the management API. Defaults to false.
+    #[serde(default)]
+    pub enabled: bool,
+    /// TCP port to bind (loopback only). Defaults to 7999.
+    #[serde(default = "default_management_port")]
+    pub port: u16,
+    /// Bind address. Must resolve to loopback; agentd refuses to start otherwise.
+    #[serde(default = "default_management_bind_addr")]
+    pub bind_addr: String,
+}
+
+fn default_management_port() -> u16 {
+    7999
+}
+fn default_management_bind_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
+impl Default for ManagementConfig {
+    fn default() -> Self {
+        Self {
+            enabled:   false,
+            port:      default_management_port(),
+            bind_addr: default_management_bind_addr(),
         }
     }
 }

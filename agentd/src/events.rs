@@ -125,6 +125,12 @@ pub enum EventKind {
     /// A stale pooled connection caused a connect error; the request was retried once and succeeded.
     /// data: { agent_id, model, retries: u32 }
     InferenceTransportRetried,
+    /// Management HTTP API bound and ready.
+    /// data: { addr }
+    ManagementStarted,
+    /// Management HTTP API received a request.
+    /// data: { method, path, status: u16 }
+    ManagementRequest,
     Error,
 }
 
@@ -200,6 +206,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::SchedulerStarted), "scheduler_started");
         assert_eq!(kind_str(EventKind::SchedulerStopped), "scheduler_stopped");
         assert_eq!(kind_str(EventKind::InferenceTransportRetried), "inference_transport_retried");
+        assert_eq!(kind_str(EventKind::ManagementStarted), "management_started");
+        assert_eq!(kind_str(EventKind::ManagementRequest), "management_request");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

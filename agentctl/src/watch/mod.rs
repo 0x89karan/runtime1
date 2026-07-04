@@ -17,13 +17,14 @@ pub mod approvals;
 pub mod inspector;
 pub mod memory;
 pub mod reader;
+pub mod source;
 pub mod spawn;
 pub mod topology;
 pub mod views;
 
 use app::{App, MemoryPane, PendingSpawn, SpawnFocus, View};
 use approvals::ApprovalsMode;
-use reader::load_snapshot;
+use source::{detect_source, DataSource};
 
 /// Outcome of `execute_pending_spawn`. Determines whether the TUI stays alive
 /// (InjectedViaControl) or the process is replaced by agentd (FellBackToExec).
@@ -39,6 +40,11 @@ pub struct Args {
     /// Path to the agentd FUSE mountpoint
     #[arg(long, default_value = "/agents")]
     pub agents_dir: PathBuf,
+
+    /// Management API URL (e.g. http://127.0.0.1:7999). Overrides FUSE.
+    /// Falls back to AGENTCTL_URL env var when not set.
+    #[arg(long, env = "AGENTCTL_URL")]
+    pub url: Option<String>,
 
     /// Refresh interval in seconds
     #[arg(long, default_value = "1")]
@@ -58,20 +64,13 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
-    let agents_dir = args.agents_dir;
+    let agents_dir = args.agents_dir.clone();
     let interval   = Duration::from_secs(args.interval.max(1));
     let log_path   = args.log_path;
 
-    // Startup mount validation: require system/ subdir to be present.
-    let sys_dir = agents_dir.join("system");
-    if !sys_dir.exists() {
-        anyhow::bail!(
-            "agents dir {:?} does not contain a 'system/' subdirectory.\n\
-             Is agentd running with the FUSE filesystem mounted?\n\
-             Start agentd, or point --agents-dir at the correct mountpoint.",
-            agents_dir
-        );
-    }
+    // Detect data source: --url > AGENTCTL_URL env > FUSE > HTTP default port.
+    // When --url is given, skip the FUSE mount validation.
+    let data_source = detect_source(args.url.as_deref(), &agents_dir)?;
 
     // Decide TUI vs plain mode.
     let is_tty = io::stdout().is_terminal();
@@ -81,17 +80,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         if !is_tty && !args.plain {
             eprintln!("note: stdout is not a TTY — using plain text mode (--plain)");
         }
-        run_plain(agents_dir, interval, log_path)
+        run_plain(agents_dir, interval, log_path, data_source)
     } else {
-        run_tui(agents_dir, interval, log_path)
+        run_tui(agents_dir, interval, log_path, data_source)
     }
 }
 
-fn run_plain(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -> anyhow::Result<()> {
+fn run_plain(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, source: Box<dyn DataSource>) -> anyhow::Result<()> {
     let mut app = App::new(agents_dir.clone());
     app.log_path = log_path;
     loop {
-        let snap = load_snapshot(&agents_dir);
+        let snap = source.load_snapshot();
         app.apply_snapshot(snap);
         let text = views::render_plain(&app);
         print!("{text}");
@@ -104,7 +103,7 @@ fn run_plain(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>)
     }
 }
 
-fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -> anyhow::Result<()> {
+fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, source: Box<dyn DataSource>) -> anyhow::Result<()> {
     let stdout = io::stdout();
 
     // CleanupGuard: restores terminal on both normal exit and panic.
@@ -140,7 +139,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
 
     loop {
         // Refresh state on every frame.
-        let snap = load_snapshot(&agents_dir);
+        let snap = source.load_snapshot();
         app.apply_snapshot(snap);
 
         term.draw(|f| views::render(f, &app))?;
@@ -222,7 +221,7 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>) -
                 app2.spawn_banner = Some(format!("Agent '{}' injected via /agents/control", agent_id_hint));
 
                 loop {
-                    let snap = load_snapshot(&agents_dir);
+                    let snap = source.load_snapshot();
                     app2.apply_snapshot(snap);
                     term2.draw(|f| views::render(f, &app2))?;
                     if event::poll(Duration::from_millis(tick_ms))? {

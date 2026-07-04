@@ -3,6 +3,37 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [p7.7] - 2026-07-04 (v0.53.0)
+
+### Added
+- Management HTTP API on `127.0.0.1:7999` (loopback-only, hyper v1). Routes:
+  - `GET /healthz` — liveness probe.
+  - `GET /api/v1/snapshot` — full `SchedulerSnapshot` JSON (agents, system stats).
+  - `GET /api/v1/approvals` — pending approval queue.
+  - `GET /api/v1/memory/:ns?limit=&offset=` — paginated Tier-3 KB entries (max 100 per page).
+  - `GET /api/v1/events` — SSE fan-out of raw flight-recorder events.
+- `[management]` section in agent TOML config: `enabled` (default false), `port` (default 7999),
+  `bind_addr` (default "127.0.0.1").
+- `ManagementStarted` and `ManagementRequest` flight events.
+- `broadcast::Sender<String>` added to `FlightRecorder` via `with_broadcast()` builder; every
+  `record()` call also sends the JSON line to the channel for SSE consumers.
+- `agentctl/src/watch/source.rs` — `DataSource` trait with `FuseSource` (existing FUSE
+  filesystem) and `HttpSource` (management API). `detect_source()` auto-detects: explicit
+  `--url` flag → FUSE `system/` dir present → HTTP health-check on `127.0.0.1:7999` → error.
+- `agentctl watch --url <http://HOST:PORT>` flag (also `AGENTCTL_URL` env var) to connect
+  `agentctl watch` to a remote or host-side management API without requiring a FUSE mount.
+- Manual `Serialize` impl for `AgentSnapshot` emitting `status` as a flat string plus optional
+  `status_detail` for tuple variants (`AwaitingChild`, `AwaitingApproval`).
+- `Serialize` derived for all other snapshot types (`SchedulerSnapshot`, `SandboxSummary`,
+  `ServerEnforcement`, `PendingActionView`).
+
+### Changed
+- `agentd` and `agentctl` versions bumped to 0.53.0.
+
+### Fixed
+- SSE stream framing: flight-recorder lines are now `trim_end_matches('\n')` before wrapping
+  in `data: ...\n\n`, preventing spurious triple-newline (empty event) after each real event.
+
 ## [dx.1] - 2026-07-04 (v0.52.0)
 
 ### Added
