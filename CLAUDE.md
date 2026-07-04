@@ -276,7 +276,10 @@ write, mode 0600); `agentctl/src/auth/google.rs` with RFC test vector; `docker-c
 env vars (now `ANTHROPIC_API_KEY`-only); `entrypoint.sh cos` preflight exits on missing
 secrets with actionable message; `oauth_mcp.py` reads `/run/secrets/google.json` first with
 env-var fallback + hardcoded Google URL defaults; `reqwest = {blocking}` + `sha2 = "0.10"` in
-agentctl; 9 new unit tests (PKCE primitives + RFC test vector); 1039 workspace tests.
+agentctl; 14 unit tests (PKCE primitives + RFC test vector + callback + secrets file); 7 pre-landing
+fixes (redirect_uri timing, CSRF bail→Ok(None), HTML XSS escape, double lock-gap race, empty
+refresh_token validation, dead code removal); 5 `exchange_code()` httpmock tests; 6 oauth_mcp
+self-tests (21/21 — 5× `_is_ssrf_blocked()` + 401 auto-retry); 1062 workspace tests.
 
 ## How to work here
 
