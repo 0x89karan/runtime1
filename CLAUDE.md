@@ -300,6 +300,18 @@ always wired on Linux (removed `maybe_session` gate); optimistic TUI removal on 
 `source.load_approvals()` fix; `AgentInfo.status_detail` parsed + shown in AgentDetail view;
 `agentctl approve <id>` + `agentctl deny <id> [--reason ...]` CLI subcommands; resolved
 p7.7-ar-01/02/04; 1096 workspace tests.
+**ma.1 complete (v0.55.0).** aarch64 CI — `build-aarch64` CI job using `cross` + QEMU emulation
+(`ubuntu-latest` + `taiki-e/install-action`); both `agentd` and `agentctl` build, clippy, and test
+under QEMU for `aarch64-unknown-linux-musl`; per-binary size guard (≤ 6 MB, `if: always()`);
+`Cross.toml` at repo root pinning `ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5` for `ring`
+compat; `make clippy-aarch64` Makefile target + CLAUDE.md gate for `#[cfg(target_arch)]`-conditional
+code; TODOS P4 closed.
+**ma.3 complete (v0.56.0).** Multi-arch Docker image: `publish-docker` CI job builds and pushes
+`linux/amd64` + `linux/arm64` manifest to `ghcr.io/0x89karan/runtime1:latest` and
+`ghcr.io/0x89karan/runtime1:v{semver}` on every push to `main`; gated on `build-and-test` +
+`build-aarch64` + `audit`; `docker/setup-qemu-action@v3` + `docker/setup-buildx-action@v3` + GHA
+layer cache; `provenance: false` for Docker client < 24.x compat; concurrency group prevents
+parallel publishes.
 
 ## How to work here
 

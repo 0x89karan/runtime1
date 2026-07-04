@@ -98,7 +98,7 @@ build-aarch64:
     - name: Install cross (pre-built binary — faster than cargo install)
       uses: taiki-e/install-action@v2
       with:
-        tool: cross
+        tool: cross@0.2.5
     - name: Build agentd (aarch64 musl)
       run: cross build --release --target aarch64-unknown-linux-musl
       working-directory: agentd

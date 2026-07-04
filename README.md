@@ -14,7 +14,7 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phases 0–7 + dx.1 complete (v0.52.0).** `agentd` is a working Rust binary.
+**Phases 0–7 + ma.1 + ma.3 complete (v0.56.0).** `agentd` is a working Rust binary.
 Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
 inference gateway, tools, MCP stdio client, cooperative scheduler, capability
 system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
@@ -37,6 +37,10 @@ and streaming: p7.1 ships the Streamable HTTP MCP transport (`McpHttpClient`,
 event) so agentd can connect to hosted MCP services like Linear and GitHub
 without running a local subprocess; p7.2 adds opt-in SSE streaming inference
 (`streaming = true` in `[model]`) so tokens print to stdout as they arrive.
+ma.1 (v0.55.0) adds aarch64 CI — `cross` + QEMU emulation, `Cross.toml` image
+pin, per-arch size guards, and `make clippy-aarch64`. ma.3 (v0.56.0) publishes
+a multi-arch Docker image (`linux/amd64` + `linux/arm64`) to
+`ghcr.io/0x89karan/runtime1` on every push to `main`.
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
@@ -47,6 +51,7 @@ agentos/                   ← run `claude` here
 ├── CLAUDE.md              project memory for Claude Code
 ├── CHANGELOG.md           notable changes per release
 ├── TODOS.md               open technical-debt items and completed increments
+├── Cross.toml             cross-compilation image pin for aarch64 (ring compat)
 ├── docs/
 │   ├── DESIGN.md          full design & research — the why
 │   ├── ROADMAP.md         the staged build plan — the what
@@ -73,6 +78,24 @@ cargo run -- agent.toml           # single agent
 cargo run -- agents.toml          # multiple agents concurrently (p1.2+)
 tail -f flight.jsonl              # watch the flight log
 ```
+
+## Docker quickstart
+
+A pre-built multi-arch image (`linux/amd64` + `linux/arm64`) is published to
+`ghcr.io/0x89karan/runtime1` on every push to `main`. Apple Silicon and ARM
+cloud users get a native image — no Rosetta emulation.
+
+```bash
+docker pull ghcr.io/0x89karan/runtime1:latest
+
+# Run with your Anthropic key (uses the cos/shell entrypoint)
+export ANTHROPIC_API_KEY=sk-ant-...
+docker run --rm -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:latest cos
+```
+
+Versioned tags (`ghcr.io/0x89karan/runtime1:v0.56.0`) are also pushed. If the
+package is private, set it to Public once: GitHub repo → Packages → agentos →
+Package Settings → Change visibility → Public.
 
 ## Docker quickstart (cos + Google)
 

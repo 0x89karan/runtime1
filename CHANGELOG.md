@@ -3,6 +3,27 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [ma.3] - 2026-07-04 (v0.56.0)
+
+### Added
+- `publish-docker` CI job: builds and pushes a multi-arch Docker image
+  (`linux/amd64` + `linux/arm64`) to `ghcr.io/0x89karan/runtime1:latest` and
+  `ghcr.io/0x89karan/runtime1:v{semver}` on every push to `main`. Gated on
+  `build-and-test`, `build-aarch64`, and `audit` all passing — a broken Rust build
+  or failing audit never publishes an image. Uses `docker/setup-qemu-action@v3` + `docker/setup-buildx-action@v3` +
+  GHA layer caching (`type=gha,mode=max`) for faster arm64 rebuilds (~8-12 min cached,
+  20-30 min cold). `provenance: false` ensures compatibility with Docker clients < 24.x.
+- Apple Silicon Mac, ARM cloud, and ARM single-board computer users can now
+  `docker pull ghcr.io/0x89karan/runtime1:latest` and run agentd natively — no
+  Rosetta emulation, no "wrong platform" warning.
+
+### Notes
+- One-time manual step after first merge: set ghcr.io package visibility to Public
+  (GitHub repo → Packages → agentos → Package Settings → Change visibility → Public).
+- `provenance: false` disables OCI SBOM attestations. Remove it before adding SBOM tooling.
+- `docker compose up` still uses `build: .` (local build) — pulling the published image
+  requires `image: ghcr.io/0x89karan/runtime1:latest` in docker-compose.yml (deferred).
+
 ## [ma.1] - 2026-07-04 (v0.55.0)
 
 ### Added
