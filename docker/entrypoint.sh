@@ -83,6 +83,23 @@ case "${1:-shell}" in
     # Chief of Staff — fully self-contained, no repo mount needed.
     # Runtime state (checkpoint, memory, briefs) goes to /data (named volume).
     check_api_key
+
+    # Secrets preflight: google.json must be provisioned before the CoS starts.
+    # Run once on the Mac host: agentctl auth google
+    # Then mount with: -v ~/.agentos-secrets:/run/secrets:ro (already in compose)
+    if [ ! -f /run/secrets/google.json ]; then
+      echo ""
+      echo "  ERROR: Google credentials not provisioned."
+      echo ""
+      echo "  Run on your Mac (once):"
+      echo "    agentctl auth google"
+      echo ""
+      echo "  Then restart:"
+      echo "    docker compose restart cos"
+      echo ""
+      exit 1
+    fi
+
     mkdir -p /data /data/output
     # Patch the baked config: rewrite dev-mode relative paths to absolute paths.
     sed \

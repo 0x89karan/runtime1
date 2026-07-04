@@ -922,6 +922,133 @@ pool connect errors (streaming path, parallel to the non-streaming retry in con.
 
 ---
 
+## Platform DX — Deployment experience + consistent operator surface
+
+**Why this exists:** cos.1 proved the runtime works. The deployment story — daily
+use on Mac, production on Linux, observable from outside the container — still has
+sharp edges. These increments close the gap before Phase 8 harness extensions, which
+assume a stable operator experience. Three architectural decisions drive the work:
+
+1. `agentd` serves an HTTP management API on `:7999` — the single surface that
+   works identically on Mac (Docker port binding) and Linux (QEMU hostfwd or local).
+2. `~/.agentos-secrets/` is the host-side secrets directory — mounted read-only into
+   the container or VM; no OAuth or API key env vars needed at runtime.
+3. The FUSE surface stays as an internal fast path; `agentctl` becomes a thin HTTP
+   client that doesn't depend on filesystem access.
+
+**dx.1 — Mac Docker DX: secrets model + agentctl auth** *(done — v0.52.0)*
+Brings the CoS harness to `docker compose up -d cos` with no OAuth env var boilerplate.
+
+Scope:
+- `docker/oauth_mcp.py`: read `/run/secrets/google.json` first; fall back to
+  `OAUTH_REFRESH_TOKEN` env var for backward compat. Hardcode Google OAuth URLs
+  (`OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_SCOPES`, `OAUTH_ALLOWED_HOSTS`,
+  `OAUTH_PROVIDER_NAME`) as module-level defaults — remove them from user-facing config.
+- `docker-compose.yml`: add `~/.agentos-secrets:/run/secrets:ro` volume bind; expose
+  ports `7999:7999` and `8080:8080`; remove the 5 hardcoded Google URL env vars +
+  `OAUTH_REFRESH_TOKEN` from the environment block.
+- `agentctl auth google` subcommand: runs OAuth PKCE flow on the host (local callback
+  server on port 8585), writes `~/.agentos-secrets/google.json` (mode 0600). This is
+  the one-time provisioning step — the browser dance moves to the host, outside any
+  container.
+- `agentctl auth` guards: clear error if `~/.agentos-secrets/` doesn't exist (mkdir
+  prompt); re-auth if token file already present (overwrite with confirmation).
+
+Acceptance:
+- `agentctl auth google` completes the PKCE flow and writes the token file.
+- `docker compose up -d cos` starts the CoS harness with no OAuth env vars in the
+  shell — only `ANTHROPIC_API_KEY` + `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET`.
+- `docker compose logs -f cos` shows the cron agent waking and running the brief.
+- Existing `OAUTH_REFRESH_TOKEN` env var bypass still works (backward compat).
+
+**p7.7 — Management HTTP API** *(next — depends on: dx.1)*
+The structural change that makes `agentctl watch` work identically on Mac and Linux,
+and surfaces deep observability without filesystem access.
+
+Scope:
+- `agentd/src/management.rs` (new): `ManagementServer` binds `0.0.0.0:7999` (port
+  configurable via `[management] port` in agent TOML, disabled by default, enabled
+  when `[management] enabled = true`). Uses `tokio` + `hyper` (already a transitive
+  dep via `reqwest`).
+- Routes:
+  - `GET /api/v1/agents` → JSON array of `AgentSnapshot` (same struct as FUSE surface).
+  - `GET /api/v1/agents/:id` → single `AgentSnapshot` or 404.
+  - `GET /api/v1/stream` → SSE stream; every `FlightRecorder::emit()` call fans out to
+    all connected SSE subscribers via a `tokio::sync::broadcast` channel (capacity 1024).
+    Events are the same JSONL structs written to disk, serialized as `data: <json>\n\n`.
+  - `GET /api/v1/approvals` → pending approvals from `ApprovalStore`.
+  - `GET /api/v1/memory/:ns` → memory entries for namespace (proxies `MemoryStore`).
+- `agentctl`: add `--url` flag (default `http://localhost:7999`); auto-detect mode —
+  if `/agents/` FUSE mount is readable, use FUSE (fast path); else use HTTP API. Env
+  var `AGENTCTL_URL` overrides. All existing `agentctl watch` views (Dashboard,
+  AgentDetail, Topology, Memory, Approvals, Inspector) work via HTTP API.
+- `ManagementStarted` + `ManagementRequest` flight events.
+- New tests: management server binds, routes return correct JSON, SSE fan-out delivers
+  events to two concurrent subscribers, FUSE fallback to HTTP in agentctl.
+
+Acceptance:
+- `agentctl watch --url http://localhost:7999` on the Mac host (outside Docker) shows
+  the same Dashboard view as running `agentctl watch` inside the container.
+- Inspector view streams live flight events over SSE with no polling lag.
+- Killing the management server (port unavailable) → agentctl falls back to FUSE with
+  a `[warn] management API unreachable, using FUSE` message.
+- Binary stays ≤ 6 MB (hyper already present; no new heavy deps).
+
+**dx.2 — HTTP approval surface** *(depends on: p7.7)*
+Makes `request_approval()` reachable from outside the container or VM — resolves the
+core headless/unattended operation problem identified in `docs/plans/pure-os-ux-alignment.md`.
+
+Scope:
+- `agentd/src/approval_http.rs` (new): when `request_approval()` fires, agentd serves
+  a minimal HTML page on `:8080` (`GET /` → pending approvals list; `POST /approve/:id`
+  + `POST /deny/:id` → write decision to `ApprovalStore`, return 200). HTML is
+  self-contained (no external CSS/JS). Page auto-refreshes every 5 s when idle.
+- `request_approval()` tool gains optional `timeout_s: u64` + `default: "approve" |
+  "deny"` parameters. When timeout fires with a pending decision, the default is
+  applied and `ApprovalAutoResolved { id, default, timeout_s }` flight event emitted.
+  Omitting timeout = blocking indefinitely (current behavior, backward compat).
+- `docker-compose.yml` port `8080:8080` already added in dx.1.
+- Convention: `kind="data-access"` in approval description → safe to set
+  `default="approve"` + long timeout. `kind="send"` / `kind="modify"` → always
+  omit default (block indefinitely).
+
+Acceptance:
+- Agent calls `request_approval(description="...", kind="data-access", timeout_s=3600,
+  default="approve")` → browser at `http://localhost:8080` shows the pending action.
+- Clicking Approve → agent continues; clicking Deny → agent receives denial.
+- Timeout fires after `timeout_s` with no human action → auto-approved per default;
+  `ApprovalAutoResolved` event in `flight.jsonl`.
+- Port 8080 on Mac host (Docker port bind) reaches the same approval page as
+  `localhost:8080` inside the container.
+
+**dx.3 — Linux QEMU production** *(depends on: dx.2)*
+Closes the loop: the pure OS vision running on a Linux server with hardware-accelerated
+KVM, systemd supervision, and the same secrets + approval model as the Mac Docker path.
+
+Scope:
+- `distro/Makefile`: add `secrets0` virtfs mount: `-virtfs
+  local,path=$(HOME)/.agentos-secrets,mount_tag=secrets0,security_model=mapped-xattr,readonly=on`.
+  Add `hostfwd=tcp::7999-:7999` and `hostfwd=tcp::8080-:8080` to the QEMU netdev line.
+- `distro/overlay/init` (PID-1 sh script): mount `secrets0` → `/run/secrets` alongside
+  existing `memory0` + `output0` mounts.
+- `agentd/cos.agents.toml`: verify all paths use `/run/secrets/` not env vars; add
+  `[management] enabled = true` so `agentctl watch` works from the Linux host.
+- `distro/agentos-cos.service` (new): systemd unit that launches the QEMU process,
+  `Restart=on-failure`, `WantedBy=multi-user.target`. Install path: `/etc/systemd/system/`.
+- `docs/DEPLOYMENT.md` (new, brief): two-page operator guide — Mac Docker path and
+  Linux QEMU path, from zero to `agentctl watch` showing a running CoS agent.
+
+Acceptance:
+- On a Linux x86-64 host with KVM: `systemctl start agentos-cos` → QEMU boots,
+  agentd starts, CoS cron agent runs.
+- `agentctl watch` on the Linux host (outside the VM) shows the Dashboard by talking
+  to `:7999` (QEMU hostfwd).
+- Browser at `http://server-ip:8080` shows pending approvals from inside the VM.
+- `~/.agentos-secrets/google.json` provisioned on Mac via `agentctl auth google`,
+  then `scp`'d to the Linux server — CoS brief runs with no OAuth dance on the server.
+
+---
+
 ## Phase 8 — Harness extensions
 
 **h8.1 — Layer 2 semantic memory** [HARNESS] *(depends on: cos.1 tested + working — a smarter

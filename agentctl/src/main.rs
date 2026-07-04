@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use agentd::template::TemplateResolver;
 use clap::Parser;
 
+mod auth;
 mod list;
 mod spawn;
 mod verify;
@@ -22,6 +23,8 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Commands {
+    /// Provision OAuth credentials for use by Docker agents
+    Auth(auth::AuthCmd),
     ListTemplates(list::Args),
     Spawn(spawn::Args),
     Verify(verify::Args),
@@ -31,6 +34,7 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
+        Commands::Auth(cmd) => auth::run(cmd),
         Commands::ListTemplates(args) => list::run(args),
         Commands::Spawn(args) => spawn::run(args),
         Commands::Verify(args) => verify::run(args),

@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentOS — Runtime Architecture</title>
+<style>
+:root {
+  --ground:        #070D1A;
+  --surface:       #0E1626;
+  --surface-2:     #13203A;
+  --surface-3:     #192948;
+  --border:        #1C2E4A;
+  --border-bright: #243D64;
+  --text:          #CDD6E8;
+  --text-muted:    #4A6080;
+  --text-dim:      #28405A;
+  --accent:        #E8A030;
+  --accent-dim:    rgba(232,160,48,.13);
+  --accent-glow:   rgba(232,160,48,.06);
+  --teal:          #35C4BB;
+  --teal-dim:      rgba(53,196,187,.12);
+  --green:         #38D48A;
+  --green-dim:     rgba(56,212,138,.12);
+  --purple:        #9880F0;
+  --purple-dim:    rgba(152,128,240,.12);
+  --red:           #D45070;
+  --planned-bg:    #0F1E3C;
+  --planned-text:  #4068A8;
+  --planned-bdr:   #1E3870;
+  --mono: 'Courier New', 'Consolas', 'Liberation Mono', monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--ground);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 32px 24px 48px;
+}
+
+/* ─── PAGE HEADER ─────────────────────────────────────────────────── */
+.page-header {
+  max-width: 1240px;
+  margin: 0 auto 28px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+}
+.page-title {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: normal;
+  color: var(--accent);
+  letter-spacing: -0.01em;
+}
+.page-subtitle {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-family: var(--mono);
+}
+.legend {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  letter-spacing: 0.04em;
+}
+.legend-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+/* ─── DIAGRAM WRAPPER ─────────────────────────────────────────────── */
+.diagram {
+  max-width: 1240px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow-x: auto;
+}
+
+/* ─── ZONES ───────────────────────────────────────────────────────── */
+.zone {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: visible;
+}
+.zone + .zone {
+  margin-top: -1px;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+.zone:not(:last-child) {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.zone-label {
+  position: absolute;
+  top: -1px;
+  left: 0;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  padding: 3px 10px;
+  border-bottom-right-radius: 3px;
+  z-index: 2;
+}
+
+/* HOST zone */
+.zone-host {
+  background: var(--surface);
+  border-color: var(--accent);
+  border-width: 1.5px;
+  padding: 24px 16px 16px;
+}
+.zone-host .zone-label {
+  background: var(--accent);
+  color: var(--ground);
+  font-weight: bold;
+}
+
+/* RUNTIME zone */
+.zone-runtime {
+  background: var(--ground);
+  border-color: var(--border-bright);
+  border-width: 1.5px;
+  padding: 24px 16px 16px;
+  min-height: 600px;
+}
+.zone-runtime .zone-label {
+  background: var(--border-bright);
+  color: var(--text);
+  font-weight: normal;
+}
+
+/* OBSERVABILITY zone */
+.zone-obs {
+  background: var(--surface);
+  border-color: var(--purple);
+  border-width: 1.5px;
+  padding: 18px 16px 16px;
+}
+.zone-obs .zone-label {
+  background: var(--purple);
+  color: var(--ground);
+  font-weight: bold;
+}
+
+/* NETWORK zone */
+.zone-network {
+  background: var(--surface);
+  border-color: var(--teal);
+  border-width: 1.5px;
+  padding: 18px 16px 16px;
+}
+.zone-network .zone-label {
+  background: var(--teal);
+  color: var(--ground);
+  font-weight: bold;
+}
+
+/* ─── HOST ZONE INTERNALS ─────────────────────────────────────────── */
+.host-content {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.mount-group {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  flex: 1;
+}
+.mount {
+  background: var(--surface-2);
+  border: 1px solid var(--border-bright);
+  border-top: 2px solid var(--accent);
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text);
+  border-radius: 2px;
+  min-width: 160px;
+}
+.mount .arrow {
+  color: var(--text-muted);
+  display: block;
+  margin-top: 2px;
+}
+.mount .dest {
+  color: var(--teal);
+  font-size: 9px;
+}
+.mount .perm {
+  color: var(--text-muted);
+  font-size: 9px;
+}
+.agentctl-box {
+  background: var(--surface-2);
+  border: 1px solid var(--accent);
+  border-top: 2px solid var(--accent);
+  padding: 8px 12px;
+  border-radius: 2px;
+  min-width: 200px;
+}
+.agentctl-box .ctl-name {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: bold;
+}
+.agentctl-box .ctl-cmds {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+.agentctl-box .ctl-note {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.port-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.port-pill {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: bold;
+  padding: 2px 7px;
+  border-radius: 2px;
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+/* ─── RUNTIME GRID ────────────────────────────────────────────────── */
+.runtime-grid {
+  display: grid;
+  grid-template-columns: 320px 310px 1fr;
+  gap: 12px;
+  min-width: 0;
+}
+
+.col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.col-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 2px;
+}
+
+/* ─── COMPONENTS (chip aesthetic) ─────────────────────────────────── */
+.chip {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.chip-header {
+  background: var(--surface-3);
+  border-bottom: 1px solid var(--border);
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.chip-title {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: bold;
+  color: var(--text);
+}
+.chip-type {
+  font-family: var(--mono);
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+}
+.type-native  { background: var(--green-dim);  color: var(--green);  border: 1px solid rgba(56,212,138,.25); }
+.type-stdio   { background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(232,160,48,.25); }
+.type-http    { background: var(--teal-dim);   color: var(--teal);   border: 1px solid rgba(53,196,187,.25); }
+.type-obs     { background: var(--purple-dim); color: var(--purple); border: 1px solid rgba(152,128,240,.25); }
+.chip-body {
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.chip-note {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+}
+.chip-note .hl { color: var(--teal); }
+.chip-note .amber { color: var(--accent); }
+
+/* ─── SCHEDULER ───────────────────────────────────────────────────── */
+.agent-chips-row {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin: 2px 0;
+}
+.agent-chip {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 3px 7px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-bright);
+  border-radius: 2px;
+  color: var(--text);
+}
+.agent-chip.more {
+  color: var(--text-muted);
+  border-style: dashed;
+}
+
+/* ─── NATIVE TOOLS ────────────────────────────────────────────────── */
+.tool-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+}
+.tool-item {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--green);
+  padding: 2px 4px;
+  background: var(--green-dim);
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+/* ─── MEMORY TIERS ────────────────────────────────────────────────── */
+.tier-badge {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: bold;
+  padding: 1px 6px;
+  border-radius: 2px;
+  letter-spacing: 0.08em;
+}
+.t0 { background: rgba(74,96,128,.3);  color: var(--text-muted); border: 1px solid var(--border); }
+.t1 { background: var(--green-dim);    color: var(--green);       border: 1px solid rgba(56,212,138,.3); }
+.t2 { background: var(--accent-dim);   color: var(--accent);      border: 1px solid rgba(232,160,48,.3); }
+.t3 { background: var(--teal-dim);     color: var(--teal);        border: 1px solid rgba(53,196,187,.3); }
+
+.tier-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+}
+
+.segment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 4px 0;
+}
+.segment {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  padding: 3px 6px;
+  border-radius: 2px;
+}
+.seg-canon  { background: rgba(53,196,187,.1); border: 1px solid rgba(53,196,187,.2); }
+.seg-log    { background: rgba(56,212,138,.1); border: 1px solid rgba(56,212,138,.2); }
+.seg-scratch{ background: rgba(232,160,48,.1); border: 1px solid rgba(232,160,48,.2); }
+.seg-label  { font-weight: bold; min-width: 48px; }
+.seg-canon  .seg-label { color: var(--teal); }
+.seg-log    .seg-label { color: var(--green); }
+.seg-scratch .seg-label { color: var(--accent); }
+.seg-desc   { color: var(--text-muted); font-size: 9px; }
+
+.storage-chip {
+  background: var(--surface);
+  border: 1px dashed var(--border-bright);
+  border-radius: 3px;
+  padding: 7px 10px;
+  margin-top: 2px;
+}
+.storage-path {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--teal);
+}
+.storage-sub {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* ─── PLANNED (future) ────────────────────────────────────────────── */
+.chip.planned {
+  background: var(--planned-bg);
+  border-color: var(--planned-bdr);
+  border-style: dashed;
+}
+.chip.planned .chip-header {
+  background: rgba(30,56,112,.4);
+  border-color: var(--planned-bdr);
+}
+.chip.planned .chip-title {
+  color: var(--planned-text);
+}
+.planned-badge {
+  font-family: var(--mono);
+  font-size: 8px;
+  font-weight: bold;
+  padding: 1px 5px;
+  border-radius: 2px;
+  background: rgba(64,104,168,.2);
+  border: 1px solid var(--planned-bdr);
+  color: var(--planned-text);
+  letter-spacing: 0.08em;
+}
+
+/* ─── SIDECARS ────────────────────────────────────────────────────── */
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.mcp-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+.mcp-row:last-child { border-bottom: none; }
+.mcp-name {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: bold;
+  color: var(--accent);
+}
+.mcp-name.ext { color: var(--teal); }
+.mcp-tools {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+/* operator surfaces */
+.surface-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.surface-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 10.5px;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--border);
+}
+.surface-row:last-child { border-bottom: none; }
+.surface-port {
+  font-family: var(--mono);
+  font-weight: bold;
+  color: var(--accent);
+  min-width: 52px;
+  font-size: 10px;
+}
+.surface-fuse {
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: bold;
+  padding: 1px 5px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-bright);
+  border-radius: 2px;
+  color: var(--text-muted);
+  min-width: 52px;
+  text-align: center;
+}
+.surface-desc {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-muted);
+}
+.surface-desc em { color: var(--text); font-style: normal; }
+
+/* ─── OBSERVABILITY ZONE ──────────────────────────────────────────── */
+.obs-pipeline {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+.obs-step {
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 5px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  position: relative;
+  white-space: nowrap;
+}
+.obs-step.src { border-color: var(--purple); color: var(--purple); }
+.obs-step.dst { border-color: var(--teal); color: var(--teal); }
+.obs-arrow {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-dim);
+  padding: 0 2px;
+}
+.obs-note {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+
+/* ─── NETWORK ZONE ────────────────────────────────────────────────── */
+.network-content {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.net-group {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--teal);
+  padding: 8px 10px;
+  border-radius: 2px;
+  min-width: 140px;
+}
+.net-group-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  color: var(--text-muted);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  margin-bottom: 5px;
+}
+.net-item {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--teal);
+  line-height: 1.8;
+}
+
+/* ─── SIGNAL ANIMATION ────────────────────────────────────────────── */
+.signal-rail {
+  height: 1px;
+  background: var(--border);
+  position: relative;
+  overflow: hidden;
+  margin: 0 0;
+}
+.signal-rail::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -30%;
+  width: 30%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: signal-flow 2.4s linear infinite;
+}
+.signal-rail.teal::after {
+  background: linear-gradient(90deg, transparent, var(--teal), transparent);
+  animation-duration: 3.2s;
+  animation-delay: 0.8s;
+}
+.signal-rail.purple::after {
+  background: linear-gradient(90deg, transparent, var(--purple), transparent);
+  animation-duration: 2.8s;
+  animation-delay: 1.4s;
+}
+
+@keyframes signal-flow {
+  0%   { left: -30%; }
+  100% { left: 130%; }
+}
+
+/* ─── EGRESS PROXY ────────────────────────────────────────────────── */
+.egress-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+.key-badge {
+  padding: 2px 6px;
+  border-radius: 2px;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+}
+.key-ephemeral {
+  background: var(--green-dim);
+  color: var(--green);
+  border: 1px solid rgba(56,212,138,.3);
+}
+.key-real {
+  background: rgba(212,80,112,.1);
+  color: var(--red);
+  border: 1px solid rgba(212,80,112,.3);
+}
+.key-arrow { color: var(--text-muted); }
+
+@media (prefers-reduced-motion: reduce) {
+  .signal-rail::after { animation: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- ════ PAGE HEADER ════════════════════════════════════════════════ -->
+<div class="page-header">
+  <div>
+    <div class="page-title">AgentOS — Runtime Architecture</div>
+    <div class="page-subtitle">v0.51.0 · sidecars, memory tiers, and operator surfaces</div>
+  </div>
+  <div class="legend">
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--green)"></div>in-process / native
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--accent)"></div>stdio subprocess
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--teal)"></div>HTTP MCP / external
+    </div>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--purple)"></div>observability sidecar
+    </div>
+    <div class="legend-dot" style="background:var(--planned-bdr); border: 1px dashed var(--planned-bdr); border-radius:1px; width:8px; height:8px; flex-shrink:0"></div>
+    <span style="font-family:var(--mono);font-size:10px;color:var(--text-muted)">h8.1 planned</span>
+  </div>
+</div>
+
+<div class="diagram">
+
+<!-- ════ HOST ZONE ══════════════════════════════════════════════════ -->
+<div class="zone zone-host">
+  <div class="zone-label">HOST &nbsp;·&nbsp; macOS (Docker volume) or Linux (QEMU virtfs)</div>
+  <div class="host-content">
+    <div class="mount-group">
+      <div class="mount">
+        <span style="font-size:9px;color:var(--text-muted);letter-spacing:.1em;">SECRETS</span><br>
+        ~/.agentos-secrets/<br>
+        <span class="dest">→ /run/secrets/</span>&nbsp;<span class="perm">ro</span>
+      </div>
+      <div class="mount">
+        <span style="font-size:9px;color:var(--text-muted);letter-spacing:.1em;">OUTPUT</span><br>
+        ~/agentos-output/<br>
+        <span class="dest">→ /run/output/</span>&nbsp;<span class="perm">rw</span>
+      </div>
+      <div class="mount">
+        <span style="font-size:9px;color:var(--text-muted);letter-spacing:.1em;">MEMORY</span><br>
+        ~/.agentos-memory/<br>
+        <span class="dest">→ /run/memory/</span>&nbsp;<span class="perm">rw</span>
+      </div>
+    </div>
+    <div class="agentctl-box">
+      <div class="ctl-name">agentctl</div>
+      <div class="ctl-cmds">watch · auth · inject · verify · spawn · list-templates</div>
+      <div class="ctl-note" style="margin-top:6px;font-size:10px;color:var(--text-muted);">reads FUSE <span style="color:var(--text-dim)">or</span> falls back to</div>
+      <div class="port-row">
+        <div class="port-pill">:7999 mgmt API</div>
+        <div class="port-pill">:8080 approvals</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="signal-rail"></div>
+
+<!-- ════ RUNTIME ZONE ═══════════════════════════════════════════════ -->
+<div class="zone zone-runtime">
+  <div class="zone-label">CONTAINER / VM &nbsp;·&nbsp; agentd &nbsp;·&nbsp; PID 1</div>
+  <div class="runtime-grid">
+
+    <!-- ── COLUMN 1: CORE ──────────────────────────────────── -->
+    <div class="col">
+      <div class="col-label">Runtime Core</div>
+
+      <!-- Scheduler -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">Scheduler</span>
+          <span class="chip-type type-native">native</span>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note" style="color:var(--text-muted);font-size:9px;letter-spacing:.08em;">RUNNING AGENTS</div>
+          <div class="agent-chips-row">
+            <div class="agent-chip">agent:A</div>
+            <div class="agent-chip">agent:B</div>
+            <div class="agent-chip">agent:C</div>
+            <div class="agent-chip more">+N</div>
+          </div>
+          <div class="chip-note">cooperative · budget-bounded · checkpoint/restore</div>
+          <div class="chip-note"><span class="hl">spawn_agent</span> / <span class="hl">send_message</span> A→A bus</div>
+        </div>
+      </div>
+
+      <!-- Flight Recorder -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">Flight Recorder</span>
+          <span class="chip-type type-native">native</span>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note"><span class="hl">flight.jsonl</span> — append-only JSONL, every event</div>
+          <div class="chip-note"><span class="amber">SSE fan-out</span> → <span class="amber">:7999/api/v1/stream</span> <span style="color:var(--text-dim)">(p7.7)</span></div>
+          <div class="chip-note">Ed25519 signed receipts on every tool result</div>
+        </div>
+      </div>
+
+      <!-- Egress Proxy -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">Egress Proxy</span>
+          <span class="chip-type type-native">native</span>
+        </div>
+        <div class="chip-body">
+          <div class="egress-row">
+            <span class="key-badge key-ephemeral">ephemeral key</span>
+            <span class="key-arrow">→</span>
+            <span class="key-badge key-real">ANTHROPIC_API_KEY</span>
+          </div>
+          <div class="chip-note" style="margin-top:4px;">loopback-only · budget pre-check · token cap</div>
+          <div class="chip-note">allowlist: api.anthropic.com only</div>
+          <div class="chip-note"><span class="chip-type type-http" style="font-size:9px;">gVisor</span> universal-tier agents get ephemeral key injected</div>
+        </div>
+      </div>
+
+      <!-- Native Tools -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">Native Tool Registry</span>
+          <span class="chip-type type-native">in-process</span>
+        </div>
+        <div class="chip-body">
+          <div class="tool-grid">
+            <div class="tool-item">mem_remember</div>
+            <div class="tool-item">mem_recall</div>
+            <div class="tool-item">kb_put</div>
+            <div class="tool-item">kb_get</div>
+            <div class="tool-item">kb_search</div>
+            <div class="tool-item">kv_get · kv_set</div>
+            <div class="tool-item">spawn_agent</div>
+            <div class="tool-item">send_message</div>
+            <div class="tool-item">request_approval</div>
+            <div class="tool-item">read_file</div>
+            <div class="tool-item">write_file</div>
+            <div class="tool-item">list_dir</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Operator surfaces -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">Operator Surfaces</span>
+          <span class="chip-type type-native">native</span>
+        </div>
+        <div class="chip-body">
+          <div class="surface-list">
+            <div class="surface-row">
+              <div class="surface-port">:7999</div>
+              <div class="surface-desc"><em>Management HTTP API</em> + SSE stream <span style="color:var(--text-dim)">(p7.7)</span></div>
+            </div>
+            <div class="surface-row">
+              <div class="surface-port">:8080</div>
+              <div class="surface-desc"><em>Approval HTML</em> · approve/deny/timeout <span style="color:var(--text-dim)">(dx.2)</span></div>
+            </div>
+            <div class="surface-row">
+              <div class="surface-fuse">FUSE</div>
+              <div class="surface-desc"><em>/agents/</em> filesystem · Linux fast path</div>
+            </div>
+            <div class="surface-row">
+              <div class="surface-fuse">WRITE</div>
+              <div class="surface-desc"><em>/agents/control</em> · inject · kill</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /col core -->
+
+    <!-- ── COLUMN 2: MEMORY ────────────────────────────────── -->
+    <div class="col">
+      <div class="col-label">Memory Subsystem</div>
+
+      <!-- T0 -->
+      <div class="chip">
+        <div class="chip-header">
+          <div class="tier-header" style="margin:0">
+            <span class="tier-badge t0">T0</span>
+            <span class="chip-title">Short-term context</span>
+          </div>
+          <span class="chip-type type-native">in-agent</span>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note"><span style="color:var(--text-muted);font-family:var(--mono);font-size:9.5px;">Vec&lt;MemItem&gt;</span> per AgentTask · RAM only · ephemeral</div>
+          <div class="chip-note">auto-page at 75% soft / 90% hard pressure threshold</div>
+          <div class="chip-note">distill → T1 via <span class="hl">distill_on_complete</span> (inference summarization)</div>
+        </div>
+      </div>
+
+      <!-- T1 -->
+      <div class="chip">
+        <div class="chip-header">
+          <div class="tier-header" style="margin:0">
+            <span class="tier-badge t1">T1</span>
+            <span class="chip-title">Long-term per-agent</span>
+          </div>
+          <span class="chip-type type-native">redb</span>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note">namespace: <span class="hl">agent/{id}/&lt;ns-key&gt;</span></div>
+          <div class="chip-note">8 KiB per entry · FNV-1a task fingerprint · provenance JSON</div>
+          <div class="chip-note">BM25 inverted index · max_entries / max_age eviction</div>
+          <div class="chip-note">tools: <span style="color:var(--green)">mem_remember</span> / <span style="color:var(--green)">mem_recall</span></div>
+        </div>
+      </div>
+
+      <!-- T2 -->
+      <div class="chip">
+        <div class="chip-header">
+          <div class="tier-header" style="margin:0">
+            <span class="tier-badge t2">T2</span>
+            <span class="chip-title">Shared KB</span>
+          </div>
+          <span class="chip-type type-native">redb</span>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note">same redb store · namespace-segmented · 3 mutability classes</div>
+          <div class="segment-list">
+            <div class="segment seg-canon">
+              <span class="seg-label">canon</span>
+              <span class="seg-desc">operator-seeded · agent read-only · deny writes</span>
+            </div>
+            <div class="segment seg-log">
+              <span class="seg-label">log</span>
+              <span class="seg-desc">append-only · monotonic key · immutable history</span>
+            </div>
+            <div class="segment seg-scratch">
+              <span class="seg-label">scratch</span>
+              <span class="seg-desc">last-writer-wins · version counter · TOCTOU safe</span>
+            </div>
+          </div>
+          <div class="chip-note" style="margin-top:2px;">tools: <span style="color:var(--accent)">kb_put</span> / <span style="color:var(--accent)">kb_get</span> / <span style="color:var(--accent)">kb_search</span> (BM25-lite)</div>
+        </div>
+      </div>
+
+      <!-- T3 planned -->
+      <div class="chip planned">
+        <div class="chip-header">
+          <div class="tier-header" style="margin:0">
+            <span class="tier-badge t3">T3</span>
+            <span class="chip-title">Semantic / vector memory</span>
+          </div>
+          <span class="planned-badge">h8.1</span>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note" style="color:var(--planned-text)">HelixDB MCP sidecar — graph + vector + provenance links</div>
+          <div class="chip-note" style="color:var(--planned-text)">embeddings via Voyage AI / Cohere (remote, cognition-is-remote lock)</div>
+          <div class="chip-note" style="color:var(--planned-text)">transport: HTTP/SSE MCP (p7.1) · coexists with T1/T2 BM25</div>
+          <div class="chip-note" style="color:var(--planned-text)">tools: semantic_search · graph_query · embed_store</div>
+        </div>
+      </div>
+
+      <!-- Storage line -->
+      <div class="storage-chip">
+        <div class="storage-path">memory.redb</div>
+        <div class="storage-sub">/run/memory/ → Docker named vol  or  QEMU virtfs memory0</div>
+        <div class="storage-sub" style="margin-top:3px;">T1 + T2 share one redb instance · NAMESPACES table for O(k) listing</div>
+      </div>
+
+    </div><!-- /col memory -->
+
+    <!-- ── COLUMN 3: SIDECARS + SURFACES ──────────────────── -->
+    <div class="col">
+      <div class="col-label">MCP Sidecars</div>
+
+      <!-- stdio MCP servers -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">stdio MCP servers</span>
+          <span class="chip-type type-stdio">subprocess · sandboxed</span>
+        </div>
+        <div class="chip-body">
+          <div class="mcp-list">
+            <div class="mcp-row">
+              <div class="mcp-name">oauth_mcp.py</div>
+              <div class="mcp-tools">oauth_start_auth · oauth_check_auth · oauth_call_api<br>PKCE · CSRF nonce · reads /run/secrets/google.json</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name">cron_mcp.py</div>
+              <div class="mcp-tools">wait_for_trigger · 5-field cron UTC + interval<br>poll-and-retry within MCP_TIMEOUT=30s</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name">fs_watch_mcp.py</div>
+              <div class="mcp-tools">wait_for_trigger · mtime+size+inode · fnmatch ignore<br>quiet-period debounce</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name">webhook_mcp.py</div>
+              <div class="mcp-tools">wait_for_trigger · HMAC-SHA256 · ±5 min timestamp<br>Content-Length bomb guard</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name">shell_mcp.py</div>
+              <div class="mcp-tools">run_command · requires ShellExec capability<br>30s / 120s timeout · 64 KB cap · PASSENV_BLOCKLIST</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name">http_mcp.py</div>
+              <div class="mcp-tools">fetch_url · HTTPS only · 4 MB cap · no redirects<br>requires Net capability</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name">search_mcp.py</div>
+              <div class="mcp-tools">web_search · Brave Search API · graceful missing-key<br>requires Net capability</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- HTTP MCP external -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">HTTP MCP servers</span>
+          <span class="chip-type type-http">external · p7.1 SSE transport</span>
+        </div>
+        <div class="chip-body">
+          <div class="mcp-list">
+            <div class="mcp-row">
+              <div class="mcp-name ext">Linear MCP</div>
+              <div class="mcp-tools">issues · projects · teams · comments<br>Mcp-Session-Id · headers from env</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name ext">GitHub MCP</div>
+              <div class="mcp-tools">repos · PRs · issues · code search<br>HTTPS only · embedded credentials rejected</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Planned: helix_mcp -->
+      <div class="chip planned">
+        <div class="chip-header">
+          <span class="chip-title">helix_mcp</span>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <span class="chip-type type-http" style="color:var(--planned-text);background:rgba(32,56,112,.3);border-color:var(--planned-bdr);">stdio or HTTP</span>
+            <span class="planned-badge">h8.1</span>
+          </div>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note" style="color:var(--planned-text)">HelixDB sidecar — Rust · graph + vector · provenance links</div>
+          <div class="chip-note" style="color:var(--planned-text)">semantic_search · graph_query · embed_store · relate</div>
+          <div class="chip-note" style="color:var(--planned-text)">T3 memory tools exposed as MCP — same tool ABI, no core changes</div>
+        </div>
+      </div>
+
+      <!-- Sandbox note -->
+      <div class="chip" style="border-color:rgba(212,80,112,.25);background:rgba(212,80,112,.04);">
+        <div class="chip-header" style="background:rgba(212,80,112,.08);border-color:rgba(212,80,112,.2);">
+          <span class="chip-title" style="color:var(--red);">Sandbox enforcement</span>
+          <span class="chip-type" style="background:rgba(212,80,112,.1);color:var(--red);border-color:rgba(212,80,112,.3);">kernel</span>
+        </div>
+        <div class="chip-body">
+          <div class="chip-note">Landlock LSM + seccomp-bpf on all stdio MCP subprocesses</div>
+          <div class="chip-note">gVisor / runsc for universal-tier (untrusted / foreign-framework) agents</div>
+          <div class="chip-note">per-server SandboxSummary visible in <span class="amber">:7999/api/v1/agents/:id</span></div>
+        </div>
+      </div>
+
+    </div><!-- /col sidecars -->
+
+  </div><!-- /runtime-grid -->
+</div><!-- /zone-runtime -->
+
+<div class="signal-rail purple"></div>
+
+<!-- ════ OBSERVABILITY ZONE ═════════════════════════════════════════ -->
+<div class="zone zone-obs">
+  <div class="zone-label">OBSERVABILITY SIDECAR</div>
+  <div class="obs-pipeline">
+    <div class="obs-step src">agentos-otel</div>
+    <div class="obs-arrow">→</div>
+    <div class="obs-step">FileTailer + sentinel</div>
+    <div class="obs-arrow">→</div>
+    <div class="obs-step">SpanBuilder</div>
+    <div class="obs-arrow">→</div>
+    <div class="obs-step">BatchSpanProcessor (512, 30s flush)</div>
+    <div class="obs-arrow">→</div>
+    <div class="obs-step">OTLP gRPC / http-proto</div>
+    <div class="obs-arrow">→</div>
+    <div class="obs-step dst">Grafana · Honeycomb · any OTel backend</div>
+  </div>
+  <div class="obs-note" style="margin-top:10px;">
+    run = trace &nbsp;·&nbsp; agent = span &nbsp;·&nbsp; turn / inference / tool / egress = child spans &nbsp;·&nbsp; tokens / $ = OTLP metrics &nbsp;·&nbsp; GenAI gen_ai.* semconv &nbsp;·&nbsp; credential guard (API key scrub)
+  </div>
+</div>
+
+<div class="signal-rail teal"></div>
+
+<!-- ════ NETWORK ZONE ═══════════════════════════════════════════════ -->
+<div class="zone zone-network">
+  <div class="zone-label">EXTERNAL NETWORK</div>
+  <div class="network-content">
+    <div class="net-group">
+      <div class="net-group-label">Inference</div>
+      <div class="net-item">api.anthropic.com</div>
+      <div class="net-item" style="color:var(--text-muted);font-size:9px;">via egress proxy · signed receipt</div>
+    </div>
+    <div class="net-group">
+      <div class="net-group-label">OAuth / Gmail</div>
+      <div class="net-item">accounts.google.com</div>
+      <div class="net-item">gmail.googleapis.com</div>
+      <div class="net-item" style="color:var(--text-muted);font-size:9px;">via oauth_mcp.py</div>
+    </div>
+    <div class="net-group">
+      <div class="net-group-label">Search</div>
+      <div class="net-item">api.search.brave.com</div>
+      <div class="net-item" style="color:var(--text-muted);font-size:9px;">via search_mcp.py</div>
+    </div>
+    <div class="net-group">
+      <div class="net-group-label">HTTP MCP hosts</div>
+      <div class="net-item">linear.app / mcp</div>
+      <div class="net-item">api.github.com / mcp</div>
+    </div>
+    <div class="net-group">
+      <div class="net-group-label">OTLP backend</div>
+      <div class="net-item">grafana.com</div>
+      <div class="net-item">api.honeycomb.io</div>
+      <div class="net-item" style="color:var(--text-muted);font-size:9px;">via agentos-otel</div>
+    </div>
+    <div class="net-group" style="border-top-color:var(--planned-bdr);border-style:dashed;">
+      <div class="net-group-label" style="color:var(--planned-text);">h8.1 · embeddings</div>
+      <div class="net-item" style="color:var(--planned-text);">voyageai.com</div>
+      <div class="net-item" style="color:var(--planned-text);">cohere.com</div>
+      <div class="net-item" style="color:var(--planned-text);font-size:9px;">T3 embed API</div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /diagram -->
+</body>
+</html>

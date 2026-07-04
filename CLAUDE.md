@@ -269,6 +269,14 @@ default flipped to `true` via `fn default_streaming() -> bool { true }` +
 to `AnthropicGateway` reqwest client; 4 streaming-default tests (defaults_to_true, can_be_disabled,
 can_be_enabled, default_impl_streaming_is_true); fixes Docker agent silent hang and google-agent
 OAuth URL invisibility; 1030 workspace tests.
+**dx.1 complete (v0.52.0).** Mac Docker DX: secrets model + `agentctl auth google`: PKCE
+OAuth2 flow on Mac host writes `~/.agentos-secrets/google.json` (SHA256/base64url, atomic
+write, mode 0600); `agentctl/src/auth/google.rs` with RFC test vector; `docker-compose.yml`
+`cos` service gains `~/.agentos-secrets:/run/secrets:ro` volume bind + removes 7 static OAuth
+env vars (now `ANTHROPIC_API_KEY`-only); `entrypoint.sh cos` preflight exits on missing
+secrets with actionable message; `oauth_mcp.py` reads `/run/secrets/google.json` first with
+env-var fallback + hardcoded Google URL defaults; `reqwest = {blocking}` + `sha2 = "0.10"` in
+agentctl; 9 new unit tests (PKCE primitives + RFC test vector); 1039 workspace tests.
 
 ## How to work here
 

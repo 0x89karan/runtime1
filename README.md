@@ -14,7 +14,7 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phases 0–7.2 complete (v0.36.0).** `agentd` is a working Rust binary.
+**Phases 0–7 + dx.1 complete (v0.52.0).** `agentd` is a working Rust binary.
 Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
 inference gateway, tools, MCP stdio client, cooperative scheduler, capability
 system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
@@ -73,3 +73,36 @@ cargo run -- agent.toml           # single agent
 cargo run -- agents.toml          # multiple agents concurrently (p1.2+)
 tail -f flight.jsonl              # watch the flight log
 ```
+
+## Docker quickstart (cos + Google)
+
+The `cos` (chain-of-scouts) service runs on Docker and requires only your
+Anthropic API key at launch time. Google credentials are provisioned once on
+the Mac host via `agentctl auth google` and mounted into the container as a
+read-only secrets volume.
+
+**One-time setup:**
+
+```bash
+# 1. Get Google OAuth credentials
+#    console.cloud.google.com → APIs & Services → Credentials
+#    Create (or edit) an OAuth 2.0 Client ID (Desktop app type)
+#    Add http://127.0.0.1:8585 to Authorized redirect URIs
+
+# 2. Provision credentials on the Mac host (runs the PKCE OAuth2 flow in a
+#    local browser tab, writes ~/.agentos-secrets/google.json)
+agentctl auth google \
+  --client-id YOUR_CLIENT_ID \
+  --client-secret YOUR_CLIENT_SECRET
+
+# 3. Set your Anthropic key
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# 4. Start the cos service
+docker compose up -d cos
+docker compose logs -f cos        # watch the agent run
+```
+
+`~/.agentos-secrets/google.json` is mounted at `/run/secrets` inside the
+container (read-only). The container never sees your OAuth client credentials
+directly — only the refresh token written by the one-time setup step.

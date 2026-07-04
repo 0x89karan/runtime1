@@ -6,19 +6,14 @@ services:
     volumes:
       # Named volume for all runtime state — no repo bind mount, no checkpoint bleed-through
       - cos-data:/data
-    # No static port binding — OAuth callback requires --service-ports:
-    #   docker compose run --service-ports --rm cos
+      # Secrets provisioned by `agentctl auth google` on the Mac host (read-only)
+      - ${HOME}/.agentos-secrets:/run/secrets:ro
     environment:
       - ANTHROPIC_API_KEY
-      - OAUTH_CLIENT_ID
-      - OAUTH_CLIENT_SECRET
-      - OAUTH_REFRESH_TOKEN
-      - OAUTH_AUTH_URL=https://accounts.google.com/o/oauth2/v2/auth
-      - OAUTH_TOKEN_URL=https://oauth2.googleapis.com/token
-      - OAUTH_SCOPES=https://www.googleapis.com/auth/gmail.readonly
-      - OAUTH_ALLOWED_HOSTS=accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com
-      - OAUTH_PROVIDER_NAME=google
-      - OAUTH_CALLBACK_PORT=8585
+      # Google OAuth credentials are read from /run/secrets/google.json (the volume above).
+      # To override credentials via env vars instead of the secrets file, add:
+      #   - OAUTH_CLIENT_ID
+      #   - OAUTH_CLIENT_SECRET
       - TRIGGER_INTERVAL=${TRIGGER_INTERVAL:-every 2m}
     command: cos
     stdin_open: true
@@ -71,14 +66,11 @@ services:
       #   4. Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET in your environment
       - OAUTH_CLIENT_ID
       - OAUTH_CLIENT_SECRET
-      # Optional: skip the OAuth dance on re-runs.
-      # Extract with: docker compose run --rm agent cat /data/.agentos-oauth/google.json | jq -r .refresh_token
+      # Optional: bypass the in-container OAuth dance.
+      # Preferred path: run `agentctl auth google` once on your Mac, then add:
+      #   volumes: ["${HOME}/.agentos-secrets:/run/secrets:ro"]
+      # Quick override for testing: set OAUTH_REFRESH_TOKEN in env instead.
       - OAUTH_REFRESH_TOKEN
-      - OAUTH_AUTH_URL=https://accounts.google.com/o/oauth2/v2/auth
-      - OAUTH_TOKEN_URL=https://oauth2.googleapis.com/token
-      - OAUTH_SCOPES=https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.readonly
-      - OAUTH_ALLOWED_HOSTS=accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com
-      - OAUTH_PROVIDER_NAME=google
       # OAUTH_CALLBACK_PORT: set to 8585 when using google-agent (or any OAuth template).
       # Leave unset for scout, librarian, coordinator, and other non-OAuth templates.
       # When set, the entrypoint prints a --service-ports reminder; port must be forwarded.

@@ -7,17 +7,25 @@ Tools:
   oauth_check_auth()                              → { ready: bool, scopes?: [str], error?: str }
   oauth_call_api(url, method?, headers?, body?)   → { status: int, body: str }
 
-Required env vars (via passenv):
+Preferred setup (Mac host):
+  agentctl auth google          # one-time: runs PKCE flow, writes ~/.agentos-secrets/google.json
+  docker compose up -d cos      # reads /run/secrets/google.json at startup
+
+Fallback (env vars, legacy):
   OAUTH_CLIENT_ID      — OAuth client ID
   OAUTH_CLIENT_SECRET  — OAuth client secret
-  OAUTH_AUTH_URL       — Authorization endpoint
-  OAUTH_TOKEN_URL      — Token endpoint
+  OAUTH_REFRESH_TOKEN  — Refresh token (skips interactive dance)
 
 Optional env vars:
-  OAUTH_SCOPES         — Space-separated scopes (default: "")
+  OAUTH_AUTH_URL       — Authorization endpoint (default: Google)
+  OAUTH_TOKEN_URL      — Token endpoint (default: Google)
+  OAUTH_SCOPES         — Space-separated scopes (default: Gmail + Drive read)
   OAUTH_ALLOWED_HOSTS  — Comma-separated host allowlist for oauth_call_api
   OAUTH_PROVIDER_NAME  — Token file basename (default: "oauth")
-  OAUTH_REFRESH_TOKEN  — Skip the dance; use this refresh token directly
+
+Credential precedence (highest → lowest):
+  1. /run/secrets/google.json (provisioned by agentctl auth google)
+  2. OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REFRESH_TOKEN env vars
 
 Token file: ~/.agentos-oauth/<OAUTH_PROVIDER_NAME>.json (0600, atomic write)
 Access tokens: in-memory only, never written to disk.
@@ -25,7 +33,7 @@ Access tokens: in-memory only, never written to disk.
 Capability required:
   capabilities = [{ Net = { hosts = [...provider hosts...], ports = [443] } }]
 """
-import base64, hashlib, json, os, secrets, socket, ssl, sys
+import base64, hashlib, html, json, os, secrets, socket, ssl, sys
 import tempfile, threading, time, urllib.error, urllib.parse, urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -40,6 +48,16 @@ RESPONSE_CAP    = 4 * 1024 * 1024   # 4 MB cap on oauth_call_api response body
 ERROR_BODY_CAP  = 512               # bytes read from token endpoint error body
 REQUEST_TIMEOUT = 20                 # seconds per sub-request (refresh + api call)
 CALLBACK_TIMEOUT_S = 600            # 10 minutes for the user to complete auth
+
+# Google OAuth defaults — used when env vars are absent.
+# Keep in sync with agentctl/src/auth/google.rs (GOOGLE_AUTH_URL / GOOGLE_TOKEN_URL / GOOGLE_SCOPES).
+GOOGLE_AUTH_URL      = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL     = "https://oauth2.googleapis.com/token"
+GOOGLE_SCOPES        = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.readonly"
+GOOGLE_ALLOWED_HOSTS = "accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
+
+# Path written by `agentctl auth google` on the host, bind-mounted into containers.
+SECRETS_FILE = "/run/secrets/google.json"
 
 TOOLS = [
     {
@@ -89,19 +107,56 @@ TOOLS = [
 _cfg: dict = {}
 
 def _load_config() -> Optional[str]:
-    """Return error string if required vars are missing, else populate _cfg."""
-    required = ["OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL"]
-    for var in required:
-        val = os.environ.get(var, "").strip()
-        if not val:
-            return f"oauth_mcp: missing required env {var}"
-        _cfg[var] = val
+    """Populate _cfg from secrets file (preferred) then env vars (fallback).
 
-    _cfg["OAUTH_SCOPES"]        = os.environ.get("OAUTH_SCOPES", "").strip()
-    _cfg["OAUTH_PROVIDER_NAME"] = os.environ.get("OAUTH_PROVIDER_NAME", "oauth").strip() or "oauth"
-    _cfg["OAUTH_REFRESH_TOKEN"] = os.environ.get("OAUTH_REFRESH_TOKEN", "").strip()
+    Precedence:
+      1. /run/secrets/google.json  (provisioned by `agentctl auth google`)
+      2. OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REFRESH_TOKEN env vars
+    URL/scope fields default to hardcoded Google values; env vars override.
+    """
+    file_client_id = ""
+    file_client_secret = ""
+    file_refresh_token = ""
 
-    raw_hosts = os.environ.get("OAUTH_ALLOWED_HOSTS", "").strip()
+    if os.path.isfile(SECRETS_FILE):
+        try:
+            with open(SECRETS_FILE) as fh:
+                data = json.load(fh)
+            file_client_id     = (data.get("client_id")     or "").strip()
+            file_client_secret = (data.get("client_secret") or "").strip()
+            file_refresh_token = (data.get("refresh_token") or "").strip()
+        except Exception as exc:
+            print(f"oauth_mcp: WARNING: could not read {SECRETS_FILE}: {exc}", file=sys.stderr)
+
+    # Env vars override the secrets file if non-empty.
+    client_id     = os.environ.get("OAUTH_CLIENT_ID",     "").strip() or file_client_id
+    client_secret = os.environ.get("OAUTH_CLIENT_SECRET", "").strip() or file_client_secret
+    refresh_token = os.environ.get("OAUTH_REFRESH_TOKEN", "").strip() or file_refresh_token
+
+    if not client_id or not client_secret:
+        msg = (
+            "oauth_mcp: OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET are not set.\n"
+            "  Provision credentials on your Mac (once):\n"
+            "    agentctl auth google\n"
+            "  Then restart the container:\n"
+            "    docker compose restart cos"
+        )
+        print(msg, file=sys.stderr)
+        return "oauth_mcp: credentials not configured — see stderr for instructions"
+
+    _cfg["OAUTH_CLIENT_ID"]     = client_id
+    _cfg["OAUTH_CLIENT_SECRET"] = client_secret
+    _cfg["OAUTH_REFRESH_TOKEN"] = refresh_token
+
+    # URL / scope / host fields: env var takes priority, Google defaults as fallback.
+    _cfg["OAUTH_AUTH_URL"]  = os.environ.get("OAUTH_AUTH_URL",  "").strip() or GOOGLE_AUTH_URL
+    _cfg["OAUTH_TOKEN_URL"] = os.environ.get("OAUTH_TOKEN_URL", "").strip() or GOOGLE_TOKEN_URL
+    _cfg["OAUTH_SCOPES"]    = os.environ.get("OAUTH_SCOPES",    "").strip() or GOOGLE_SCOPES
+    _cfg["OAUTH_PROVIDER_NAME"] = (
+        os.environ.get("OAUTH_PROVIDER_NAME", "").strip() or "google"
+    )
+
+    raw_hosts = os.environ.get("OAUTH_ALLOWED_HOSTS", "").strip() or GOOGLE_ALLOWED_HOSTS
     _cfg["ALLOWED_HOSTS"] = {h.strip() for h in raw_hosts.split(",") if h.strip()}
 
     token_dir = os.path.expanduser("~/.agentos-oauth")
@@ -201,7 +256,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
             error = params.get("error", [None])[0]
             if error:
                 sess.result = {"error": error}
-                self._respond(400, f"Authorization failed: {error}")
+                self._respond(400, f"Authorization failed: {html.escape(error)}")
                 return
 
             code  = params.get("code",  [None])[0]
@@ -385,6 +440,15 @@ def _ensure_fresh_token() -> Optional[str]:
 def handle_oauth_start_auth(_args: dict) -> tuple:
     global _session, _auth_state
 
+    # If credentials were pre-provisioned via agentctl auth google (refresh token
+    # present), the in-container OAuth dance is unnecessary.
+    if _cfg.get("OAUTH_REFRESH_TOKEN"):
+        print(
+            "oauth_mcp: INFO: refresh token already available — "
+            "call oauth_check_auth instead of starting a new auth flow.",
+            file=sys.stderr,
+        )
+
     # PKCE
     code_verifier  = secrets.token_urlsafe(64)   # 86-char URL-safe string
     code_challenge = base64.urlsafe_b64encode(
@@ -399,8 +463,14 @@ def handle_oauth_start_auth(_args: dict) -> tuple:
     except ValueError:
         return None, "OAUTH_CALLBACK_PORT must be an integer (e.g. 8585)"
 
-    # Close any pending session BEFORE binding the new server so a fixed port
-    # (set via OAUTH_CALLBACK_PORT) is not already in use.
+    # When a fixed port is requested (Docker mode), bind on all interfaces so
+    # Docker's port-mapping (which forwards to the container's eth0, not loopback)
+    # can reach the server.  Ephemeral-port path keeps loopback for safety.
+    bind_host = "0.0.0.0" if callback_port else "127.0.0.1"
+
+    # Close old session, bind the new server, and register it atomically under
+    # _session_lock — prevents a concurrent oauth_start_auth from orphaning the
+    # new server (double-lock gap race condition).
     with _session_lock:
         old = _session
         if old is not None:
@@ -408,26 +478,17 @@ def handle_oauth_start_auth(_args: dict) -> tuple:
                 old.server.server_close()
             except Exception:
                 pass
-        _session = None
-
-    # When a fixed port is requested (Docker mode), bind on all interfaces so
-    # Docker's port-mapping (which forwards to the container's eth0, not loopback)
-    # can reach the server.  Ephemeral-port path keeps loopback for safety.
-    bind_host = "0.0.0.0" if callback_port else "127.0.0.1"
-    srv = HTTPServer((bind_host, callback_port), _CallbackHandler)
-    port = srv.server_address[1]
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
-
-    new_sess = AuthSession(
-        state=csrf_state,
-        code_verifier=code_verifier,
-        redirect_uri=redirect_uri,
-        expires_at=time.monotonic() + CALLBACK_TIMEOUT_S,
-        server=srv,
-        thread=Thread(target=_run_callback_server, daemon=True),
-    )
-
-    with _session_lock:
+        srv = HTTPServer((bind_host, callback_port), _CallbackHandler)
+        port = srv.server_address[1]
+        redirect_uri = f"http://127.0.0.1:{port}/callback"
+        new_sess = AuthSession(
+            state=csrf_state,
+            code_verifier=code_verifier,
+            redirect_uri=redirect_uri,
+            expires_at=time.monotonic() + CALLBACK_TIMEOUT_S,
+            server=srv,
+            thread=Thread(target=_run_callback_server, daemon=True),
+        )
         _session = new_sess
 
     _auth_state = "pending"
@@ -468,8 +529,6 @@ def handle_oauth_check_auth(_args: dict) -> tuple:
             with _token_lock:
                 _auth_state = "idle"
             return None, err
-        # Load scopes from token file if available
-        saved = _load_token_file()
         with _token_lock:
             return {"ready": True, "scopes": _token_scopes}, None
 
@@ -928,9 +987,120 @@ def _self_test():
     finally:
         _os.environ.pop("OAUTH_CALLBACK_PORT", None)
 
+    # --- Test 13: _load_config reads from SECRETS_FILE when present ---
+    _reset_state()
+    _cfg.clear()
+    secrets_json = json.dumps({
+        "client_id": "file-cid",
+        "client_secret": "file-cs",
+        "refresh_token": "file-rt",
+    })
+    with patch("builtins.open", return_value=__import__("io").StringIO(secrets_json)), \
+         patch("os.path.isfile", return_value=True), \
+         patch("os.makedirs"), \
+         patch.dict(_os.environ, {"OAUTH_CLIENT_ID": "", "OAUTH_CLIENT_SECRET": "",
+                                   "OAUTH_REFRESH_TOKEN": ""}, clear=False):
+        for k in ("OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
+                  "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL", "OAUTH_SCOPES",
+                  "OAUTH_PROVIDER_NAME", "OAUTH_ALLOWED_HOSTS"):
+            _os.environ.pop(k, None)
+        err13 = _load_config()
+    if (err13 is None
+            and _cfg.get("OAUTH_CLIENT_ID") == "file-cid"
+            and _cfg.get("OAUTH_CLIENT_SECRET") == "file-cs"
+            and _cfg.get("OAUTH_REFRESH_TOKEN") == "file-rt"):
+        ok("13: _load_config reads credentials from SECRETS_FILE")
+    else:
+        fail("13", f"err={err13} cfg={dict(_cfg)}")
+
+    # --- Test 14: env vars override SECRETS_FILE credentials ---
+    _reset_state()
+    _cfg.clear()
+    with patch("builtins.open", return_value=__import__("io").StringIO(secrets_json)), \
+         patch("os.path.isfile", return_value=True), \
+         patch("os.makedirs"), \
+         patch.dict(_os.environ, {
+             "OAUTH_CLIENT_ID": "env-cid",
+             "OAUTH_CLIENT_SECRET": "env-cs",
+             "OAUTH_REFRESH_TOKEN": "env-rt",
+         }, clear=False):
+        err14 = _load_config()
+    if (err14 is None
+            and _cfg.get("OAUTH_CLIENT_ID") == "env-cid"
+            and _cfg.get("OAUTH_CLIENT_SECRET") == "env-cs"
+            and _cfg.get("OAUTH_REFRESH_TOKEN") == "env-rt"):
+        ok("14: env vars override SECRETS_FILE credentials")
+    else:
+        fail("14", f"err={err14} cfg={dict(_cfg)}")
+
+    # --- Test 15: malformed SECRETS_FILE → warning to stderr, falls through ---
+    _reset_state()
+    _cfg.clear()
+    import io as _io
+    with patch("builtins.open", return_value=_io.StringIO("not-json")), \
+         patch("os.path.isfile", return_value=True), \
+         patch("os.makedirs"), \
+         patch.dict(_os.environ, {"OAUTH_CLIENT_ID": "env-cid2",
+                                   "OAUTH_CLIENT_SECRET": "env-cs2"}, clear=False):
+        _os.environ.pop("OAUTH_REFRESH_TOKEN", None)
+        err15 = _load_config()
+    if err15 is None and _cfg.get("OAUTH_CLIENT_ID") == "env-cid2":
+        ok("15: malformed SECRETS_FILE → warning, falls through to env vars")
+    else:
+        fail("15", f"err={err15} cfg={dict(_cfg)}")
+
+    # --- Tests 16-20: _is_ssrf_blocked() ---
+    for label, url, want in [
+        ("16: loopback IP literal",   "http://127.0.0.1/",   True),
+        ("17: private range IP",      "http://192.168.1.1/", True),
+        ("18: link-local IP",         "http://169.254.0.1/", True),
+        ("19: public IP literal",     "https://8.8.8.8/",    False),
+        ("20: empty URL (exception)", "",                     False),
+    ]:
+        got = _is_ssrf_blocked(url)
+        if got == want:
+            ok(label)
+        else:
+            fail(label, f"_is_ssrf_blocked({url!r}) = {got}, want {want}")
+
+    # --- Test 21: 401 auto-retry → _do_refresh + retry succeeds ---
+    # _do_call uses _opener.open; _do_refresh uses urllib.request.urlopen
+    _reset_state()
+    _auth_state = "authorized"; _access_token = "old_tok"; _refresh_token = "rt"
+    _token_expiry = time.monotonic() + 3600  # valid — ensures _ensure_fresh_token skips refresh
+
+    api_calls_21: list = []
+
+    def _fake_opener_21(req, timeout=None):
+        url_21 = req.get_full_url() if hasattr(req, "get_full_url") else str(req)
+        api_calls_21.append(url_21)
+        if len(api_calls_21) == 1:  # first API call → 401
+            raise urllib.error.HTTPError(url_21, 401, "Unauthorized", {}, io.BytesIO(b""))
+        resp = MagicMock()  # second API call → success
+        resp.read.return_value = b'{"retry":"ok"}'
+        resp.status = 200; resp.__enter__ = lambda s: s; resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def _fake_urlopen_21(req, **kwargs):
+        # _do_refresh hits the token endpoint via urlopen (passes context=, timeout=)
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"access_token": "new_tok", "expires_in": 3600}).encode()
+        resp.__enter__ = lambda s: s; resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    with patch("urllib.request.OpenerDirector.open", side_effect=_fake_opener_21), \
+         patch("urllib.request.urlopen", side_effect=_fake_urlopen_21):
+        result21, err21 = handle_oauth_call_api({"url": "https://api.example.com/data"})
+
+    if err21 is None and result21 is not None and len(api_calls_21) == 2 and _access_token == "new_tok":
+        ok("21: 401 auto-retry → refresh + retry succeeds")
+    else:
+        fail("21", f"result={result21} err={err21} calls={len(api_calls_21)} token={_access_token}")
+
     print(file=sys.stderr)
+    total = 21
     if not failures:
-        print("oauth_mcp.py: self-test PASSED (12/12)", file=sys.stderr)
+        print(f"oauth_mcp.py: self-test PASSED ({total}/{total})", file=sys.stderr)
         sys.exit(0)
     else:
         print(f"oauth_mcp.py: self-test FAILED ({len(failures)} failures: {failures})", file=sys.stderr)

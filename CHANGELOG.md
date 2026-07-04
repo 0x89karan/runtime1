@@ -3,6 +3,30 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [dx.1] - 2026-07-04 (v0.52.0)
+
+### Added
+- `agentctl auth google` subcommand: runs PKCE OAuth2 authorization-code flow on the host
+  Mac, writes `~/.agentos-secrets/google.json` (mode 0600, atomic tmp→rename). Args:
+  `--client-id` / `--client-secret` (or env vars), `--port` (default 8585), `--force`.
+  SHA256/base64url PKCE with RFC test-vector unit test.
+- `~/.agentos-secrets:/run/secrets:ro` volume bind in `docker-compose.yml` `cos` service.
+  Replaces seven hardcoded Google OAuth env vars with a single pre-provisioned secrets file.
+- `entrypoint.sh cos` mode preflight: exits immediately with an actionable error if
+  `/run/secrets/google.json` is absent, rather than hanging inside the agent loop.
+- `oauth_mcp.py` reads `/run/secrets/google.json` at startup; env vars override if non-empty
+  (backward compat). Hardcoded Google OAuth URL defaults eliminate `OAUTH_AUTH_URL`,
+  `OAUTH_TOKEN_URL`, `OAUTH_SCOPES`, `OAUTH_ALLOWED_HOSTS`, `OAUTH_PROVIDER_NAME` from
+  user-facing config. `oauth_start_auth` logs a deprecation notice when a refresh token is
+  already present in the secrets file.
+
+### Changed
+- `agentctl` version bumped to 0.52.0. `agentd` version bumped to 0.52.0.
+- `docker-compose.yml` `cos` service: removed `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`,
+  `OAUTH_REFRESH_TOKEN`, `OAUTH_AUTH_URL`, `OAUTH_TOKEN_URL`, `OAUTH_SCOPES`,
+  `OAUTH_ALLOWED_HOSTS`, `OAUTH_PROVIDER_NAME`, `OAUTH_CALLBACK_PORT` from env block.
+  Required user config is now only `ANTHROPIC_API_KEY` in the shell.
+
 ## [h7.4] - 2026-07-03 (v0.51.0)
 
 ### Changed
