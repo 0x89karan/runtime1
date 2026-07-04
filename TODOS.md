@@ -597,12 +597,12 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
   On pre_exec failure, the child writes "sandbox" to the pipe; the parent reads it and includes
   "(sandbox stage: 'sandbox')" in the error message. Previously all failures surfaced as EPERM.
 
-**P4 — aarch64 CI runner needed to validate DenySpawn no-op behavior (p4.1 eng review)**
-- The fix in T1 (gate BPF with `#[cfg(target_arch = "x86_64")]`) emits `SandboxSkipped` on
-  non-x86_64 when DenySpawn is requested. There is no aarch64 GitHub Actions runner in CI
-  to verify the behavior. Current `ubuntu-latest` runners are x86_64.
-- Action: add a self-hosted aarch64 runner or QEMU-emulated job to CI when one becomes
-  available; until then the logic is unit-tested but not E2E verified on real hardware.
+**~~P4 — aarch64 CI runner needed to validate DenySpawn no-op behavior (p4.1 eng review)~~** ✓ Resolved in ma.1 (v0.55.0).
+- Added `build-aarch64` CI job using `cross` + QEMU emulation (`ubuntu-latest` +
+  `taiki-e/install-action`). Both `agentd` and `agentctl` build, clippy, and test under
+  QEMU for `aarch64-unknown-linux-musl`. Size guard (≤ 6 MB) enforced per-arch.
+  `Cross.toml` pins the cross Docker image for `ring` compat. `make clippy-aarch64` added
+  for local aarch64 clippy. DenySpawn no-op behavior now exercised in QEMU CI on every push.
 
 **~~P4 — `sandbox_probe` fixture not wired to any integration test (p4.1 eng review)~~** ✓ Done in p4.4.
 - 3 integration tests added in `tests/integration.rs` (Linux-gated): `allowed_path_read_succeeds`,

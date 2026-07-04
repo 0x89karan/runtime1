@@ -320,6 +320,13 @@ p7.7-ar-01/02/04; 1096 workspace tests.
   never compiled on macOS, so local clippy is a false green. Run
   `make clippy-linux` from the repo root (requires Docker) before pushing a
   branch that touches Linux-gated code. This mirrors the CI step exactly.
+- **aarch64-gated code requires an aarch64 clippy pass before pushing.** Any code
+  under `#[cfg(target_arch = "x86_64")]` or `#[cfg(not(target_arch = "x86_64"))]`
+  (e.g. `sandbox/src/lib.rs` DenySpawn gate) has different behavior on aarch64.
+  Run `make clippy-aarch64` from the repo root (requires Docker and `cross` installed
+  via `cargo install cross --locked`) before pushing a branch that changes
+  arch-conditional behavior. `Cross.toml` at the repo root pins the Docker image
+  version so `ring`'s `build.rs` gets the correct `aarch64-linux-musl-gcc`.
 - **Match the existing style.** Small modules, narrow traits, minimal
   dependencies. This is meant to be a *light* runtime — justify every new crate.
 - Update `docs/ROADMAP.md` (check off the increment) and any affected doc in the

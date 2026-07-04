@@ -84,6 +84,72 @@ jobs:
           MAX_BYTES=6291456  # 6 MB = 6 * 1024 * 1024
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
 
+  build-aarch64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            agentd
+            agentctl
+          key: aarch64
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build agentd (aarch64 musl)
+        run: cross build --release --target aarch64-unknown-linux-musl
+        working-directory: agentd
+
+      - name: Build agentctl (aarch64 musl)
+        run: cross build --release --target aarch64-unknown-linux-musl
+        working-directory: agentctl
+
+      - name: Clippy agentd (aarch64)
+        run: cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+        working-directory: agentd
+
+      - name: Clippy agentctl (aarch64)
+        run: cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+        working-directory: agentctl
+
+      - name: Test agentd (aarch64, QEMU)
+        # --lib runs unit tests only; integration tests in tests/ spawn agentd as a
+        # subprocess which fails with ENOEXEC under QEMU user-mode (no binfmt_misc).
+        # Integration tests run on native x86_64 in the build-and-test job above.
+        run: cross test --lib --target aarch64-unknown-linux-musl
+        working-directory: agentd
+
+      - name: Test agentctl (aarch64, QEMU)
+        run: cross test --target aarch64-unknown-linux-musl
+        working-directory: agentctl
+
+      # Size guards run from repo root — cargo workspace puts aarch64-musl artifacts
+      # at <repo-root>/target/, not <crate>/target/.
+      # if: always() ensures size guards run even if QEMU tests fail or timeout.
+      - name: Binary size guard — agentd aarch64 ≤ 6 MB
+        if: always()
+        run: |
+          SIZE=$(stat -c %s target/aarch64-unknown-linux-musl/release/agentd)
+          echo "agentd aarch64: ${SIZE} bytes"
+          MAX_BYTES=6291456
+          [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
+
+      - name: Binary size guard — agentctl aarch64 ≤ 6 MB
+        if: always()
+        run: |
+          SIZE=$(stat -c %s target/aarch64-unknown-linux-musl/release/agentctl)
+          echo "agentctl aarch64: ${SIZE} bytes"
+          MAX_BYTES=6291456
+          [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
+
   audit:
     runs-on: ubuntu-latest
     steps:

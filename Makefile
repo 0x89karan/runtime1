@@ -23,6 +23,17 @@ test-linux:
 	  $(RUST_IMAGE) \
 	  sh -c "apt-get update -qq && apt-get install -y -qq libfuse-dev pkg-config && rustup component add clippy && cargo test"
 
+# Run clippy for aarch64 via cross — required before pushing any code that
+# changes #[cfg(target_arch = "x86_64")] or #[cfg(not(target_arch = "x86_64"))]
+# behavior (e.g. sandbox DenySpawn gate). Requires Docker + `cross` installed.
+# Cross.toml at the repo root pins the image version for `ring` compat.
+.PHONY: clippy-aarch64
+clippy-aarch64:
+	@docker info >/dev/null 2>&1 || { echo "ERROR: Docker must be running (cross uses Docker+QEMU internally)"; exit 1; }
+	@command -v cross >/dev/null 2>&1 || { echo "ERROR: cross not installed — run: cargo install cross --locked"; exit 1; }
+	(cd agentd && cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings)
+	(cd agentctl && cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings)
+
 # Run self-tests for the bundled standard MCP servers (no API key required).
 # Assumes python3 is on PATH.
 .PHONY: test-harness

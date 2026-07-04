@@ -1,0 +1,6 @@
+# Pin the cross Docker image version for aarch64-unknown-linux-musl.
+# The `ring` crate's build.rs requires `aarch64-linux-musl-gcc`; floating to
+# latest can silently break the build when cross releases a new image that
+# ships a different toolchain layout.
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5"

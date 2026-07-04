@@ -1035,7 +1035,7 @@ Acceptance:
 Design + `/autoplan`-ready increments live in **`docs/DEPLOYMENT-TOPOLOGY.md`**; fold them in here
 when picked up. Two tracks — substrate reach, not the flagship (the CoS harness stays that):
 
-- **Track MA (multi-arch):** `ma.1` aarch64 binary target · `ma.2` arm64 distro + `qemu-system-aarch64
+- **Track MA (multi-arch):** ~~`ma.1` aarch64 binary target~~ ✅ *(v0.55.0 — cross+QEMU CI, Cross.toml, size guard, make clippy-aarch64)* · `ma.2` arm64 distro + `qemu-system-aarch64
   -accel hvf` boot (fast pure-OS on Apple Silicon) · `ma.3` multi-arch container images · `ma.4`
   isolation-tier detection + honest per-device reporting. **Decide multi-arch before dx.3/dx.4 freeze
   x86-only** — parameterize the deployment by `$ARCH` from the start rather than retrofit.

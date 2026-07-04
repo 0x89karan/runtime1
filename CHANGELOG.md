@@ -3,6 +3,30 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [ma.1] - 2026-07-04 (v0.55.0)
+
+### Added
+- `build-aarch64` CI job: cross-compiles `agentd` and `agentctl` to
+  `aarch64-unknown-linux-musl` via `cross` + QEMU emulation on every push.
+  Includes `cross clippy -- -D warnings` and `cross test` (QEMU-emulated),
+  with per-binary size guard (≤ 6 MB). Job has `timeout-minutes: 45` to
+  prevent indefinite hang under QEMU. Closes TODOS P4.
+- `Cross.toml` at repo root pinning `ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5`
+  for reproducible `ring` cross-compilation (avoids breakage on Docker image updates).
+- `make clippy-aarch64` Makefile target: runs `cross clippy` for both crates against
+  `aarch64-unknown-linux-musl` with Docker + `cross` preflight checks. Use before
+  pushing any code that changes `#[cfg(target_arch)]`-gated behavior.
+- CLAUDE.md `aarch64-gated code` gate: documents the `make clippy-aarch64` requirement
+  for arch-conditional changes, mirrors the existing `make clippy-linux` guidance.
+
+### Known Arch Gaps (documented, not fixed in ma.1)
+- `DenySpawn` (seccomp-bpf): no-op on aarch64 — `#[cfg(target_arch = "x86_64")]` guard;
+  `EnforcementStatus.spawn_enforcement` = `"none"` already correct. Fix in ma.4.
+- gVisor/runsc (universal tier): no aarch64 build; `which_runsc()` returns `None`;
+  `BestEffort` behavior. Fix when runsc ships aarch64 support.
+- Landlock FS, IsolateNetwork, IsolateMount, Landlock V4 net: all work on aarch64
+  (same syscall numbers 444–446; `unshare` available on capable kernels).
+
 ## [dx.2] - 2026-07-04 (v0.54.0)
 
 ### Added
