@@ -48,13 +48,18 @@ promote to `docs/ROADMAP.md` (DX track) when picked up.
   artifact. Also: the `agent` compose service does not mount `~/.agentos-secrets` (only `cos`
   does) — add the mount (or document it) so the host-provisioned `google.json` reaches the agent.
 
-## h8.3 — Agent orchestrator (on-demand dispatch + conversational follow-up) [planned]
+## orch.1 — Interactive agent orchestrator (on-demand dispatch + conversational follow-up) [planned]
+
+> **Renamed from `h8.3`** (2026-07-05) to resolve a collision with ROADMAP's `h8.3` (multi-device
+> migration) and to give the concept its correct name: the former "Track ORCH" (multi-instance) was
+> renamed **Track MESH** (`mesh.*`), freeing `orch.*` for the intra-instance interactive
+> orchestrator. In the Phase-10 build order, `orch.1` lands after `cred.3` (foundation-first).
 
 Supersedes the "no chat mode" dogfood finding (Bug C, 2026-07-05). Agents today are
 one-shot (perceive→infer→act→complete→exit); there is no way to ask a follow-up or have
 the system route a request to the right agent on demand. The `inject` primitive (p7.3) and
-the CoS coordinator pattern are the building blocks. To be scoped via `/autoplan`; promote
-to `docs/ROADMAP.md` (harness track) when scheduled.
+the CoS coordinator pattern are the building blocks. To be scoped via `/office-hours` +
+`/plan-eng-review`; promote to a `docs/ROADMAP.md` phase when scheduled.
 
 - **Core:** an orchestrator entry point that takes a natural-language request, selects/spawns
   the right template(s), runs them, and streams results back.

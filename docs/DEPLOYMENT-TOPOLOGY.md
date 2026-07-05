@@ -1,4 +1,4 @@
-# DEPLOYMENT-TOPOLOGY — multi-arch reach + multi-instance orchestration
+# DEPLOYMENT-TOPOLOGY — multi-arch reach + multi-instance coordination
 
 **Status:** design + increment plan (planning session, 2026-07). Not yet built. Companion to
 `docs/DESIGN.md` (thesis), `docs/PRODUCT-THESIS.md` (positioning), `docs/ROADMAP.md` (queue).
@@ -11,7 +11,7 @@ session.
 ## 0. TL;DR + the vision stance
 
 Two moves, one direction: make AgentOS **run on the devices people own** (multi-arch) and
-**coordinate many instances** (orchestration).
+**coordinate many instances** (coordination).
 
 **This fulfills the vision, it does not dilute it.** "Agent as the OS primitive on a thin,
 owned, remote-cognition host" *requires* running where the primitives run. A single-arch OS is
@@ -55,7 +55,7 @@ tablets, and air-gapped devices stay out. Multi-arch widens the range *within* t
 
 ## 2. Orchestration model (multiple instances)
 
-**AgentOS already has the orchestration primitives — they operate *inside* one instance today.**
+**AgentOS already has the coordination primitives — they operate *inside* one instance today.**
 Multi-instance = federate them across the instance boundary.
 
 Built (intra-instance): the **A2A bus** (`send_message`, Agent Cards for discovery), `spawn_agent`,
@@ -82,7 +82,7 @@ each instance network-addressable. That last one is the substrate for cross-inst
 > checkpoints, and can vanish; memory + the context graph persist in the sidecar and are shared.
 
 Devices run ephemeral compute; the memory sidecar is shared state; the management API + a
-federated A2A bus are the coordination plane. This is *why h8.1 matters for orchestration* — it's
+federated A2A bus are the coordination plane. This is *why h8.1 matters for coordination* — it's
 the shared brain a mesh coordinates through, not just a smarter brief.
 
 ---
@@ -105,7 +105,7 @@ the shared brain a mesh coordinates through, not just a smarter brief.
 
 Each is a self-contained unit with goal / depends-on / scope / acceptance — the ROADMAP style.
 Run `/autoplan` (or `/plan-eng-review`) per increment. Two tracks: **ma.\*** (multi-arch reach),
-**orch.\*** (orchestration).
+**mesh.\*** (coordination).
 
 ### Track MA — multi-arch reach
 
@@ -141,24 +141,24 @@ Run `/autoplan` (or `/plan-eng-review`) per increment. Two tracks: **ma.\*** (mu
 - *Acceptance:* on a full-kernel host it reports "Full"; on a stock-Pi-class kernel it reports
   "capability-only" with the specific missing pieces; the info is visible in `agentctl`.
 
-### Track ORCH — multi-instance orchestration
+### Track MESH — multi-instance coordination
 
-**orch.1 — instance identity + fleet registry**
+**mesh.1 — instance identity + fleet registry**
 - *Goal:* instances are discoverable by a coordinator.
 - *Depends on:* p7.7 (management API).
 - *Scope:* stable instance identity; a lightweight registry (static config or discovery) mapping
   instance → its `:7999` endpoint + Agent Cards.
 - *Acceptance:* a coordinator can enumerate N instances and reach each one's management API.
 
-**orch.2 — federated A2A bus**
+**mesh.2 — federated A2A bus**
 - *Goal:* agents on different instances/devices discover + message each other.
-- *Depends on:* orch.1, p1.5/p1.6 (bus + Agent Cards).
+- *Depends on:* mesh.1, p1.5/p1.6 (bus + Agent Cards).
 - *Scope:* extend `send_message`/`list_agents` across the instance boundary over the management
   API; cross-instance Agent Card discovery; addressing (`agent@instance`).
 - *Acceptance:* agent A on instance X messages agent B on instance Y; the exchange is recorded on
   both; discovery lists remote agents.
 
-**orch.3 — shared memory sidecar**
+**mesh.3 — shared memory sidecar**
 - *Goal:* the h8.1 memory sidecar is network-addressable and shared across instances (compute/
   memory separation).
 - *Depends on:* h8.1 (HelixDB memory sidecar).
@@ -166,23 +166,23 @@ Run `/autoplan` (or `/plan-eng-review`) per increment. Two tracks: **ma.\*** (mu
   HTTP/SSE transport; provenance carries the writing instance.
 - *Acceptance:* two instances read/write one shared memory/context graph with correct provenance.
 
-**orch.4 — `agentctl fleet` (lightweight coordinator)**
+**mesh.4 — `agentctl mesh` (lightweight coordinator)**
 - *Goal:* one operator view + control over a mesh of your instances.
-- *Depends on:* orch.1, ma.4.
-- *Scope:* `agentctl fleet` lists instances, their agents, spend, status, isolation tier (via each
+- *Depends on:* mesh.1, ma.4.
+- *Scope:* `agentctl mesh` lists instances, their agents, spend, status, isolation tier (via each
   `:7999` API); place/spawn/message across the mesh; the "my trusting mesh" control plane.
 - *Acceptance:* from one terminal, see + act on all your instances across devices.
 
-**orch.5 — agent migration across instances** *(= h8.3)*
+**mesh.5 — agent migration across instances** *(= h8.3)*
 - *Goal:* move a running agent between instances/devices.
-- *Depends on:* orch.1-3, p3.2 (checkpoint), p5.3.5 (memory volume).
+- *Depends on:* mesh.1-3, p3.2 (checkpoint), p5.3.5 (memory volume).
 - *Scope:* serialize checkpoint + memory reference into a portable artifact; restore on another
   instance; identity continuity.
 - *Acceptance:* an agent mid-task on instance X resumes on instance Y with state intact.
 
-**orch.6 — multi-tenant fleet control plane** *(deferred / enterprise)*
+**mesh.6 — multi-tenant fleet control plane** *(deferred / enterprise)*
 - *Goal:* orchestrate many *owners'* instances safely.
-- *Depends on:* orch.1-4, the microVM isolation floor (ma.2 / p7.6).
+- *Depends on:* mesh.1-4, the microVM isolation floor (ma.2 / p7.6).
 - *Scope:* microVM-per-tenant + a distrusting control plane (K8s operator/CRD or equivalent);
   per-tenant identity, quotas, audit isolation.
 - *Acceptance:* two mutually-distrusting tenants' instances run isolated under one control plane.
@@ -196,15 +196,15 @@ Run `/autoplan` (or `/plan-eng-review`) per increment. Two tracks: **ma.\*** (mu
 ma.1 aarch64 binary ─┬─▶ ma.2 arm64+HVF boot (fast OS on Mac/ARM)
                      ├─▶ ma.3 multi-arch images
                      └─▶ ma.4 isolation-tier reporting
-p7.7 mgmt API ──▶ orch.1 registry ─┬─▶ orch.2 federated A2A ─┐
-                                   └─▶ orch.4 agentctl fleet ├─▶ orch.5 migration
-h8.1 memory sidecar ──▶ orch.3 shared memory ───────────────┘
-                                                             orch.6 multi-tenant (deferred)
+p7.7 mgmt API ──▶ mesh.1 registry ─┬─▶ mesh.2 federated A2A ─┐
+                                   └─▶ mesh.4 agentctl mesh ├─▶ mesh.5 migration
+h8.1 memory sidecar ──▶ mesh.3 shared memory ───────────────┘
+                                                             mesh.6 multi-tenant (deferred)
 ```
 
 **Recommended order:** ma.1 → ma.2 (unlocks fast OS on your Mac + ARM devices) → ma.4 (honesty) →
-ma.3 (images). In parallel once p7.7 + h8.1 land: orch.1 → orch.2/orch.3 → orch.4 → orch.5.
-orch.6 deferred. **Fold into `ROADMAP.md` at pickup;** flag the ma.\* arch decision **before
+ma.3 (images). In parallel once p7.7 + h8.1 land: mesh.1 → mesh.2/mesh.3 → mesh.4 → mesh.5.
+mesh.6 deferred. **Fold into `ROADMAP.md` at pickup;** flag the ma.\* arch decision **before
 dx.3/dx.4 freeze x86-only** (parameterize the deployment by arch from the start, not retrofit).
 
 ---
@@ -212,8 +212,8 @@ dx.3/dx.4 freeze x86-only** (parameterize the deployment by arch from the start,
 ## 6. Using this with `/autoplan`
 
 Each §4 increment is a self-contained unit: `/autoplan <increment>` (CEO→Eng→DX) for the
-architectural ones (ma.2, orch.2, orch.3, orch.6), `/plan-eng-review` for the mechanical ones
-(ma.1, ma.3, ma.4, orch.1). Keep one increment per branch; `main` stays shippable; each carries
+architectural ones (ma.2, mesh.2, mesh.3, mesh.6), `/plan-eng-review` for the mechanical ones
+(ma.1, ma.3, ma.4, mesh.1). Keep one increment per branch; `main` stays shippable; each carries
 its own tests + the guardrails from §3 (arch out of core; isolation-tier honesty; CoS flagship;
 arch boot CI-tested). Build the CoS/harness/memory tracks to a stable point first — this is
 substrate reach, not the flagship.

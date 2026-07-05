@@ -41,6 +41,33 @@ Working rules:
 
 ---
 
+## Current build order (next up)
+
+Everything through Phase 7, the harness (`h7.*`), `obs.*`, `cos.1`, and multi-arch (`ma.1–3`) is
+shipped (v0.57.0). **Foundation-first** order for the remaining work — one increment per branch,
+`main` shippable between, each through `/autoplan` (or `/plan-eng-review`) → build → `/review` →
+`/qa` → `/ship`:
+
+1. **cred.1** — Mac unblock (secrets mount + README fix). *Ship first — unblocks live testing.*
+2. **cred.2** — unified secrets substrate (completes the folded-in dx.5).
+3. **`/plan-eng-review` → cred.3** — credential broker core, *before* the features that consume credentials.
+4. **orch.1** — interactive agent orchestrator (`/office-hours` + `/plan-eng-review` first).
+5. **h8.1** — Layer-2 semantic memory sidecar (its embedding API key rides the `cred.3` broker).
+6. **cred.4 / cred.5** — egress gateway + surfacing · **ma.4** — isolation-tier honesty (small, slot anytime).
+7. **dx.3 / dx.4** — Linux QEMU production + prebuilt images (when targeting Linux hardware).
+8. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
+9. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
+
+**Deferred:** Track MESH (`mesh.1–6`, multi-instance) and ROADMAP `h8.3` (multi-device migration).
+
+Why foundation-first: the broker (`cred.3`) lands before `h8.1`/`orch.1` because `h8.1` introduces a
+remote embedding API key that should ride the broker rather than become another ad-hoc secret;
+deployment (`dx.3/4`) waits until you target Linux hardware; observability (Phase 9) is the heaviest
+and least urgent. (If daily conversational use is the priority instead, swap to interactivity-first:
+`cred.1 → cred.2 → orch.1 → cred.3 → h8.1`.)
+
+---
+
 ## Phase 0 — Single-agent spike
 
 Goal: prove the **agent-loop-as-process** model end to end. By the end of Phase
@@ -1030,7 +1057,7 @@ Acceptance:
 
 ---
 
-## Planned — multi-arch reach + multi-instance orchestration
+## Planned — multi-arch reach + multi-instance coordination
 
 Design + `/autoplan`-ready increments live in **`docs/DEPLOYMENT-TOPOLOGY.md`**; fold them in here
 when picked up. Two tracks — substrate reach, not the flagship (the CoS harness stays that):
@@ -1038,13 +1065,18 @@ when picked up. Two tracks — substrate reach, not the flagship (the CoS harnes
 - **Track MA (multi-arch):** ~~`ma.1` aarch64 binary target~~ ✅ *(v0.55.0 — cross+QEMU CI, Cross.toml, size guard, make clippy-aarch64)* · ~~`ma.2` arm64 distro + `qemu-system-aarch64 -accel hvf` boot~~ ✅ *(v0.57.0 — aarch64 Buildroot config, PL011 UART, HVF/KVM/TCG auto-detect, ARCH= Makefile, distro-aarch64 CI dry-run)* · ~~`ma.3` multi-arch container images~~ ✅ *(v0.56.0 — ghcr.io linux/amd64+linux/arm64 manifest, QEMU buildx, GHA cache, gated on both Rust CI jobs)* · `ma.4`
   isolation-tier detection + honest per-device reporting. **Decide multi-arch before dx.3/dx.4 freeze
   x86-only** — parameterize the deployment by `$ARCH` from the start rather than retrofit.
-- **Track ORCH (orchestration):** `orch.1` instance registry (on p7.7) · `orch.2` federated A2A across
-  instances · `orch.3` shared memory sidecar (on h8.1 — compute/memory separation) · `orch.4`
-  `agentctl fleet` (lightweight "my-mesh" coordinator) · `orch.5` agent migration (= h8.3) · `orch.6`
+- **Track MESH (multi-instance):** `mesh.1` instance registry (on p7.7) · `mesh.2` federated A2A across
+  instances · `mesh.3` shared memory sidecar (on h8.1 — compute/memory separation) · `mesh.4`
+  `agentctl mesh` (lightweight "my-mesh" coordinator) · `mesh.5` agent migration (= h8.3) · `mesh.6`
   multi-tenant control plane (deferred/enterprise).
 
 Guardrails (from `DEPLOYMENT-TOPOLOGY.md` §3): arch/hypervisor never leak into the core; state the
 isolation tier per device (breadth must not outrun trust); every arch's boot is CI-tested or it rots.
+
+**Naming:** `mesh.*` is *multi-instance* coordination (above). The single word "orchestrator" now
+denotes the *intra-instance* interactive dispatcher — **`orch.1`** (conversational follow-ups via
+p7.3 `inject`; see `TODOS.md` and the build order). Formerly mis-filed as `h8.3`; ROADMAP's `h8.3`
+stays multi-device migration.
 
 ---
 
