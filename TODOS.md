@@ -1,5 +1,62 @@
 # TODOS
 
+## dx.5 — Mac first-run works end-to-end (dogfood findings, 2026-07-05)
+
+First real end-to-end dogfooding of AgentOS on Apple Silicon via the Docker path.
+The container agent (`scout`) runs correctly to completion; the findings below block
+the `google-agent` and a smooth clean-Mac first run. Fix as a batch.
+**Acceptance:** on a clean Apple Silicon Mac, `docker compose` scout **and** google-agent
+both run, and a documented quickstart works, without manual patching. Not yet scheduled;
+promote to `docs/ROADMAP.md` (DX track) when picked up.
+
+**mac-df-01 (P2) — `docker compose run --service-ports` publishes nothing for the `agent` service**
+- `docker-compose.yml`: the `agent` service declares no `ports:`, and `--service-ports`
+  only publishes *declared* ports. The service's own comment tells users to pass
+  `--service-ports` for the OAuth callback — which is a silent no-op. The browser callback
+  to `http://127.0.0.1:<port>` then hits nothing → `ERR_CONNECTION_REFUSED`.
+- Fix: add `ports: ["8585:8585"]` to the `agent` service (or document `-p 8585:8585` on the
+  run command) and correct the misleading comment.
+
+**mac-df-02 (P2) — `google-agent` template `passenv` omits `OAUTH_CALLBACK_PORT`**
+- `templates/google-agent.template.toml` `[[...mcp_servers]] passenv` lists the OAuth client
+  vars (`OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, …) but **not** `OAUTH_CALLBACK_PORT`.
+  agentd spawns MCP servers with `env_clear()` + the `passenv` allowlist (`tools/mcp.rs:115`),
+  so a caller-set `-e OAUTH_CALLBACK_PORT=8585` is stripped before `oauth_mcp.py` sees it.
+  oauth_mcp then falls back to binding a random ephemeral loopback port (`127.0.0.1:0`,
+  observed `:43151`), which is both unpredictable and unreachable from the host — so the
+  in-container OAuth flow is fundamentally broken for this template.
+- Fix: add `"OAUTH_CALLBACK_PORT"` to the template's `passenv` list. Pairs with mac-df-01
+  (with the port fixed + forwarded, oauth_mcp binds `0.0.0.0:8585` and the callback lands).
+
+**mac-df-03 (P2) — no host `agentctl` on Mac blocks the clean `agentctl auth google` path**
+- The dx.1-intended OAuth flow (`agentctl auth google` runs on the host, binds the real
+  `127.0.0.1:8585`, writes `~/.agentos-secrets/google.json`) needs a native macOS `agentctl`
+  binary, which is not built or shipped. `cargo build --release -p agentctl` may not build on
+  macOS (the `surfaces`/`fuser` dep is Linux-only) — needs verification.
+- Fix: verify `agentctl` builds natively on macOS (gate any FUSE deps behind
+  `#[cfg(target_os = "linux")]` if needed); document `cargo build -p agentctl` +
+  `agentctl auth google` in RUNBOOK as the Mac OAuth path; optionally publish a Mac `agentctl`
+  artifact. Also: the `agent` compose service does not mount `~/.agentos-secrets` (only `cos`
+  does) — add the mount (or document it) so the host-provisioned `google.json` reaches the agent.
+
+## h8.3 — Agent orchestrator (on-demand dispatch + conversational follow-up) [planned]
+
+Supersedes the "no chat mode" dogfood finding (Bug C, 2026-07-05). Agents today are
+one-shot (perceive→infer→act→complete→exit); there is no way to ask a follow-up or have
+the system route a request to the right agent on demand. The `inject` primitive (p7.3) and
+the CoS coordinator pattern are the building blocks. To be scoped via `/autoplan`; promote
+to `docs/ROADMAP.md` (harness track) when scheduled.
+
+- **Core:** an orchestrator entry point that takes a natural-language request, selects/spawns
+  the right template(s), runs them, and streams results back.
+- **Conversational follow-up:** keep an agent alive and route follow-ups via `inject` (context
+  preserved) instead of one-shot re-runs that lose all prior context.
+- **Docker `chat`/`orchestrate` mode:** an entrypoint REPL wrapping the above
+  (stdin → inject → stream), so a follow-up in the same window works.
+- **Fold-in friction found while dogfooding:** the `agent` entrypoint wipes the checkpoint on
+  every `docker compose run` (no memory across runs); Haiku's "Would you like me to dive
+  deeper…?" phrasing misleads users into typing follow-ups that go nowhere (no loop reads them).
+
 ## Phase 5 — Open (deferred from p5.9 hardening; all P2, none data-loss-class)
 
 See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2s remain:
