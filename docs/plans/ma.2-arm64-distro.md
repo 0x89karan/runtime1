@@ -1,6 +1,7 @@
+<!-- /autoplan restore point: /Users/0x89karan/.gstack/projects/0x89karan-runtime1/main-autoplan-restore-20260705-010354.md -->
 # ma.2 — arm64 distro + HVF boot
 
-**Status:** DEFERRED — final gate decision: ship ma.3 (Docker multi-arch) first, then ma.2
+**Status:** READY — ma.3 shipped (v0.56.0, 2026-07-05); unblocked
 **Version target:** v0.57.0 (v0.56.0 was claimed by ma.3)
 **Depends on:** ma.1 ✅ (v0.55.0)
 **Branch:** `ma.2-arm64-distro`

@@ -1,8 +1,12 @@
 # AgentOS distro — Buildroot minimal rootfs
 
-Builds a minimal Linux VM (x86_64 musl + BusyBox) that boots straight to
-`agentd`. The kernel + rootfs fit in ~50 MB; the whole VM image pair is
-`output/bzImage` + `output/rootfs.cpio.gz`.
+Builds a minimal Linux VM that boots straight to `agentd` as PID 1. Supports
+two architectures:
+
+| Arch | QEMU | Kernel | Acceleration |
+|------|------|--------|--------------|
+| x86_64 (default) | `qemu-system-x86_64` | `output/bzImage` | none (KVM opt-in) |
+| aarch64 | `qemu-system-aarch64` | `output/aarch64/Image` | HVF on Apple Silicon; KVM or TCG on Linux |
 
 ## Prerequisites
 
@@ -10,7 +14,7 @@ Builds a minimal Linux VM (x86_64 musl + BusyBox) that boots straight to
 
 | macOS | Debian/Ubuntu |
 |-------|---------------|
-| `brew install qemu` | `apt-get install qemu-system-x86 jq` |
+| `brew install qemu` | `apt-get install qemu-system-x86 qemu-system-arm jq` |
 | `brew install jq` | |
 
 **Build tools** (only needed for `make build`, not `make run`/`make test`):
@@ -33,43 +37,76 @@ through the environment. No key is ever written to disk inside the VM.
 **agentd musl binary** (pre-built, not tracked in git):
 
 ```sh
-cd ../agentd
+# x86_64 (default)
 cross build --target x86_64-unknown-linux-musl --release
-# binary: target/x86_64-unknown-linux-musl/release/agentd
+
+# aarch64 (Apple Silicon / ARM)
+cross build --target aarch64-unknown-linux-musl --release
 ```
 
-`make build` will copy it into `overlay/usr/bin/agentd` automatically.
+`make build` (or `make build ARCH=aarch64`) copies the correct binary into
+`overlay/usr/bin/agentd` automatically.
 
 ## Usage
 
 All targets must be run from this directory (`distro/`).
 
 ```sh
-# Check that QEMU and secrets are present
+# x86_64 (default)
 make prereqs
-
-# Build (downloads Buildroot ~80 MB, compiles ~30-60 min on first run; subsequent ~2 min)
 make build
-
-# Boot interactively (Ctrl-A X to exit QEMU)
-make run
-
-# Automated acceptance test (boots, waits for agent_completed in flight.jsonl, exits)
-make test
-
-# Clean built artifacts (keeps Buildroot download cache)
+make run          # Ctrl-A X to exit QEMU
+make test         # automated acceptance test
 make clean
 
-# Full clean including Buildroot source tree
+# aarch64 — Apple Silicon Mac with HVF acceleration
+make prereqs ARCH=aarch64
+make build ARCH=aarch64
+make run ARCH=aarch64
+make clean ARCH=aarch64
+
+# Full clean including Buildroot source tree (all arches)
 make distclean
 ```
+
+## Apple Silicon quickstart
+
+```sh
+# 1. Install QEMU (includes qemu-system-aarch64)
+brew install qemu
+
+# 2. Build the aarch64 cross binary (from repo root)
+cross build --target aarch64-unknown-linux-musl --release
+
+# 3. Build the aarch64 distro (first run ~30-60 min; ccache makes reruns ~2 min)
+cd distro
+make build ARCH=aarch64
+
+# 4. Boot with HVF acceleration
+make run ARCH=aarch64
+# Output lands in distro/output/aarch64/run/flight.jsonl
+# Ctrl-A X to exit QEMU
+```
+
+The Makefile automatically detects macOS and passes `-accel hvf -cpu host` to
+`qemu-system-aarch64`. On Linux, it uses KVM if `/dev/kvm` exists, or falls
+back to TCG (`-cpu cortex-a72`).
+
+> **Note:** `make build ARCH=aarch64` and `make build` (x86_64) use separate
+> Buildroot output trees (`build/output-aarch64/` vs `build/output-x86_64/`)
+> and separate output directories (`output/aarch64/` vs `output/`), so both
+> arches can coexist on disk without interfering.
 
 ## Boot sequence
 
 ```
-QEMU
-  -kernel output/bzImage
-  -initrd output/rootfs.cpio.gz
+QEMU (x86_64: qemu-system-x86_64 / aarch64: qemu-system-aarch64 -M virt [-accel hvf])
+  -kernel output/bzImage                   (x86_64)
+         output/aarch64/Image              (aarch64)
+  -initrd output/rootfs.cpio.gz            (x86_64)
+          output/aarch64/rootfs.cpio.gz    (aarch64)
+  -append "console=ttyS0 ..."             (x86_64)
+          "console=ttyAMA0 ..."           (aarch64)
   -virtfs secrets0 ──► /run/secrets/  (read: ~/.agentos-secrets/)
   -virtfs output0  ──► /run/output/   (write: output/run/ or output/test-run/)
   -netdev user / -device virtio-net-pci  (NAT; DNS at 10.0.2.3)
@@ -95,32 +132,37 @@ kernel panic → QEMU exits (with -no-reboot)
 After `make run` (Ctrl-A X) or `make test`:
 
 ```sh
-# Flight events
+# x86_64
 jq . output/run/flight.jsonl
-
-# Demo greeting written by the agent
 cat output/run/greeting.txt
+cat output/console.log        # test mode only
 
-# Console log (test mode only)
-cat output/console.log
+# aarch64
+jq . output/aarch64/run/flight.jsonl
+cat output/aarch64/console.log
 ```
 
 ## Directory layout
 
 ```
 distro/
-  Makefile              build / run / test / prereqs / clean
-  buildroot.config      Buildroot defconfig (x86_64 musl, busybox, cpio.gz)
-  kernel-extras.config  kernel fragment: virtio-net + virtio-9p
+  Makefile                      build / run / test / prereqs / clean  [ARCH=x86_64|aarch64]
+  buildroot.config              Buildroot defconfig (x86_64)
+  buildroot.aarch64.config      Buildroot defconfig (aarch64)
+  kernel-extras.config          kernel fragment: virtio-net + virtio-9p (x86_64)
+  kernel-extras.aarch64.config  kernel fragment: adds PL011 UART + VIRTIO_MMIO (aarch64)
   overlay/
-    init                /init PID-1 sh script
+    init                /init PID-1 sh script (arch-agnostic)
     usr/bin/agentd      (gitignored; copied by `make build`)
     etc/
       resolv.conf       nameserver 10.0.2.3 (QEMU SLIRP DNS)
       agentd/
         agent.toml      demo agent config (haiku, native tools only)
-  build/                Buildroot sources + build tree (gitignored)
-  output/               QEMU artifacts: bzImage, rootfs.cpio.gz (gitignored)
+  build/
+    output-x86_64/      Buildroot build tree (gitignored)
+    output-aarch64/     Buildroot build tree, aarch64 (gitignored)
+  output/               x86_64 QEMU artifacts: bzImage, rootfs.cpio.gz (gitignored)
+  output/aarch64/       aarch64 QEMU artifacts: Image, rootfs.cpio.gz (gitignored)
 ```
 
 ## Troubleshooting

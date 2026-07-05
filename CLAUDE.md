@@ -306,6 +306,14 @@ under QEMU for `aarch64-unknown-linux-musl`; per-binary size guard (≤ 6 MB, `i
 `Cross.toml` at repo root pinning `ghcr.io/cross-rs/aarch64-unknown-linux-musl:0.2.5` for `ring`
 compat; `make clippy-aarch64` Makefile target + CLAUDE.md gate for `#[cfg(target_arch)]`-conditional
 code; TODOS P4 closed.
+**ma.2 complete (v0.57.0).** arm64 distro + HVF boot: `distro/buildroot.aarch64.config` (aarch64
+target, `BR2_LINUX_KERNEL_IMAGE=y`); `distro/kernel-extras.aarch64.config` (adds
+`CONFIG_VIRTIO_MMIO=y` + `CONFIG_SERIAL_AMBA_PL011_CONSOLE=y` for `ttyAMA0` console);
+`distro/Makefile` parameterized by `ARCH` — `ARCH=aarch64` selects `qemu-system-aarch64 -M virt`,
+`Image` kernel, `output/aarch64/` output dir, `aarch64-unknown-linux-musl` binary;
+HVF/KVM/TCG accel auto-detected (macOS → HVF, Linux+KVM → KVM, fallback → TCG `-cpu cortex-a72`);
+separate `build/output-$(ARCH)/` trees prevent x86_64/aarch64 clobber; `distro-aarch64` CI
+dry-run job (`make -n build/run ARCH=aarch64`); `distro/README.md` Apple Silicon quickstart.
 **ma.3 complete (v0.56.0).** Multi-arch Docker image: `publish-docker` CI job builds and pushes
 `linux/amd64` + `linux/arm64` manifest to `ghcr.io/0x89karan/runtime1:latest` and
 `ghcr.io/0x89karan/runtime1:v{semver}` on every push to `main`; gated on `build-and-test` +

@@ -156,7 +156,7 @@ jobs:
   publish-docker:
     needs: [build-and-test, build-aarch64, audit]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120  # arm64 QEMU build ~60-90 min on first push; GHA cache cuts subsequent runs to ~15 min
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     concurrency:
       group: publish-docker
@@ -200,6 +200,20 @@ jobs:
             ghcr.io/0x89karan/runtime1:v${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  distro-aarch64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate aarch64 Makefile parameterization (dry-run)
+        # make -n validates variable expansion without running QEMU or Buildroot.
+        # Full build + HVF boot requires an Apple Silicon Mac; not run in CI.
+        run: |
+          make -n build ARCH=aarch64
+          make -n run ARCH=aarch64
+        working-directory: distro
 
   audit:
     runs-on: ubuntu-latest

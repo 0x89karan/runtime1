@@ -613,6 +613,27 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - `--no-fuse` CLI flag and `AGENTOS_NO_FUSE` env var added to `main.rs`. When either is set,
   the FUSE mount is skipped with `tracing::info!` instead of attempted (no warning on CI).
 
+## ma.2 — Open (pre-existing distro issues, not introduced by ma.2)
+
+**ma.2-ar-01 (P3) — `make test` appends a duplicate `memory0` virtfs mount**
+- `QEMU_FLAGS` already contains `-virtfs local,...,mount_tag=memory0,...` (the persistent memory
+  volume). The `test` target appends a second `-virtfs` with `mount_tag=memory0` pointing at a
+  local `test-memory/` directory. QEMU rejects duplicate device IDs at boot with a fatal error,
+  so `make test` cannot succeed when `QEMU_FLAGS` includes the first memory0 mount.
+- This is a pre-existing footgun from the three-mount model landing (p5.3.5); it was not
+  introduced by ma.2 and affects both x86_64 and aarch64.
+- Fix: rename the test override to `memory0` → `test-memory` (a distinct tag), and update
+  `/init` to mount `test-memory` over `/run/memory` when the tag is present, falling back to
+  `memory0`. Alternatively, strip the `memory0` mount from `QEMU_FLAGS` in the `test` target.
+
+**ma.2-ar-02 (P3) — `make distclean` does not remove the aarch64 output tree**
+- `distclean` runs `clean` (removes `output/`) then `rm -rf build/`. After `make build ARCH=aarch64`,
+  artifacts land in `output/aarch64/`. Running `make distclean` (without `ARCH=aarch64`) removes
+  `output/` (the x86_64 tree) but leaves `output/aarch64/` and the shared `build/output-aarch64/`
+  cache directory on disk.
+- Fix: expand `distclean` to `rm -rf build/ output/ output/aarch64/`, or better, make the recipe
+  independent of `$(ARCH)` by using a glob: `rm -rf build/ output/`.
+
 ## obs.3 — Open (deferred from obs.3)
 
 **obs.3-ar-01 (P3) — `BatchSpanProcessor` internal 2048-slot queue drops uncounted**

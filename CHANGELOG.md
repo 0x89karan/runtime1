@@ -3,6 +3,51 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [ma.2] - 2026-07-05 (v0.57.0)
+
+### Added
+- `distro/buildroot.aarch64.config` — Buildroot defconfig for aarch64 (`BR2_aarch64=y`,
+  `BR2_LINUX_KERNEL_IMAGE=y` for raw `Image` format, arm64 generic `defconfig`).
+- `distro/kernel-extras.aarch64.config` — kernel config fragment for the QEMU `virt`
+  machine: inherits all x86_64 flags (9P, virtio, FUSE, Landlock, seccomp, namespaces)
+  plus `CONFIG_VIRTIO_MMIO=y` (ARM MMIO bus) and `CONFIG_SERIAL_AMBA_PL011_CONSOLE=y`
+  (PL011 UART for `console=ttyAMA0`; without this the guest boots silently).
+- `distro-aarch64` CI job: `make -n build ARCH=aarch64` + `make -n run ARCH=aarch64`
+  dry-run validates Makefile variable expansion without running QEMU or Buildroot.
+  Full build + HVF boot is a local developer workflow on Apple Silicon.
+
+### Changed
+- `distro/Makefile` parameterized by `ARCH` (default `x86_64`):
+  - `ARCH=aarch64` selects `qemu-system-aarch64 -M virt`, `Image` kernel, `ttyAMA0`
+    console, `aarch64-unknown-linux-musl` binary, and `output/aarch64/` output dir.
+  - HVF/KVM/TCG acceleration auto-detected: macOS → `-accel hvf -cpu host`;
+    Linux with `/dev/kvm` → `-accel kvm -cpu host`; fallback → `-accel tcg -cpu cortex-a72`.
+  - Buildroot output goes to `build/output-$(ARCH)/` (separate trees; no clobber on arch switch).
+  - `overlay/usr/bin/agentd` copy uses `$(MUSL_TARGET)` to pick the correct cross binary.
+  - x86_64 `OUTPUT_DIR` stays `output/` — no CI churn or muscle-memory breakage.
+- `distro/README.md` updated with Apple Silicon quickstart and both-arch directory layout.
+
+### Fixed
+- HVF acceleration for aarch64 guests now correctly gates on Apple Silicon (`UNAME_M=arm64`);
+  Intel Macs previously received `-accel hvf` which fails with "invalid accelerator" on
+  aarch64 guests (HVF is host-arch-specific).
+- KVM detection changed from `test -e /dev/kvm` to `test -w /dev/kvm`; the old check
+  selected `-accel kvm` even when the user lacked group membership, causing a confusing
+  QEMU "Permission denied" error at boot rather than a graceful TCG fallback.
+- `ARCH` values other than `x86_64`/`aarch64` now fail immediately with a clear Make error
+  instead of silently falling through to x86_64 defaults.
+- `overlay/usr/bin/agentd` and `overlay/usr/bin/agentctl` now declare the source musl
+  binary as a real-file prerequisite; Make re-copies when the source is newer, preventing
+  a stale x86_64 binary from being embedded in an aarch64 rootfs after an arch switch
+  without `make clean`.
+
+### Notes
+- `make build ARCH=aarch64` and `make build` (x86_64) coexist on disk: separate
+  `build/output-aarch64/` and `output/aarch64/` vs `build/output-x86_64/` and `output/`.
+- gVisor (`runsc`) has no aarch64 release; universal-tier templates degrade gracefully.
+- `DenySpawn` seccomp filter is `#[cfg(target_arch = "x86_64")]` — documented gap;
+  `CONFIG_SECCOMP=y` still set in aarch64 kernel config for other seccomp uses.
+
 ## [ma.3] - 2026-07-04 (v0.56.0)
 
 ### Added
