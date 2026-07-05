@@ -1099,3 +1099,71 @@ outranks the agents it watches), Linux-gated, kernel-version floor. Tractable on
 (Sequencing across Phases 7-9: **p7.5 egress mediator → obs.1 OTLP → Phase 9 eBPF**. p7.5 is the
 prerequisite — you can't observe what you don't broker. See `docs/PRODUCT-THESIS.md` for why
 observability is ~half the product.)
+
+---
+
+## Phase 10 — Credential manager
+
+Goal: give AgentOS **one credential model across all surfaces**. Today every MCP server reads
+its own secrets file or env, and the three surfaces (Docker `agent`, Docker `cos`, QEMU boot)
+handle secrets differently. This phase makes one in-process broker own provisioning, the OAuth
+lifecycle, per-agent capability scoping, and audit, so tools become credential-agnostic —
+generalizing the `EgressProxy` model-key broker (p7.5b) to *all* credentials. Full design:
+`docs/plans/credential-manager.md`. **Subsumes dx.5** (`cred.1` + `cred.2`). Decisions: broker is
+**in-process** (extends `EgressProxy`), not a sidecar; the "MCP gateway" is an **authenticating
+egress proxy** so tools never hold raw credentials; two-tier storage (`~/.agentos-secrets` `:ro`
+provisioning + `/run/state/oauth` writable cache). `cred.1` is near-term (the Mac unblock) despite
+the phase number; `cred.3+` gate on `/plan-eng-review`.
+
+### ▣ cred.1 — Immediate unblock (secrets mount + README fix)
+**Depends on:** nothing (ship first — the "test it today" increment).
+**Goal:** the google-agent runs on a clean Apple-Silicon Mac via host-auth.
+**Scope:** mount `${HOME}/.agentos-secrets:/run/secrets:ro` into the Docker `agent` service
+(mirror `cos`); fix the false `README.md` "container never sees your OAuth client credentials"
+claim; add `mkdir -p ~/.agentos-secrets` guidance + a fail-fast preflight when
+`/run/secrets/google.json` is absent for OAuth templates.
+**Acceptance:** clean Apple-Silicon Mac runs `docker compose` scout **and** google-agent via
+`agentctl auth google`, no manual patching.
+
+### ▣ cred.2 — Unified secrets substrate
+**Depends on:** cred.1.
+**Goal:** one host-OS-neutral credentials story across all three surfaces.
+**Scope:** Docker entrypoint sources `/run/secrets/agentos.env` if present (guarded, before
+`check_api_key`, no clobber of compose env) to match QEMU's `ANTHROPIC_API_KEY` channel; make the
+QEMU 9p secrets mount read-only; deprecate + gate in-container OAuth (strip `OAUTH_*` from the
+`agent` compose block; deprecation notice; record the `0.0.0.0` bind in `THREAT_MODEL.md`);
+rewrite the stale `RUNBOOK.md` (v0.20.0) with one "Credentials & first run" section; de-Mac the
+strings.
+**Acceptance:** the one story works on Docker `agent`, Docker `cos`, and QEMU; no misleading docs.
+Tests: writer/reader schema-drift guard, entrypoint DRY_RUN smoke, `agentos.env` source-safety,
+`macos-latest` CI build for `agentctl`.
+
+### ▣ cred.3 — Broker core (the credential manager)
+**Depends on:** cred.2 + `/plan-eng-review` on the plan's open questions.
+**Goal:** one in-process broker owns provisioning, OAuth lifecycle, scoping, and audit.
+**Scope:** `CredentialBroker` in `agentd/src/egress.rs` (extends `EgressProxy`): provisioning
+ingest; OAuth refresh/rotation → `/run/state/oauth`; `CredentialStore` trait (file backend);
+`Capability::Credential { provider }` + enforcement + audit events; **inject-at-spawn** —
+agentd hands each MCP server only the credentials that agent's capabilities allow, replacing
+per-server file reads and the ad-hoc `passenv`/`extra_env` path in `agentd/src/tools/mcp.rs`.
+**Acceptance:** MCP servers get scoped credentials via the broker with audit; a capability-denied
+agent cannot obtain a provider credential. Broker unit tests + inject-at-spawn integration test.
+
+### ▣ cred.4 — Egress gateway (the "MCP of MCP servers")
+**Depends on:** cred.3.
+**Goal:** tools never hold raw credentials.
+**Scope:** authenticating egress proxy — tools call upstream APIs through the broker
+unauthenticated, the broker attaches the credential and forwards; rewrite `oauth_mcp.py` /
+`http_mcp.py` / `search_mcp.py` to be credential-agnostic. Generalizes p7.5 boundary rewriting +
+p7.5b forwarding proxy to all providers.
+**Acceptance:** a tool process holds no raw credential in env or memory-at-rest; outbound calls
+are authenticated at the broker; a denied provider is blocked.
+
+### ▣ cred.5 — Surfacing + hardening (optional)
+**Depends on:** cred.3.
+**Goal:** operator visibility + lifecycle polish.
+**Scope:** `/agents/credentials` FUSE view + `agentctl` credential pane (per-agent provider
+grants, last access, token expiry); rotation policy; alternate `CredentialStore` backends (OS
+keychain / vault).
+**Acceptance:** operator sees per-agent credential grants + last access via FUSE and `agentctl`;
+rotation policy configurable.

@@ -2,6 +2,15 @@
 
 ## dx.5 — Mac first-run works end-to-end (dogfood findings, 2026-07-05)
 
+> **SUPERSEDED — folded into Phase 10 (Credential manager).** A 4-voice CEO+Eng review
+> (2026-07-05) found the root cause is the absence of a coherent credential model across all
+> three surfaces, not three isolated Mac bugs. dx.5 is now **`cred.1` + `cred.2`** of Phase 10
+> (`docs/plans/credential-manager.md`; ROADMAP "Phase 10 — Credential manager"). Do **not**
+> implement dx.5 standalone — implement the `cred.*` increments. Notably, the original
+> `mac-df-02` fix (add `OAUTH_CALLBACK_PORT` to the shared template) is **wrong** under the
+> reframe (it polishes the in-container OAuth path cred.2 deprecates); it is dropped. The
+> findings below remain accurate as the symptom record.
+
 First real end-to-end dogfooding of AgentOS on Apple Silicon via the Docker path.
 The container agent (`scout`) runs correctly to completion; the findings below block
 the `google-agent` and a smooth clean-Mac first run. Fix as a batch.
