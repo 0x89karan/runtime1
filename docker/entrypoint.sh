@@ -85,14 +85,16 @@ case "${1:-shell}" in
     check_api_key
 
     # Secrets preflight: google.json must be provisioned before the CoS starts.
-    # Run once on the Mac host: agentctl auth google
+    # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
     # Then mount with: -v ~/.agentos-secrets:/run/secrets:ro (already in compose)
-    if [ ! -f /run/secrets/google.json ]; then
+    if [ ! -s /run/secrets/google.json ]; then
       echo ""
       echo "  ERROR: Google credentials not provisioned."
       echo ""
       echo "  Run on your Mac (once):"
-      echo "    agentctl auth google"
+      echo "    agentctl auth google \\"
+      echo "      --client-id YOUR_CLIENT_ID \\"
+      echo "      --client-secret YOUR_CLIENT_SECRET"
       echo ""
       echo "  Then restart:"
       echo "    docker compose restart cos"
@@ -128,6 +130,38 @@ case "${1:-shell}" in
         echo "ERROR: $TEMPLATE requires a persistent /run/memory volume (Phase-5 memory store)." >&2
         echo "  Run it in the QEMU-based environment where /run/memory is a persistent 9p mount." >&2
         exit 1
+        ;;
+      google-agent)
+        # TODO cred.3: replace with broker startup validation (generic preflight from gated_requires)
+        # Fail only when BOTH the secrets file is absent AND the env-var fallback is incomplete.
+        # Users who set OAUTH_CLIENT_ID + OAUTH_CLIENT_SECRET + OAUTH_REFRESH_TOKEN still work.
+        if [ ! -s /run/secrets/google.json ] && {
+          [ -z "${OAUTH_CLIENT_ID:-}" ] ||
+          [ -z "${OAUTH_CLIENT_SECRET:-}" ] ||
+          [ -z "${OAUTH_REFRESH_TOKEN:-}" ]
+        }; then
+          if [ ! -d /run/secrets ]; then
+            echo ""
+            echo "  ERROR: Secrets volume not mounted."
+            echo ""
+            echo "  The docker-compose.yml agent service mounts ~/.agentos-secrets."
+            echo "  If running with 'docker run', add: -v ~/.agentos-secrets:/run/secrets:ro"
+            echo ""
+          else
+            echo ""
+            echo "  ERROR: Google credentials not provisioned."
+            echo ""
+            echo "  Run on your Mac (once):"
+            echo "    agentctl auth google \\"
+            echo "      --client-id YOUR_CLIENT_ID \\"
+            echo "      --client-secret YOUR_CLIENT_SECRET"
+            echo ""
+            echo "  Then re-run:"
+            echo "    TEMPLATE_NAME=google-agent AGENT_TASK=\"your task\" docker compose run --rm agent"
+            echo ""
+          fi
+          exit 1
+        fi
         ;;
     esac
     mkdir -p /data

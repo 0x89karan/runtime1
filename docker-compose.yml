@@ -31,6 +31,8 @@ services:
     privileged: true
     volumes:
       - agent-data:/data
+      # Secrets provisioned by `agentctl auth google` on the Mac host (read-only)
+      - ${HOME}/.agentos-secrets:/run/secrets:ro
       # For templates that read files from the host (scout, librarian — uncomment if needed):
       # - ./my-files:/workspace:ro
     # No static port binding — OAuth callback requires --service-ports:
@@ -52,24 +54,20 @@ services:
       #   journaler:    "Write a brief journal entry about today"
       - AGENT_TASK
       #
-      # HOME=/data: token files (e.g. ~/.agentos-oauth/google.json) persist on the
-      # named volume across --rm runs so OAuth re-auth is not required every time.
+      # HOME=/data: persists checkpoint/flight files on the named volume across --rm runs.
+      # NOTE: agentctl auth google must run on the Mac host (real $HOME), not the container.
+      # Token refresh write-back is blocked by the :ro secrets mount (see cred.1-ki-01).
       - HOME=/data
       # Makes template resolution explicit; avoids the 8-level binary-walk heuristic.
       - AGENTOS_REPO_TEMPLATES_DIR=/etc/agentd/templates
       #
       # ── OAuth (google-agent and any OAuth-gated template) ───────────────────
-      # Google OAuth one-time setup:
-      #   1. Go to console.cloud.google.com → APIs & Services → Credentials
-      #   2. Edit your OAuth 2.0 Client (Desktop app type recommended)
-      #   3. Add http://127.0.0.1:8585 to Authorized redirect URIs
-      #   4. Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET in your environment
+      # Google credentials are read from /run/secrets/google.json (the volume above).
+      # Run `agentctl auth google --client-id ... --client-secret ...` on the Mac host
+      # once to write ~/.agentos-secrets/google.json, then docker compose run --rm agent.
+      # Env-var fallback (all three vars set) still works if no secrets file is present.
       - OAUTH_CLIENT_ID
       - OAUTH_CLIENT_SECRET
-      # Optional: bypass the in-container OAuth dance.
-      # Preferred path: run `agentctl auth google` once on your Mac, then add:
-      #   volumes: ["${HOME}/.agentos-secrets:/run/secrets:ro"]
-      # Quick override for testing: set OAUTH_REFRESH_TOKEN in env instead.
       - OAUTH_REFRESH_TOKEN
       # OAUTH_CALLBACK_PORT: set to 8585 when using google-agent (or any OAuth template).
       # Leave unset for scout, librarian, coordinator, and other non-OAuth templates.

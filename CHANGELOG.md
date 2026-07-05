@@ -3,6 +3,33 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cred.1] - 2026-07-05 (v0.58.0)
+
+### Added
+- `docker-compose.yml`: `agent` service now mounts `${HOME}/.agentos-secrets:/run/secrets:ro`,
+  matching the `cos` service. `docker compose run --rm agent TEMPLATE_NAME=google-agent` now
+  picks up credentials written by `agentctl auth google` without manual patching.
+- `docker/entrypoint.sh`: `google-agent)` arm in the `agent` mode template switch — fail-fast
+  preflight with a two-branch error (volume not mounted vs. credentials absent). Accepts either
+  `/run/secrets/google.json` (recommended) or a complete `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET`
+  + `OAUTH_REFRESH_TOKEN` env-var fallback (backwards compat for existing users).
+
+### Fixed
+- `README.md`: removed the false "container never sees your OAuth client credentials" claim.
+  `google.json` stores `client_id`, `client_secret`, and `refresh_token`. Added accurate text
+  and `mkdir -p ~/.agentos-secrets` as step 1 in the one-time setup flow.
+- `docker/entrypoint.sh` cos preflight: the `agentctl auth google` command in the error message
+  now includes `--client-id` and `--client-secret` flags (was truncated since dx.1 / v0.52.0).
+- `docker/entrypoint.sh` cos preflight: guard changed from `[ ! -f ]` (existence) to
+  `[ ! -s ]` (existence + non-zero size), consistent with the `google-agent` arm. A zero-byte
+  file no longer passes the cos preflight silently.
+- `docker/entrypoint.sh` google-agent error message: re-run instruction now includes
+  `TEMPLATE_NAME=google-agent AGENT_TASK="..."` to avoid a second error on bare `docker compose run`.
+- `docker-compose.yml`: corrected the stale `HOME=/data` comment (wrong path reference).
+- `docs/SPIKES/cred.1-secrets-mount.md`: corrected cred.1-ki-01 — `oauth_mcp.py` writes
+  refresh tokens to the named volume (`/data`), not `/run/secrets/`; `:ro` does not block
+  token refresh write-back.
+
 ## [ma.2] - 2026-07-05 (v0.57.0)
 
 ### Added

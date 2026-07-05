@@ -107,25 +107,30 @@ read-only secrets volume.
 **One-time setup:**
 
 ```bash
-# 1. Get Google OAuth credentials
+# 1. Create the secrets directory on your Mac host
+mkdir -p ~/.agentos-secrets
+
+# 2. Get Google OAuth credentials
 #    console.cloud.google.com → APIs & Services → Credentials
 #    Create (or edit) an OAuth 2.0 Client ID (Desktop app type)
 #    Add http://127.0.0.1:8585 to Authorized redirect URIs
 
-# 2. Provision credentials on the Mac host (runs the PKCE OAuth2 flow in a
+# 3. Provision credentials on the Mac host (runs the PKCE OAuth2 flow in a
 #    local browser tab, writes ~/.agentos-secrets/google.json)
 agentctl auth google \
   --client-id YOUR_CLIENT_ID \
   --client-secret YOUR_CLIENT_SECRET
 
-# 3. Set your Anthropic key
+# 4. Set your Anthropic key
 export ANTHROPIC_API_KEY=sk-ant-...
 
-# 4. Start the cos service
+# 5. Start the cos service
 docker compose up -d cos
 docker compose logs -f cos        # watch the agent run
 ```
 
-`~/.agentos-secrets/google.json` is mounted at `/run/secrets` inside the
-container (read-only). The container never sees your OAuth client credentials
-directly — only the refresh token written by the one-time setup step.
+Credentials provisioned by `agentctl auth google` are stored as
+`~/.agentos-secrets/google.json` (containing `client_id`, `client_secret`, and
+`refresh_token`) and mounted read-only at `/run/secrets` in the provided
+`docker-compose.yml` services. The mount is `:ro` — the container cannot
+modify the file.

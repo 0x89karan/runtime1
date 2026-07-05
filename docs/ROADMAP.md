@@ -1147,7 +1147,7 @@ egress proxy** so tools never hold raw credentials; two-tier storage (`~/.agento
 provisioning + `/run/state/oauth` writable cache). `cred.1` is near-term (the Mac unblock) despite
 the phase number; `cred.3+` gate on `/plan-eng-review`.
 
-### ▣ cred.1 — Immediate unblock (secrets mount + README fix)
+### ✓ cred.1 — Immediate unblock (secrets mount + README fix) [v0.58.0]
 **Depends on:** nothing (ship first — the "test it today" increment).
 **Goal:** the google-agent runs on a clean Apple-Silicon Mac via host-auth.
 **Scope:** mount `${HOME}/.agentos-secrets:/run/secrets:ro` into the Docker `agent` service
