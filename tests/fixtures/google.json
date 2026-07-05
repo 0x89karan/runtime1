@@ -1,0 +1,5 @@
+{
+  "client_id": "TESTING_ONLY_not-a-real-oauth-client",
+  "client_secret": "test-client-secret",
+  "refresh_token": "test-refresh-token"
+}

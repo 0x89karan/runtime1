@@ -1,5 +1,27 @@
 # TODOS
 
+## sec.1 — THREAT_MODEL.md full update (deferred from cred.2)
+
+**Priority: P2.** `docs/THREAT_MODEL.md` is at v0.25.0 / Phase 5.8; the codebase is now
+v0.59.0. The following surfaces are missing and must be documented before sec.1 closes:
+
+- **p7.5b egress proxy** (`EgressProxy`, `:proxy_port`): loopback HTTP proxy; real
+  `ANTHROPIC_API_KEY` held by proxy, never in agent env; placeholder ephemeral keys;
+  streaming unsupported (returns 501); bind must stay loopback.
+- **p7.7 management API** (`:7999`): operator HTTP/SSE surface; approval routes; localhost-only
+  bind guard; Docker/QEMU exposure implications if port-forwarded.
+- **p7.6 universal-tier gVisor** (`runsc do`): foreign workload process boundary;
+  `--network=host` loopback exposure; `ANTHROPIC_BASE_URL` + ephemeral key injection;
+  no Landlock/seccomp in that path (gVisor owns isolation).
+- **h7.2 OAuth callback bind**: `docker/oauth_mcp.py` binds `0.0.0.0` when
+  `OAUTH_CALLBACK_PORT` is set; under privileged Docker + port forwarding this is a real
+  network surface. Deprecation or documentation required.
+
+Do **not** partially update THREAT_MODEL.md — a partial update makes the document look
+authoritative while missing major surfaces. Either do the full update or leave untouched.
+
+---
+
 ## dx.5 — Mac first-run works end-to-end (dogfood findings, 2026-07-05)
 
 > **SUPERSEDED — folded into Phase 10 (Credential manager).** A 4-voice CEO+Eng review

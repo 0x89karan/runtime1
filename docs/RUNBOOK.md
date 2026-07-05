@@ -1,12 +1,13 @@
 # RUNBOOK — Operating AgentOS
 
+> ⚠️ **PARTIALLY STALE** — This document was last fully updated at v0.20.0. The
+> codebase is now at **v0.59.0** (Phases 0–10 partially complete). §11 (Credentials)
+> has been updated to reflect the current `agentctl auth google` + secrets-file flow.
+> Other sections may still reference `cargo run -- agentd`, old env-var flows, or paths
+> that no longer apply. When in doubt, consult `CHANGELOG.md` and `docs/plans/`.
+
 > The single source of operational truth. Every command is runnable as written.
-> **Current state:** `main` is **v0.20.0** — Phases 0–4 complete (p4.7 hardening
-> landed all P0/P1 audit fixes) + **p5.1** (memory storage primitive) + **p5.2**
-> (per-agent short-term + paging) + **p5.3** (per-agent long-term memory) + **p5.3.5**
-> (detachable memory volume) shipped. Remaining Phase 5 and all of Phase 6 are
-> *designed but not built* — marked ***(lands in pX.Y)*** throughout. Design lives
-> in `DESIGN.md`; threats in `THREAT_MODEL.md` (referenced by §number, not restated);
+> Design in `DESIGN.md`; threats in `THREAT_MODEL.md` (referenced by §number);
 > how to extend in `CONVENTIONS.md`.
 
 ---
@@ -660,67 +661,64 @@ Google Cloud Console setup (one-time):
 3. **Credentials → Create → OAuth client ID** → Application type: **Desktop app**.
 4. Copy the **Client ID** and **Client Secret**.
 
-### 11.3 Environment variables
+### 11.3 Credentials (cred.2 — current flow)
+
+**One-time setup on the Mac host:**
 
 ```bash
-# Required:
-export ANTHROPIC_API_KEY="sk-ant-..."
-export OAUTH_CLIENT_ID="<client-id>.apps.googleusercontent.com"
-export OAUTH_CLIENT_SECRET="<client-secret>"
+# 1. Create the secrets directory (one time only)
+mkdir -p ~/.agentos-secrets
 
-# Pre-set for Google — copy exactly, no changes needed:
-export OAUTH_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
-export OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
-export OAUTH_SCOPES="https://www.googleapis.com/auth/gmail.readonly"
-export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
-export OAUTH_PROVIDER_NAME="google"
+# 2. Write your Anthropic key into the secrets file
+printf 'ANTHROPIC_API_KEY=sk-ant-...\n' > ~/.agentos-secrets/agentos.env
+chmod 600 ~/.agentos-secrets/agentos.env
 
-# Schedule (default: daily 08:00 UTC):
-export TRIGGER_CRON="0 8 * * *"
-# Weekdays only: export TRIGGER_CRON="0 9 * * 1-5"
-
-# After first run — skip the OAuth dance:
-export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
+# 3. Provision Google credentials (opens a browser for OAuth consent)
+agentctl auth google \
+  --client-id YOUR_CLIENT_ID \
+  --client-secret YOUR_CLIENT_SECRET
+# Writes ~/.agentos-secrets/google.json (mode 0600)
 ```
 
-### 11.4 First run (OAuth browser dance — required once)
+`docker-compose.yml` mounts `~/.agentos-secrets` as `/run/secrets:ro` in both the `cos`
+and `agent` services. The entrypoint sources `agentos.env` automatically before any key
+checks — no shell exports needed.
 
-The first run requires a browser to authorize Gmail access. You need two terminals.
-
-**Terminal 1 — start agentd:**
+**Schedule (optional):**
 ```bash
-cd agentd
-cargo run -- cos.agents.toml
+# Add to docker-compose.yml agent or cos environment block, or export in your shell:
+TRIGGER_INTERVAL="every 2m"   # cos default; accepts cron expressions too
 ```
 
-**Terminal 2 — watch for the auth prompt:**
+### 11.4 First run (Docker — recommended)
+
 ```bash
-cargo run --bin agentctl -- watch
-# Press [a] to open the Approvals pane
+# Start the CoS (runs continuously; Ctrl-C to stop)
+docker compose up cos
+
+# Watch in a second terminal:
+docker compose exec cos agentctl watch --url http://localhost:7999
+# or, from the host (if management API exposed):
+agentctl watch --url http://localhost:7999
 ```
 
-What happens:
-1. The Inbox agent calls `oauth_start_auth` → gets a Google authorization URL.
-2. The URL appears in the `agentctl watch` Approvals pane.
-3. Click the URL (or copy it to your browser), sign in with Google, grant Gmail read access.
-4. The Inbox agent calls `oauth_check_auth` → `ready: true`.
-5. The refresh token is saved to `~/.agentos-oauth/google.json` (mode 0600).
-
-After the first run, add to your shell profile:
-```bash
-export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
-```
+The Inbox agent handles the first-run Gmail authorization automatically using the
+refresh token written by `agentctl auth google`. No browser dance required on
+subsequent runs — the one-time browser step is §11.3 step 3 (`agentctl auth google`).
 
 ### 11.5 Subsequent runs
 
 ```bash
-# Set OAUTH_REFRESH_TOKEN (no browser needed):
-export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
-cargo run -- agentd/cos.agents.toml
+# CoS resumes from checkpoint automatically on restart:
+docker compose up cos
+
+# Named volume cos-data holds checkpoint, memory, evidence — survives --rm.
+# To reset state completely (rare):
+docker compose down -v   # WARNING: deletes cos-data volume + all KB
 ```
 
-The orchestrator parks on `wait_for_trigger` between runs. Ctrl-C checkpoints state;
-restart picks up from where it left off.
+The orchestrator parks on `wait_for_trigger` between brief cycles. Ctrl-C checkpoints
+state; restart picks up from where it left off.
 
 ### 11.6 Where the brief lands
 
@@ -756,7 +754,12 @@ jq 'select(.kind=="REQUEST_APPROVAL" or .kind=="APPROVAL_GRANTED" or .kind=="APP
 ### 11.8 Monitoring with agentctl watch
 
 ```bash
-cargo run --bin agentctl -- watch
+# From inside the container:
+docker compose exec cos agentctl watch --agents-dir /agents
+
+# From the host via management API (p7.7+) — requires port forwarding in docker-compose.yml:
+#   ports: ["7999:7999"]   (under the 'cos' service; not enabled by default)
+agentctl watch --url http://localhost:7999
 ```
 
 Key views:
@@ -791,11 +794,13 @@ Events that would have fired during downtime are not replayed.
 | Symptom | Cause | Fix |
 |---|---|---|
 | No brief after 24h; `max_turns_reached` in flight.jsonl | max_turns too low | Check cos.agents.toml has `max_turns = 200_000` |
-| `{"error":"host_not_allowed"}` from Gmail | `OAUTH_ALLOWED_HOSTS` not in env or not in passenv | Export the var and check cos.agents.toml `passenv` |
-| OAuth URL never appears | agentctl watch not running | Open second terminal, run `agentctl watch`, press `[a]` |
+| `ERROR: ANTHROPIC_API_KEY is not set` | Key not in agentos.env or shell env | Run `printf 'ANTHROPIC_API_KEY=sk-ant-...\n' > ~/.agentos-secrets/agentos.env` |
+| `ERROR: Google credentials not provisioned` | google.json missing | Run `agentctl auth google --client-id ... --client-secret ...` |
+| `{"error":"host_not_allowed"}` from Gmail | MCP server passenv issue | Check `docker compose exec cos env | grep OAUTH` |
+| OAuth URL never appears | agentctl watch not running | `docker compose exec cos agentctl watch --agents-dir /agents`, press `[a]` |
 | Orchestrator dies after one brief | Task prompt missing re-trigger instruction | Check orchestrator task ends with explicit `wait_for_trigger` loop |
 | Second cron cycle spawns no children | Child ID collision | Verify orchestrator uses date-stamped child IDs |
-| `budget_exceeded` in flight.jsonl | Lifetime token budget exhausted | `rm checkpoint.json` and restart |
+| `budget_exceeded` in flight.jsonl | Lifetime token budget exhausted | `docker compose exec cos rm /data/checkpoint.json` and restart |
 | `agent_admission_denied` in flight.jsonl | Child ID collision guard fired | Child ID is already in outcomes map; confirm date-stamping |
 
 ---

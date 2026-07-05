@@ -85,6 +85,33 @@ jobs:
           MAX_BYTES=6291456  # 6 MB = 6 * 1024 * 1024
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
 
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: agentctl
+
+      - name: Build agentctl (macOS)
+        run: cargo build --verbose
+        working-directory: agentctl
+
+      - name: Clippy agentctl (macOS)
+        run: cargo clippy --all-targets -- -D warnings
+        working-directory: agentctl
+
+      - name: Test agentctl (macOS)
+        # PKCE primitives, RFC test vector, secrets file, OAuth flow — all host-side tools
+        run: cargo test --verbose
+        working-directory: agentctl
+
   build-aarch64:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -154,7 +181,7 @@ jobs:
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
 
   publish-docker:
-    needs: [build-and-test, build-aarch64, audit]
+    needs: [build-and-test, build-aarch64, build-macos, audit]
     runs-on: ubuntu-latest
     timeout-minutes: 120  # arm64 QEMU build ~60-90 min on first push; GHA cache cuts subsequent runs to ~15 min
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'

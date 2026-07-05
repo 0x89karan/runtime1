@@ -4,11 +4,33 @@ set -o pipefail
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+# Source secrets file before any key check — this is the preferred credential path.
+# Parse KEY=value pairs directly (no shell sourcing) to prevent code execution from
+# a malformed or externally-controlled secrets file. File wins over compose env vars
+# (intentional: the secrets file is the authoritative source).
+if [ -f /run/secrets/agentos.env ]; then
+  while IFS= read -r _agentos_line || [ -n "$_agentos_line" ]; do
+    case "$_agentos_line" in ''|'#'*) continue ;; esac
+    _agentos_key="${_agentos_line%%=*}"
+    _agentos_val="${_agentos_line#*=}"
+    case "$_agentos_key" in *[!A-Za-z0-9_]*|''|[0-9]*) continue ;; esac
+    case "$_agentos_key" in BASH_ENV|LD_PRELOAD|LD_LIBRARY_PATH|PATH|IFS|ENV|PS4|CDPATH) continue ;; esac
+    export "${_agentos_key}=${_agentos_val}"
+  done < /run/secrets/agentos.env
+fi
+
 check_api_key() {
   if [ -z "$ANTHROPIC_API_KEY" ]; then
     echo ""
     echo "  ERROR: ANTHROPIC_API_KEY is not set."
-    echo "  Pass it with:  docker run -e ANTHROPIC_API_KEY=sk-ant-... ..."
+    echo ""
+    echo "  Option 1 — secrets file (recommended):"
+    echo "    mkdir -p ~/.agentos-secrets"
+    echo "    printf 'ANTHROPIC_API_KEY=sk-ant-...\\n' > ~/.agentos-secrets/agentos.env"
+    echo "    chmod 600 ~/.agentos-secrets/agentos.env"
+    echo ""
+    echo "  Option 2 — environment variable:"
+    echo "    docker run -e ANTHROPIC_API_KEY=sk-ant-... ..."
     echo ""
     exit 1
   fi
@@ -86,7 +108,9 @@ case "${1:-shell}" in
 
     # Secrets preflight: google.json must be provisioned before the CoS starts.
     # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
-    # Then mount with: -v ~/.agentos-secrets:/run/secrets:ro (already in compose)
+    # Then mount with: -v ~/.agentos-secrets:/run/secrets:ro (already in compose).
+    # Unlike the 'agent' mode, 'cos' intentionally has no OAUTH_* env-var fallback —
+    # the multi-agent setup requires the persistent token file, not one-shot env vars.
     if [ ! -s /run/secrets/google.json ]; then
       echo ""
       echo "  ERROR: Google credentials not provisioned."
@@ -165,13 +189,6 @@ case "${1:-shell}" in
         ;;
     esac
     mkdir -p /data
-    # Warn when OAuth callback port is configured — port forwarding requires --service-ports
-    if [ -n "${OAUTH_CALLBACK_PORT:-}" ]; then
-      echo ""
-      echo "  IMPORTANT: OAuth mode — port $OAUTH_CALLBACK_PORT must be forwarded to receive the callback."
-      echo "  Run with: docker compose run --service-ports --rm agent"
-      echo ""
-    fi
     # Lower template → TOML, rewrite MCP script paths to /etc/agentd/ (Docker path layout).
     # Sed is scoped to 'args' lines to avoid rewriting task text that happens to match.
     # Both path conventions used across the catalogue are handled:

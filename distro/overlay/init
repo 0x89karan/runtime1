@@ -12,7 +12,7 @@ mount -t devtmpfs none /dev 2>/dev/null || mdev -s
 mkdir -p /run/secrets /run/output /run/memory
 
 # Mount host-shared directories injected by QEMU -virtfs.
-mount -t 9p -o trans=virtio,version=9p2000.L secrets0 /run/secrets || {
+mount -t 9p -o trans=virtio,version=9p2000.L,ro secrets0 /run/secrets || {
     echo "ERROR: failed to mount secrets0 via 9p." >&2
     echo "       Is -virtfs local,...,mount_tag=secrets0 in the QEMU command?" >&2
     exec sh
@@ -29,7 +29,9 @@ mount -t 9p -o trans=virtio,version=9p2000.L memory0 /run/memory || {
     exec sh
 }
 
-# Source secrets. agentos.env must export ANTHROPIC_API_KEY (and any other vars).
+# Load secrets. agentos.env must set ANTHROPIC_API_KEY (and any other vars).
+# Parse KEY=value directly — do not shell-source the file (prevents code execution
+# from a malformed secrets file, consistent with the Docker entrypoint parser).
 if [ ! -f /run/secrets/agentos.env ]; then
     echo "ERROR: /run/secrets/agentos.env not found." >&2
     echo "       Create ~/.agentos-secrets/agentos.env with:" >&2
@@ -37,8 +39,14 @@ if [ ! -f /run/secrets/agentos.env ]; then
     exec sh
 fi
 
-# shellcheck disable=SC1091
-. /run/secrets/agentos.env
+while IFS= read -r _ln || [ -n "$_ln" ]; do
+    case "$_ln" in ''|'#'*) continue ;; esac
+    _k="${_ln%%=*}"
+    _v="${_ln#*=}"
+    case "$_k" in *[!A-Za-z0-9_]*|''|[0-9]*) continue ;; esac
+    case "$_k" in BASH_ENV|LD_PRELOAD|LD_LIBRARY_PATH|PATH|IFS|ENV|PS4|CDPATH) continue ;; esac
+    export "${_k}=${_v}"
+done < /run/secrets/agentos.env
 
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     echo "ERROR: ANTHROPIC_API_KEY not set in agentos.env" >&2

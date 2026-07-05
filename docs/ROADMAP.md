@@ -1157,7 +1157,7 @@ claim; add `mkdir -p ~/.agentos-secrets` guidance + a fail-fast preflight when
 **Acceptance:** clean Apple-Silicon Mac runs `docker compose` scout **and** google-agent via
 `agentctl auth google`, no manual patching.
 
-### ▣ cred.2 — Unified secrets substrate
+### ✓ cred.2 — Unified secrets substrate [v0.59.0]
 **Depends on:** cred.1.
 **Goal:** one host-OS-neutral credentials story across all three surfaces.
 **Scope:** Docker entrypoint sources `/run/secrets/agentos.env` if present (guarded, before

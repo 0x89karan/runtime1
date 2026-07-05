@@ -68,7 +68,7 @@ QEMU_FLAGS  := \
 	-append "console=$(CONSOLE) quiet ip=dhcp" \
 	-netdev user,id=net0 \
 	-device virtio-net-pci,netdev=net0 \
-	-virtfs local,path=$(HOME)/.agentos-secrets,mount_tag=secrets0,security_model=none,id=secrets0 \
+	-virtfs local,path=$(HOME)/.agentos-secrets,mount_tag=secrets0,security_model=none,readonly=on,id=secrets0 \
 	-virtfs local,path=$(HOME)/.agentos-memory,mount_tag=memory0,security_model=none,id=memory0
 
 .PHONY: all prereqs build run test clean distclean

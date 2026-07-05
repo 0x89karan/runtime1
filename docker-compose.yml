@@ -7,13 +7,12 @@ services:
       # Named volume for all runtime state — no repo bind mount, no checkpoint bleed-through
       - cos-data:/data
       # Secrets provisioned by `agentctl auth google` on the Mac host (read-only)
-      - ${HOME}/.agentos-secrets:/run/secrets:ro
+      - ${AGENTOS_SECRETS_DIR:-${HOME}/.agentos-secrets}:/run/secrets:ro
     environment:
       - ANTHROPIC_API_KEY
       # Google OAuth credentials are read from /run/secrets/google.json (the volume above).
-      # To override credentials via env vars instead of the secrets file, add:
-      #   - OAUTH_CLIENT_ID
-      #   - OAUTH_CLIENT_SECRET
+      # cos requires /run/secrets/google.json — there is no env-var fallback for this mode.
+      # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
       - TRIGGER_INTERVAL=${TRIGGER_INTERVAL:-every 2m}
     command: cos
     stdin_open: true
@@ -32,7 +31,7 @@ services:
     volumes:
       - agent-data:/data
       # Secrets provisioned by `agentctl auth google` on the Mac host (read-only)
-      - ${HOME}/.agentos-secrets:/run/secrets:ro
+      - ${AGENTOS_SECRETS_DIR:-${HOME}/.agentos-secrets}:/run/secrets:ro
       # For templates that read files from the host (scout, librarian — uncomment if needed):
       # - ./my-files:/workspace:ro
     # No static port binding — OAuth callback requires --service-ports:
@@ -62,17 +61,10 @@ services:
       - AGENTOS_REPO_TEMPLATES_DIR=/etc/agentd/templates
       #
       # ── OAuth (google-agent and any OAuth-gated template) ───────────────────
-      # Google credentials are read from /run/secrets/google.json (the volume above).
-      # Run `agentctl auth google --client-id ... --client-secret ...` on the Mac host
-      # once to write ~/.agentos-secrets/google.json, then docker compose run --rm agent.
-      # Env-var fallback (all three vars set) still works if no secrets file is present.
-      - OAUTH_CLIENT_ID
-      - OAUTH_CLIENT_SECRET
-      - OAUTH_REFRESH_TOKEN
-      # OAUTH_CALLBACK_PORT: set to 8585 when using google-agent (or any OAuth template).
-      # Leave unset for scout, librarian, coordinator, and other non-OAuth templates.
-      # When set, the entrypoint prints a --service-ports reminder; port must be forwarded.
-      - OAUTH_CALLBACK_PORT
+      # Google credentials come from ~/.agentos-secrets/google.json (the :ro volume above).
+      # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
+      # BREAKING (cred.2): OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN/CALLBACK_PORT env vars
+      # removed from this block. Use the secrets file; see CHANGELOG.md [cred.2].
       #
       # ── Web search (scout, librarian) ───────────────────────────────────────
       - BRAVE_SEARCH_API_KEY

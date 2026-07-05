@@ -1097,8 +1097,64 @@ def _self_test():
     else:
         fail("21", f"result={result21} err={err21} calls={len(api_calls_21)} token={_access_token}")
 
+    # --- Tests 22-23: google.json schema-drift guard ---
+    # Test 22 reads the actual tests/fixtures/google.json on disk so that field-name
+    # changes in agentctl auth google's write_secrets_file() are caught automatically.
+    # If someone renames "refresh_token" → "refreshToken" in both the Rust writer and the
+    # fixture but forgets to update _load_config here, this test will fail.
+    _fixture_path = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)), "..", "tests", "fixtures", "google.json"
+    )
+    try:
+        with open(_fixture_path) as _ff:
+            _fixture_data = _ff.read()
+        _fixture_json = json.loads(_fixture_data)
+    except (OSError, json.JSONDecodeError) as _fe:
+        fail("22", f"cannot read/parse fixture {_fixture_path}: {_fe}")
+        _fixture_json = {}
+        _fixture_data = "{}"
+
+    _reset_state()
+    _cfg.clear()
+    with patch("os.path.isfile", return_value=True), \
+         patch("builtins.open", return_value=__import__("io").StringIO(_fixture_data)), \
+         patch("os.makedirs"):
+        for k in ("OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
+                  "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL", "OAUTH_SCOPES",
+                  "OAUTH_PROVIDER_NAME", "OAUTH_ALLOWED_HOSTS"):
+            _os.environ.pop(k, None)
+        err22 = _load_config()
+    if (err22 is None
+            and _fixture_json.get("client_id")
+            and _cfg.get("OAUTH_CLIENT_ID") == _fixture_json["client_id"]
+            and _cfg.get("OAUTH_CLIENT_SECRET") == _fixture_json["client_secret"]
+            and _cfg.get("OAUTH_REFRESH_TOKEN") == _fixture_json["refresh_token"]):
+        ok("22: schema-drift guard — {client_id,client_secret,refresh_token} maps to expected _cfg keys")
+    else:
+        fail("22", f"err={err22} cfg={dict(_cfg)} fixture={_fixture_json}")
+
+    _reset_state()
+    _cfg.clear()
+    _bad_fixture = json.dumps({
+        "client_id": "fixture-cid",
+        "refresh_token": "fixture-rt",
+        # client_secret intentionally absent — simulates key rename drift
+    })
+    with patch("os.path.isfile", return_value=True), \
+         patch("builtins.open", return_value=__import__("io").StringIO(_bad_fixture)), \
+         patch("os.makedirs"):
+        for k in ("OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
+                  "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL", "OAUTH_SCOPES",
+                  "OAUTH_PROVIDER_NAME", "OAUTH_ALLOWED_HOSTS"):
+            _os.environ.pop(k, None)
+        err23 = _load_config()
+    if err23 is not None and "not configured" in err23:
+        ok("23: schema-drift guard — missing client_secret yields explicit error (not silent)")
+    else:
+        fail("23", f"expected credentials-not-configured error, got err={err23}")
+
     print(file=sys.stderr)
-    total = 21
+    total = 23
     if not failures:
         print(f"oauth_mcp.py: self-test PASSED ({total}/{total})", file=sys.stderr)
         sys.exit(0)

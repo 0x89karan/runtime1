@@ -3,6 +3,47 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cred.2] - 2026-07-05 (v0.59.0)
+
+### Added
+- `docker/entrypoint.sh`: parses `/run/secrets/agentos.env` as `KEY=value` pairs
+  before `check_api_key` on every mode. Uses a safe `while read` loop (no shell sourcing)
+  that rejects keys with non-identifier characters and digit-leading names. File wins if
+  the same key exists in both compose env and the secrets file (intentional: secrets file
+  is authoritative). Values with embedded `=` (e.g., base64 tokens) are preserved correctly.
+- `check_api_key` error message updated: now shows both the secrets-file path
+  (`~/.agentos-secrets/agentos.env`) and the `-e ANTHROPIC_API_KEY=...` option.
+- `docker-compose.yml`: volume mounts now use `${AGENTOS_SECRETS_DIR:-${HOME}/.agentos-secrets}`
+  so Linux CI runners can set `AGENTOS_SECRETS_DIR` to override the `${HOME}` expansion
+  (fixes cred.1-ki-02).
+- `distro/overlay/init`: guest-side 9p mount for `secrets0` now passes `,ro` — belt-and-suspenders
+  with the server-side `readonly=on` in `distro/Makefile`.
+- `tests/fixtures/google.json`: checked-in schema fixture (`client_id`, `client_secret`,
+  `refresh_token`) — cross-language contract between `agentctl auth google` (writer) and
+  `docker/oauth_mcp.py` (reader).
+- `docker/oauth_mcp.py`: 2 new self-tests (22, 23) — schema-drift guard verifying the fixture
+  field names map to expected config keys; missing-key test confirms explicit error over silent
+  empty value. Total self-tests: 23.
+- `.github/workflows/ci.yml`: `build-macos` job — agentctl build + clippy + tests on
+  `macos-latest` (covers PKCE primitives, RFC test vector, `agentctl auth google` host-side logic).
+
+### Changed
+- `distro/Makefile`: QEMU `secrets0` virtfs mount is now read-only (`readonly=on`).
+  The host-path `~/.agentos-secrets` is exported to the guest as read-only; agents and
+  MCP servers inside QEMU cannot modify the host secrets directory.
+- `docs/RUNBOOK.md`: added `PARTIALLY STALE` banner; §11 credentials section rewritten —
+  `agentctl auth google` + secrets-file flow replaces the old `OAUTH_*` env-var export
+  instructions and `~/.agentos-oauth/google.json` path (which no longer exists).
+
+### Breaking
+- `docker-compose.yml` `agent` service: **`OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`,
+  `OAUTH_REFRESH_TOKEN`, and `OAUTH_CALLBACK_PORT` removed from the `environment` block.**
+  These vars are no longer injected into the container by `docker compose run`.
+  **Migration:** use `agentctl auth google` to write `~/.agentos-secrets/google.json`
+  (see RUNBOOK §11.3). The entrypoint's google-agent preflight still accepts a complete
+  set of `OAUTH_CLIENT_ID` + `OAUTH_CLIENT_SECRET` + `OAUTH_REFRESH_TOKEN` env vars
+  passed via `docker run -e` for users not using compose.
+
 ## [cred.1] - 2026-07-05 (v0.58.0)
 
 ### Added
