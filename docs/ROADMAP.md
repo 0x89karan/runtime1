@@ -1178,7 +1178,7 @@ strings.
 Tests: writer/reader schema-drift guard, entrypoint DRY_RUN smoke, `agentos.env` source-safety,
 `macos-latest` CI build for `agentctl`.
 
-### ▣ cred.3 — Broker core (the credential manager)
+### ✓ cred.3 — Broker core (the credential manager) [v0.60.0]
 **Depends on:** cred.2 + `/plan-eng-review` on the plan's open questions.
 **Goal:** one in-process broker owns provisioning, OAuth lifecycle, scoping, and audit.
 **Scope:** `CredentialBroker` in `agentd/src/egress.rs` (extends `EgressProxy`): provisioning
@@ -1189,8 +1189,22 @@ per-server file reads and the ad-hoc `passenv`/`extra_env` path in `agentd/src/t
 **Acceptance:** MCP servers get scoped credentials via the broker with audit; a capability-denied
 agent cannot obtain a provider credential. Broker unit tests + inject-at-spawn integration test.
 
-### ▣ cred.4 — Egress gateway (the "MCP of MCP servers")
+### ✓ cred.3.1 — Broker hardening gate (v0.61.0)
 **Depends on:** cred.3.
+**Goal:** close 10 security gaps found in the cred.3 audit before any code consumes the broker.
+**Scope:** ar-04 (SSRF DNS check on `upstream_base`); ar-06 (OAuth state loaded from disk on
+startup so token survives daemon restarts); ar-07 (deny-by-default fast path for empty
+`allowed_providers`); ar-08 (header allow-list replacing deny-list); ar-09 (doc: cred service
+is orch.1 prerequisite); ar-10 (shared `LoopbackForwardingProxy` so egress and credential
+clients can't drift); S1 (OV-1 startup guard: signing key path must not fall inside any MCP
+FsRead sandbox prefix); S2 (remove `content_audited: true` lie from `EgressBrokered` events);
+S3 (de-claim `SecretRewriter` from CLAUDE.md/THREAT_MODEL — never built); THREAT_MODEL §8.6–8.7
+(universal-tier has no credential path; egress content audit is NOT implemented).
+Every gate item: fix + a test that fails without it + adversarial verification.
+**Acceptance:** all 10 items closed; `cargo test` green; clippy clean; docs true.
+
+### ▣ cred.4 — Egress gateway (the "MCP of MCP servers")
+**Depends on:** cred.3 + cred.3.1 (hardening gate).
 **Goal:** tools never hold raw credentials.
 **Scope:** authenticating egress proxy — tools call upstream APIs through the broker
 unauthenticated, the broker attaches the credential and forwards; rewrite `oauth_mcp.py` /

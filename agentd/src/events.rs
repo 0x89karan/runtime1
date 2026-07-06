@@ -96,7 +96,7 @@ pub enum EventKind {
     /// data: { agent_id, approval_id, reason? }
     ApprovalRejected,
     /// Egress call permitted and action receipt written.
-    /// data: { agent, kind, dest, input_tokens, output_tokens, content_audited }
+    /// data: { agent, kind, dest, input_tokens, output_tokens }
     EgressBrokered,
     /// Egress call denied by policy; receipt written.
     /// data: { agent, attempted_dest }

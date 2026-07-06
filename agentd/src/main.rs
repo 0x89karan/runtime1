@@ -524,11 +524,12 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         );
         // Build credential env: AGENTD_CREDENTIAL_GATEWAY_URL + AGENTD_CREDENTIAL_TOKEN.
         // Issued only when the credential gateway is enabled. The token's allowed_providers
-        // list mirrors the Credential capabilities on this server (None = all configured).
+        // list mirrors the Credential capabilities on this server. None (no capabilities
+        // field) means no credential access — providers must be granted explicitly.
         let credential_env: std::collections::HashMap<String, String> =
             if let (Some(ref gw), Some(ref gw_url)) = (&maybe_cred_gw, &cred_gw_url) {
                 let allowed: Vec<String> = match &server.capabilities {
-                    None => cfg.credential_gateway.providers.keys().cloned().collect(),
+                    None => vec![],
                     Some(caps) => caps.iter().filter_map(|cap| {
                         if let Capability::Credential { provider } = cap {
                             Some(match provider {
@@ -886,6 +887,33 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                      move the evidence file outside all server FS write prefixes \
                      (e.g. set evidence_path = \"/run/evidence.jsonl\" in [egress])",
                     norm_ev.display(),
+                    srv.name,
+                    norm_prefix.display()
+                );
+            }
+        }
+    }
+    // OV-1 (S1 / cred.3.1): signing key must not fall inside any MCP server's FsRead prefix.
+    // An MCP server that can read egress_key_path can exfiltrate the Ed25519 private key and
+    // forge the receipt chain.
+    {
+        let norm_key = normalize_path(&egress_key_path);
+        for srv in &cfg.tools.mcp_servers {
+            for cap in srv.capabilities.iter().flatten() {
+                let prefix = match cap {
+                    Capability::FsRead { prefix } => prefix,
+                    _ => continue,
+                };
+                let norm_prefix = normalize_path(std::path::Path::new(prefix));
+                if norm_prefix.as_os_str().is_empty() {
+                    continue;
+                }
+                anyhow::ensure!(
+                    !norm_key.starts_with(&norm_prefix),
+                    "egress signing key {} falls inside MCP server {:?}'s FsRead sandbox prefix {}; \
+                     move key_path outside all server FS read prefixes \
+                     (e.g. set key_path = \"/run/egress/signing.key\" in [egress])",
+                    norm_key.display(),
                     srv.name,
                     norm_prefix.display()
                 );
@@ -1729,6 +1757,100 @@ mod tests {
             check("/run/memory/memory.redb", "").is_ok(),
             "empty MCP FS prefix must be skipped (not a wildcard match)"
         );
+    }
+
+    // ── cred.3.1 (S1) startup invariant: signing key must not fall inside MCP FsRead prefix ──
+
+    #[test]
+    fn signing_key_inside_fs_read_prefix_fails_startup() {
+        use agentd::capability::normalize_path;
+        use std::path::{Path, PathBuf};
+
+        // Replicates the S1 OV-1 guard from run() in isolation.
+        fn check(key_path_str: &str, prefix_str: &str) -> anyhow::Result<()> {
+            let norm_key = normalize_path(&PathBuf::from(key_path_str));
+            let norm_prefix = normalize_path(Path::new(prefix_str));
+            if norm_prefix.as_os_str().is_empty() {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                !norm_key.starts_with(&norm_prefix),
+                "signing key {} inside FsRead prefix {}",
+                norm_key.display(),
+                norm_prefix.display()
+            );
+            Ok(())
+        }
+
+        // Case 1: key inside MCP FsRead prefix → rejected
+        assert!(
+            check("/run/egress/signing.key", "/run/egress").is_err(),
+            "signing key inside FsRead prefix must be rejected"
+        );
+
+        // Case 2: key outside all MCP FsRead prefixes → accepted
+        assert!(
+            check("/run/egress/signing.key", "/tmp/workspace").is_ok(),
+            "signing key outside FsRead prefix must be accepted"
+        );
+
+        // Case 3: key path with '..' that normalizes into prefix → rejected
+        assert!(
+            check("/run/egress/../egress/signing.key", "/run/egress").is_err(),
+            "signing key path with '..' resolving inside prefix must be rejected"
+        );
+
+        // Case 4: empty prefix is skipped → accepted
+        assert!(
+            check("/run/egress/signing.key", "").is_ok(),
+            "empty MCP FsRead prefix must be skipped"
+        );
+    }
+
+    // ── cred.3.1 Codex Critical: None capabilities must not grant all credential providers ──
+    // This test FAILS without the `None => vec![]` fix in the credential_env build block.
+    // Before the fix: `None` (no capabilities field) granted the server tokens for ALL
+    // configured providers — a forgotten capabilities field silently bypassed deny-by-default.
+
+    #[test]
+    fn none_capabilities_yields_empty_credential_providers() {
+        use agentd::capability::Capability;
+
+        fn build_allowed(caps: &Option<Vec<Capability>>) -> Vec<String> {
+            use agentd::capability::CredentialProvider;
+            match caps {
+                None => vec![],
+                Some(cap_list) => cap_list.iter().filter_map(|cap| {
+                    if let Capability::Credential { provider } = cap {
+                        Some(match provider {
+                            CredentialProvider::Google      => "google".to_string(),
+                            CredentialProvider::BraveSearch => "brave-search".to_string(),
+                            CredentialProvider::Custom(s)   => s.clone(),
+                        })
+                    } else {
+                        None
+                    }
+                }).collect(),
+            }
+        }
+
+        // None capabilities → empty list (deny-by-default)
+        assert!(
+            build_allowed(&None).is_empty(),
+            "None capabilities must not grant any credential providers"
+        );
+
+        // Some([]) → empty list (explicit empty grant)
+        assert!(
+            build_allowed(&Some(vec![])).is_empty(),
+            "Empty capabilities list must not grant any credential providers"
+        );
+
+        // Some([Credential{Google}]) → ["google"]
+        let allowed = build_allowed(&Some(vec![Capability::Credential {
+            provider: agentd::capability::CredentialProvider::Google,
+        }]));
+        assert_eq!(allowed, ["google"]);
     }
 
     // ── p5.8 CONVENTIONS.md event taxonomy completeness check ─────────────────

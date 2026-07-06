@@ -474,6 +474,14 @@ capabilities, or the operator must not use IsolateNetwork.
 via the broker's upstream forwarding (the broker relays responses back to the
 caller). The `allowed_providers` list limits which upstreams are reachable.
 
+**DNS rebinding limitation:** The startup SSRF check (`is_ssrf_blocked`) resolves
+`upstream_base` once at boot. A zero-TTL or short-TTL DNS entry could switch from a
+valid public IP to `169.254.169.254` (IMDS) after the check passes. `upstream_base` is
+operator-configured (not MCP-controlled input), so exploitation requires compromising
+the operator's DNS infrastructure. Tracked as cred.3.1-adv-02. Per-request DNS re-check
+is not implemented; operators should use IP addresses rather than hostnames for
+`upstream_base` when IMDS exposure is a concern.
+
 ### §8.4 Token state write integrity (QEMU 9p)
 
 On QEMU virtfs 9p mounts, the `rename()` system call is not atomic (known
@@ -490,10 +498,36 @@ the next refresh attempt will fail and the operator must re-run `agentctl auth`.
 
 ### §8.5 Header scrubbing
 
-The broker always strips `Authorization`, `Host`, `X-Subscription-Token`,
-`X-Credential-Token`, and the provider's `header_name` from inbound MCP server
-requests before forwarding. This prevents credential injection attacks where
-a compromised MCP server tries to bypass the broker by sending its own auth header.
+The broker forwards only an explicit allow-list of headers from inbound MCP server
+requests (`content-type`, `accept`, `accept-language`, `cache-control`,
+`x-goog-api-version`). All other headers are dropped before forwarding.
+The broker always adds `Authorization` (or `X-Api-Key`) with the real credential,
+plus `Content-Length` and `Host` set by reqwest.
+
+Note: `x-goog-user-project` was removed from the allow-list in v0.61.0 (cred.3.1-adv,
+F2). Forwarding it would allow a compromised MCP server to redirect API quota and
+billing charges to an arbitrary GCP project.
+
+**Gap (pre-cred.3.1):** Prior to v0.61.0, scrubbing was a deny-list of 7 specific
+headers. Any header not in the list passed through, enabling header injection attacks.
+Fixed in v0.61.0 (ar-08).
+
+### §8.6 Universal-tier agents and credentials
+
+Universal-tier agents (gVisor/runsc subprocesses) currently receive **no** credential
+gateway access. They are spawned with an ephemeral `ANTHROPIC_API_KEY` (for inference
+only, via `ProxyRegistry`) but do NOT receive `AGENTD_CREDENTIAL_TOKEN` or
+`AGENTD_CREDENTIAL_GATEWAY_URL`. Universal-tier MCP servers requiring OAuth or API-key
+credentials will receive a 503 from those servers. This is intentional: universal-tier
+credential plumbing is deferred to cred.4 or cred.5.
+
+### §8.7 Egress content audit (NOT IMPLEMENTED)
+
+Tool output is **not** scanned for credential-shaped tokens before it reaches the flight
+log or the agent context. No `SecretRewriter` struct exists. The `EgressBrokered` flight
+event does NOT contain a `content_audited` field (removed in v0.61.0 as it was
+hardcoded `true` with no actual scanning behind it). A real content audit
+(`SecretRewriter`) is tracked as cred.3-ar-S3 (P2) in TODOS.md.
 
 ---
 
@@ -515,3 +549,7 @@ a compromised MCP server tries to bypass the broker by sending its own auth head
 | Prompt-injection persistence (p5.4+) | See §7.4 | Provenance shown; canon trusted; no sanitization of retrieved content |
 | `memory.redb` at rest (p5.1+) | See §7.5 | No encryption; mode 0600 only; startup asserts store not inside MCP sandbox |
 | Memory substrate availability (p5.1+) | See §7.6 | No retry/failover; store-open failure silently disables memory tools |
+| Credential SSRF (cred.3+) | See §8.3 | DNS-checked at startup only (rebinding not defended — see §8.3); link-local/private/IMDS ranges blocked (v0.61.0+) |
+| Credential header injection (cred.3+) | See §8.5 | Allow-list enforced (v0.61.0+); x-goog-user-project blocked (billing injection) |
+| Universal-tier credential access | See §8.6 | Not implemented; deferred to cred.4/5 |
+| Egress content scan | See §8.7 | NOT IMPLEMENTED; no credential-shaped token scanning in tool output |

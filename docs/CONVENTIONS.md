@@ -107,7 +107,7 @@ Phase 0 kinds (canonical — do not rename):
 | `approval_requested` | agent invoked `request_approval`; scheduler parks agent pending operator decision (agent_id, approval_id, kind, risk, summary) (p7.4+) |
 | `approval_granted` | operator approved a pending action; agent resumed (agent_id, approval_id, auto_approve_kind: Option<String>) (p7.4+) |
 | `approval_rejected` | operator rejected a pending action; agent receives rejection reason (agent_id, approval_id, reason: Option<String>) (p7.4+) |
-| `egress_brokered` | egress call permitted; signed receipt written to evidence.jsonl (agent, kind, dest, input_tokens, output_tokens, content_audited) (p7.5+) |
+| `egress_brokered` | egress call permitted; signed receipt written to evidence.jsonl (agent, kind, dest, input_tokens, output_tokens) (p7.5+) |
 | `egress_denied` | egress call denied by policy; receipt written (agent, attempted_dest) (p7.5+) |
 | `action_receipt_emitted` | action receipt appended to evidence.jsonl (agent, verdict, chain_seq) (p7.5+) |
 | `egress_proxy_failed` | egress proxy failed to initialise or write a receipt (error) (p7.5+) |

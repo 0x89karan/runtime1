@@ -198,10 +198,12 @@ FUSE directory + per-approval JSON files; `approve` / `deny` write paths; `Appro
 pending/decided maps; `PendingActionView` in `SchedulerSnapshot`; `agentctl watch` Approvals pane
 (`[a]` key) with approve/deny key-bindings; `REQUEST_APPROVAL` / `APPROVAL_GRANTED` /
 `APPROVAL_DENIED` flight events; 932 workspace tests (up from 902).
-**p7.5 complete (v0.39.0).** Boundary secret rewriting + Ed25519 signed receipts: `SecretRewriter`
-strips `ANTHROPIC_API_KEY`-shaped tokens from native-tier tool outputs; `ReceiptSigner` signs
-every `ToolResult` with an Ed25519 key pair; `agentctl verify <flight.jsonl>` validates receipt
-chain; `BoundarySecretRedacted` + `ToolResultSigned` flight events; 945 workspace tests.
+**p7.5 complete (v0.39.0).** Ed25519 signed action receipts: `EvidenceWriter` signs egress
+allow/deny records in `evidence.jsonl`; `agentctl verify <flight.jsonl>` validates the receipt
+chain; `EgressBrokered` + `ActionReceiptEmitted` flight events; 945 workspace tests. NOTE:
+boundary secret rewriting (`SecretRewriter`) was planned but NOT built — tool output is NOT
+scanned for credential-shaped tokens, and no `BoundarySecretRedacted` event exists.
+De-claimed in cred.3.1 (v0.61.0); tracked as cred.3-ar-S3 (P2) in TODOS.md.
 **p7.5b complete (v0.40.0).** HTTP forwarding proxy (real key routing): `ProxyRegistry`
 (`RwLock<HashMap<String, ProxyEntry>>`); `ProxyPolicy { allowed_hosts, token_budget_remaining }`;
 `start_http_proxy()` binds hyper v1 listener + routes requests via `handle_proxy_request()`;
@@ -332,6 +334,18 @@ gains `credential_env` param (highest priority, collision warning); `ProxyRegist
 `std::sync::RwLock` to `tokio::sync::RwLock`; `docker/search_mcp.py` + `docker/oauth_mcp.py` migrated
 to broker with legacy env-var fallback; `THREAT_MODEL.md` §8 (5 subsections); 5 new `EventKind` variants;
 1112 workspace tests (up from 1096).
+**cred.3.1 complete (v0.61.0).** Credential broker hardening gate — 10 security items closed:
+`loopback_proxy.rs` shared `build_loopback_client()` (ar-10, drift guard compile error);
+`is_ssrf_blocked()` + DNS resolution check on `upstream_base` at startup (ar-04); PASSTHROUGH_HEADERS
+allow-list replacing SCRUB_HEADERS deny-list (ar-08); OAuthTokenCache `load_from_disk()` with expired-
+token guard (ar-06); deny-by-default fast path for empty `allowed_providers` (ar-07); OV-1 FsRead
+startup invariant for the Ed25519 signing key path (S1); removed `content_audited: true` lie from
+`EgressBrokered` event (S2); de-claimed `SecretRewriter`/`BoundarySecretRedacted` from docs and
+THREAT_MODEL (S3); THREAT_MODEL §8.6 (universal-tier has no credential path) + §8.7 (egress content
+audit NOT implemented); ar-09 doc: cred.3.1 is prerequisite for cred.4/orch.1. Every gate item has
+a test that fails without the fix. 7 new adversarial tests (T18–T24) + 5 follow-up SSRF fixes
+(IPv4-mapped IPv6, fc00::/7, extract_host IPv6 literal, extract_host userinfo, empty-token
+guard); T22 rewritten as live-gateway integration test; 1136 workspace tests total.
 
 ## How to work here
 

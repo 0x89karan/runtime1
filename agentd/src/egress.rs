@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::{BodyExt, Empty, Full};
@@ -39,10 +39,6 @@ const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 // content-type is NOT passed through — the proxy always sends application/json to prevent
 // workloads from injecting unexpected content types (e.g. multipart/form-data) upstream.
 const PASSTHROUGH_HEADERS: [&str; 2] = ["anthropic-version", "anthropic-beta"];
-/// Connect timeout for upstream requests.
-const EGRESS_CONNECT_TIMEOUT_SECS: u64 = 10;
-/// Total timeout for upstream requests (including waiting for response body).
-const EGRESS_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Default upstream URL for Anthropic messages API.
 const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -147,7 +143,6 @@ impl EgressProxy {
                         "dest": model,
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
-                        "content_audited": true,
                     }),
                 );
                 self.recorder.record(
@@ -536,13 +531,9 @@ async fn start_http_proxy_impl(
         "egress proxy: refusing to bind on non-loopback address {bound} — proxy must be localhost-only"
     );
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(EGRESS_CONNECT_TIMEOUT_SECS))
-        .timeout(std::time::Duration::from_secs(EGRESS_REQUEST_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::none())
-        .use_rustls_tls()
-        .build()
-        .map_err(|e| anyhow::anyhow!("egress proxy: failed to build HTTP client: {e}"))?;
+    let client = crate::loopback_proxy::build_loopback_client(
+        crate::loopback_proxy::LoopbackClientConfig::egress(),
+    ).context("egress proxy: failed to build HTTP client")?;
 
     let egress = Arc::new(EgressProxy::new(writer, recorder));
     let state = Arc::new(ProxyState {

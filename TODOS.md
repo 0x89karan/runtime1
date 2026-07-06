@@ -561,67 +561,167 @@ tool calls for that provider for up to 60 s.
 - **Depends on:** cred.3 (OAuthTokenCache mutex change from review).
 - **Where to start:** `agentd/src/credential/mod.rs:get_or_refresh()`.
 
-**cred.3-ar-06 (P2) — rotated refresh token written to `state_path` but never read back**
+**~~cred.3-ar-06~~ (P1 — cred.3.1 gate) — state_path not read on startup** ✓ Fixed in cred.3.1 (v0.61.0).
 
-The two-tier writable cache (`/run/state/oauth`) is effectively write-only: `OAuthState` is persisted
-on rotation, but startup always re-reads the original `/run/secrets` refresh token — there is no
-`state_path` read path anywhere. With Google's single-use refresh-token rotation, re-auth silently
-breaks after **any** restart (worst on the QEMU/OS-boot surface, where the 9p write may also fail).
-This defeats the design's own durability goal.
+`OAuthTokenCache::new()` always initializes `token: None, expires_at: 0, refresh_token: None`.
+Even when a valid `state_path` file exists from a previous run (containing a rotated refresh
+token), it is never read. The broker always re-fetches using the stale secrets-file refresh
+token, which may have been rotated single-use by the provider.
 
-- **Why:** a token rotation + restart → all refreshes 503, operator must re-run `agentctl auth`.
-- **How to apply:** on cache init read `state_path` if present and prefer its `refresh_token` over
-  `token_path`; fsync file + parent dir. If not read back, `state_path` is pointless — remove it and
-  document the re-auth requirement honestly.
-- **Depends on:** cred.3.
-- **Where to start:** `agentd/src/credential/mod.rs` (`OAuthTokenCache` init + write path ~:184,235).
+- **Why:** Google's OAuth spec allows (and encourages) refresh-token rotation on each use.
+  If the previous run wrote a new refresh token to state_path and then agentd restarted, the
+  broker discards that rotated token and re-uses the original — which is now invalid.
+- **How to apply:** add `OAuthTokenCache::load_from_disk(state_path)` called at first use,
+  inside the mutex, before the fast-path check. Pre-populates token/expires_at/refresh_token
+  if the file is valid and not expired.
+- **Depends on:** cred.3 (OAuthTokenCache and state_path write path).
+- **Where to start:** `agentd/src/credential/mod.rs` — `OAuthTokenCache::new()` + `get_or_refresh()`.
 
-**cred.3-ar-07 (P2) — gateway token scoped per-MCP-server; missing caps grant all providers (fail-open)**
+**~~cred.3-ar-07~~ (P1 — cred.3.1 gate) — deny-by-default provider scoping fast path** ✓ Fixed in cred.3.1 (v0.61.0).
 
-`main.rs` registers `server.name` as the registry `agent_id` (so flight attribution shows the server
-name, not the owning agent), and an MCP server with no `capabilities` block is granted **every**
-configured provider.
+When a token is registered with an empty `allowed_providers` list (no `Credential` capability),
+a request falls through to step 5 (provider config lookup) and returns 503 "not provisioned"
+rather than 403 "denied". The distinction matters: 503 implies a config problem; 403 is the
+correct access-denial response.
 
-- **Why:** fail-open scoping + confusing audit attribution; a server that omits its cap block silently
-  gets all credentials.
-- **How to apply:** deny-by-default when the gateway is enabled (no caps → no providers); scope the
-  token to the owning agent/session rather than the server name.
-- **Depends on:** cred.3.
-- **Where to start:** `agentd/src/main.rs:530,544`.
+- **Why:** an agent that should have no credential access receives a misleading error message
+  that could cause the operator to provision credentials they should not have.
+- **How to apply:** add an explicit fast-path in `handle_credential_request()` before step 4:
+  if `allowed_providers.is_empty()`, emit `CredentialDenied` with `reason: "no_providers_configured"`
+  and return 403.
+- **Depends on:** cred.3 (CredentialRegistry and handle_credential_request flow).
+- **Where to start:** `agentd/src/credential/mod.rs` — `handle_credential_request()` step 4.
 
-**cred.3-ar-08 (P2) — inbound header scrubbing is a blocklist (fail-open)**
+**~~cred.3-ar-08~~ (P1 — cred.3.1 gate) — header scrubbing is a deny-list, not an allow-list** ✓ Fixed in cred.3.1 (v0.61.0).
 
-The gateway forwards all caller headers except a scrub list; the model-key proxy (`egress.rs`) uses a
-whitelist. A compromised MCP server can smuggle extra headers (`X-Forwarded-*`, provider-honored keys)
-to the upstream alongside the injected credential.
+`SCRUB_HEADERS` (7 entries) blocks specific headers but passes through all others. A compromised
+MCP server can inject `X-Forwarded-For`, `X-Real-IP`, `X-Cloud-Trace-Context`, or any
+provider-trusted header, turning the broker into a header injection vector.
 
-- **How to apply:** switch to a whitelist (content-type, accept, provider-necessary headers only),
-  matching the `egress.rs` pattern.
-- **Depends on:** cred.3.
-- **Where to start:** `agentd/src/credential/mod.rs:355`.
+- **Why:** the current model assumes the threat list is complete and static. An allow-list
+  is the correct model: only forward headers the broker explicitly trusts.
+- **How to apply:** replace SCRUB_HEADERS with `PASSTHROUGH_HEADERS` — an explicit allow-list
+  of forwarded headers (`content-type`, `accept`, `accept-encoding`, `accept-language`,
+  `cache-control`, plus a small set of Google-specific headers). All others are dropped.
+- **Depends on:** cred.3 (SCRUB_HEADERS in credential/mod.rs).
+- **Where to start:** `agentd/src/credential/mod.rs:SCRUB_HEADERS` + step 10 of `handle_credential_request()`.
 
-**cred.3-ar-09 (P2) — mesh refresh collision blocks multi-instance**
+**~~cred.3-ar-09~~ (P1 — cred.3.1 gate) — document shared credential service as mesh prerequisite** ✓ Fixed in cred.3.1 (v0.61.0).
 
-The refresh mutex serializes only within one agentd process. Multiple instances sharing one Google
-credential each refresh independently; single-use rotation makes them mutually invalidate each other's
-token. A shared credential service / single refresh-owner is a **prerequisite for `mesh.*`** (couples
-to mesh.3) and must be designed before `orch.1`/mesh land.
+The current credential broker is single-host. orch.1 (mesh orchestration) assumes a stable
+broker API. This dependency must be documented in the ROADMAP before orch.1 begins.
 
-- **How to apply:** design note now; the in-process broker is correct for single-instance v1 — record
-  that mesh requires a shared credential service so federation is an extension, not a migration.
-- **Depends on:** cred.3; blocks mesh.2/mesh.3.
-- **Where to start:** `agentd/src/credential/mod.rs:134` (per-process mutex only).
+- **Why:** without explicit documentation, orch.1 might design a conflicting credential model.
+- **How to apply:** add a prerequisites note to orch.1 in docs/ROADMAP.md stating that
+  cred.3.1 must be green and that multi-host broker support is deferred to cred.5+.
+- **Depends on:** cred.3.1 completion.
+- **Where to start:** `docs/ROADMAP.md` — orch.1 entry.
 
-**cred.3-ar-10 (P3) — "extends EgressProxy" framing is misleading; extract a shared forwarding-proxy core**
+**~~cred.3-ar-10~~ (P1 — cred.3.1 gate) — extract LoopbackForwardingProxy to fix guard drift** ✓ Fixed in cred.3.1 (v0.61.0).
 
-`credential/mod.rs` shares no code with `egress.rs` — it is a parallel egress subsystem. The guard
-drift between the two (redirect policy, SSRF/host-allowlist, body-cap, header policy) **is** the root
-cause of ar-04 and ar-08. Extract a shared `LoopbackForwardingProxy` (loopback bind + ephemeral-identity
-+ the full guard set) with a pluggable auth-injector so `egress.rs` and the credential gateway cannot
-diverge on security guards again. Also reconcile docs/CLAUDE.md that call cred.3 an EgressProxy extension.
+`EgressProxy` (egress.rs) and `CredentialGateway` (credential/mod.rs) have separate loopback
+HTTP proxy implementations. Security guards (redirect policy, connect timeout, hop-by-hop
+header strip, body size cap) live in two copies. A fix in one never flows to the other.
 
-- **Depends on:** cred.3.
-- **Where to start:** new shared module factored from `agentd/src/egress.rs` + `agentd/src/credential/mod.rs`.
+- **Why:** duplicate proxy implementations are a maintenance hazard — cred.3 review already
+  found redirect policy drift. Future guards will drift again unless there is one shared struct.
+- **How to apply:** extract `LoopbackForwardingProxy` in `agentd/src/loopback_proxy.rs` with
+  a single `build_client()` that enforces all guards. Both EgressProxy and CredentialGateway
+  delegate to it. External APIs unchanged.
+- **Depends on:** cred.3 (both implementations landed).
+- **Where to start:** `agentd/src/credential/mod.rs` (GatewayState::new client build) +
+  `agentd/src/egress.rs` (start_http_proxy client build).
+
+**~~cred.3-ar-S1~~ (P1 — cred.3.1 gate) — signing key readable by MCP FsRead capability** ✓ Fixed in cred.3.1 (v0.61.0).
+
+The Ed25519 signing key at `cfg.egress.key_path` has no startup guard preventing MCP servers
+with `AllowFsRead` from reading it. The existing OV-1 check only covers the evidence *data*
+file (FsWrite prefix) and the memory store. An MCP server with a broad FsRead prefix that
+includes `key_path` can exfiltrate the private signing key.
+
+- **Why:** the signing key is the root of trust for the entire evidence chain. If it leaks,
+  the chain can be forged.
+- **How to apply:** add an OV-1 check in main.rs: `egress_key_path` must not fall inside any
+  MCP server's `AllowFsRead` prefix (using `normalize_path` + `starts_with`, same pattern as
+  the memory store guard in p5.8).
+- **Depends on:** cred.3 (main.rs OV-1 pattern established in p5.8).
+- **Where to start:** `agentd/src/main.rs` — OV-1 startup invariant block.
+
+**~~cred.3-ar-S2~~ (P1 — cred.3.1 gate) — content_audited: true is a lie** ✓ Fixed in cred.3.1 (v0.61.0).
+
+`EgressBrokered` events hardcode `"content_audited": true` (egress.rs:150) but no content
+auditing is implemented. The flight log and OTLP sidecar record a false compliance claim.
+
+- **Why:** this was the audit's #1 finding — security features claimed but not built.
+  Any system that parses this event (OTLP sidecar, operators, future compliance tooling)
+  will be misled.
+- **How to apply:** remove the `"content_audited": true` field from line 150 and update the
+  `EgressBrokered` doc comment in events.rs. Do NOT add content auditing in this increment —
+  that is cred.3-ar-S3.
+- **Depends on:** cred.3 (EgressProxy and egress events).
+- **Where to start:** `agentd/src/egress.rs:150` + `agentd/src/events.rs:99`.
+
+**cred.3-ar-S3 (P2) — SecretRewriter claimed but not built**
+
+p7.5 was described as including "boundary secret rewriting" but only signed receipts were
+built. No `SecretRewriter` struct exists. The THREAT_MODEL and CLAUDE.md p7.5 description
+imply this feature is active when it is not.
+
+- **Why:** the audit's #1 finding was security features claimed but not built. The claim
+  must be corrected before cred.4/orch.1 proceed.
+- **How to apply (cred.3.1):** de-claim: update THREAT_MODEL.md and CLAUDE.md p7.5 description
+  to state explicitly that tool output is NOT scanned for credential-shaped tokens and that
+  `SecretRewriter` is not implemented.
+- **How to apply (future, P2):** build a real `SecretRewriter` in `agentd/src/tools/mod.rs`
+  that scans `ToolResult` content for `sk-ant-*`, `Bearer ` and other credential patterns
+  and redacts them before the flight log. At that point set `"content_audited": true` again.
+- **Depends on:** S2 completion (content_audited field removed).
+- **Where to start:** `docs/THREAT_MODEL.md` + `CLAUDE.md` (p7.5 summary) + `TODOS.md`
+  (file this as ongoing P2 work).
+
+**cred.3.1-adv-01 (P2) — OAuthTokenCache loses in-memory rotated refresh token on daemon restart**
+
+When the broker refreshes a token, the provider may return a new refresh token (rotation).
+`get_or_refresh()` stores it in memory, and `write_state_atomic()` persists it to `state_path`.
+But `load_from_disk()` only reads the *access token* expiry and refresh token from the secrets
+file, not from `state_path`. After a restart beyond access-token lifetime, the broker re-reads
+the original secrets file refresh token, which is now invalid if the provider rotated it.
+
+- **Why:** Google (and others) rotate refresh tokens on each use. One unclean restart can
+  permanently break OAuth until the user re-authenticates.
+- **How to apply:** `load_from_disk()` should try `state_path` first (written by `get_or_refresh`),
+  falling back to the secrets file only if `state_path` is absent or expired.
+- **Depends on:** cred.3.1 (load_from_disk introduced).
+- **Where to start:** `agentd/src/credential/mod.rs` — `OAuthTokenCache::load_from_disk()`.
+
+**cred.3.1-adv-02 (P3) — DNS rebinding bypasses startup SSRF check on `upstream_base`**
+
+`CredentialGateway::start()` resolves `upstream_base` once at boot. A DNS TTL of zero (or
+a short-TTL attacker-controlled domain) can switch from a valid public IP to `169.254.169.254`
+(IMDS) after the check passes. All subsequent credential-bearing requests bypass the SSRF guard.
+
+- **Why:** startup-only DNS checks are a known limitation; the guard gives false assurance if
+  the operator uses a DNS name rather than an IP address for `upstream_base`.
+- **Note:** `upstream_base` is operator config, not MCP-controlled input, so exploitability
+  requires compromising the operator's DNS infrastructure. Severity is P3.
+- **How to apply:** either document the limitation in THREAT_MODEL.md §8 (minimal fix), or
+  implement per-request SSRF enforcement via a custom reqwest connector that re-resolves and
+  re-checks each connection (complex; requires a custom `hyper::Connector`).
+- **Where to start:** `agentd/src/credential/mod.rs` — `CredentialGateway::start()` SSRF check
+  comment + THREAT_MODEL.md §8.
+
+**cred.3.1-adv-03 (P3) — `ApiKeyQuery` key clobbered by MCP-injected duplicate query param**
+
+For `auth_style = "api-key-query"`, the broker appends `?{key}={credential}` via reqwest's
+`.query()`. A compromised MCP server can pre-inject the key param in the request URL
+(`?api_key=dummy`). APIs that take the *first* query param occurrence would see `dummy` instead
+of the real key, effectively disabling credential injection without breaking the request flow.
+
+- **Why:** a DoS on credential injection for query-param auth. Credential doesn't leak.
+- **How to apply:** strip the provider's `key` parameter from the inbound query string before
+  forwarding. Parse the query string, remove matching keys, reconstruct it.
+- **Depends on:** cred.3.1 (PASSTHROUGH_HEADERS + upstream URL build).
+- **Where to start:** `agentd/src/credential/mod.rs` — step 9 upstream URL build.
 
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment

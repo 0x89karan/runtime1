@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -42,11 +42,6 @@ const TOKEN_EXPIRY_BUFFER_SECS: u64 = 60;
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum inbound request body from an MCP server (4 MB).
 const MAX_INBOUND_REQUEST_BYTES: usize = 4 * 1024 * 1024;
-/// Connect timeout for upstream requests.
-const CREDENTIAL_CONNECT_TIMEOUT_SECS: u64 = 10;
-/// Total request + response timeout.
-const CREDENTIAL_REQUEST_TIMEOUT_SECS: u64 = 60;
-
 // ── Token cache types ──────────────────────────────────────────────────────────
 
 /// Secrets file written by `agentctl auth google` and mounted at `/run/secrets/google.json`.
@@ -148,6 +143,40 @@ impl OAuthTokenCache {
                 refresh_token: None,
             }),
         }
+    }
+
+    /// Pre-populate the cache from a persisted state file (ar-06).
+    ///
+    /// Called eagerly at startup for providers that have a `state_path`. If the file
+    /// is absent or malformed, silently starts cold — the next request will refresh.
+    /// If the stored token has already expired, the cache stays cold.
+    async fn load_from_disk(&self, state_path: &str) {
+        let bytes = match tokio::fs::read(state_path).await {
+            Ok(b) => b,
+            Err(_) => return,  // file absent on first run — start cold
+        };
+        let state: OAuthState = match serde_json::from_slice(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(path = %state_path, error = %e,
+                    "credential: state file parse failed — starting cold");
+                return;
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if state.expires_at_unix <= now + TOKEN_EXPIRY_BUFFER_SECS {
+            return;  // already expired; start cold so next request triggers refresh
+        }
+        if state.access_token.is_empty() {
+            return;  // empty token in state file — start cold, avoid returning "" to upstream
+        }
+        let mut inner = self.state.lock().await;
+        inner.token         = Some(state.access_token);
+        inner.expires_at    = state.expires_at_unix;
+        inner.refresh_token = state.refresh_token;
     }
 
     /// Return a valid access token, refreshing if needed.
@@ -270,9 +299,17 @@ impl OAuthTokenCache {
 
 /// Normalise a path segment from the inbound URI, removing `..` components to
 /// prevent path traversal outside the upstream base path.
+///
+/// Also rejects percent-encoded traversal sequences (`%2e` = `.`, `%2e%2e` = `..`)
+/// because URL parsers on the upstream server can silently decode them before routing.
 fn normalize_path_segment(seg: &str) -> String {
     seg.split('/')
-        .filter(|c| !c.is_empty() && *c != ".." && *c != ".")
+        .filter(|c| {
+            if c.is_empty() || *c == ".." || *c == "." { return false; }
+            let l = c.to_ascii_lowercase();
+            // Reject percent-encoded single- and double-dot sequences.
+            l != "%2e" && l != "%2e%2e"
+        })
         .collect::<Vec<_>>()
         .join("/")
 }
@@ -305,6 +342,35 @@ async fn write_state_atomic(path: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Extract the hostname from an `https://host/path` URL for DNS resolution (ar-04).
+///
+/// Returns `Err(())` for any URL that is structurally malformed, contains userinfo
+/// (`user@host`), or has a non-HTTPS scheme — the caller must treat `Err` as a hard
+/// startup failure, not a silent skip, to prevent SSRF bypass via parse failure.
+fn extract_host(url: &str) -> Result<String, ()> {
+    let without_scheme = url.strip_prefix("https://").ok_or(())?;
+    // Reject userinfo (user@host or user:pass@host) — DNS lookup on "user@host"
+    // fails, causing the SSRF check to be skipped rather than enforced.
+    if without_scheme.contains('@') { return Err(()); }
+    // IPv6 literals: https://[::1]/path — must NOT split on ':'.
+    if without_scheme.starts_with('[') {
+        let close = without_scheme.find(']').ok_or(())?;
+        let addr_str = &without_scheme[1..close];
+        // Validate it parses as a real IPv6 address (not a bypass like "[junk]").
+        addr_str.parse::<std::net::Ipv6Addr>().map_err(|_| ())?;
+        // Return bracketed so lookup_host("[::1]:443") resolves correctly.
+        return Ok(format!("[{addr_str}]"));
+    }
+    let host = without_scheme
+        .split('/')
+        .next()
+        .ok_or(())?
+        .split(':')  // strip port if present
+        .next()
+        .ok_or(())?;
+    if host.is_empty() { Err(()) } else { Ok(host.to_string()) }
+}
+
 // ── GatewayState ──────────────────────────────────────────────────────────────
 
 struct GatewayState {
@@ -316,17 +382,25 @@ struct GatewayState {
 }
 
 impl GatewayState {
-    fn new(config: CredentialGatewayConfig, recorder: Arc<FlightRecorder>) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(CREDENTIAL_CONNECT_TIMEOUT_SECS))
-            .timeout(Duration::from_secs(CREDENTIAL_REQUEST_TIMEOUT_SECS))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("build credential gateway reqwest client")?;
+    async fn new(config: CredentialGatewayConfig, recorder: Arc<FlightRecorder>) -> Result<Self> {
+        let client = crate::loopback_proxy::build_loopback_client(
+            crate::loopback_proxy::LoopbackClientConfig::credential(),
+        )?;
+        // Eagerly load persisted OAuth state for all providers that have state_path (ar-06).
+        let mut caches = HashMap::new();
+        for (name, prov) in &config.providers {
+            if prov.auth_style == crate::config::AuthStyle::OauthBearer {
+                let cache = Arc::new(OAuthTokenCache::new());
+                if let Some(ref sp) = prov.state_path {
+                    cache.load_from_disk(sp).await;
+                }
+                caches.insert(name.clone(), cache);
+            }
+        }
         Ok(Self {
             config,
             registry:  Arc::new(CredentialRegistry::new()),
-            caches:    RwLock::new(HashMap::new()),
+            caches:    RwLock::new(caches),
             client,
             recorder,
         })
@@ -352,16 +426,21 @@ impl GatewayState {
 
 // ── HTTP handler ──────────────────────────────────────────────────────────────
 
-/// Headers always stripped from inbound caller requests before broker attaches auth.
-const SCRUB_HEADERS: &[&str] = &[
-    "authorization",
-    "host",
-    "x-subscription-token",
-    "x-credential-token",
-    // Hop-by-hop headers.
-    "connection",
-    "transfer-encoding",
-    "content-length",
+/// Headers explicitly forwarded from caller to upstream (all others dropped — ar-08).
+///
+/// The broker always adds `Authorization`/`X-Api-Key` (auth attach step) plus
+/// `Content-Length` and `Host` set automatically by reqwest from the URL.
+/// Using an allow-list prevents header-injection attacks where a compromised MCP
+/// server sends headers the upstream provider trusts (e.g. `X-Forwarded-For`).
+const PASSTHROUGH_HEADERS: &[&str] = &[
+    "content-type",
+    "accept",
+    "accept-language",
+    "cache-control",
+    // Google-specific API headers (safe to forward; no auth or routing semantics).
+    // NOTE: x-goog-user-project is intentionally excluded — it has billing/quota
+    // semantics and a compromised MCP server could use it to redirect charges.
+    "x-goog-api-version",
 ];
 
 fn json_response(status: u16, body: serde_json::Value) -> Response<Full<Bytes>> {
@@ -413,19 +492,37 @@ async fn handle_credential_request(
     };
     let rest = segments.next().unwrap_or("");
 
-    // 4. Provider capability check (cred.4 enforces; here we just audit).
+    // 4. Provider capability check (ar-07: deny-by-default fast path).
+    // Empty allowed_providers means no Credential capability was granted at all.
+    if allowed_providers.is_empty() {
+        state.recorder.record(
+            &agent_id,
+            None,
+            EventKind::CredentialDenied,
+            json!({"agent_id": &agent_id, "provider": &provider, "reason": "no_providers_configured"}),
+        );
+        return Ok(json_response(
+            403,
+            json!({
+                "error":  "credential_denied",
+                "reason": "no_providers_configured",
+                "hint":   "Add a Credential capability to your agent's [capabilities] config",
+            }),
+        ));
+    }
     if !allowed_providers.contains(&provider) {
         state.recorder.record(
             &agent_id,
             None,
             EventKind::CredentialDenied,
-            json!({"agent_id": agent_id, "provider": provider}),
+            json!({"agent_id": &agent_id, "provider": &provider, "reason": "provider_not_allowed"}),
         );
         return Ok(json_response(
             403,
             json!({
                 "error":    "credential_denied",
                 "provider": provider,
+                "reason":   "provider_not_allowed",
                 "hint":     "Add Credential capability for this provider to your agent config",
             }),
         ));
@@ -475,11 +572,7 @@ async fn handle_credential_request(
         }
     };
 
-    // 7. Build scrub set: always-scrubbed + provider-specific header.
-    let mut scrub_set: Vec<String> = SCRUB_HEADERS.iter().map(|s| s.to_lowercase()).collect();
-    if let Some(ref hname) = prov_cfg.header_name {
-        scrub_set.push(hname.to_lowercase());
-    }
+    // 7. No scrub set needed: step 10 now uses an allow-list (ar-08).
 
     // 8. Get credential.
     let credential = match prov_cfg.auth_style {
@@ -543,14 +636,14 @@ async fn handle_credential_request(
         format!("{upstream_base}/{safe_rest}{query}")
     };
 
-    // 10. Build upstream request, scrubbing inbound headers.
+    // 10. Build upstream request, forwarding only allow-listed headers (ar-08).
     let mut req_builder = state.client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         &upstream_url,
     );
     for (name, value) in &parts.headers {
         let name_lower = name.as_str().to_lowercase();
-        if scrub_set.contains(&name_lower) {
+        if !PASSTHROUGH_HEADERS.contains(&name_lower.as_str()) {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -656,13 +749,39 @@ pub struct CredentialGateway {
     registry: Arc<CredentialRegistry>,
 }
 
+/// Return true if the IP is private, loopback, or link-local (SSRF-blocked).
+/// Mirrors the logic in docker/oauth_mcp.py:_is_ssrf_blocked() (ar-04).
+pub(crate) fn is_ssrf_blocked(addr: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match addr {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()           // 127.0.0.0/8
+            || v4.is_private()         // 10/8, 172.16/12, 192.168/16
+            || v4.is_link_local()      // 169.254.0.0/16 (IMDS)
+            || v4.is_broadcast()
+            || v4.is_documentation()
+            || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()           // ::1
+            || v6.is_unspecified()     // ::
+            // fe80::/10 link-local
+            || (v6.segments()[0] & 0xffc0) == 0xfe80
+            // fc00::/7 unique-local (IPv6 equivalent of RFC 1918)
+            || (v6.segments()[0] & 0xfe00) == 0xfc00
+            // ::ffff:0:0/96 IPv4-mapped — delegate to the IPv4 check
+            || v6.to_ipv4().map(|v4| is_ssrf_blocked(IpAddr::V4(v4))).unwrap_or(false)
+        }
+    }
+}
+
 impl CredentialGateway {
     /// Start the gateway. Returns `(Arc<CredentialGateway>, bound_addr)`.
     pub async fn start(
         cfg:      &CredentialGatewayConfig,
         recorder: Arc<FlightRecorder>,
     ) -> Result<(Arc<Self>, std::net::SocketAddr)> {
-        // Validate all provider configs at startup.
+        // Validate all provider configs at startup (ar-04: SSRF DNS check).
         for (name, prov) in &cfg.providers {
             anyhow::ensure!(
                 prov.upstream_base.starts_with("https://"),
@@ -670,8 +789,37 @@ impl CredentialGateway {
                 name,
                 prov.upstream_base,
             );
+            // Resolve the hostname and reject private/loopback/link-local ranges.
+            // extract_host() failure is a hard error — a silent skip would be a bypass.
+            // DNS lookup failure (air-gapped environment) is a warning, not a fatal error.
+            let host = extract_host(&prov.upstream_base).map_err(|_| anyhow::anyhow!(
+                "credential gateway: provider '{}' upstream_base '{}' is malformed — \
+                 must be https://hostname[/path] with no userinfo (user@host)",
+                name, prov.upstream_base,
+            ))?;
+            match tokio::net::lookup_host(format!("{host}:443")).await {
+                Ok(addrs) => {
+                    for sa in addrs {
+                        anyhow::ensure!(
+                            !is_ssrf_blocked(sa.ip()),
+                            "credential gateway: provider '{}' upstream_base '{}' resolves to \
+                             SSRF-blocked address {} — use a public endpoint",
+                            name, prov.upstream_base, sa.ip(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %name,
+                        upstream = %prov.upstream_base,
+                        error    = %e,
+                        "credential gateway: DNS lookup failed at startup — SSRF check skipped \
+                         (air-gapped environment?)"
+                    );
+                }
+            }
         }
-        let state = Arc::new(GatewayState::new(cfg.clone(), recorder)?);
+        let state = Arc::new(GatewayState::new(cfg.clone(), recorder).await?);
         let registry = Arc::clone(&state.registry);
 
         let listener = TcpListener::bind("127.0.0.1:0").await
@@ -869,30 +1017,69 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert!(!std::path::Path::new(&tmp_path).exists(), ".tmp file must be cleaned up");
     }
 
-    // ── T9: header scrubbing removes Authorization ────────────────────────────
+    // ── T9: header allow-list does NOT contain auth or routing headers (ar-08) ─
 
     #[test]
-    fn test_header_scrubbing_removes_authorization() {
-        let scrub = SCRUB_HEADERS;
-        assert!(scrub.contains(&"authorization"), "authorization must be scrubbed");
-        assert!(scrub.contains(&"host"), "host must be scrubbed");
-        assert!(scrub.contains(&"x-subscription-token"), "x-subscription-token must be scrubbed");
-        assert!(scrub.contains(&"x-credential-token"), "x-credential-token must be scrubbed");
+    fn test_header_allowlist_excludes_auth_headers() {
+        // The passthrough list must never contain credential or routing headers.
+        // If it did, a compromised MCP server could inject auth or routing semantics.
+        let blocked = [
+            "authorization",
+            "host",
+            "x-subscription-token",
+            "x-credential-token",
+            "x-forwarded-for",
+            "x-real-ip",
+            "x-cloud-trace-context",
+            "connection",
+            "transfer-encoding",
+            "content-length",
+            // x-goog-user-project has billing/quota semantics — must never be forwarded
+            // (F2: a compromised MCP server could redirect API charges to an arbitrary project).
+            "x-goog-user-project",
+        ];
+        for h in &blocked {
+            assert!(
+                !PASSTHROUGH_HEADERS.contains(h),
+                "PASSTHROUGH_HEADERS must not contain '{}' — injection risk",
+                h
+            );
+        }
     }
 
-    // ── T10: custom header_name also scrubbed ─────────────────────────────────
+    // ── T10: PASSTHROUGH_HEADERS allows safe content negotiation headers (ar-08) ─
 
     #[test]
-    fn test_header_scrubbing_removes_custom_header() {
-        let cfg = provider_cfg_api_key_header();
-        // Verify header_name is set.
-        assert_eq!(cfg.header_name.as_deref(), Some("X-Subscription-Token"));
-        // The handler adds header_name to scrub set (lowercased).
-        let mut scrub_set: Vec<String> = SCRUB_HEADERS.iter().map(|s| s.to_lowercase()).collect();
-        if let Some(ref hname) = cfg.header_name {
-            scrub_set.push(hname.to_lowercase());
-        }
-        assert!(scrub_set.contains(&"x-subscription-token".to_string()));
+    fn test_header_allowlist_includes_safe_headers() {
+        assert!(PASSTHROUGH_HEADERS.contains(&"content-type"),
+            "content-type must be forwarded");
+        assert!(PASSTHROUGH_HEADERS.contains(&"accept"),
+            "accept must be forwarded");
+        // accept-encoding intentionally excluded (broker controls compression).
+        assert!(!PASSTHROUGH_HEADERS.contains(&"accept-encoding"),
+            "accept-encoding must NOT be forwarded — broker controls compression");
+    }
+
+    // ── T10b: header injection blocked end-to-end (ar-08) ─────────────────────
+
+    #[test]
+    fn test_header_injection_blocked_by_allowlist() {
+        // Simulate the step-10 allowlist filter from handle_credential_request.
+        let inbound: Vec<(&str, &str)> = vec![
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-real-ip", "5.6.7.8"),
+            ("content-type", "application/json"),
+            ("authorization", "Bearer stolen-token"),
+        ];
+        let forwarded: Vec<&str> = inbound
+            .iter()
+            .filter(|(name, _)| PASSTHROUGH_HEADERS.contains(name))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(!forwarded.contains(&"x-forwarded-for"), "x-forwarded-for must be blocked");
+        assert!(!forwarded.contains(&"x-real-ip"), "x-real-ip must be blocked");
+        assert!(!forwarded.contains(&"authorization"), "authorization must be blocked");
+        assert!(forwarded.contains(&"content-type"), "content-type must be forwarded");
     }
 
     // ── T11: Capability::Credential satisfies ────────────────────────────────
@@ -983,6 +1170,27 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert_eq!(normalize_path_segment(""), "");
     }
 
+    // ── T15c: normalize_path_segment blocks percent-encoded traversal (F1) ────
+    // This test FAILS without the %2e/%2e%2e filter in normalize_path_segment.
+    // A `%2e%2e` component passes the literal-".." filter but decodes to ".." on
+    // the upstream server, enabling path traversal outside the upstream base path.
+
+    #[test]
+    fn test_normalize_path_segment_blocks_pct_encoded_traversal() {
+        // %2e%2e decodes to ".." — must be stripped
+        assert_eq!(normalize_path_segment("v1/%2e%2e/secret"), "v1/secret");
+        // uppercase variant
+        assert_eq!(normalize_path_segment("v1/%2E%2E/secret"), "v1/secret");
+        // mixed case
+        assert_eq!(normalize_path_segment("v1/%2e%2E/secret"), "v1/secret");
+        // single %2e (encoded ".") must also be stripped
+        assert_eq!(normalize_path_segment("v1/%2e/messages"), "v1/messages");
+        // chained traversal: /a/%2e%2e/%2e%2e/etc/passwd => "etc/passwd"
+        assert_eq!(normalize_path_segment("a/%2e%2e/%2e%2e/etc/passwd"), "a/etc/passwd");
+        // Normal path segments containing "2e" in names are untouched
+        assert_eq!(normalize_path_segment("v1/color2e3/data"), "v1/color2e3/data");
+    }
+
     // ── T16: upstream_base must use https:// ─────────────────────────────────
 
     #[tokio::test]
@@ -1020,5 +1228,309 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert!(addr.port() > 0, "gateway must bind on non-zero port");
         gw.register_token("tok".to_string(), "agent-x".to_string(), vec!["google".to_string()]).await;
         gw.deregister_token("tok").await;
+    }
+
+    // ── T18: is_ssrf_blocked catches all private/loopback/link-local (ar-04) ───
+
+    #[test]
+    fn test_ssrf_blocked_loopback() {
+        assert!(is_ssrf_blocked("127.0.0.1".parse().unwrap()));
+        assert!(is_ssrf_blocked("127.255.255.255".parse().unwrap()));
+        assert!(is_ssrf_blocked("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ssrf_blocked_link_local_imds() {
+        assert!(is_ssrf_blocked("169.254.169.254".parse().unwrap()));
+        assert!(is_ssrf_blocked("169.254.0.1".parse().unwrap()));
+        assert!(is_ssrf_blocked("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ssrf_blocked_rfc1918_private() {
+        assert!(is_ssrf_blocked("10.0.0.1".parse().unwrap()));
+        assert!(is_ssrf_blocked("172.16.0.1".parse().unwrap()));
+        assert!(is_ssrf_blocked("192.168.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ssrf_not_blocked_public_ips() {
+        // Public IPs must NOT be blocked.
+        assert!(!is_ssrf_blocked("142.250.80.46".parse().unwrap())); // google
+        assert!(!is_ssrf_blocked("1.1.1.1".parse().unwrap()));       // cloudflare
+        assert!(!is_ssrf_blocked("52.84.0.1".parse().unwrap()));     // aws cloudfront
+    }
+
+    #[test]
+    fn test_ssrf_blocked_ipv4_mapped_ipv6() {
+        // ::ffff:192.168.1.1 is IPv4-mapped IPv6 for a private address — must be blocked.
+        // This test FAILS if the `v6.to_ipv4()` delegation is removed from is_ssrf_blocked.
+        assert!(is_ssrf_blocked("::ffff:192.168.1.1".parse().unwrap()));
+        assert!(is_ssrf_blocked("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(is_ssrf_blocked("::ffff:169.254.169.254".parse().unwrap()));
+        // Public IPv4 mapped to IPv6 must NOT be blocked.
+        assert!(!is_ssrf_blocked("::ffff:1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_ssrf_blocked_unique_local_ipv6() {
+        // fc00::/7 unique-local is the IPv6 equivalent of RFC 1918 — must be blocked.
+        // This test FAILS if the `fc00::/7` check is removed from is_ssrf_blocked.
+        assert!(is_ssrf_blocked("fd00::1".parse().unwrap()));
+        assert!(is_ssrf_blocked("fc00::1".parse().unwrap()));
+        assert!(is_ssrf_blocked("fdff:ffff::1".parse().unwrap()));
+        // Public IPv6 global-unicast (2000::/3) must NOT be blocked.
+        assert!(!is_ssrf_blocked("2001:db8::1".parse().unwrap()));
+    }
+
+    // ── T19: extract_host parses correctly ────────────────────────────────────
+
+    #[test]
+    fn test_extract_host_basic() {
+        assert_eq!(extract_host("https://www.googleapis.com/auth"), Ok("www.googleapis.com".to_string()));
+        assert_eq!(extract_host("https://api.search.brave.com/res"), Ok("api.search.brave.com".to_string()));
+        assert_eq!(extract_host("https://host:8443/path"), Ok("host".to_string()));
+    }
+
+    #[test]
+    fn test_extract_host_rejects_non_https() {
+        assert!(extract_host("http://evil.com").is_err());
+        assert!(extract_host("").is_err());
+    }
+
+    #[test]
+    fn test_extract_host_rejects_userinfo() {
+        // user@host is a bypass: DNS lookup on "user@host:443" fails, SSRF check skipped.
+        // This test FAILS if the '@' guard is removed from extract_host.
+        assert!(extract_host("https://user@169.254.169.254/path").is_err());
+        assert!(extract_host("https://user:pass@example.com/path").is_err());
+        assert!(extract_host("https://attacker@victim.internal/").is_err());
+    }
+
+    #[test]
+    fn test_extract_host_ipv6_literal() {
+        // IPv6 literals must be returned in bracketed form for lookup_host.
+        // The old split-on-':' logic returned "[" for "[::1]", causing DNS failure
+        // and silent SSRF-check skip.
+        // This test FAILS if the IPv6 literal handling is removed from extract_host.
+        let h = extract_host("https://[::1]/path").unwrap();
+        assert_eq!(h, "[::1]");
+        let h2 = extract_host("https://[fe80::1]:8443/path").unwrap();
+        assert_eq!(h2, "[fe80::1]");
+        // Invalid IPv6 literal must be rejected.
+        assert!(extract_host("https://[not-ipv6]/path").is_err());
+    }
+
+    // ── T20: SSRF guard rejects http:// and private IP upstream_base (ar-04) ──
+
+    #[tokio::test]
+    async fn test_gateway_rejects_private_ip_upstream() {
+        // 169.254.169.254 is the IMDS endpoint — must be blocked.
+        // We can't actually test DNS resolution in unit tests (it would fail in CI
+        // for arbitrary IPs), so we test is_ssrf_blocked() directly instead.
+        // The integration coverage for the DNS path is T16 (http:// rejected at startup).
+        assert!(is_ssrf_blocked("169.254.169.254".parse().unwrap()),
+            "IMDS address must be SSRF-blocked");
+        assert!(is_ssrf_blocked("192.168.0.1".parse().unwrap()),
+            "RFC 1918 must be SSRF-blocked");
+    }
+
+    // ── T21: load_from_disk pre-populates cache from valid state file (ar-06) ──
+
+    #[tokio::test]
+    async fn test_load_from_disk_prepopulates_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        // Write a valid state file with a far-future expiry.
+        let state = OAuthState {
+            access_token:    "cached_access_token".to_string(),
+            expires_at_unix: u64::MAX / 2,
+            refresh_token:   Some("rotated_refresh_token".to_string()),
+        };
+        tokio::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).await.unwrap();
+
+        let cache = OAuthTokenCache::new();
+        cache.load_from_disk(state_path.to_str().unwrap()).await;
+
+        let inner = cache.state.lock().await;
+        assert_eq!(inner.token.as_deref(), Some("cached_access_token"),
+            "token must be pre-populated from disk");
+        assert_eq!(inner.refresh_token.as_deref(), Some("rotated_refresh_token"),
+            "refresh_token must be pre-populated from disk");
+        assert!(inner.expires_at > 0, "expires_at must be set");
+    }
+
+    #[tokio::test]
+    async fn test_load_from_disk_absent_file_starts_cold() {
+        // Missing state file is not an error — broker starts cold.
+        let cache = OAuthTokenCache::new();
+        cache.load_from_disk("/nonexistent/path/state.json").await;
+        let inner = cache.state.lock().await;
+        assert!(inner.token.is_none(), "cold start: token must be None");
+    }
+
+    #[tokio::test]
+    async fn test_load_from_disk_expired_token_starts_cold() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        // Write an already-expired token.
+        let state = OAuthState {
+            access_token:    "expired_token".to_string(),
+            expires_at_unix: 1,  // Unix epoch + 1s = long expired
+            refresh_token:   None,
+        };
+        tokio::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).await.unwrap();
+
+        let cache = OAuthTokenCache::new();
+        cache.load_from_disk(state_path.to_str().unwrap()).await;
+
+        let inner = cache.state.lock().await;
+        assert!(inner.token.is_none(),
+            "expired token must not be pre-populated — broker should re-fetch");
+    }
+
+    #[tokio::test]
+    async fn test_load_from_disk_empty_token_starts_cold() {
+        // Empty access_token in state file must not be loaded — returning "" to
+        // upstream would produce a confusing auth failure rather than a clear refresh.
+        // This test FAILS if the empty-token guard is removed from load_from_disk.
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+
+        let state = OAuthState {
+            access_token:    "".to_string(),  // empty — should be rejected
+            expires_at_unix: u64::MAX / 2,    // not expired
+            refresh_token:   None,
+        };
+        tokio::fs::write(&state_path, serde_json::to_vec(&state).unwrap()).await.unwrap();
+
+        let cache = OAuthTokenCache::new();
+        cache.load_from_disk(state_path.to_str().unwrap()).await;
+
+        let inner = cache.state.lock().await;
+        assert!(inner.token.is_none(),
+            "empty access_token must not be pre-populated — broker should start cold");
+    }
+
+    // ── T22: empty allowed_providers denied with explicit 403 (ar-07) ─────────
+    //
+    // The previous version of this test constructed its own JSON payload and
+    // verified the shape of json_response() — it never called
+    // handle_credential_request, so it would pass even if the fast-path branch
+    // were removed. This version starts a live gateway and makes a real HTTP
+    // request to verify the path actually fires.
+
+    #[tokio::test]
+    async fn test_deny_fast_path_empty_providers_returns_403() {
+        // ar-07 gate: a token registered with no allowed providers must get HTTP 403
+        // from the live gateway. This test FAILS if the `allowed_providers.is_empty()`
+        // branch is removed from handle_credential_request.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("flight.jsonl"))
+                .expect("recorder"),
+        );
+        // Empty providers map — no SSRF check runs at startup, gateway binds cleanly.
+        let cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+            .expect("gateway must start");
+
+        // Register a token with NO providers (the ar-07 case).
+        let token = "test-no-providers-ar07";
+        gw.register_token(token.to_string(), "test-agent".to_string(), vec![]).await;
+
+        // Make a real HTTP request to the live gateway.
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/some-provider/v1/endpoint"))
+            .header("x-credential-token", token)
+            .send()
+            .await
+            .expect("HTTP request to gateway must succeed");
+
+        assert_eq!(resp.status().as_u16(), 403,
+            "empty allowed_providers must return 403 (ar-07 fast path removed?)");
+        let body: serde_json::Value = resp.json().await.expect("response must be JSON");
+        assert_eq!(body["error"], "credential_denied");
+        assert_eq!(body["reason"], "no_providers_configured");
+    }
+
+    // ── T23: S2 — EgressBrokered event has no content_audited field ───────────
+
+    #[test]
+    fn test_egress_brokered_event_lacks_content_audited() {
+        // S2 gate: scan the actual egress.rs source for "content_audited".
+        // This test FAILS if you revert the S2 fix (bring back `"content_audited": true`).
+        // A pure-payload construction test would always pass regardless of the fix.
+        let src = include_str!("../egress.rs");
+        assert!(
+            !src.contains("\"content_audited\""),
+            "egress.rs must not contain \"content_audited\" — that field was a hardcoded lie \
+             (S2 fix reverted?). The EgressBrokered event must not claim an audit that never ran."
+        );
+    }
+
+    // ── T24: loopback proxy shared client builds (ar-10) ──────────────────────
+
+    #[test]
+    fn test_loopback_proxy_shared_client_builds() {
+        crate::loopback_proxy::build_loopback_client(
+            crate::loopback_proxy::LoopbackClientConfig::credential()
+        ).expect("credential loopback client must build");
+        crate::loopback_proxy::build_loopback_client(
+            crate::loopback_proxy::LoopbackClientConfig::egress()
+        ).expect("egress loopback client must build");
+    }
+
+    // ── T25: ApiKeyHeader adapter — missing env var returns 503 (Group E) ────
+    //
+    // Exercises the ApiKeyHeader code path in handle_credential_request: steps
+    // 3 (URI parse), 4 (provider check), 5 (config lookup), and 8 (ApiKeyHeader
+    // env-var read → 503 when unset). Uses provider_cfg_api_key_header() as the
+    // fixture. This test FAILS if the ApiKeyHeader branch in step 8 is removed.
+
+    #[tokio::test]
+    async fn test_api_key_header_missing_env_var_returns_503() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("flight.jsonl"))
+                .expect("recorder"),
+        );
+
+        // Use provider_cfg_api_key_header() as the fixture, override secret_key
+        // to a test-only name guaranteed not to be set in any CI environment.
+        let mut provider = provider_cfg_api_key_header();
+        provider.secret_key = Some("_AGENTOS_TEST_API_KEY_ABSENT_T25".to_string());
+
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("brave-search".to_string(), provider);
+
+        // Gateway start: DNS lookup for api.search.brave.com warns but does not fail
+        // when unreachable (air-gapped), so this test is CI-safe.
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+            .expect("gateway must start");
+
+        let token = "test-api-key-header-missing-t25";
+        gw.register_token(token.to_string(), "agent-t25".to_string(), vec!["brave-search".to_string()]).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/brave-search/web/search?q=test"))
+            .header("x-credential-token", token)
+            .send()
+            .await
+            .expect("HTTP request to live gateway must succeed");
+
+        assert_eq!(resp.status().as_u16(), 503,
+            "ApiKeyHeader with missing env var must return 503 (ApiKeyHeader branch removed?)");
+        let body: serde_json::Value = resp.json().await.expect("response must be JSON");
+        assert_eq!(body["error"], "credential_not_provisioned",
+            "error field must be credential_not_provisioned");
+        assert!(
+            body["hint"].as_str().unwrap_or("").contains("_AGENTOS_TEST_API_KEY_ABSENT_T25"),
+            "hint must name the missing env var: {body}"
+        );
     }
 }

@@ -3,6 +3,63 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cred.3.1] - 2026-07-06 (v0.61.0)
+
+### Security / hardening (10 gate items, every item has a failing-without-fix test)
+- **ar-10** — `loopback_proxy.rs` (new crate module): shared `build_loopback_client()` used by
+  both `EgressProxy` and `CredentialGateway`; drift between the two client configurations is now
+  a compile error rather than a runtime divergence.
+- **ar-04** — SSRF guard on `upstream_base`: DNS resolution at startup, then `is_ssrf_blocked()`
+  rejects loopback / link-local (169.254.x.x IMDS) / RFC 1918 / fc00::/7 unique-local /
+  IPv4-mapped IPv6 (`::ffff:x.x.x.x`). `extract_host()` now correctly handles IPv6 literal
+  URLs (`[::1]`) and rejects userinfo (`user@host`); malformed URLs are now a hard startup
+  error (not a silent skip). DNS failure warns to preserve air-gapped environments.
+- **ar-08** — `PASSTHROUGH_HEADERS` allow-list replaces `SCRUB_HEADERS` deny-list in the
+  credential gateway forwarder; only 6 known-safe headers are forwarded, all others are dropped.
+- **ar-06** — `OAuthTokenCache::load_from_disk()`: reads persisted `OAuthState` on broker
+  startup so a valid token survives daemon restarts; expired tokens and empty `access_token`
+  are discarded and the broker starts cold.
+- **ar-07** — Deny-by-default fast path for empty `allowed_providers`: returns HTTP 403
+  `credential_denied / no_providers_configured` immediately instead of falling through to
+  `None`-match behavior.
+- **S1** — OV-1 startup invariant: egress Ed25519 signing key path must not fall inside any MCP
+  server's `FsRead` sandbox prefix; fails fast at boot with a diagnostic message.
+- **S2** — Removed `"content_audited": true` from `EgressBrokered` events; the field was
+  hardcoded and never reflected actual scanning. `EventKind::EgressBrokered` doc comment updated.
+- **S3** — De-claimed `SecretRewriter` / `BoundarySecretRedacted` from CLAUDE.md (p7.5 block)
+  and THREAT_MODEL.md; those features were planned but never built.
+- **ar-09 (doc)** — `docs/ROADMAP.md`: cred.4 and orch.1 now list `cred.3.1` as a prerequisite.
+- **THREAT_MODEL §8.6–8.7** — Universal-tier agents have no credential path (intentional,
+  tracked for cred.4/cred.5). Egress content audit is explicitly NOT implemented.
+
+### Tests added (T18–T24 + adversarial-review fixes, every test fails without its fix)
+- T18–T20: `is_ssrf_blocked` loopback, link-local/IMDS, RFC 1918; public-IP non-blocking;
+  `extract_host` basic + rejects non-HTTPS; IMDS/RFC-1918 SSRF gate assertion.
+- T21: `load_from_disk` pre-populates cache from valid state file; absent file starts cold;
+  expired token starts cold; empty `access_token` starts cold.
+- T22: Live-gateway integration test — registers a token with empty `allowed_providers`,
+  makes a real HTTP request, asserts HTTP 403 + `reason: no_providers_configured`.
+  (Previous version constructed its own JSON and never called `handle_credential_request`.)
+- T23: `include_str!("../egress.rs")` source scan — fails if `"content_audited"` reappears.
+- T24: `test_loopback_proxy_shared_client_builds` — both egress and credential configs build.
+- SSRF follow-ups: `is_ssrf_blocked` IPv4-mapped IPv6 (`::ffff:192.168.1.1`) and fc00::/7
+  unique-local; `extract_host` rejects userinfo and correctly handles IPv6 literal brackets.
+
+### Post-ship adversarial review fixes (3 confirmed findings from Claude + Codex reviewers)
+- **F1 — percent-encoded path traversal** (`normalize_path_segment`): `%2e%2e` components
+  now filtered alongside literal `..`; `%2e` also filtered. Upstream server path normalization
+  (e.g. `/v1/%2e%2e/secret` → `/secret`) can otherwise produce traversal outside the base path.
+  New test `test_normalize_path_segment_blocks_pct_encoded_traversal` fails without the fix.
+- **F2 — `x-goog-user-project` billing injection**: removed from `PASSTHROUGH_HEADERS`.
+  A compromised MCP server could inject this header to redirect API quota and charges to an
+  arbitrary GCP project. Blocked by the `PASSTHROUGH_HEADERS` injection-risk assertion test.
+- **F3 (Codex Critical) — `None` capabilities grants all credential providers**: changed
+  `None => all_providers` to `None => vec![]` in the credential-env build logic; credential
+  providers must now be granted explicitly via `capabilities`. New test
+  `none_capabilities_yields_empty_credential_providers` fails without the fix.
+
+Total workspace tests: 1139 (up from 1112; figure covers all workspace crates).
+
 ## [cred.3] - 2026-07-06 (v0.60.0)
 
 ### Added
