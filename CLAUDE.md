@@ -346,6 +346,17 @@ audit NOT implemented); ar-09 doc: cred.3.1 is prerequisite for cred.4/orch.1. E
 a test that fails without the fix. 7 new adversarial tests (T18–T24) + 5 follow-up SSRF fixes
 (IPv4-mapped IPv6, fc00::/7, extract_host IPv6 literal, extract_host userinfo, empty-token
 guard); T22 rewritten as live-gateway integration test; 1136 workspace tests total.
+**cred.3.2 complete (v0.62.0).** Credential gateway hardening completion — security fixes + review-pass hardening:
+`is_ssrf_blocked()` + `extract_host()` moved to `loopback_proxy.rs` as single source of truth (ar-10);
+`GatewayState::new()` DNS-resolves each `upstream_base` and pins the IP via `reqwest::ClientBuilder::resolve()` —
+DNS rebinding defended for process lifetime (ar-04/D2); empty DNS iterator (`NOERROR NODATA`) now warns instead
+of silently bypassing SSRF check and IP pin (ADV-1/ADV-2); `get_or_refresh()` SSRF-checks `token_url` before
+token endpoint POST (ar-04c); `upstream_resp.bytes().await` → `bytes_stream()` per-chunk cap (OOM fix / D14);
+inbound query string always discarded (D3); `owning_agent_id()` helper with multi-agent "shared" sentinel
+(ar-07 wiring fix — prevents all tokens being attributed to agent[0] in multi-agent mode);
+`loopback_proxy::base_builder()` extracted so `GatewayState::new()` shares the canonical builder settings
+(drift guard); self-referential source-scan assertions fixed in T28/T34/T35b; THREAT_MODEL §8.3 updated,
+§8.7 ratified de-claims; RUNBOOK.md v0.62.0 + §11.11; 1159 workspace tests (21 new).
 
 ## How to work here
 

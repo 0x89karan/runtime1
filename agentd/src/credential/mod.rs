@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use futures::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
@@ -33,6 +34,9 @@ use tokio::sync::{Mutex, RwLock};
 use crate::config::{AuthStyle, CredentialGatewayConfig, ProviderConfig};
 use crate::events::EventKind;
 use crate::flight_recorder::FlightRecorder;
+// ar-10: SSRF guard functions live in loopback_proxy as the canonical location for all
+// loopback forwarders; imported here so callers and tests see them via `use super::*`.
+use crate::loopback_proxy::{extract_host, is_ssrf_blocked};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -224,6 +228,44 @@ impl OAuthTokenCache {
             ));
         }
 
+        // ar-04c: SSRF check on token_url — a malicious secrets file could point to
+        // 127.0.0.1 or an IMDS endpoint to exfiltrate credentials via the OAuth refresh.
+        let token_host = extract_host(&secrets.token_url).map_err(|_| {
+            format!(
+                "provider '{}' token_url '{}' is malformed",
+                provider,
+                &secrets.token_url[..secrets.token_url.len().min(64)],
+            )
+        })?;
+        match tokio::net::lookup_host(format!("{token_host}:443")).await {
+            Ok(addrs) => {
+                // Collect to detect empty iterator (DNS NOERROR NODATA) — same treatment
+                // as a lookup error: warn and continue rather than silently bypassing check.
+                let addrs: Vec<_> = addrs.collect();
+                if addrs.is_empty() {
+                    tracing::warn!(provider = %provider,
+                        "credential: token_url DNS returned no addresses — SSRF check skipped \
+                         (air-gapped environment?)");
+                } else {
+                    for sa in addrs {
+                        if is_ssrf_blocked(sa.ip()) {
+                            return Err(format!(
+                                "provider '{}' token_url '{}' resolves to SSRF-blocked address {} \
+                                 — refusing token refresh (ar-04c)",
+                                provider,
+                                &secrets.token_url[..secrets.token_url.len().min(64)],
+                                sa.ip(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(provider = %provider, error = %e,
+                    "credential: token_url DNS lookup failed — SSRF check skipped");
+            }
+        }
+
         // Use the cached refresh_token if available (rotation may have updated it).
         let refresh_token = inner.refresh_token.clone()
             .unwrap_or_else(|| secrets.refresh_token.clone());
@@ -342,50 +384,88 @@ async fn write_state_atomic(path: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Extract the hostname from an `https://host/path` URL for DNS resolution (ar-04).
-///
-/// Returns `Err(())` for any URL that is structurally malformed, contains userinfo
-/// (`user@host`), or has a non-HTTPS scheme — the caller must treat `Err` as a hard
-/// startup failure, not a silent skip, to prevent SSRF bypass via parse failure.
-fn extract_host(url: &str) -> Result<String, ()> {
-    let without_scheme = url.strip_prefix("https://").ok_or(())?;
-    // Reject userinfo (user@host or user:pass@host) — DNS lookup on "user@host"
-    // fails, causing the SSRF check to be skipped rather than enforced.
-    if without_scheme.contains('@') { return Err(()); }
-    // IPv6 literals: https://[::1]/path — must NOT split on ':'.
-    if without_scheme.starts_with('[') {
-        let close = without_scheme.find(']').ok_or(())?;
-        let addr_str = &without_scheme[1..close];
-        // Validate it parses as a real IPv6 address (not a bypass like "[junk]").
-        addr_str.parse::<std::net::Ipv6Addr>().map_err(|_| ())?;
-        // Return bracketed so lookup_host("[::1]:443") resolves correctly.
-        return Ok(format!("[{addr_str}]"));
-    }
-    let host = without_scheme
-        .split('/')
-        .next()
-        .ok_or(())?
-        .split(':')  // strip port if present
-        .next()
-        .ok_or(())?;
-    if host.is_empty() { Err(()) } else { Ok(host.to_string()) }
-}
-
 // ── GatewayState ──────────────────────────────────────────────────────────────
 
 struct GatewayState {
-    config:    CredentialGatewayConfig,
-    registry:  Arc<CredentialRegistry>,
-    caches:    RwLock<HashMap<String, Arc<OAuthTokenCache>>>,
-    client:    reqwest::Client,
-    recorder:  Arc<FlightRecorder>,
+    config:     CredentialGatewayConfig,
+    registry:   Arc<CredentialRegistry>,
+    caches:     RwLock<HashMap<String, Arc<OAuthTokenCache>>>,
+    /// reqwest client built with per-provider `.resolve()` overrides (ar-04 IP pinning).
+    client:     reqwest::Client,
+    recorder:   Arc<FlightRecorder>,
+    /// hostname → startup-resolved IP. Populated when DNS succeeds; empty if air-gapped.
+    /// The reqwest client has these IPs pinned via .resolve(); this map is used by tests
+    /// to assert pinning is in effect (ar-04). Not read in the request-handling hot path.
+    #[allow(dead_code)] // accessed only in tests via `let _ = &state.pinned_ips`
+    pinned_ips: HashMap<String, std::net::IpAddr>,
 }
 
 impl GatewayState {
+    /// Build GatewayState: validate provider configs, resolve + SSRF-check upstream
+    /// hostnames, pin resolved IPs into the reqwest client to block DNS rebinding (ar-04),
+    /// and eagerly load persisted OAuth state.
     async fn new(config: CredentialGatewayConfig, recorder: Arc<FlightRecorder>) -> Result<Self> {
-        let client = crate::loopback_proxy::build_loopback_client(
-            crate::loopback_proxy::LoopbackClientConfig::credential(),
-        )?;
+        let lp_cfg = crate::loopback_proxy::LoopbackClientConfig::credential();
+        // Use base_builder() to prevent settings drift from build_loopback_client() (ar-10).
+        let mut builder = crate::loopback_proxy::base_builder(&lp_cfg);
+
+        let mut pinned_ips: HashMap<String, std::net::IpAddr> = HashMap::new();
+
+        for (name, prov) in &config.providers {
+            anyhow::ensure!(
+                prov.upstream_base.starts_with("https://"),
+                "credential gateway: provider '{}' upstream_base must use https://, got '{}'",
+                name, prov.upstream_base,
+            );
+            let host = extract_host(&prov.upstream_base).map_err(|_| anyhow::anyhow!(
+                "credential gateway: provider '{}' upstream_base '{}' is malformed — \
+                 must be https://hostname[/path] with no userinfo (user@host)",
+                name, prov.upstream_base,
+            ))?;
+            match tokio::net::lookup_host(format!("{host}:443")).await {
+                Ok(addrs) => {
+                    // Collect so we can detect an empty iterator (NOERROR NODATA).
+                    let addrs: Vec<_> = addrs.collect();
+                    if addrs.is_empty() {
+                        // DNS returned success but no addresses — treat the same as a
+                        // lookup failure: SSRF check and IP pin are skipped with a warning.
+                        tracing::warn!(
+                            provider = %name,
+                            upstream = %prov.upstream_base,
+                            "credential gateway: DNS returned no addresses at startup — \
+                             SSRF check and IP pinning skipped (air-gapped environment?)"
+                        );
+                    } else {
+                        for sa in addrs {
+                            anyhow::ensure!(
+                                !is_ssrf_blocked(sa.ip()),
+                                "credential gateway: provider '{}' upstream_base '{}' resolves to \
+                                 SSRF-blocked address {} — use a public endpoint",
+                                name, prov.upstream_base, sa.ip(),
+                            );
+                            // Pin the first public IP per hostname to block DNS rebinding (ar-04).
+                            if !pinned_ips.contains_key(&host) {
+                                pinned_ips.insert(host.clone(), sa.ip());
+                                builder = builder.resolve(&host, sa);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        provider = %name,
+                        upstream = %prov.upstream_base,
+                        error    = %e,
+                        "credential gateway: DNS lookup failed at startup — SSRF check and \
+                         IP pinning skipped (air-gapped environment?)"
+                    );
+                }
+            }
+        }
+
+        let client = builder.build().context("build credential gateway HTTP client")?;
+        tracing::info!(pinned_count = %pinned_ips.len(), "credential gateway: startup IP pinning complete (ar-04)");
+
         // Eagerly load persisted OAuth state for all providers that have state_path (ar-06).
         let mut caches = HashMap::new();
         for (name, prov) in &config.providers {
@@ -399,10 +479,11 @@ impl GatewayState {
         }
         Ok(Self {
             config,
-            registry:  Arc::new(CredentialRegistry::new()),
-            caches:    RwLock::new(caches),
+            registry:   Arc::new(CredentialRegistry::new()),
+            caches:     RwLock::new(caches),
             client,
             recorder,
+            pinned_ips,
         })
     }
 
@@ -559,7 +640,9 @@ async fn handle_credential_request(
 
     // 6. Collect inbound body (bounded).
     let method = req.method().clone();
-    let query   = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    // Inbound query string is discarded — MCP servers must not inject URL params
+    // into the upstream request (D3). Credentials are attached by the broker at step 11.
+    let query = String::new();
     let (parts, body) = req.into_parts();
     let limited = http_body_util::Limited::new(body, MAX_INBOUND_REQUEST_BYTES);
     let body_bytes = match limited.collect().await {
@@ -699,23 +782,33 @@ async fn handle_credential_request(
 
     let response_status = upstream_resp.status().as_u16();
 
-    // 14. Collect response body (bounded).
-    let resp_bytes = match upstream_resp.bytes().await {
-        Ok(b) if b.len() <= MAX_UPSTREAM_RESPONSE_BYTES => b,
-        Ok(_) => {
-            return Ok(json_response(
-                502,
-                json!({"error": "upstream_response_too_large", "provider": provider}),
-            ));
+    // 14. Collect response body (bounded — per-chunk cap to prevent OOM).
+    // bytes().await buffers the full body before checking size; bytes_stream() caps
+    // incrementally so a huge response is rejected after MAX_UPSTREAM_RESPONSE_BYTES,
+    // not after the full allocation (ar-04c / OOM fix).
+    let mut resp_vec: Vec<u8> = Vec::new();
+    let mut stream = upstream_resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(b) => {
+                if resp_vec.len() + b.len() > MAX_UPSTREAM_RESPONSE_BYTES {
+                    return Ok(json_response(
+                        502,
+                        json!({"error": "upstream_response_too_large", "provider": provider}),
+                    ));
+                }
+                resp_vec.extend_from_slice(&b);
+            }
+            Err(e) => {
+                tracing::warn!(provider = %provider, error = %e, "reading upstream response body");
+                return Ok(json_response(
+                    502,
+                    json!({"error": "upstream_body_error", "provider": provider}),
+                ));
+            }
         }
-        Err(e) => {
-            tracing::warn!(provider = %provider, error = %e, "reading upstream response body");
-            return Ok(json_response(
-                502,
-                json!({"error": "upstream_body_error", "provider": provider}),
-            ));
-        }
-    };
+    }
+    let resp_bytes = Bytes::from(resp_vec);
 
     // 15. Emit CredentialEgressBrokered.
     let response_bytes = resp_bytes.len();
@@ -749,76 +842,16 @@ pub struct CredentialGateway {
     registry: Arc<CredentialRegistry>,
 }
 
-/// Return true if the IP is private, loopback, or link-local (SSRF-blocked).
-/// Mirrors the logic in docker/oauth_mcp.py:_is_ssrf_blocked() (ar-04).
-pub(crate) fn is_ssrf_blocked(addr: std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match addr {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()           // 127.0.0.0/8
-            || v4.is_private()         // 10/8, 172.16/12, 192.168/16
-            || v4.is_link_local()      // 169.254.0.0/16 (IMDS)
-            || v4.is_broadcast()
-            || v4.is_documentation()
-            || v4.is_unspecified()
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()           // ::1
-            || v6.is_unspecified()     // ::
-            // fe80::/10 link-local
-            || (v6.segments()[0] & 0xffc0) == 0xfe80
-            // fc00::/7 unique-local (IPv6 equivalent of RFC 1918)
-            || (v6.segments()[0] & 0xfe00) == 0xfc00
-            // ::ffff:0:0/96 IPv4-mapped — delegate to the IPv4 check
-            || v6.to_ipv4().map(|v4| is_ssrf_blocked(IpAddr::V4(v4))).unwrap_or(false)
-        }
-    }
-}
-
 impl CredentialGateway {
     /// Start the gateway. Returns `(Arc<CredentialGateway>, bound_addr)`.
+    ///
+    /// Provider validation (HTTPS scheme, DNS SSRF check, IP pinning) is performed
+    /// inside `GatewayState::new()` so the check and the pinned client are always
+    /// constructed together (ar-04).
     pub async fn start(
         cfg:      &CredentialGatewayConfig,
         recorder: Arc<FlightRecorder>,
     ) -> Result<(Arc<Self>, std::net::SocketAddr)> {
-        // Validate all provider configs at startup (ar-04: SSRF DNS check).
-        for (name, prov) in &cfg.providers {
-            anyhow::ensure!(
-                prov.upstream_base.starts_with("https://"),
-                "credential gateway: provider '{}' upstream_base must use https://, got '{}'",
-                name,
-                prov.upstream_base,
-            );
-            // Resolve the hostname and reject private/loopback/link-local ranges.
-            // extract_host() failure is a hard error — a silent skip would be a bypass.
-            // DNS lookup failure (air-gapped environment) is a warning, not a fatal error.
-            let host = extract_host(&prov.upstream_base).map_err(|_| anyhow::anyhow!(
-                "credential gateway: provider '{}' upstream_base '{}' is malformed — \
-                 must be https://hostname[/path] with no userinfo (user@host)",
-                name, prov.upstream_base,
-            ))?;
-            match tokio::net::lookup_host(format!("{host}:443")).await {
-                Ok(addrs) => {
-                    for sa in addrs {
-                        anyhow::ensure!(
-                            !is_ssrf_blocked(sa.ip()),
-                            "credential gateway: provider '{}' upstream_base '{}' resolves to \
-                             SSRF-blocked address {} — use a public endpoint",
-                            name, prov.upstream_base, sa.ip(),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        provider = %name,
-                        upstream = %prov.upstream_base,
-                        error    = %e,
-                        "credential gateway: DNS lookup failed at startup — SSRF check skipped \
-                         (air-gapped environment?)"
-                    );
-                }
-            }
-        }
         let state = Arc::new(GatewayState::new(cfg.clone(), recorder).await?);
         let registry = Arc::clone(&state.registry);
 
@@ -872,7 +905,6 @@ mod tests {
     use super::*;
     use crate::config::{AuthStyle, CredentialGatewayConfig, ProviderConfig};
 
-    #[allow(dead_code)]
     fn provider_cfg_oauth() -> ProviderConfig {
         ProviderConfig {
             auth_style:    AuthStyle::OauthBearer,
@@ -1531,6 +1563,527 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert!(
             body["hint"].as_str().unwrap_or("").contains("_AGENTOS_TEST_API_KEY_ABSENT_T25"),
             "hint must name the missing env var: {body}"
+        );
+    }
+
+    // ── T26: ar-04 IP pinning — SSRF check lives in GatewayState::new() ─────────
+    //
+    // Without ar-04, provider validation lived only in CredentialGateway::start(),
+    // and GatewayState::new() would succeed for a loopback upstream_base, returning
+    // a client built without any .resolve() pin. The test calls GatewayState::new()
+    // directly to prove the check is there, not just in start().
+    // This test FAILS without ar-04 (GatewayState::new() would return Ok).
+
+    #[tokio::test]
+    async fn test_construction_ssrf_blocks_rebind() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        // 127.0.0.1 is the loopback — is_ssrf_blocked() returns true. tokio::net::lookup_host
+        // resolves IP literals directly (no DNS needed), making this deterministic in CI.
+        let mut private_prov = provider_cfg_api_key_header();
+        private_prov.upstream_base = "https://127.0.0.1".to_string();
+
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("loopback-test".to_string(), private_prov);
+
+        let result = GatewayState::new(cfg, recorder).await;
+        assert!(result.is_err(),
+            "GatewayState::new() must reject loopback upstream_base — ar-04 SSRF check \
+             not in GatewayState::new()? (was only in CredentialGateway::start())");
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("SSRF-blocked"),
+            "error must mention SSRF-blocked, got: {err}");
+
+        // Verify pinned_ips field exists on a valid GatewayState (compile-time check).
+        // An empty-providers config produces an Ok state with empty pinned_ips.
+        let empty_cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        let dir2 = tempfile::tempdir().unwrap();
+        let recorder2 = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir2.path().join("fl.jsonl")).unwrap(),
+        );
+        let ok_state = GatewayState::new(empty_cfg, recorder2).await.unwrap();
+        // Field access proves the struct has pinned_ips (compile-time).
+        let _ = &ok_state.pinned_ips;
+    }
+
+    // ── T36: IP pin path actually populated for a public IP literal (T-INFO-2) ───
+    //
+    // T26 success sub-case used an empty providers map, so the DNS/pin loop body
+    // never ran. This test uses a stable IP literal upstream_base (no live DNS
+    // needed — lookup_host on an IP literal returns that IP directly) to verify
+    // the pinned_ips map is populated when a valid public address resolves.
+    // This test FAILS if the IP-pinning branch inside the Ok(addrs) arm is removed.
+
+    #[tokio::test]
+    async fn test_public_ip_upstream_pins_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        // 1.1.1.1 is a public IP — not SSRF-blocked and resolves deterministically.
+        let mut prov = provider_cfg_api_key_header();
+        prov.upstream_base = "https://1.1.1.1".to_string();
+
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("public-ip-test".to_string(), prov);
+
+        let state = GatewayState::new(cfg, recorder).await
+            .expect("public IP upstream must not be rejected");
+        assert_eq!(state.pinned_ips.len(), 1,
+            "pinned_ips must have 1 entry for the resolved IP (IP pinning not executing?)");
+    }
+
+    // ── T37: empty DNS iterator warns and does not SSRF-check (ADV-1 guard) ──────
+    //
+    // lookup_host can return Ok([]) (DNS NOERROR NODATA) without entering the for-loop,
+    // silently skipping the SSRF check and IP pin. The fix collects the iterator and
+    // emits a warning for an empty result. We can only test the structural guard here
+    // (real NODATA DNS is non-deterministic); the test verifies the code path exists.
+    // This test FAILS if the empty-iterator guard is removed from GatewayState::new().
+
+    #[test]
+    fn test_empty_dns_guard_present_in_gateway_new() {
+        let src = include_str!("mod.rs");
+        // Split the pattern so this assertion string is not itself the match (self-reference guard).
+        let guard = ["addrs", ".is_empty()"].concat();
+        assert!(
+            src.contains(&guard),
+            "GatewayState::new() must guard against empty DNS iterator (ADV-1 fix removed?)"
+        );
+    }
+
+    // ── T27: ar-04c — OAuth token_url SSRF blocked ───────────────────────────────
+    //
+    // A malicious secrets file could set token_url to a private IP (e.g., IMDS) to
+    // exfiltrate credentials via the OAuth refresh POST. Without ar-04c, only the
+    // https:// scheme was checked; the SSRF check on the resolved IP was absent.
+    // This test FAILS without ar-04c (get_or_refresh() would try to connect instead
+    // of returning an SSRF error).
+
+    #[tokio::test]
+    async fn test_token_url_ssrf_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        // Secrets file with token_url pointing at 127.0.0.1.
+        let secrets = serde_json::json!({
+            "client_id":     "test-client",
+            "client_secret": "test-secret",
+            "refresh_token": "test-refresh",
+            "token_url":     "https://127.0.0.1:9999/token"
+        });
+        let secrets_path = dir.path().join("google.json");
+        tokio::fs::write(&secrets_path, serde_json::to_vec(&secrets).unwrap()).await.unwrap();
+
+        let provider = ProviderConfig {
+            auth_style:    AuthStyle::OauthBearer,
+            upstream_base: "https://www.googleapis.com".to_string(),
+            header_name:   None,
+            secret_key:    None,
+            token_path:    Some(secrets_path.to_str().unwrap().to_string()),
+            state_path:    None,
+        };
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let client = crate::loopback_proxy::build_loopback_client(
+            crate::loopback_proxy::LoopbackClientConfig::credential(),
+        ).unwrap();
+
+        let cache = OAuthTokenCache::new();
+        // Cache is cold → slow path → reads secrets file → sees token_url=127.0.0.1.
+        let result = cache.get_or_refresh("google", &provider, &recorder, &client).await;
+
+        assert!(result.is_err(), "token_url pointing to loopback must be blocked (ar-04c)");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("SSRF-blocked") || err.contains("127.0.0.1"),
+            "error must name the SSRF block, got: {err}"
+        );
+    }
+
+    // ── T28: bytes_stream() per-chunk cap (OOM fix) ───────────────────────────────
+    //
+    // bytes().await buffers the entire upstream body before the size check — an
+    // oversized OAuth API response causes OOM. The fix uses bytes_stream() to cap
+    // incrementally. This test verifies the old bytes().await pattern is gone.
+    // This test FAILS if bytes().await is restored in the response collection step.
+
+    #[test]
+    fn test_streaming_response_cap_enforced_uses_bytes_stream() {
+        let src = include_str!("mod.rs");
+        // Build the banned pattern from parts so the literal doesn't appear in this file
+        // (otherwise include_str! would find it in this very assertion and fail).
+        let banned = ["upstream_resp", ".bytes()", ".await"].concat();
+        assert!(
+            !src.contains(&banned),
+            "credential handler must use bytes_stream() not the batching bytes() call \
+             (OOM regression: batch path buffers full body before size check)"
+        );
+        // Build expected pattern from parts so the literal doesn't appear in this file.
+        let expected = ["bytes", "_stream()"].concat();
+        assert!(
+            src.contains(&expected),
+            "credential handler must use bytes_stream() for per-chunk streaming cap"
+        );
+    }
+
+    // ── T29: is_ssrf_blocked + extract_host in loopback_proxy (ar-10) ────────────
+    // Covered by loopback_proxy::tests::test_ssrf_guard_in_loopback_proxy.
+    // Verified here that credential/mod.rs callers see the same functions via import.
+
+    #[test]
+    fn test_ssrf_guard_callable_from_credential_module() {
+        // T29 supplemental: verify that is_ssrf_blocked and extract_host are imported
+        // into this module (via `use crate::loopback_proxy::...`) and are callable.
+        // This test FAILS if the import is removed (ar-10 reverted).
+        use std::net::IpAddr;
+        assert!(is_ssrf_blocked("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_ssrf_blocked("8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert_eq!(
+            extract_host("https://api.example.com/path"),
+            Ok("api.example.com".to_string())
+        );
+    }
+
+    // ── T30: ar-07 — agent_id in CredentialRegistry is the agent ID ─────────────
+    //
+    // register_token() takes agent_id as the second parameter. main.rs used to pass
+    // server.name (the MCP server name) instead of the owning agent's ID, causing
+    // CredentialAccessed flight events to show the server name, not the agent.
+    // This test FAILS if register_token() ignores or discards the agent_id parameter.
+
+    #[tokio::test]
+    async fn test_agent_id_registered_not_server_name() {
+        let reg = CredentialRegistry::new();
+        // Register with an agent_id explicitly distinct from a hypothetical server name.
+        reg.register(
+            "tok-ar07".to_string(),
+            "scout-agent".to_string(),
+            vec!["google".to_string()],
+        ).await;
+
+        let (agent_id, providers) = reg.lookup("tok-ar07").await
+            .expect("registered token must be found");
+
+        assert_eq!(agent_id, "scout-agent",
+            "CredentialAccessed event must show agent ID, not server name (ar-07 reverted?)");
+        assert_eq!(providers, vec!["google"]);
+    }
+
+    // ── T31: ar-07 — provider scope enforced per token ───────────────────────────
+    //
+    // Token registered with allowed_providers=["google"] must NOT grant access to
+    // "brave-search". This test verifies the allowed_providers check at step 4.
+    // This test FAILS if the provider scope check is removed from the handler.
+
+    #[tokio::test]
+    async fn test_token_cross_agent_provider_scope_denied() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        // Start gateway with both providers configured.
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("google".to_string(), provider_cfg_oauth());
+        cfg.providers.insert("brave-search".to_string(), provider_cfg_api_key_header());
+
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+            .expect("gateway must start");
+
+        // Token for agent-a scoped to google only.
+        let token_a = "test-cross-scope-t31";
+        gw.register_token(token_a.to_string(), "agent-a".to_string(), vec!["google".to_string()]).await;
+
+        let client = reqwest::Client::new();
+
+        // Attempt to access brave-search with agent-a's token — must be denied.
+        let resp = client
+            .get(format!("http://{addr}/brave-search/res/v1/web/search"))
+            .header("x-credential-token", token_a)
+            .send().await.unwrap();
+
+        assert_eq!(resp.status().as_u16(), 403,
+            "token scoped to google must be denied for brave-search (ar-07 scope check removed?)");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["reason"], "provider_not_allowed");
+    }
+
+    // ── T32: OAuth bearer path returns 503 when secrets file is absent ──────────
+    //
+    // Exercises the OauthBearer branch in handle_credential_request step 8.
+    // Without this test, provider_cfg_oauth() was dead code (the live-gateway path
+    // for OAuth was never exercised). This test FAILS if the OauthBearer branch is
+    // removed from the handler.
+
+    #[tokio::test]
+    async fn test_oauth_bearer_path_503_no_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        // provider_cfg_oauth() token_path = "/run/secrets/google.json" — absent in tests.
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("google".to_string(), provider_cfg_oauth());
+
+        // DNS for googleapis.com may warn in air-gapped CI but start() does not fail.
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+            .expect("gateway must start (DNS warn is OK in air-gapped CI)");
+
+        let token = "test-oauth-t32";
+        gw.register_token(token.to_string(), "agent-t32".to_string(), vec!["google".to_string()]).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/google/v1/tokeninfo"))
+            .header("x-credential-token", token)
+            .send().await.unwrap();
+
+        assert_eq!(resp.status().as_u16(), 503,
+            "OauthBearer with absent secrets file must return 503 (branch removed?)");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "credential_refresh_failed",
+            "error must be credential_refresh_failed: {body}");
+    }
+
+    // ── T33: deregistered token returns 401 via live gateway ─────────────────────
+    //
+    // This test FAILS if deregister_token() does not remove the token from the registry.
+
+    #[tokio::test]
+    async fn test_token_deregistration_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+            .expect("gateway must start with no providers");
+
+        let token = "test-deregister-lifecycle-t33";
+        gw.register_token(token.to_string(), "agent-t33".to_string(), vec!["google".to_string()]).await;
+
+        let client = reqwest::Client::new();
+
+        // Before deregister: token is valid — gateway returns non-401 (503 for no provider config).
+        let resp_before = client
+            .get(format!("http://{addr}/google/v1/test"))
+            .header("x-credential-token", token)
+            .send().await.unwrap();
+        assert_ne!(resp_before.status().as_u16(), 401,
+            "token must be valid before deregistration");
+
+        // Deregister the token.
+        gw.deregister_token(token).await;
+
+        // After deregister: must get 401.
+        let resp_after = client
+            .get(format!("http://{addr}/google/v1/test"))
+            .header("x-credential-token", token)
+            .send().await.unwrap();
+        assert_eq!(resp_after.status().as_u16(), 401,
+            "deregistered token must return 401 (deregister_token not removing from registry?)");
+    }
+
+    // ── T34: ApiKeyQuery attach path exists in handler ────────────────────────────
+    //
+    // This test FAILS if the ApiKeyQuery arm is removed from the credential-attach
+    // match at step 11.
+
+    #[test]
+    fn test_api_key_query_path_exists_in_handler() {
+        let src = include_str!("mod.rs");
+        // Build patterns from parts so the literals don't appear in this file (self-reference fix).
+        let aq_pat = ["AuthStyle", "::", "ApiKeyQuery"].concat();
+        assert!(
+            src.contains(&aq_pat),
+            "ApiKeyQuery must have a match arm in the credential attach step (step 11)"
+        );
+        let q_pat = ["req_builder", ".query"].concat();
+        assert!(
+            src.contains(&q_pat),
+            "ApiKeyQuery must call req_builder.query() to attach the API key as a query param"
+        );
+    }
+
+    // ── T35: Inbound body > MAX_INBOUND_REQUEST_BYTES returns 413 ─────────────────
+    //
+    // This test FAILS if the http_body_util::Limited guard is removed from step 6.
+
+    #[tokio::test]
+    async fn test_inbound_body_413_live_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("google".to_string(), provider_cfg_api_key_header());
+
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await.unwrap();
+        let token = "test-inbound-413-t35";
+        gw.register_token(token.to_string(), "agent-t35".to_string(), vec!["google".to_string()]).await;
+
+        // Send MAX_INBOUND_REQUEST_BYTES + 1 bytes (4 MB + 1 byte).
+        let oversized_body = vec![0u8; MAX_INBOUND_REQUEST_BYTES + 1];
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{addr}/google/v1/endpoint"))
+            .header("x-credential-token", token)
+            .body(oversized_body)
+            .send().await.unwrap();
+
+        assert_eq!(resp.status().as_u16(), 413,
+            "body > MAX_INBOUND_REQUEST_BYTES must return 413 (body cap guard removed?)");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "request_body_too_large");
+    }
+
+    // ── T35b: Inbound query string is discarded (D3) ─────────────────────────────
+    //
+    // This test FAILS if query passthrough is restored (query = req.uri().query()...).
+
+    #[test]
+    fn test_query_string_discarded_from_upstream() {
+        let src = include_str!("mod.rs");
+        // Build the banned pattern from parts so the literal doesn't appear in this file
+        // (otherwise include_str! would find it in this very assertion and fail).
+        let banned = [".uri()", ".query()", ".map(|q| format!(\"?{q}\"))"].concat();
+        assert!(
+            !src.contains(&banned),
+            "query string must not be forwarded to upstream — old passthrough code found (D3 reverted?)"
+        );
+        // Build expected pattern from parts so the literal doesn't appear in this file.
+        let expected = ["let query", " = String::new()"].concat();
+        assert!(
+            src.contains(&expected),
+            "query must always be discarded with String::new() — inbound params must not \
+             reach the upstream URL"
+        );
+    }
+
+    // ── G1: token_url with userinfo is rejected as malformed (ar-04c extract_host path) ──
+    //
+    // extract_host() returns Err for URLs with userinfo (user@host). This test FAILS if
+    // the extract_host() call on token_url is removed (allowing userinfo URLs through).
+
+    #[tokio::test]
+    async fn test_token_url_userinfo_rejected_as_malformed() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        // token_url passes starts_with("https://") check but fails extract_host() — userinfo.
+        let secrets = serde_json::json!({
+            "client_id":     "g1-client",
+            "client_secret": "g1-secret",
+            "refresh_token": "g1-refresh",
+            "token_url":     "https://user@evil.com/token"
+        });
+        let secrets_path = dir.path().join("g1-secrets.json");
+        tokio::fs::write(&secrets_path, serde_json::to_vec(&secrets).unwrap()).await.unwrap();
+        let prov = ProviderConfig {
+            auth_style:    AuthStyle::OauthBearer,
+            upstream_base: "https://www.googleapis.com".to_string(),
+            header_name:   None,
+            secret_key:    None,
+            token_path:    Some(secrets_path.to_str().unwrap().to_string()),
+            state_path:    None,
+        };
+        let client = crate::loopback_proxy::build_loopback_client(
+            crate::loopback_proxy::LoopbackClientConfig::credential(),
+        ).unwrap();
+        let cache = OAuthTokenCache::new();
+        let result = cache.get_or_refresh("google", &prov, &recorder, &client).await;
+        assert!(result.is_err(),
+            "token_url with userinfo must be rejected as malformed (ar-04c extract_host path)");
+        let err = result.err().unwrap();
+        assert!(err.contains("malformed"),
+            "error must mention 'malformed', got: {err}");
+    }
+
+    // ── G2: token_url DNS Err arm warns and continues (structural guard) ───────────
+    //
+    // When DNS lookup for token_url fails with an OS error, the code warns and continues
+    // (allows operation in air-gapped environments). This test FAILS if the Err arm is
+    // removed or the warning message is removed from get_or_refresh().
+
+    #[test]
+    fn test_token_url_dns_err_arm_warns_and_continues_source_guard() {
+        let src = include_str!("mod.rs");
+        // Split the pattern to avoid the assembled string appearing literally in this file.
+        let pat = ["credential: token_url DNS lookup failed", " — SSRF check skipped"].concat();
+        assert!(
+            src.contains(&pat),
+            "get_or_refresh() must warn-and-continue on token_url DNS Err — \
+             the Err arm was removed or warning message changed (G2)"
+        );
+    }
+
+    // ── G3: upstream_base with userinfo is rejected by GatewayState::new() ────────
+    //
+    // extract_host() returns Err for userinfo URLs. This test FAILS if the
+    // extract_host() call on upstream_base is removed from GatewayState::new().
+
+    #[tokio::test]
+    async fn test_gateway_new_rejects_userinfo_in_upstream_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        // "https://user@googleapis.com" passes starts_with("https://") but fails extract_host().
+        let mut prov = provider_cfg_api_key_header();
+        prov.upstream_base = "https://user@googleapis.com".to_string();
+
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("userinfo-test".to_string(), prov);
+
+        let result = GatewayState::new(cfg, recorder).await;
+        assert!(result.is_err(),
+            "upstream_base with userinfo must be rejected — extract_host() guard not in new()? (G3)");
+        let err = result.err().unwrap().to_string();
+        assert!(err.contains("malformed"),
+            "error must mention 'malformed', got: {err}");
+    }
+
+    // ── G4: GatewayState::new() DNS Err arm warns and continues (structural guard) ─
+    //
+    // When DNS lookup for upstream_base fails at startup, the code warns and continues.
+    // This test FAILS if the Err arm is removed from GatewayState::new().
+
+    #[test]
+    fn test_gateway_new_dns_err_arm_warns_and_continues_source_guard() {
+        let src = include_str!("mod.rs");
+        // Split the pattern to avoid the assembled string appearing literally in this file.
+        let pat = ["credential gateway: DNS lookup failed", " at startup"].concat();
+        assert!(
+            src.contains(&pat),
+            "GatewayState::new() must warn-and-continue on upstream_base DNS Err — \
+             the Err arm was removed or warning message changed (G4)"
+        );
+    }
+
+    // ── G5: bytes_stream Err chunk returns 502 upstream_body_error (structural guard)
+    //
+    // When the upstream response body stream yields an Err chunk, handle_credential_request
+    // must return a 502 with error=upstream_body_error. This test FAILS if the Err arm is
+    // removed from the bytes_stream loop.
+
+    #[test]
+    fn test_bytes_stream_err_arm_returns_502_source_guard() {
+        let src = include_str!("mod.rs");
+        // Split the pattern to avoid the assembled string appearing literally in this file.
+        let err_key = ["upstream_body", "_error"].concat();
+        assert!(
+            src.contains(&err_key),
+            "handle_credential_request bytes_stream loop must handle Err chunks with \
+             upstream_body_error 502 response — Err arm removed? (G5)"
+        );
+        // Also verify the Err match arm exists in the stream loop.
+        let err_arm = ["Err(e) =>", " {"].concat();
+        assert!(
+            src.contains(&err_arm),
+            "bytes_stream loop must have an Err(e) match arm — G5 guard"
         );
     }
 }

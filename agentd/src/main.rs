@@ -543,7 +543,11 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                     }).collect(),
                 };
                 let token = uuid::Uuid::new_v4().to_string();
-                gw.register_token(token.clone(), server.name.clone(), allowed).await;
+                // ar-07: attribute the token to the owning agent principal.
+                // In multi-agent mode mcp_servers is a flat shared pool — use "shared"
+                // sentinel to avoid false attribution to the first agent only.
+                let owning_agent = owning_agent_id(&agent_cfgs, &server.name);
+                gw.register_token(token.clone(), owning_agent, allowed).await;
                 cred_tokens.push(token.clone());
                 let mut env = std::collections::HashMap::new();
                 env.insert("AGENTD_CREDENTIAL_GATEWAY_URL".to_string(), gw_url.clone());
@@ -1354,6 +1358,27 @@ async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Return the agent principal to attribute a shared MCP server credential token to.
+///
+/// ar-07: tokens must be attributed to the agent principal, not the MCP server name.
+/// In single-agent mode there is exactly one agent. In multi-agent mode `mcp_servers`
+/// is a flat shared pool so no single agent owns a server — use "shared" sentinel.
+fn owning_agent_id(agent_cfgs: &[config::AgentConfig], server_name: &str) -> String {
+    match agent_cfgs {
+        [] => server_name.to_owned(),
+        [single] => single.id.clone(),
+        _ => {
+            tracing::warn!(
+                server = %server_name,
+                agents = %agent_cfgs.len(),
+                "credential token attributed to 'shared' — mcp_servers pool is global in \
+                 multi-agent mode; per-agent attribution requires per-agent tools sections"
+            );
+            "shared".to_owned()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1805,6 +1830,41 @@ mod tests {
             check("/run/egress/signing.key", "").is_ok(),
             "empty MCP FsRead prefix must be skipped"
         );
+    }
+
+    // ── cred.3.2: owning_agent_id attribution (ar-07 wiring + multi-agent sentinel) ──
+    //
+    // ar-07 fix: token must be attributed to agent ID, not server name.
+    // Multi-agent case: when mcp_servers is a flat shared pool, all tokens must use
+    // the "shared" sentinel rather than silently attributing all accesses to agent[0].
+    // This test FAILS if owning_agent_id() reverts to using agent_cfgs.first() always.
+
+    fn make_agent_cfg(id: &str) -> config::AgentConfig {
+        toml::from_str(&format!("id = \"{id}\"")).unwrap()
+    }
+
+    #[test]
+    fn owning_agent_id_single_agent_uses_agent_id() {
+        let id = owning_agent_id(&[make_agent_cfg("scout-1")], "google-mcp-server");
+        assert_eq!(id, "scout-1",
+            "single-agent mode must return the agent ID (ar-07 reverted to server.name?)");
+    }
+
+    #[test]
+    fn owning_agent_id_multi_agent_uses_shared_sentinel() {
+        let id = owning_agent_id(
+            &[make_agent_cfg("coordinator"), make_agent_cfg("scout")],
+            "google-mcp-server",
+        );
+        assert_eq!(id, "shared",
+            "multi-agent mode must use 'shared' sentinel — not agent[0].id (misleading audit trail)");
+    }
+
+    #[test]
+    fn owning_agent_id_empty_agents_falls_back_to_server_name() {
+        let id = owning_agent_id(&[], "fallback-server");
+        assert_eq!(id, "fallback-server",
+            "zero-agent case must fall back to server name");
     }
 
     // ── cred.3.1 Codex Critical: None capabilities must not grant all credential providers ──

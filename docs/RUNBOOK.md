@@ -1,8 +1,8 @@
 # RUNBOOK — Operating AgentOS
 
 > ⚠️ **PARTIALLY STALE** — This document was last fully updated at v0.20.0. The
-> codebase is now at **v0.59.0** (Phases 0–10 partially complete). §11 (Credentials)
-> has been updated to reflect the current `agentctl auth google` + secrets-file flow.
+> codebase is now at **v0.62.0** (cred.3.2). §11 (Credentials) has been updated to
+> reflect the current `agentctl auth google` + secrets-file + credential broker flow.
 > Other sections may still reference `cargo run -- agentd`, old env-var flows, or paths
 > that no longer apply. When in doubt, consult `CHANGELOG.md` and `docs/plans/`.
 
@@ -661,7 +661,7 @@ Google Cloud Console setup (one-time):
 3. **Credentials → Create → OAuth client ID** → Application type: **Desktop app**.
 4. Copy the **Client ID** and **Client Secret**.
 
-### 11.3 Credentials (cred.2 — current flow)
+### 11.3 Credentials (cred.3.2 — current flow)
 
 **One-time setup on the Mac host:**
 
@@ -802,6 +802,62 @@ Events that would have fired during downtime are not replayed.
 | Second cron cycle spawns no children | Child ID collision | Verify orchestrator uses date-stamped child IDs |
 | `budget_exceeded` in flight.jsonl | Lifetime token budget exhausted | `docker compose exec cos rm /data/checkpoint.json` and restart |
 | `agent_admission_denied` in flight.jsonl | Child ID collision guard fired | Child ID is already in outcomes map; confirm date-stamping |
+
+### 11.11 Credential broker operations (cred.3.2+)
+
+The credential broker (`CredentialGateway`) runs as a loopback HTTP server inside `agentd`.
+It resolves upstream API credentials so MCP servers never hold them directly.
+
+**How the broker starts:**
+1. `agentd` reads `[credential_gateway.providers.*]` from the TOML config.
+2. For each provider, it resolves `upstream_base` via DNS and pins the result
+   using `reqwest::ClientBuilder::resolve()` (IP pinning — DNS rebinding blocked).
+3. It rejects `upstream_base` values that resolve to loopback, private, or
+   link-local addresses (SSRF guard).
+4. The broker binds on `127.0.0.1:0`; the OS-assigned port is injected into each
+   MCP server's environment as `AGENTD_CREDENTIAL_GATEWAY_URL`.
+
+**Verifying the broker is running:**
+```bash
+# Flight event emitted at startup:
+jq 'select(.kind=="credential_gateway_started")' flight.jsonl
+
+# Each MCP server token registration:
+jq 'select(.kind=="credential_token_registered")' flight.jsonl
+```
+
+**OAuth token cache on disk:**
+The broker writes the OAuth token state to the provider's secrets file path (same
+`~/.agentos-secrets/google.json` written by `agentctl auth google`). It does NOT
+hold tokens in memory between process restarts — on startup it re-reads the cache
+from disk and checks token expiry before use.
+
+**Token refresh failures:**
+```bash
+# Watch for refresh failures (emit on every failed refresh):
+jq 'select(.kind=="credential_refresh_failed")' flight.jsonl
+# If you see token_written: false — secrets file is on a 9p mount with non-atomic
+# rename (QEMU). A subsequent request triggers a re-fetch; if the refresh token
+# rotated (single-use), run: agentctl auth google --client-id ... --client-secret ...
+```
+
+**Security: what the broker does NOT do:**
+- Tool output is **not** scanned for credential-shaped tokens (no `SecretRewriter`).
+  `flight.jsonl` may contain live tokens that appear in API responses. Restrict
+  flight log access accordingly.
+- The `EgressBrokered` event records routing only; it does NOT indicate content was audited.
+  See §8.7 in `THREAT_MODEL.md`.
+
+**Adding a new provider:**
+```toml
+[credential_gateway.providers.my-api]
+type         = "api-key-header"
+upstream_base = "https://api.example.com"
+header_name  = "Authorization"
+secret_env   = "MY_API_SECRET"   # read from environment at startup
+```
+
+Then grant the `credential:custom` capability to any agent that should use it.
 
 ---
 

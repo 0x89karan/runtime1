@@ -3,6 +3,55 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cred.3.2] - 2026-07-06 (v0.62.0)
+
+### Security / hardening (Groups A–E + post-review hardening)
+- **ar-10** — `is_ssrf_blocked()` and `extract_host()` moved to `loopback_proxy.rs` as the
+  canonical SSRF guard; both proxies import from there — no diverging private copies.
+- **ar-04 / D2** — IP pinning: `GatewayState::new()` DNS-resolves each `upstream_base` hostname
+  at startup and pins the resolved IP into the `reqwest::Client` via `ClientBuilder::resolve()`.
+  DNS rebinding is blocked for the process lifetime.
+- **ar-04c** — OAuth `token_url` SSRF check: `get_or_refresh()` resolves and SSRF-checks the
+  token endpoint before posting to it. Empty DNS iterator (`NOERROR NODATA`) now warns and
+  continues instead of silently bypassing the check (ADV-1/ADV-2).
+- **OOM fix / D14** — `upstream_resp.bytes().await` → `bytes_stream()` per-chunk accumulator;
+  size cap enforced incrementally.
+- **D3 / query sanitization** — Inbound query string always discarded; MCP servers cannot inject
+  URL parameters into the upstream forwarded URL.
+- **ar-07 / multi-agent attribution** — `owning_agent_id()` helper extracted; single-agent mode
+  returns the agent ID; multi-agent mode uses `"shared"` sentinel (all MCP servers share the
+  global pool); zero-agent falls back to `server.name`. Prevents false attribution of all
+  credential accesses to `agent[0]` in multi-agent configs.
+- **base_builder() / drift guard** — `loopback_proxy::base_builder()` extracted; `GatewayState::new()`
+  now calls it instead of re-implementing all four `reqwest::Client::builder()` settings, closing
+  the drift risk the module doc warned about.
+
+### Known limitations (documented, not fixed — deferred to cred.4)
+- `token_url` hostname is SSRF-checked at lookup-time but not pinned in the reqwest client;
+  a TOCTOU window exists between the check and the OAuth POST. Mitigated by operator control of
+  secrets files. See THREAT_MODEL §8.3.
+- D3 query discard strips ALL query params including functional ones (e.g. search terms for
+  GET-based APIs). MCP servers using `ApiKeyQuery` providers must encode params in the URL path.
+
+### Documentation
+- **THREAT_MODEL.md** — version header bumped to v0.62.0; §8.3 updated (IP pinning landed);
+  §8.7 expanded with S2/S3 ratified de-claims.
+- **RUNBOOK.md** — version updated to v0.62.0; §11.11 credential broker ops added.
+- **CLAUDE.md** — cred.3.2 status line added.
+
+### Tests
+- T26–T35b + T36/T37 + `owning_agent_id` + `base_builder` drift guard (21 new tests total):
+  startup SSRF rejection, empty-DNS-iterator guard, IP pin path with public IP literal,
+  token_url SSRF rejection, bytes_stream enforcement, ar-07 single/multi-agent attribution,
+  base_builder delegation, self-referential assertion fixes in T28/T34/T35b, and more.
+- G1–G5 coverage gap tests (5 new): `token_url` userinfo rejection (behavioral),
+  `upstream_base` userinfo rejection (behavioral), plus structural source-scan guards for
+  the warn-and-continue DNS Err arms in `get_or_refresh()` and `GatewayState::new()`,
+  and the 502 `upstream_body_error` arm in the bytes_stream loop.
+- Total workspace tests: 1164 (up from 1139).
+
+---
+
 ## [cred.3.1] - 2026-07-06 (v0.61.0)
 
 ### Security / hardening (10 gate items, every item has a failing-without-fix test)

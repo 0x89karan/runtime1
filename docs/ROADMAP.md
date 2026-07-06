@@ -48,17 +48,7 @@ credential broker (`cred.1`–`cred.3`) is shipped (v0.60.0). **Foundation-first
 remaining work — one increment per branch, `main` shippable between, each through `/autoplan`
 (or `/plan-eng-review`) → build → `/review` → `/qa` → `/ship`:
 
-- ~~`cred.1` (v0.58.0) · `cred.2` (v0.59.0) · `cred.3` (v0.60.0)~~ ✅ shipped — credential broker core.
-- **⚠️ GATE — credential-manager hardening** *(blocks everything below until complete)*:
-  - `cred.3.1` (PR #85, v0.61.0, in review) — closed most of the gate. Plan:
-    `docs/plans/cred.3.1-hardening.md` · prompt: `docs/prompts/06-cred31-hardening.md`.
-  - **`cred.3.2` — completion (NEXT).** A branch-verified review found cred.3.1 **reduced** three items
-    and **de-claimed** two defenses: ar-10 (shares only the client — request-level guards still
-    duplicated across two handlers), ar-04 (SSRF startup-only — DNS rebinding open), ar-07 (token scoped
-    per-server, not per-agent), S2 + S3 (content audit + SecretRewriter not built), and the
-    RUNBOOK/THREAT_MODEL headers left stale. Plan: `docs/plans/cred.3.2-hardening-completion.md` ·
-    prompt: `docs/prompts/07-cred32-completion.md`.
-  - cred.3 is **not "robust"** — cred.4 / orch.1 stay blocked — until `cred.3.2` is green.
+- ~~`cred.1` (v0.58.0) · `cred.2` (v0.59.0) · `cred.3` (v0.60.0) · `cred.3.1` (v0.61.0) · `cred.3.2` (v0.62.0)~~ ✅ shipped — credential broker core + hardening complete.
 1. **orch.1** — interactive agent orchestrator (`/office-hours` + `/plan-eng-review` first).
 2. **h8.1** — Layer-2 semantic memory sidecar (its embedding API key rides the `cred.3` broker).
 3. **cred.4 / cred.5** — egress gateway + surfacing · **ma.4** — isolation-tier honesty (small, slot anytime).

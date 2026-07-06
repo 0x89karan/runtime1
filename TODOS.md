@@ -675,6 +675,10 @@ imply this feature is active when it is not.
 - **How to apply (future, P2):** build a real `SecretRewriter` in `agentd/src/tools/mod.rs`
   that scans `ToolResult` content for `sk-ant-*`, `Bearer ` and other credential patterns
   and redacts them before the flight log. At that point set `"content_audited": true` again.
+  **Design requirements (cred.3.2 autoplan, eng phase):** use PER-TYPE patterns with explicit
+  prefix anchors (`(?:^|\s|")`) to prevent false positives on base64 content, SHA hashes, and
+  JWT payloads; include a false-positive test suite; cap match to specific credential shapes
+  (`sk-ant-[A-Za-z0-9_-]{40,}`, `ya29\.[A-Za-z0-9_-]+`, `BSA[A-Za-z0-9]{32,}`).
 - **Depends on:** S2 completion (content_audited field removed).
 - **Where to start:** `docs/THREAT_MODEL.md` + `CLAUDE.md` (p7.5 summary) + `TODOS.md`
   (file this as ongoing P2 work).
@@ -694,34 +698,30 @@ the original secrets file refresh token, which is now invalid if the provider ro
 - **Depends on:** cred.3.1 (load_from_disk introduced).
 - **Where to start:** `agentd/src/credential/mod.rs` — `OAuthTokenCache::load_from_disk()`.
 
-**cred.3.1-adv-02 (P3) — DNS rebinding bypasses startup SSRF check on `upstream_base`**
+**cred.3.1-adv-02 (P3 → FIXED in cred.3.2) — DNS rebinding bypasses startup SSRF check on `upstream_base`**
 
 `CredentialGateway::start()` resolves `upstream_base` once at boot. A DNS TTL of zero (or
 a short-TTL attacker-controlled domain) can switch from a valid public IP to `169.254.169.254`
 (IMDS) after the check passes. All subsequent credential-bearing requests bypass the SSRF guard.
 
-- **Why:** startup-only DNS checks are a known limitation; the guard gives false assurance if
-  the operator uses a DNS name rather than an IP address for `upstream_base`.
-- **Note:** `upstream_base` is operator config, not MCP-controlled input, so exploitability
-  requires compromising the operator's DNS infrastructure. Severity is P3.
-- **How to apply:** either document the limitation in THREAT_MODEL.md §8 (minimal fix), or
-  implement per-request SSRF enforcement via a custom reqwest connector that re-resolves and
-  re-checks each connection (complex; requires a custom `hyper::Connector`).
-- **Where to start:** `agentd/src/credential/mod.rs` — `CredentialGateway::start()` SSRF check
-  comment + THREAT_MODEL.md §8.
+- **Status:** **Fixed in cred.3.2 (Group A, ar-04) via IP pinning.** Resolved IP stored in
+  `GatewayState` at startup; per-request connection uses stored IP with SNI set to original hostname.
+  A host that rebinds to a private IP after startup is blocked. Test T26 covers the rebinding path.
+- **Why:** startup-only DNS checks are a known limitation.
+- **Where fixed:** `agentd/src/credential/mod.rs` — `GatewayState` + per-request IP check.
 
-**cred.3.1-adv-03 (P3) — `ApiKeyQuery` key clobbered by MCP-injected duplicate query param**
+**cred.3.1-adv-03 (P3 → FIXED in cred.3.2) — `ApiKeyQuery` key clobbered by MCP-injected duplicate query param**
 
 For `auth_style = "api-key-query"`, the broker appends `?{key}={credential}` via reqwest's
 `.query()`. A compromised MCP server can pre-inject the key param in the request URL
 (`?api_key=dummy`). APIs that take the *first* query param occurrence would see `dummy` instead
 of the real key, effectively disabling credential injection without breaking the request flow.
 
-- **Why:** a DoS on credential injection for query-param auth. Credential doesn't leak.
-- **How to apply:** strip the provider's `key` parameter from the inbound query string before
-  forwarding. Parse the query string, remove matching keys, reconstruct it.
-- **Depends on:** cred.3.1 (PASSTHROUGH_HEADERS + upstream URL build).
-- **Where to start:** `agentd/src/credential/mod.rs` — step 9 upstream URL build.
+- **Status:** **Fixed in cred.3.2 (Group A, D3) — inbound query string sanitized before forwarding.**
+  Inbound query string is stripped (discarded) so MCP server cannot inject params into upstream URL.
+  Test T35b covers the injection path.
+- **Why:** a DoS on credential injection for query-param auth.
+- **Where fixed:** `agentd/src/credential/mod.rs` — step 9 upstream URL build (query stripped).
 
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment

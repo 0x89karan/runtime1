@@ -1,7 +1,7 @@
 # AgentOS / agentd Threat Model
 
 This document enumerates the security boundaries, threats, controls, and known
-limitations of the `agentd` runtime as of v0.25.0 (Phase 5.8). It is the operator
+limitations of the `agentd` runtime as of v0.62.0 (cred.3.2). It is the operator
 reference for understanding what the sandbox stops, what it doesn't, and why.
 
 ---
@@ -475,12 +475,14 @@ via the broker's upstream forwarding (the broker relays responses back to the
 caller). The `allowed_providers` list limits which upstreams are reachable.
 
 **DNS rebinding limitation:** The startup SSRF check (`is_ssrf_blocked`) resolves
-`upstream_base` once at boot. A zero-TTL or short-TTL DNS entry could switch from a
-valid public IP to `169.254.169.254` (IMDS) after the check passes. `upstream_base` is
-operator-configured (not MCP-controlled input), so exploitation requires compromising
-the operator's DNS infrastructure. Tracked as cred.3.1-adv-02. Per-request DNS re-check
-is not implemented; operators should use IP addresses rather than hostnames for
-`upstream_base` when IMDS exposure is a concern.
+`upstream_base` once at boot and pins the result into the `reqwest::Client` via
+`ClientBuilder::resolve()` (IP pinning, ar-04, v0.62.0). This prevents the common
+DNS rebinding path: the resolved IP is locked for the lifetime of the gateway process.
+A zero-TTL or short-TTL DNS entry injected *before* startup (not after) could still
+reach an SSRF target, but that requires compromising the operator's DNS infrastructure
+before the process starts. `upstream_base` is operator-configured (not MCP-controlled
+input). Per-process-lifetime IP pinning is implemented; per-request re-resolution is
+not and is not necessary given pinning is in place.
 
 ### §8.4 Token state write integrity (QEMU 9p)
 
@@ -521,13 +523,24 @@ only, via `ProxyRegistry`) but do NOT receive `AGENTD_CREDENTIAL_TOKEN` or
 credentials will receive a 503 from those servers. This is intentional: universal-tier
 credential plumbing is deferred to cred.4 or cred.5.
 
-### §8.7 Egress content audit (NOT IMPLEMENTED)
+### §8.7 Egress content audit (NOT IMPLEMENTED — ratified de-claim)
 
 Tool output is **not** scanned for credential-shaped tokens before it reaches the flight
-log or the agent context. No `SecretRewriter` struct exists. The `EgressBrokered` flight
-event does NOT contain a `content_audited` field (removed in v0.61.0 as it was
-hardcoded `true` with no actual scanning behind it). A real content audit
-(`SecretRewriter`) is tracked as cred.3-ar-S3 (P2) in TODOS.md.
+log or the agent context. This is an explicit, ratified limitation (S2/S3 de-claims,
+cred.3.2):
+
+- **No `SecretRewriter` struct.** Credential-shaped tokens that appear in upstream API
+  responses are forwarded as-is to the calling MCP server and logged in `flight.jsonl`.
+- **`EgressBrokered` event does not audit content.** The field `content_audited` was
+  removed in v0.61.0 (it was hardcoded `true` with no actual scanning). The event now
+  accurately records only that the egress was brokered; it makes no content-audit claim.
+- **`EvidenceWriter` (p7.5) is the signing mechanism for the *egress proxy* path only.**
+  The credential gateway uses `FlightRecorder` only; it does not write to `evidence.jsonl`
+  and does not compute body hashes.
+- **Tracking.** A real content audit (`SecretRewriter`) scanning tool output for
+  credential-shaped tokens is tracked as cred.3-ar-S3 (P2) in TODOS.md. Operators who
+  require this control should treat `flight.jsonl` as potentially containing live tokens
+  and restrict access accordingly.
 
 ---
 
@@ -549,7 +562,7 @@ hardcoded `true` with no actual scanning behind it). A real content audit
 | Prompt-injection persistence (p5.4+) | See §7.4 | Provenance shown; canon trusted; no sanitization of retrieved content |
 | `memory.redb` at rest (p5.1+) | See §7.5 | No encryption; mode 0600 only; startup asserts store not inside MCP sandbox |
 | Memory substrate availability (p5.1+) | See §7.6 | No retry/failover; store-open failure silently disables memory tools |
-| Credential SSRF (cred.3+) | See §8.3 | DNS-checked at startup only (rebinding not defended — see §8.3); link-local/private/IMDS ranges blocked (v0.61.0+) |
+| Credential SSRF (cred.3+) | See §8.3 | DNS-checked at startup + IP pinned for process lifetime (v0.62.0); link-local/private/IMDS ranges blocked |
 | Credential header injection (cred.3+) | See §8.5 | Allow-list enforced (v0.61.0+); x-goog-user-project blocked (billing injection) |
 | Universal-tier credential access | See §8.6 | Not implemented; deferred to cred.4/5 |
 | Egress content scan | See §8.7 | NOT IMPLEMENTED; no credential-shaped token scanning in tool output |
