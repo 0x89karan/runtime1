@@ -449,14 +449,14 @@ impl Scheduler {
                                 allowed_hosts:           vec![],
                                 token_budget_remaining:  Arc::new(AtomicU64::new(cfg.token_budget)),
                             },
-                        });
+                        }).await;
                     }
                     match UniversalAgent::spawn(&cfg, addr, &ephemeral_key, &recorder) {
                         Ok(ua) => { state.universal_agents.insert(cfg.id.clone(), ua); }
                         Err(e) => {
                             // Deregister the key since the agent never started.
                             if let Some(reg) = &state.proxy_registry {
-                                reg.deregister_by_key(&ephemeral_key);
+                                reg.deregister_by_key(&ephemeral_key).await;
                             }
                             let msg = format!("universal spawn failed: {e}");
                             recorder.record(
@@ -892,7 +892,7 @@ impl Scheduler {
             let ua = state.universal_agents.get_mut(&id).unwrap();
             let ephemeral_key = ua.ephemeral_key.clone();
             if let Some(reg) = &state.proxy_registry {
-                reg.deregister_by_key(&ephemeral_key);
+                reg.deregister_by_key(&ephemeral_key).await;
             }
             ua.kill().await;
             state.outcomes.entry(id.clone()).or_insert_with(|| {
@@ -2066,7 +2066,7 @@ async fn poll_universal_agents(
             // inference requests during the 5-second SIGTERM grace window.
             let ephemeral_key = ua.ephemeral_key.clone();
             if let Some(reg) = &state.proxy_registry {
-                reg.deregister_by_key(&ephemeral_key);
+                reg.deregister_by_key(&ephemeral_key).await;
             }
             ua.kill().await;
             state.universal_agents.remove(&id);
@@ -2092,7 +2092,7 @@ async fn poll_universal_agents(
                 };
                 state.universal_agents.remove(&id);
                 if let Some(reg) = &state.proxy_registry {
-                    reg.deregister_by_key(&ephemeral_key);
+                    reg.deregister_by_key(&ephemeral_key).await;
                 }
                 state.outcomes.insert(id.clone(), outcome);
                 any_exited = true;
@@ -2109,7 +2109,7 @@ async fn poll_universal_agents(
                 let msg = e.to_string();
                 state.universal_agents.remove(&id);
                 if let Some(reg) = &state.proxy_registry {
-                    reg.deregister_by_key(&ephemeral_key);
+                    reg.deregister_by_key(&ephemeral_key).await;
                 }
                 state.outcomes.insert(id.clone(), Err(anyhow::anyhow!("universal agent poll error: {msg}")));
                 any_exited = true;

@@ -435,7 +435,69 @@ not terminated. Restart agentd to re-open the store after the volume is restored
 
 ---
 
-## 8. Summary table
+## 8. Credential gateway (cred.3+)
+
+The in-process credential broker (`agentd/src/credential/mod.rs`) is a second
+loopback HTTP listener (OS-assigned port) that MCP server subprocesses use to
+make authenticated API calls without holding provider credentials directly.
+
+### §8.1 Token identity and scope
+
+Each MCP server spawn receives one ephemeral credential token (UUID4) as
+`AGENTD_CREDENTIAL_TOKEN`. The broker validates this token against a registry
+that maps token → `(agent_id, allowed_providers)`. Tokens are deregistered
+before MCP server shutdown.
+
+**Gap:** Token is a shared secret between the host process and the subprocess.
+A compromised MCP server can make requests to any provider in its `allowed_providers`
+list for the lifetime of the token (until deregistration). cred.4 will add
+per-call budget enforcement.
+
+### §8.2 Credential isolation
+
+Secrets (`ANTHROPIC_API_KEY`, `BRAVE_SEARCH_API_KEY`, `OAUTH_REFRESH_TOKEN`,
+`OAUTH_CLIENT_SECRET`) are blocked from MCP subprocess environments via
+`PASSENV_BLOCKLIST`. The broker reads them from env/secrets-file at token-refresh
+time, not at subprocess spawn time.
+
+**Gap:** The broker process itself holds secrets in process memory. A memory
+read exploit against agentd can extract them.
+
+### §8.3 Loopback SSRF
+
+The broker binds on `127.0.0.1:0`. MCP subprocesses that are network-sandboxed
+(Landlock IsolateNetwork) cannot reach the loopback adapter. To allow broker
+access, the MCP server must have `Net { ports = [gateway_port] }` in its
+capabilities, or the operator must not use IsolateNetwork.
+
+**Gap:** A sandboxed MCP server with only loopback access could exfiltrate data
+via the broker's upstream forwarding (the broker relays responses back to the
+caller). The `allowed_providers` list limits which upstreams are reachable.
+
+### §8.4 Token state write integrity (QEMU 9p)
+
+On QEMU virtfs 9p mounts, the `rename()` system call is not atomic (known
+kernel limitation). If the OAuth access token rotates and the broker emits a
+new refresh token, the state write may fail silently. The broker:
+- Still returns the newly fetched access token for the current request.
+- Emits `CredentialRefreshFailed` with `token_written: false` so the operator
+  is alerted.
+- On next request, re-reads the original secrets file and re-fetches from the
+  token endpoint, losing the rotated refresh token.
+
+**Gap:** If the original refresh token was single-use (Google rotates them),
+the next refresh attempt will fail and the operator must re-run `agentctl auth`.
+
+### §8.5 Header scrubbing
+
+The broker always strips `Authorization`, `Host`, `X-Subscription-Token`,
+`X-Credential-Token`, and the provider's `header_name` from inbound MCP server
+requests before forwarding. This prevents credential injection attacks where
+a compromised MCP server tries to bypass the broker by sending its own auth header.
+
+---
+
+## 9. Summary table
 
 | Threat | Control | Gaps |
 |---|---|---|

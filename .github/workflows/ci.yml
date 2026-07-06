@@ -181,7 +181,7 @@ jobs:
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
 
   publish-docker:
-    needs: [build-and-test, build-aarch64, build-macos, audit]
+    needs: [build-and-test, build-aarch64, audit, build-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 120  # arm64 QEMU build ~60-90 min on first push; GHA cache cuts subsequent runs to ~15 min
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'

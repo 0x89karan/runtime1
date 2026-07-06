@@ -320,6 +320,18 @@ dry-run job (`make -n build/run ARCH=aarch64`); `distro/README.md` Apple Silicon
 `build-aarch64` + `audit`; `docker/setup-qemu-action@v3` + `docker/setup-buildx-action@v3` + GHA
 layer cache; `provenance: false` for Docker client < 24.x compat; concurrency group prevents
 parallel publishes.
+**cred.3 complete (v0.60.0).** Credential broker as egress gateway: `agentd/src/credential/mod.rs`
+(new, ~955 lines) with `CredentialGateway` (second OS-assigned loopback HTTP listener), `CredentialRegistry`
+(ephemeral UUID4 token per MCP spawn, `tokio::sync::RwLock`), `OAuthTokenCache` (atomic state write,
+token expiry buffer, `credential_refresh_failed` even on write failure); TOML-driven provider adapters
+(`oauth-bearer`, `api-key-header`, `api-key-query`) via `[credential_gateway.providers.<name>]`; header
+scrubbing (`Authorization`, `Host`, `X-Subscription-Token`, `header_name`) before upstream forward;
+`Capability::Credential { provider: CredentialProvider }` + `CredentialProvider` enum (`Google`,
+`BraveSearch`, `Custom`); `PASSENV_BLOCKLIST` extended (6 broker-managed vars); `McpClient::spawn()`
+gains `credential_env` param (highest priority, collision warning); `ProxyRegistry` converted from
+`std::sync::RwLock` to `tokio::sync::RwLock`; `docker/search_mcp.py` + `docker/oauth_mcp.py` migrated
+to broker with legacy env-var fallback; `THREAT_MODEL.md` §8 (5 subsections); 5 new `EventKind` variants;
+1112 workspace tests (up from 1096).
 
 ## How to work here
 

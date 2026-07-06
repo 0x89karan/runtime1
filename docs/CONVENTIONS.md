@@ -120,6 +120,11 @@ Phase 0 kinds (canonical — do not rename):
 | `management_request` | management HTTP API received a request (method, path, status: u16) (p7.7+) |
 | `approval_http_approved` | operator approved a pending action via the HTTP management API (id, agent_id) (dx.2+) |
 | `approval_http_denied` | operator denied a pending action via the HTTP management API (id, agent_id, reason: Option<String>) (dx.2+) |
+| `credential_egress_brokered` | credential broker forwarded an upstream API call on behalf of an agent (agent_id, provider, path, response_status: u16, response_bytes: usize) (cred.3+) |
+| `credential_accessed` | credential broker received a valid request from an MCP server (agent_id, provider, path, method) (cred.3+) |
+| `credential_refresh_failed` | OAuth token refresh write to state_path failed; access token still returned for this request (provider, error, token_written: bool) (cred.3+) |
+| `credential_not_provisioned` | requested provider is not configured in [credential_gateway.providers] (provider, hint) (cred.3+) |
+| `credential_denied` | MCP server's allowed_providers list does not include the requested provider (agent_id, provider) (cred.3+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

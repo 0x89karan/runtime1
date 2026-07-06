@@ -45,6 +45,7 @@ while IFS= read -r _ln || [ -n "$_ln" ]; do
     _v="${_ln#*=}"
     case "$_k" in *[!A-Za-z0-9_]*|''|[0-9]*) continue ;; esac
     case "$_k" in BASH_ENV|LD_PRELOAD|LD_LIBRARY_PATH|PATH|IFS|ENV|PS4|CDPATH) continue ;; esac
+    case "$_k" in PYTHONSTARTUP|PYTHONPATH|PYTHONUSERSITE|PYTHONINSPECT|RUBYOPT|NODE_OPTIONS) continue ;; esac
     export "${_k}=${_v}"
 done < /run/secrets/agentos.env
 

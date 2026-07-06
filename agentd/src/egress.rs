@@ -14,7 +14,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -95,20 +96,20 @@ impl ProxyRegistry {
     }
 
     /// Register a workload. Called at p7.6 spawn time.
-    pub fn register(&self, ephemeral_key: String, entry: ProxyEntry) {
-        let mut map = self.agents.write().unwrap();
+    pub async fn register(&self, ephemeral_key: String, entry: ProxyEntry) {
+        let mut map = self.agents.write().await;
         map.insert(ephemeral_key, entry);
     }
 
     /// Deregister a workload by its ephemeral key. Called when the workload exits.
-    pub fn deregister_by_key(&self, ephemeral_key: &str) {
-        let mut map = self.agents.write().unwrap();
+    pub async fn deregister_by_key(&self, ephemeral_key: &str) {
+        let mut map = self.agents.write().await;
         map.remove(ephemeral_key);
     }
 
     /// Look up a workload by its ephemeral key. Returns a clone of the entry.
-    pub fn entry_for_key(&self, x_api_key: &str) -> Option<ProxyEntry> {
-        let map = self.agents.read().unwrap();
+    pub async fn entry_for_key(&self, x_api_key: &str) -> Option<ProxyEntry> {
+        let map = self.agents.read().await;
         map.get(x_api_key).cloned()
     }
 }
@@ -279,7 +280,7 @@ async fn handle_proxy_request(
     };
 
     // 3. Registry lookup.
-    let entry = match state.registry.entry_for_key(&ephemeral_key) {
+    let entry = match state.registry.entry_for_key(&ephemeral_key).await {
         Some(e) => e,
         None => {
             state.egress.record_proxy_failed("unknown", "unknown_workload_key");
@@ -655,8 +656,8 @@ mod tests {
         assert!(log.contains("action_receipt_emitted"));
     }
 
-    #[test]
-    fn proxy_registry_register_deregister() {
+    #[tokio::test]
+    async fn proxy_registry_register_deregister() {
         let reg = ProxyRegistry::new();
         let budget = Arc::new(AtomicU64::new(10_000));
         reg.register(
@@ -668,17 +669,17 @@ mod tests {
                     token_budget_remaining: Arc::clone(&budget),
                 },
             },
-        );
+        ).await;
         // Lookup should succeed.
-        let entry = reg.entry_for_key("sk-ant-WORKLOAD-test-key").unwrap();
+        let entry = reg.entry_for_key("sk-ant-WORKLOAD-test-key").await.unwrap();
         assert_eq!(entry.agent_id, "scout");
         // Deregister.
-        reg.deregister_by_key("sk-ant-WORKLOAD-test-key");
-        assert!(reg.entry_for_key("sk-ant-WORKLOAD-test-key").is_none());
+        reg.deregister_by_key("sk-ant-WORKLOAD-test-key").await;
+        assert!(reg.entry_for_key("sk-ant-WORKLOAD-test-key").await.is_none());
     }
 
-    #[test]
-    fn proxy_ephemeral_key_identifies_agent() {
+    #[tokio::test]
+    async fn proxy_ephemeral_key_identifies_agent() {
         let reg = ProxyRegistry::new();
         let budget = Arc::new(AtomicU64::new(50_000));
         reg.register(
@@ -690,11 +691,11 @@ mod tests {
                     token_budget_remaining: Arc::clone(&budget),
                 },
             },
-        );
-        let entry = reg.entry_for_key("sk-ant-WORKLOAD-abc-xyz").unwrap();
+        ).await;
+        let entry = reg.entry_for_key("sk-ant-WORKLOAD-abc-xyz").await.unwrap();
         assert_eq!(entry.agent_id, "librarian");
         assert_eq!(entry.policy.allowed_hosts, vec!["api.anthropic.com"]);
-        assert!(reg.entry_for_key("wrong-key").is_none());
+        assert!(reg.entry_for_key("wrong-key").await.is_none());
     }
 
     #[test]
@@ -755,7 +756,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Path check fires before upstream — upstream never reached.
         let (bound, registry) = start_test_proxy(&dir, "sk-ant-REAL-KEY", "http://127.0.0.1:1".to_string()).await;
-        register_workload(&registry, "sk-ant-WORKLOAD-test", "test-agent", 100_000);
+        register_workload(&registry, "sk-ant-WORKLOAD-test", "test-agent", 100_000).await;
         let resp = reqwest::Client::new()
             .post(format!("http://{bound}/v1/bad-path"))
             .header("x-api-key", "sk-ant-WORKLOAD-test")
@@ -797,7 +798,7 @@ mod tests {
         let (proxy_bound, registry) =
             start_test_proxy(&dir, "sk-ant-REAL-PRODUCTION-KEY", upstream_url).await;
         let ephemeral_key = "sk-ant-WORKLOAD-ephemeral-001";
-        register_workload(&registry, ephemeral_key, "worker", 100_000);
+        register_workload(&registry, ephemeral_key, "worker", 100_000).await;
 
         let resp = reqwest::Client::new()
             .post(format!("http://{proxy_bound}/v1/messages"))
@@ -890,7 +891,7 @@ mod tests {
         (bound, registry)
     }
 
-    fn register_workload(registry: &Arc<ProxyRegistry>, key: &str, agent: &str, budget: u64) -> Arc<AtomicU64> {
+    async fn register_workload(registry: &Arc<ProxyRegistry>, key: &str, agent: &str, budget: u64) -> Arc<AtomicU64> {
         let b = Arc::new(AtomicU64::new(budget));
         registry.register(
             key.to_string(),
@@ -901,7 +902,7 @@ mod tests {
                     token_budget_remaining: Arc::clone(&b),
                 },
             },
-        );
+        ).await;
         b
     }
 
@@ -933,7 +934,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let upstream_url = format!("http://{upstream}");
         let (bound, registry) = start_test_proxy(&dir, "sk-ant-REAL-KEY", upstream_url).await;
-        register_workload(&registry, "sk-ant-WORKLOAD-hbh", "hop-agent", 100_000);
+        register_workload(&registry, "sk-ant-WORKLOAD-hbh", "hop-agent", 100_000).await;
 
         let resp = reqwest::Client::new()
             .post(format!("http://{bound}/v1/messages"))
@@ -981,7 +982,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let upstream_url = format!("http://{upstream}");
         let (bound, registry) = start_test_proxy(&dir, "sk-ant-REAL-KEY", upstream_url).await;
-        let budget = register_workload(&registry, "sk-ant-WORKLOAD-receipt", "receipt-agent", 10_000);
+        let budget = register_workload(&registry, "sk-ant-WORKLOAD-receipt", "receipt-agent", 10_000).await;
 
         let resp = reqwest::Client::new()
             .post(format!("http://{bound}/v1/messages"))
@@ -1030,7 +1031,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let upstream_url = format!("http://{upstream}");
         let (bound, registry) = start_test_proxy(&dir, "sk-ant-REAL-KEY", upstream_url).await;
-        register_workload(&registry, "sk-ant-WORKLOAD-err", "err-agent", 10_000);
+        register_workload(&registry, "sk-ant-WORKLOAD-err", "err-agent", 10_000).await;
 
         let resp = reqwest::Client::new()
             .post(format!("http://{bound}/v1/messages"))
@@ -1071,7 +1072,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // Method check fires before forwarding — upstream never reached.
         let (bound, registry) = start_test_proxy(&dir, "sk-ant-REAL-KEY", "http://127.0.0.1:1".to_string()).await;
-        register_workload(&registry, "sk-ant-WORKLOAD-get-test", "get-agent", 100_000);
+        register_workload(&registry, "sk-ant-WORKLOAD-get-test", "get-agent", 100_000).await;
         let resp = reqwest::Client::new()
             .get(format!("http://{bound}/v1/messages")) // GET not POST
             .header("x-api-key", "sk-ant-WORKLOAD-get-test")
@@ -1091,7 +1092,7 @@ mod tests {
         // Budget check fires before forwarding — upstream never reached.
         let (bound, registry) = start_test_proxy(&dir, "sk-ant-REAL-KEY", "http://127.0.0.1:1".to_string()).await;
         // Register workload with zero budget.
-        register_workload(&registry, "sk-ant-WORKLOAD-broke", "broke-agent", 0);
+        register_workload(&registry, "sk-ant-WORKLOAD-broke", "broke-agent", 0).await;
         let resp = reqwest::Client::new()
             .post(format!("http://{bound}/v1/messages"))
             .header("x-api-key", "sk-ant-WORKLOAD-broke")
@@ -1120,7 +1121,7 @@ mod tests {
         let upstream_url = format!("http://{upstream_addr}");
         let (bound, registry) =
             start_test_proxy(&dir, "sk-ant-REAL-KEY", upstream_url).await;
-        register_workload(&registry, "sk-ant-WORKLOAD-bigbody", "bigbody-agent", 100_000);
+        register_workload(&registry, "sk-ant-WORKLOAD-bigbody", "bigbody-agent", 100_000).await;
 
         // 5 MB body — exceeds the 4 MB cap
         let big_body = vec![b'x'; 5 * 1024 * 1024];
@@ -1155,7 +1156,7 @@ mod tests {
         let upstream_url = format!("http://{upstream_addr}");
         let (bound, registry) =
             start_test_proxy(&dir, "sk-ant-REAL-KEY", upstream_url).await;
-        register_workload(&registry, "sk-ant-WORKLOAD-bigres", "bigres-agent", 100_000);
+        register_workload(&registry, "sk-ant-WORKLOAD-bigres", "bigres-agent", 100_000).await;
 
         let resp = reqwest::Client::new()
             .post(format!("http://{bound}/v1/messages"))

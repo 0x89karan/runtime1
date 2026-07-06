@@ -16,7 +16,7 @@ fn echo_mcp_path() -> &'static str {
 /// McpTool::invoke returns the echoed text on success.
 #[tokio::test]
 async fn mcp_tool_invoke_returns_text() {
-    let (client, specs) = McpClient::spawn(echo_mcp_path(), &[], None, &Default::default(), &[])
+    let (client, specs) = McpClient::spawn(echo_mcp_path(), &[], None, &Default::default(), &[], &Default::default())
         .await
         .expect("failed to spawn echo-mcp");
     assert_eq!(specs.len(), 1, "echo-mcp must expose exactly one tool");
@@ -28,7 +28,7 @@ async fn mcp_tool_invoke_returns_text() {
 /// McpTool::invoke converts isError:true + text content into an Err.
 #[tokio::test]
 async fn mcp_tool_invoke_is_error_with_text_propagates_error() {
-    let (client, specs) = McpClient::spawn(echo_mcp_path(), &[], None, &Default::default(), &[])
+    let (client, specs) = McpClient::spawn(echo_mcp_path(), &[], None, &Default::default(), &[], &Default::default())
         .await
         .expect("failed to spawn echo-mcp");
     let tool = McpTool::new(client, specs.into_iter().next().unwrap(), "echo-mcp".to_string());
@@ -46,7 +46,7 @@ async fn mcp_tool_invoke_is_error_with_text_propagates_error() {
 /// content is empty (no text parts).
 #[tokio::test]
 async fn mcp_tool_invoke_is_error_no_content_uses_fallback() {
-    let (client, specs) = McpClient::spawn(echo_mcp_path(), &[], None, &Default::default(), &[])
+    let (client, specs) = McpClient::spawn(echo_mcp_path(), &[], None, &Default::default(), &[], &Default::default())
         .await
         .expect("failed to spawn echo-mcp");
     let tool = McpTool::new(client, specs.into_iter().next().unwrap(), "echo-mcp".to_string());

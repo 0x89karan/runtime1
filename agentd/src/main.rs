@@ -2,7 +2,8 @@ use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
 use agentd::{agent::{truncate, PREVIEW_CHARS}, checkpoint::CheckpointStore, config, scheduler::Scheduler};
-use agentd::capability::{normalize_path, Capability};
+use agentd::capability::{normalize_path, Capability, CredentialProvider};
+use agentd::credential::CredentialGateway;
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
 use agentd::memory::store::RedbStore;
@@ -373,6 +374,28 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         }
     }
 
+    // ── cred.3: credential broker ─────────────────────────────────────────────
+    // Start the credential gateway BEFORE spawning any MCP server so we can
+    // inject AGENTD_CREDENTIAL_GATEWAY_URL + AGENTD_CREDENTIAL_TOKEN into each
+    // subprocess environment at spawn time.
+    let (maybe_cred_gw, cred_gw_url): (Option<Arc<CredentialGateway>>, Option<String>) =
+        if cfg.credential_gateway.enabled {
+            match CredentialGateway::start(&cfg.credential_gateway, Arc::clone(&recorder)).await {
+                Ok((gw, addr)) => {
+                    tracing::info!(addr = %addr, "credential gateway started");
+                    (Some(gw), Some(format!("http://{addr}")))
+                }
+                Err(e) => {
+                    return Err(e.context("credential gateway failed to bind (fail-closed)"));
+                }
+            }
+        } else {
+            (None, None)
+        };
+    // Tokens issued to MCP servers; deregistered after the scheduler exits.
+    let mut cred_tokens: Vec<String> = Vec::new();
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Held for Drop: keeps MCP child processes (stdio) or connection objects (HTTP) alive.
     // std::process::exit() bypasses Drop, so we must return Err instead of
     // calling exit() while mcp_backends is still in scope.
@@ -499,12 +522,43 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             isolation = ?server.isolation,
             "spawning MCP server"
         );
+        // Build credential env: AGENTD_CREDENTIAL_GATEWAY_URL + AGENTD_CREDENTIAL_TOKEN.
+        // Issued only when the credential gateway is enabled. The token's allowed_providers
+        // list mirrors the Credential capabilities on this server (None = all configured).
+        let credential_env: std::collections::HashMap<String, String> =
+            if let (Some(ref gw), Some(ref gw_url)) = (&maybe_cred_gw, &cred_gw_url) {
+                let allowed: Vec<String> = match &server.capabilities {
+                    None => cfg.credential_gateway.providers.keys().cloned().collect(),
+                    Some(caps) => caps.iter().filter_map(|cap| {
+                        if let Capability::Credential { provider } = cap {
+                            Some(match provider {
+                                CredentialProvider::Google      => "google".to_string(),
+                                CredentialProvider::BraveSearch => "brave-search".to_string(),
+                                CredentialProvider::Custom(s)   => s.clone(),
+                            })
+                        } else {
+                            None
+                        }
+                    }).collect(),
+                };
+                let token = uuid::Uuid::new_v4().to_string();
+                gw.register_token(token.clone(), server.name.clone(), allowed).await;
+                cred_tokens.push(token.clone());
+                let mut env = std::collections::HashMap::new();
+                env.insert("AGENTD_CREDENTIAL_GATEWAY_URL".to_string(), gw_url.clone());
+                env.insert("AGENTD_CREDENTIAL_TOKEN".to_string(), token);
+                env
+            } else {
+                std::collections::HashMap::new()
+            };
+
         let (client, specs) = McpClient::spawn(
             effective_cmd,
             &effective_args,
             effective_compiled,
             &server.env,
             &server.passenv,
+            &credential_env,
         )
         .await
         .with_context(|| format!("spawning MCP server '{}'", server.name))?;
@@ -1021,6 +1075,15 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         );
     }
 
+    // Deregister credential tokens before MCP server shutdown so any last-gasp
+    // requests from shutting-down servers receive 401 rather than making
+    // broker calls with a token whose agent no longer exists.
+    if let Some(ref gw) = maybe_cred_gw {
+        for token in &cred_tokens {
+            gw.deregister_token(token).await;
+        }
+    }
+
     for client in &mcp_backends {
         client.shutdown().await;
     }
@@ -1160,12 +1223,13 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
                     rules.push(SandboxRule::AllowNetConnect { port });
                 }
             }
-            // Mcp/KbRead/KbWrite/ShellExec are agent-level or handled via has_spawn; no direct rule.
+            // Mcp/KbRead/KbWrite/ShellExec/Credential are agent-level or broker-handled; no sandbox rule.
             Capability::Mcp { .. }
             | Capability::Spawn
             | Capability::ShellExec
             | Capability::KbRead { .. }
-            | Capability::KbWrite { .. } => {}
+            | Capability::KbWrite { .. }
+            | Capability::Credential { .. } => {}
         }
     }
     rules

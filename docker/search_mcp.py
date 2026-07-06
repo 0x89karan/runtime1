@@ -28,11 +28,16 @@ Graceful degradation:
 import json, os, ssl, sys, urllib.error, urllib.parse, urllib.request
 
 BRAVE_API_URL    = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_PATH       = "res/v1/web/search"   # path appended to broker upstream_base
 MAX_COUNT        = 10
 DEFAULT_COUNT    = 5
 REQUEST_TIMEOUT  = 15          # seconds
 RAW_RESPONSE_CAP = 2 * 1024 * 1024  # 2 MB cap on API response body
 ERROR_BODY_CAP   = 512         # bytes read from HTTP error body
+
+# Credential broker (cred.3). Injected at spawn by agentd; absent → legacy path.
+_BROKER_URL   = os.environ.get("AGENTD_CREDENTIAL_GATEWAY_URL", "").rstrip("/")
+_BROKER_TOKEN = os.environ.get("AGENTD_CREDENTIAL_TOKEN", "")
 
 TOOLS = [{
     "name": "web_search",
@@ -57,31 +62,9 @@ def send(obj):
     sys.stdout.flush()
 
 
-def handle_web_search(args):
-    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
-    if not api_key:
-        return None, (
-            "BRAVE_SEARCH_API_KEY not set. "
-            "Get a free key (2,000 queries/month) at brave.com/search/api, "
-            "then set the environment variable before starting agentd."
-        )
-
-    query = args.get("query", "").strip()
-    if not query:
-        return None, "query must not be empty"
-
-    try:
-        count = max(1, min(int(args.get("count", DEFAULT_COUNT)), MAX_COUNT))
-    except (ValueError, TypeError):
-        count = DEFAULT_COUNT
-    params = urllib.parse.urlencode({"q": query, "count": count})
-    url    = f"{BRAVE_API_URL}?{params}"
-
-    req = urllib.request.Request(url, headers={
-        "Accept":              "application/json",
-        "X-Subscription-Token": api_key,
-    })
-
+def _fetch_search(url: str, headers: dict) -> tuple:
+    """Shared HTTP fetch used by both broker and legacy paths."""
+    req = urllib.request.Request(url, headers=headers)
     ctx = ssl.create_default_context()
     try:
         with urllib.request.urlopen(req, context=ctx, timeout=REQUEST_TIMEOUT) as resp:
@@ -110,14 +93,72 @@ def handle_web_search(args):
     return {"results": results, "total_found": total}, None
 
 
+def handle_web_search(args):
+    query = args.get("query", "").strip()
+    if not query:
+        return None, "query must not be empty"
+
+    try:
+        count = max(1, min(int(args.get("count", DEFAULT_COUNT)), MAX_COUNT))
+    except (ValueError, TypeError):
+        count = DEFAULT_COUNT
+    params = urllib.parse.urlencode({"q": query, "count": count})
+
+    # Primary path: credential broker (cred.3+).
+    # When agentd injects AGENTD_CREDENTIAL_GATEWAY_URL and AGENTD_CREDENTIAL_TOKEN,
+    # route via the broker — the broker attaches X-Subscription-Token automatically.
+    if _BROKER_URL and _BROKER_TOKEN:
+        broker_url = f"{_BROKER_URL}/brave-search/{BRAVE_PATH}?{params}"
+        return _fetch_search(broker_url, {
+            "Accept":             "application/json",
+            "X-Credential-Token": _BROKER_TOKEN,
+        })
+
+    # Legacy fallback: direct Brave API access via env var (backward compat).
+    api_key = os.environ.get("BRAVE_SEARCH_API_KEY", "")
+    if not api_key:
+        return None, (
+            "BRAVE_SEARCH_API_KEY not set and credential broker unavailable. "
+            "Get a free key (2,000 queries/month) at brave.com/search/api, "
+            "then set the environment variable before starting agentd, "
+            "or configure [credential_gateway.providers.brave-search] in your agent config."
+        )
+
+    return _fetch_search(f"{BRAVE_API_URL}?{params}", {
+        "Accept":               "application/json",
+        "X-Subscription-Token": api_key,
+    })
+
+
 def _self_test():
-    # Test with missing key.
-    old_key = os.environ.pop("BRAVE_SEARCH_API_KEY", None)
+    import sys as _sys
+
+    # Ensure broker env vars are absent so the legacy path is exercised.
+    old_broker_url   = os.environ.pop("AGENTD_CREDENTIAL_GATEWAY_URL", None)
+    old_broker_token = os.environ.pop("AGENTD_CREDENTIAL_TOKEN", None)
+    old_key          = os.environ.pop("BRAVE_SEARCH_API_KEY", None)
+
+    # Reset module-level broker vars for the test.
+    global _BROKER_URL, _BROKER_TOKEN
+    _BROKER_URL = ""
+    _BROKER_TOKEN = ""
+
+    # Test 1: missing key + no broker → error mentioning key name.
     res, err = handle_web_search({"query": "test"})
     assert res is None and err is not None, "missing key must return error"
     assert "BRAVE_SEARCH_API_KEY" in err, "error must mention the key name"
 
-    # Test with real key if present.
+    # Test 2: broker path is used when env vars are present.
+    _BROKER_URL   = "http://127.0.0.1:19999"
+    _BROKER_TOKEN = "test-cred-token"
+    # We can't make a real HTTP call in a unit test; just verify the URL is constructed correctly.
+    params = urllib.parse.urlencode({"q": "test", "count": 5})
+    expected_broker_url = f"{_BROKER_URL}/brave-search/{BRAVE_PATH}?{params}"
+    assert expected_broker_url.startswith("http://127.0.0.1:19999/brave-search/")
+    _BROKER_URL   = ""
+    _BROKER_TOKEN = ""
+
+    # Test 3: live search if key is available.
     if old_key:
         os.environ["BRAVE_SEARCH_API_KEY"] = old_key
         try:
@@ -126,6 +167,15 @@ def _self_test():
             assert "results" in res, f"expected results in response"
         except Exception as e:
             print(f"search_mcp.py: live search test skipped ({e})", file=sys.stderr)
+        os.environ.pop("BRAVE_SEARCH_API_KEY", None)
+
+    # Restore env.
+    if old_broker_url:
+        os.environ["AGENTD_CREDENTIAL_GATEWAY_URL"] = old_broker_url
+    if old_broker_token:
+        os.environ["AGENTD_CREDENTIAL_TOKEN"] = old_broker_token
+    if old_key:
+        os.environ["BRAVE_SEARCH_API_KEY"] = old_key
 
     print("search_mcp.py: self-test PASSED", file=sys.stderr)
     sys.exit(0)

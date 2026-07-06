@@ -15,6 +15,7 @@ if [ -f /run/secrets/agentos.env ]; then
     _agentos_val="${_agentos_line#*=}"
     case "$_agentos_key" in *[!A-Za-z0-9_]*|''|[0-9]*) continue ;; esac
     case "$_agentos_key" in BASH_ENV|LD_PRELOAD|LD_LIBRARY_PATH|PATH|IFS|ENV|PS4|CDPATH) continue ;; esac
+    case "$_agentos_key" in PYTHONSTARTUP|PYTHONPATH|PYTHONUSERSITE|PYTHONINSPECT|RUBYOPT|NODE_OPTIONS) continue ;; esac
     export "${_agentos_key}=${_agentos_val}"
   done < /run/secrets/agentos.env
 fi

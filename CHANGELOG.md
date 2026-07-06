@@ -3,6 +3,57 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cred.3] - 2026-07-06 (v0.60.0)
+
+### Added
+- `agentd/src/credential/mod.rs` (new, ~955 lines): `CredentialGateway` — second
+  OS-assigned loopback HTTP listener that MCP servers call to access credentials without
+  holding them directly. Implements TOML-driven provider adapters (`oauth-bearer`,
+  `api-key-header`, `api-key-query`), ephemeral per-spawn credential tokens
+  (`AGENTD_CREDENTIAL_TOKEN` + `AGENTD_CREDENTIAL_GATEWAY_URL` injected by agentd),
+  header scrubbing (strips `Authorization`, `Host`, `X-Subscription-Token`, and the
+  provider's configured `header_name` before attaching auth), `OAuthTokenCache` with
+  atomic state writes (tmp→rename, mode 0600), and `CredentialRegistry`
+  (`tokio::sync::RwLock`-backed).
+- `agentd/src/capability.rs`: `CredentialProvider` enum (`Google`, `BraveSearch`,
+  `Custom(String)`) and `Capability::Credential { provider: CredentialProvider }`.
+  `satisfies()` / `satisfies_type()` updated.
+- `agentd/src/config.rs`: `AuthStyle` enum, `ProviderConfig`, `CredentialGatewayConfig`
+  (opt-in, default disabled). Config gains `[credential_gateway]` table.
+- `agentd/src/events.rs`: 5 new `EventKind` variants: `CredentialEgressBrokered`,
+  `CredentialAccessed`, `CredentialRefreshFailed`, `CredentialNotProvisioned`,
+  `CredentialDenied`.
+- `agentd/src/tools/mcp.rs`: `PASSENV_BLOCKLIST` extended with `BRAVE_SEARCH_API_KEY`,
+  `OAUTH_REFRESH_TOKEN`, `OAUTH_CLIENT_SECRET`, `OAUTH_ACCESS_TOKEN`,
+  `AGENTD_CREDENTIAL_TOKEN`, `AGENTD_CREDENTIAL_GATEWAY_URL`. `McpClient::spawn()`
+  gains a `credential_env` parameter (applied last, highest priority, with collision
+  warning).
+- `agentd/src/main.rs`: credential gateway started before MCP loop; UUID4 token per
+  stdio MCP server spawn; tokens deregistered at shutdown. `caps_to_rules()` gains
+  `Capability::Credential` arm (no-op at cred.3; enforcement in cred.4+).
+- `docker/search_mcp.py`: dual-path — broker path via `AGENTD_CREDENTIAL_GATEWAY_URL` +
+  `AGENTD_CREDENTIAL_TOKEN`; legacy `BRAVE_SEARCH_API_KEY` env fallback preserved.
+- `docker/oauth_mcp.py`: `oauth_call_api` routes via broker when `AGENTD_CREDENTIAL_GATEWAY_URL`
+  is set; falls back to legacy PKCE flow otherwise.
+- `docs/THREAT_MODEL.md` §8 Credential Gateway (§8.1–8.5): token identity, in-process
+  credential isolation, loopback SSRF, 9p write integrity, header scrubbing.
+- `docs/CONVENTIONS.md`: 5 new event kind rows.
+
+### Changed
+- `agentd/src/egress.rs`: `ProxyRegistry` converted from `std::sync::RwLock` to
+  `tokio::sync::RwLock`; `register`, `deregister_by_key`, `entry_for_key` are now
+  `async fn`. All callers in `main.rs` and `scheduler.rs` updated.
+
+### Security
+- Credential broker strips caller-supplied credential headers before attaching auth —
+  prevents MCP server from injecting a forged `Authorization` header to the upstream.
+- Ephemeral token per-MCP-spawn deregistered on exit — minimal blast radius if a token
+  is leaked after the spawn exits.
+- `credential_refresh_failed` emitted even when an atomic write fails on QEMU 9p but the
+  current access token still works — prevents silent recovery-blocking token loss.
+- All new broker-managed env var names added to `PASSENV_BLOCKLIST` — prevents passenv
+  from tunneling raw secrets to subprocesses.
+
 ## [cred.2] - 2026-07-05 (v0.59.0)
 
 ### Added

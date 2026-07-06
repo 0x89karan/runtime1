@@ -137,6 +137,21 @@ pub enum EventKind {
     /// Operator denied a pending action via the HTTP management API.
     /// data: { id, agent_id, reason? }
     ApprovalHttpDenied,
+    /// Credential broker forwarded a request to an upstream provider.
+    /// data: { agent_id, provider, path, response_status: u16, response_bytes: usize }
+    CredentialEgressBrokered,
+    /// Credential token access audited (capability check passed).
+    /// data: { agent_id, provider, path, method }
+    CredentialAccessed,
+    /// Credential refresh (OAuth token rotation) failed.
+    /// data: { provider, error, token_written: bool }
+    CredentialRefreshFailed,
+    /// Credential not provisioned — MCP server gets 503.
+    /// data: { provider, hint }
+    CredentialNotProvisioned,
+    /// Credential access denied — agent lacks Credential capability.
+    /// data: { agent_id, provider }
+    CredentialDenied,
     Error,
 }
 
@@ -216,6 +231,11 @@ mod tests {
         assert_eq!(kind_str(EventKind::ManagementRequest), "management_request");
         assert_eq!(kind_str(EventKind::ApprovalHttpApproved), "approval_http_approved");
         assert_eq!(kind_str(EventKind::ApprovalHttpDenied), "approval_http_denied");
+        assert_eq!(kind_str(EventKind::CredentialEgressBrokered), "credential_egress_brokered");
+        assert_eq!(kind_str(EventKind::CredentialAccessed), "credential_accessed");
+        assert_eq!(kind_str(EventKind::CredentialRefreshFailed), "credential_refresh_failed");
+        assert_eq!(kind_str(EventKind::CredentialNotProvisioned), "credential_not_provisioned");
+        assert_eq!(kind_str(EventKind::CredentialDenied), "credential_denied");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

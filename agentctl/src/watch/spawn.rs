@@ -65,6 +65,7 @@ pub fn display_cap(cap: &Capability) -> String {
         Capability::Spawn => "Spawn".to_string(),
         Capability::ShellExec => "ShellExec".to_string(),
         Capability::Mcp { server, .. } => format!("Mcp     {{server: {server}}}"),
+        Capability::Credential { provider } => format!("Credential {{{provider:?}}}"),
     }
 }
 

@@ -79,6 +79,11 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::UniversalAgentIsolationDegraded => false,
         EventKind::ApprovalHttpApproved => false,
         EventKind::ApprovalHttpDenied => false,
+        EventKind::CredentialEgressBrokered => false,
+        EventKind::CredentialAccessed => false,
+        EventKind::CredentialRefreshFailed => false,
+        EventKind::CredentialNotProvisioned => false,
+        EventKind::CredentialDenied => false,
         EventKind::Error => false,
     }
 }

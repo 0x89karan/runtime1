@@ -2,6 +2,16 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Credential provider selector for `Capability::Credential`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CredentialProvider {
+    Google,
+    BraveSearch,
+    /// Custom provider — must match a `[credential_gateway.providers.<name>]` TOML entry.
+    Custom(String),
+}
+
 /// A permission an agent may be granted.
 ///
 /// `None` cap-set = unrestricted (backward compat).
@@ -55,6 +65,9 @@ pub enum Capability {
     /// Identical to `Spawn` in `caps_to_rules_inner`; distinct so config is self-documenting.
     /// Not used for agent-level gating — use `Mcp { server = "shell_exec" }` for that.
     ShellExec,
+    /// Grants an agent (or MCP server) access to a specific credential provider
+    /// via the credential broker. Audited; enforcement (deny-without-cap) deferred to cred.4+.
+    Credential { provider: CredentialProvider },
 }
 
 /// Normalize a path by resolving `.` and `..` components without filesystem
@@ -101,6 +114,10 @@ pub fn satisfies_type(granted: &[Capability], required: &Capability) -> bool {
         }
         Capability::KbWrite { segment } if segment.is_empty() => {
             granted.iter().any(|g| matches!(g, Capability::KbWrite { .. }))
+        }
+        // Empty Custom string → type-level check: "has any Credential cap?"
+        Capability::Credential { provider: CredentialProvider::Custom(s) } if s.is_empty() => {
+            granted.iter().any(|g| matches!(g, Capability::Credential { .. }))
         }
         other => satisfies(granted, other),
     }
@@ -187,6 +204,9 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
             })
         }
         Capability::ShellExec => granted.iter().any(|g| matches!(g, Capability::ShellExec)),
+        Capability::Credential { provider: req_prov } => granted.iter().any(|g| {
+            matches!(g, Capability::Credential { provider: gp } if gp == req_prov)
+        }),
     }
 }
 

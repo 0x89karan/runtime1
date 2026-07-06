@@ -40,6 +40,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from typing import Optional
 
+# Credential broker (cred.3). Injected at spawn by agentd when enabled.
+# When set, oauth_call_api routes through the broker instead of using the
+# in-memory access token directly. The broker attaches Authorization: Bearer.
+_BROKER_URL   = os.environ.get("AGENTD_CREDENTIAL_GATEWAY_URL", "").rstrip("/")
+_BROKER_TOKEN = os.environ.get("AGENTD_CREDENTIAL_TOKEN", "")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -577,9 +583,6 @@ def handle_oauth_check_auth(_args: dict) -> tuple:
 def handle_oauth_call_api(args: dict) -> tuple:
     global _auth_state
 
-    if _auth_state not in ("authorized",):
-        return None, json.dumps({"error": "auth_not_ready"})
-
     url    = args.get("url", "").strip()
     method = args.get("method", "GET").upper()
     extra_headers = args.get("headers") or {}
@@ -588,7 +591,12 @@ def handle_oauth_call_api(args: dict) -> tuple:
     if not url.startswith("https://"):
         return None, json.dumps({"error": "https_required"})
 
-    parsed = urllib.parse.urlparse(url)
+    # Method and SSRF checks apply to both broker and legacy paths.
+    method_allow = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
+    if method not in method_allow:
+        return None, json.dumps({"error": f"method_not_allowed: {method}"})
+
+    parsed   = urllib.parse.urlparse(url)
     hostname = (parsed.hostname or "").lower()
 
     if _cfg["ALLOWED_HOSTS"] and hostname not in _cfg["ALLOWED_HOSTS"]:
@@ -597,9 +605,42 @@ def handle_oauth_call_api(args: dict) -> tuple:
     if _is_ssrf_blocked(url):
         return None, json.dumps({"error": "host_not_allowed", "host": hostname})
 
-    method_allow = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
-    if method not in method_allow:
-        return None, json.dumps({"error": f"method_not_allowed: {method}"})
+    # Extra-headers type guard (string keys+values only).
+    if not all(isinstance(k, str) and isinstance(v, str) for k, v in extra_headers.items()):
+        return None, json.dumps({"error": "invalid_extra_headers"})
+
+    # Primary path: credential broker (cred.3+).
+    # Route via broker when env vars are injected by agentd — the broker injects
+    # Authorization: Bearer and manages token refresh centrally.
+    if _BROKER_URL and _BROKER_TOKEN:
+        provider = _cfg.get("OAUTH_PROVIDER_NAME", "google")
+        # Encode path+query into broker URL: {gw}/{provider}/{path}[?query]
+        broker_path = (parsed.path or "/").lstrip("/")
+        broker_url  = f"{_BROKER_URL}/{provider}/{broker_path}"
+        if parsed.query:
+            broker_url += f"?{parsed.query}"
+
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else None
+        headers = dict(extra_headers)
+        headers["X-Credential-Token"] = _BROKER_TOKEN
+        req = urllib.request.Request(broker_url, data=body_bytes, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                raw = resp.read(RESPONSE_CAP)
+                return {"status": resp.status, "body": raw.decode("utf-8", errors="replace")}, None
+        except urllib.error.HTTPError as e:
+            body_str = ""
+            try:
+                body_str = e.read(ERROR_BODY_CAP).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            return None, json.dumps({"error": f"http_{e.code}", "body": body_str})
+        except Exception as exc:
+            return None, json.dumps({"error": f"broker_request_failed: {exc}"})
+
+    # Legacy path: direct call with in-memory token.
+    if _auth_state not in ("authorized",):
+        return None, json.dumps({"error": "auth_not_ready"})
 
     def _do_call(attempt: int) -> tuple:
         err = _ensure_fresh_token()

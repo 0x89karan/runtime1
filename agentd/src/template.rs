@@ -233,6 +233,7 @@ impl TemplateConfig {
             log_path: None,
             egress: Default::default(),
             management: Default::default(),
+            credential_gateway: Default::default(),
         })
     }
 }

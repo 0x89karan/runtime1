@@ -37,7 +37,19 @@ const MCP_MAX_TOOL_PAGES: usize = 100;
 /// Env var names that must never be forwarded to MCP subprocesses via `passenv`.
 /// The scheduler replaces ANTHROPIC_API_KEY with an ephemeral scoped key after
 /// spawn; forwarding it here exposes the live production key before that swap fires.
-pub const PASSENV_BLOCKLIST: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+/// Broker-managed credential vars are also blocked: MCP servers must access these
+/// via the credential gateway (cred.3+), not by reading the parent env directly.
+pub const PASSENV_BLOCKLIST: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    // Credential broker — forwarded via gateway, never directly to subprocess.
+    "BRAVE_SEARCH_API_KEY",
+    "OAUTH_REFRESH_TOKEN",
+    "OAUTH_CLIENT_SECRET",
+    "OAUTH_ACCESS_TOKEN",
+    "AGENTD_CREDENTIAL_TOKEN",
+    "AGENTD_CREDENTIAL_GATEWAY_URL",
+];
 
 use super::{Tool, ToolContext};
 use crate::capability::Capability;
@@ -99,6 +111,7 @@ impl McpClient {
         sandbox: Option<sandbox::CompiledSandbox>,
         extra_env: &std::collections::HashMap<String, String>,
         passenv: &[String],
+        credential_env: &std::collections::HashMap<String, String>,
     ) -> Result<(Arc<Self>, Vec<ToolSpec>)> {
         use std::process::Stdio;
         use tokio::process::Command;
@@ -119,7 +132,13 @@ impl McpClient {
             }
         }
         // Per-server env overrides from config (mcp_server.env map).
+        // Same blocklist as passenv: prevent operator typos from injecting
+        // credential-adjacent vars via the explicit env table.
         for (k, v) in extra_env {
+            if PASSENV_BLOCKLIST.contains(&k.as_str()) {
+                tracing::warn!(key = %k, "extra_env: blocked credential var (in PASSENV_BLOCKLIST)");
+                continue;
+            }
             cmd.env(k, v);
         }
         // Forward named vars from the parent env (mcp_server.passenv list).
@@ -136,6 +155,17 @@ impl McpClient {
             if let Ok(val) = std::env::var(name) {
                 cmd.env(name, val);
             }
+        }
+        // Broker-injected credential env (highest priority). Overwrites any earlier
+        // setting from extra_env or passenv. Warn on collision so operators know.
+        for (k, v) in credential_env {
+            if extra_env.contains_key(k) || passenv.contains(k) {
+                tracing::warn!(
+                    key = %k,
+                    "credential_env overrides a key already set by extra_env or passenv"
+                );
+            }
+            cmd.env(k, v);
         }
 
         // Apply pre-compiled sandbox in the child process before exec().

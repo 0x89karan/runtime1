@@ -47,6 +47,9 @@ pub struct Config {
     /// Management HTTP API configuration (p7.7+).
     #[serde(default)]
     pub management: ManagementConfig,
+    /// Credential broker configuration (cred.3+).
+    #[serde(default)]
+    pub credential_gateway: CredentialGatewayConfig,
 }
 
 /// Mutability class for a declared knowledge-base segment (p5.4+).
@@ -224,6 +227,74 @@ impl Default for ManagementConfig {
             bind_addr: default_management_bind_addr(),
         }
     }
+}
+
+/// Authentication style for a credential provider adapter (cred.3+).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthStyle {
+    /// RFC 6750 Bearer token: `Authorization: Bearer <token>`
+    OauthBearer,
+    /// API key in a named request header.
+    ApiKeyHeader,
+    /// API key as a URL query parameter.
+    ApiKeyQuery,
+}
+
+/// TOML configuration for one credential provider adapter (cred.3+).
+///
+/// ```toml
+/// [credential_gateway.providers.google]
+/// auth_style    = "oauth-bearer"
+/// upstream_base = "https://www.googleapis.com"
+/// token_path    = "/run/secrets/google.json"
+/// state_path    = "/data/state/oauth/google.json"
+///
+/// [credential_gateway.providers.brave-search]
+/// auth_style    = "api-key-header"
+/// upstream_base = "https://api.search.brave.com"
+/// header_name   = "X-Subscription-Token"
+/// secret_key    = "BRAVE_SEARCH_API_KEY"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderConfig {
+    pub auth_style:    AuthStyle,
+    pub upstream_base: String,
+    /// Named header for `api-key-header` style (also scrubbed from caller requests).
+    #[serde(default)]
+    pub header_name:   Option<String>,
+    /// Env var that holds the API key for `api-key-header` / `api-key-query` styles.
+    #[serde(default)]
+    pub secret_key:    Option<String>,
+    /// Path to the JSON secrets file (OAuth flows); e.g. `/run/secrets/google.json`.
+    #[serde(default)]
+    pub token_path:    Option<String>,
+    /// Path for writing runtime token state (OAuth access + refresh rotation).
+    #[serde(default)]
+    pub state_path:    Option<String>,
+}
+
+/// Configuration for the in-process credential broker (cred.3+).
+///
+/// ```toml
+/// [credential_gateway]
+/// enabled = true
+///
+/// [credential_gateway.providers.google]
+/// auth_style    = "oauth-bearer"
+/// upstream_base = "https://www.googleapis.com"
+/// token_path    = "/run/secrets/google.json"
+/// state_path    = "/data/state/oauth/google.json"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CredentialGatewayConfig {
+    /// Enable the credential broker. Defaults to false (off by default, opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Provider adapters keyed by provider name (lowercase, kebab-case).
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
 }
 
 impl Config {

@@ -389,6 +389,87 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 - Fix: add a `provenance_unknown: true` flag on affected hits, or document the inclusive
   default in the `kb_search` tool's description string. Defer to p5.6.
 
+## Phase 10 — Credential manager — Open (deferred from /plan-eng-review cred.3, 2026-07-06)
+
+**cred.3-ar-01 (P2) — OAuth scope granularity in capability system**
+
+`Capability::Credential { provider: Google }` is too coarse. Gmail, Drive, Calendar, and
+userinfo are different OAuth grants — an agent that can read Gmail can also call the Drive
+API if the provisioned token has both scopes. The fix is `Capability::Credential { provider,
+scope_set: HashSet<OAuthScope> }` checked against the token's actual scopes at the broker.
+
+- **Why:** a compromised or over-eager agent with a single `Google` capability can call any
+  API the provisioned token was granted, not just the API its task warrants.
+- **How to apply:** scope this to cred.5+. cred.3 establishes the `CredentialProvider` enum;
+  cred.5 refines the capability shape. The broker already sees the token's scopes at refresh
+  time — the infrastructure for enforcement is there.
+- **Depends on:** cred.3 (establishes capability variant shape).
+- **Where to start:** `agentd/src/capability.rs` (`Credential` variant) + `agentd/src/credential/`
+  (token scope introspection at refresh) + `agentctl auth google` (scope selection UI).
+
+**cred.3-ar-02 (P2) — `credential_refresh_failed` persistence for agentctl when not attached**
+
+The plan says `credential_refresh_failed` must produce a visible agentctl alert. But agentctl
+may not be attached when the failure happens (overnight CoS run). The management API SSE
+broadcasts the event, but it is ephemeral — if no client is connected, the event is lost.
+
+- **Why:** a token refresh failure at 2am causes the agent to see cryptic tool errors
+  ("no tools available") with no persistent diagnosis. Operator discovers it only by
+  reading the flight log.
+- **How to apply:** add a queryable "last credential failure" field to the management API
+  (`/api/v1/status` or a new `/api/v1/credentials` endpoint) so the operator can poll
+  even after the fact. `agentctl watch` shows it in the system view.
+- **Depends on:** cred.3 (establishes the flight event) + cred.5 (credential surfacing).
+- **Where to start:** `agentd/src/management.rs` + `surfaces/src/snapshot.rs` (new
+  `CredentialStatus` field on `SchedulerSnapshot`).
+
+**cred.3-ar-03 (P3) — Hot credential reload without agentd restart**
+
+Rotating provisioned credentials (re-running `agentctl auth google` with new OAuth app
+credentials) currently requires restarting agentd to re-ingest `/run/secrets`. If the
+rotation happens mid-run, agents checkpoint, agentd restarts, agents resume — but the
+checkpoint-restore window is still a disruption.
+
+- **Why:** production credential rotations are operational events that shouldn't require
+  a full scheduler restart and agent re-initialization. The checkpoint system makes this
+  less painful, but the window is still visible to the user.
+- **How to apply:** a SIGHUP handler or `agentctl credential reload` command that calls
+  `CredentialGateway::reload_secrets()` — re-reads `/run/secrets`, validates schema,
+  updates the in-memory credential state. No agent restart required.
+- **Depends on:** cred.3 (establishes CredentialGateway).
+- **Where to start:** `agentd/src/main.rs` (SIGHUP handler) + `agentd/src/credential/mod.rs`
+  (reload path on `CredentialGateway`).
+
+**cred.3-ar-04 (P2) — SSRF: upstream_base IP-level block missing**
+
+`ProviderConfig.upstream_base` is validated for `https://` at startup (cred.3 review fix)
+but there is no DNS-resolution check to block private/link-local/loopback IP ranges (e.g.
+`https://169.254.169.254/...` for IMDS or `https://192.168.1.1/...`). `oauth_mcp.py`
+already has `_is_ssrf_blocked()` with this protection; the credential gateway does not.
+
+- **Why:** a misconfigured or template-injected upstream pointing at an IMDS endpoint would
+  cause the broker to attach live bearer tokens to IMDS requests.
+- **How to apply:** resolve the hostname in `CredentialGateway::start()` (or lazily on first
+  use) and reject if any resolved address is private/loopback/link-local. Mirror the logic
+  from `docker/oauth_mcp.py:_is_ssrf_blocked()`.
+- **Depends on:** cred.3 (`ProviderConfig` and gateway startup).
+- **Where to start:** `agentd/src/credential/mod.rs` — `CredentialGateway::start()`.
+
+**cred.3-ar-05 (P3) — OAuthTokenCache mutex held for full upstream timeout**
+
+`get_or_refresh()` holds `self.state.lock()` across the entire token refresh network call
+(up to `CREDENTIAL_REQUEST_TIMEOUT_SECS = 60 s`). All concurrent requests for the same
+provider queue on this mutex. A slow or unreachable token endpoint stalls all in-flight
+tool calls for that provider for up to 60 s.
+
+- **Why:** serializing concurrent refreshes is correct; holding the lock for a long network
+  call causes unnecessary queueing of already-valid requests.
+- **How to apply:** add a `CREDENTIAL_REFRESH_TIMEOUT_SECS` constant (e.g. 15 s) and wrap
+  the `client.post()` call in `tokio::time::timeout()`. The overall request timeout can
+  remain 60 s for forwarding; this shorter timeout is specific to token refresh.
+- **Depends on:** cred.3 (OAuthTokenCache mutex change from review).
+- **Where to start:** `agentd/src/credential/mod.rs:get_or_refresh()`.
+
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment
   (`next_log_seq` / `next_scratch_version`) commits in its own write transaction before

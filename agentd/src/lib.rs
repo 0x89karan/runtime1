@@ -2,6 +2,7 @@ pub mod agent;
 pub mod bus;
 pub mod capability;
 pub mod checkpoint;
+pub mod credential;
 pub mod config;
 pub mod control;
 pub mod egress;

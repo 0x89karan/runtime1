@@ -343,6 +343,7 @@ pub(crate) fn format_cap(cap: &Capability) -> String {
         Capability::Spawn => "spawn".to_string(),
         Capability::ShellExec => "shell-exec".to_string(),
         Capability::Mcp { server, .. } => format!("mcp:{server}"),
+        Capability::Credential { provider } => format!("credential:{provider:?}"),
     }
 }
 
