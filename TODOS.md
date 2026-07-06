@@ -1,5 +1,96 @@
 # TODOS
 
+## v0.60 whole-system audit (2026-07-06)
+
+Read-only audit: 7 parallel reviewers (Claude + Codex) across every crate + docs, main @ e2ec0e47.
+Full ranked report: `docs/AUDIT-v0.60.html` (in repo) + artifact https://claude.ai/code/artifact/e9cb8d95-d1c0-4eeb-a2a6-0d73db3cf32f
+The Phase-10 cred.3 deep-dive (separate 4-voice review) is folded into the report and the
+**Phase 10 — Credential manager** section below (`cred.3-ar-01…10`; ar-06–10 added by this pass).
+Verdict: **all 7 invariants hold in code; the security/audit *story* is over-claimed vs the code, and
+the narrative docs have drifted.** IDs below match the report. Known-debt items already tracked
+elsewhere in this file are cross-referenced, not duplicated. `[new]` / `[re-rated]` are the items this
+pass surfaced.
+
+**Remediation order (what gates what):** Wave 1 (before building further) = S1,S2,S3,C2,O1,O2 ·
+Wave 2 = C1,C3,C4,C5,C8,S5,S6,S7 · Wave 3 (docs, one pass) = D1–D5,S4 · Wave 4 = O3,O4,C6,C7,C9.
+
+### Tier 1 — security & integrity (the trust-story gap)
+- **audit-S1 (P1) [new] — Ed25519 receipt-signing key readable by any MCP server with `FsRead`.**
+  Startup blocks `FsWrite` over the evidence log but not `FsRead` over `egress-key.pkcs8` (CWD default)
+  → a malicious tool reads the key and forges valid receipts. Fix: reject startup if `egress.key_path`
+  resolves under any MCP `FsRead`/`FsWrite` prefix; default the key outside any MCP-accessible tree.
+  `config.rs:181`, `main.rs:859`, `evidence.rs:88`.
+- **audit-S2 (P1) [new] — `content_audited: true` hardcoded but nothing audits content.**
+  Flight event + receipt assert an audit that never happens; the receipt doesn't cover forwarded bytes.
+  Fix: hash the forwarded body into the receipt, or drop the claim. `egress.rs:150`.
+- **audit-S3 (P1) [new] — `SecretRewriter` / `BoundarySecretRedacted` claimed shipped (v0.39.0) but ABSENT.**
+  Tool outputs reach the model unscrubbed (`read_file /proc/self/environ` leaks to context). Fix:
+  implement at the `ToolRegistry::invoke` choke point (`tools/mod.rs:182`) OR correct CLAUDE.md + memory
+  to say only inference-egress receipting shipped. (Doc-drift + missing defense.)
+- **audit-S4 (P2) — OTEL "credential guard" (obs.1) not implemented + README default documented backwards.**
+  Only preview-redaction exists; `otel/README.md:54` says `OTEL_REDACT_PREVIEWS` defaults `false`, code
+  defaults `true`. Fix: add a scrub choke point in `finish()` or correct the docs. `otel/src/span_builder.rs`.
+- **audit-S5 (P2) — signed chain not re-verified on resume** (same as p7.5-scope-03; live append trusts the
+  tail, offline `agentctl verify` still catches). `evidence.rs:184`.
+- **audit-S6 (P2) — sandbox degradation fail-open.** Landlock/`unshare(NEWNET)` silently degrade;
+  `mcp_require_capabilities` checks non-empty rules, not that isolation applied → a "network-isolated"
+  server keeps network on userns-disabled hosts. Fix: strict mode that aborts on requested-isolation
+  failure, default-on for v0.60. `sandbox/src/lib.rs:513,714,730`, `main.rs:353`.
+- **audit-S7 (P2) [new] — universal-tier gVisor runs `--network=host`.** Only Anthropic traffic is
+  mediated; a compromised foreign agent does arbitrary non-Anthropic egress (undercuts governed-foreign
+  pillar). Fix: default universal gVisor to no-net / proxy-only; require explicit net cap. `universal.rs:66,87`.
+- **audit-S8 (P2) — `Net.hosts` advisory only** (host scoping not enforced; only ports). `capability.rs:162`.
+
+### Tier 2 — correctness / data-loss / invariants
+- **audit-C1 (P1, invariant) — token budget is soft** (overshoot per in-flight call; per-agent `EndTurn`
+  unchecked). "Cognition is metered" is not a hard bound. Fix: reserve before dispatch, clamp `max_tokens`
+  to remaining, refund. `scheduler.rs:1208`, `agent/mod.rs:572,600`. (Related: F-009.)
+- **audit-C2 (P1) [re-rated from F-10/P2] — cross-agent Tier-3 memory isolation defeatable via the
+  `agent/` prefix.** `KbRead{segment:"agent"}` satisfies `agent/anyone`; nothing reserves the prefix →
+  breaks the locked "private memory never grantable" rule. Fix: reserve `agent/` as non-grantable in
+  `capability.rs:219` + reject `[[memory.segments]]` under `agent/` at startup. **Supersedes F-10 severity.**
+- **audit-C3 (P2) — checkpoint not durable (no fsync around rename).** = F-05 (already tracked).
+- **audit-C4 (P2) [new] — restored checkpoint deleted before the restored run re-checkpoints** → crash
+  before next save loses the recovery point. Fix: keep as `.inflight` backup until a clean post-restore
+  save supersedes it. `main.rs:980`.
+- **audit-C5 (P2) [new] — send to a completed agent reports success and silently drops the message.**
+  Fix: reject sends to terminal/outcome agents with an `is_error` ToolResult. `scheduler.rs:1865,1907`.
+- **audit-C6 (P2) — `StopReason::Other`/empty end_turn completes silently as `""`.** = F-008 (tracked).
+- **audit-C7 (P2) — streaming unbounded channel + stdout head-of-line blocking.** = p7.2-ar-01/02 (tracked).
+- **audit-C8 (P2) — memory unbounded-growth trio:** `short_term` never trimmed + full-cloned per tick
+  (F-08/p5.2-ar-01); `mem_recall` full-namespace scan (p5.3-ar-04); orphaned `scratch_ver` META keys.
+- **audit-C9 (P2) — distillation off-budget + emits event on write failure.** = F-12 (tracked).
+
+### Tier 3 — packaging / CI / operability
+- **audit-O1 (P1) [new] — three catalogue templates unusable: `cron-agent`, `watcher`, `webhook-agent`
+  declare MCP servers but grant no `Mcp{}` capability** → deny-by-default lowering hides the tools. Fix:
+  add `[capabilities].mcp` for `cron_trigger`/`fs_watch`/`webhook_trigger`. `template.rs:213` + the 3 templates.
+- **audit-O2 (P1) — `make test` broken (duplicate `memory0` 9p mount).** = ma.2-ar-01 (tracked; re-rate P1).
+- **audit-O3 (P2, invariant) — distro boot not CI-gated (dry-run only)** → violates "every arch boot is
+  CI-tested or it rots"; PID-1 failure drops to interactive shell (hangs headless QEMU); Docker only
+  builds on `main` (no PR smoke). `ci.yml:231`, `distro/overlay/init:52`.
+- **audit-O4 (P2) [new] — unbounded reads on remote surfaces:** `agentctl --url` reads HTTP bodies
+  uncapped (OOM); `/api/v1/memory/:ns` loads the full namespace before paginating.
+  `agentctl/src/watch/source.rs:91`, `management.rs:244`. (Minor: watcher sidecar `FsRead "/"`;
+  OAuth callback no size bound; FUSE shared-KB inode leak; approvals `take(100)` silent/nondeterministic.)
+
+### Tier 4 — documentation drift (no canonical "what's shipped" surface)
+- **audit-D1 (P2) — RUNBOOK.md materially stale** (v0.20/v0.59 header, shipped Phase 5/6 as "future", no
+  cred.3 section). Overlaps sec.1. `RUNBOOK.md:3,808`.
+- **audit-D2 (P2) — ROADMAP build-order header contradicts its own detail** (header "shipped v0.57 /
+  cred.1–3 upcoming" vs detail "cred.1–3 shipped v0.58–0.60"). `ROADMAP.md:46` vs `:1150`.
+- **audit-D3 (P3) — roadmap has no "not-done" glyph; cred.4/cred.5 falsely marked done.** `ROADMAP.md:1184,1194`.
+- **audit-D4 (P3) — CLAUDE.md status log skips cred.1/cred.2; no current-state line.** Add a canonical
+  "v0.60.0 — phases 0–7 + tracks shipped; cred.4/5, orch.1, h8.x, Phase 9, MESH unshipped" line at top.
+- **audit-D5 (P3) — THREAT_MODEL.md header says v0.25.0 but contains cred.3 §8;** still claims "flight not
+  tamper-evident / no other credentials" (both false). Overlaps sec.1. `THREAT_MODEL.md:4,27`.
+
+### Reconciliation actions
+- **Close kv-ar-05** — timestamped `.corrupt` quarantine is already implemented (`store.rs:144`); dup of F-02.
+- **F-10 → superseded by audit-C2 (P1).**
+- Verified still-open (accurate triage): F-05, F-08, F-12, p5.2-ar-*, p5.3-ar-04/05, p7.1-ar-01,
+  p7.2-ar-*, p7.6-ar-01, obs.3-ar-01, sec.1.
+
 ## sec.1 — THREAT_MODEL.md full update (deferred from cred.2)
 
 **Priority: P2.** `docs/THREAT_MODEL.md` is at v0.25.0 / Phase 5.8; the codebase is now
@@ -469,6 +560,68 @@ tool calls for that provider for up to 60 s.
   remain 60 s for forwarding; this shorter timeout is specific to token refresh.
 - **Depends on:** cred.3 (OAuthTokenCache mutex change from review).
 - **Where to start:** `agentd/src/credential/mod.rs:get_or_refresh()`.
+
+**cred.3-ar-06 (P2) — rotated refresh token written to `state_path` but never read back**
+
+The two-tier writable cache (`/run/state/oauth`) is effectively write-only: `OAuthState` is persisted
+on rotation, but startup always re-reads the original `/run/secrets` refresh token — there is no
+`state_path` read path anywhere. With Google's single-use refresh-token rotation, re-auth silently
+breaks after **any** restart (worst on the QEMU/OS-boot surface, where the 9p write may also fail).
+This defeats the design's own durability goal.
+
+- **Why:** a token rotation + restart → all refreshes 503, operator must re-run `agentctl auth`.
+- **How to apply:** on cache init read `state_path` if present and prefer its `refresh_token` over
+  `token_path`; fsync file + parent dir. If not read back, `state_path` is pointless — remove it and
+  document the re-auth requirement honestly.
+- **Depends on:** cred.3.
+- **Where to start:** `agentd/src/credential/mod.rs` (`OAuthTokenCache` init + write path ~:184,235).
+
+**cred.3-ar-07 (P2) — gateway token scoped per-MCP-server; missing caps grant all providers (fail-open)**
+
+`main.rs` registers `server.name` as the registry `agent_id` (so flight attribution shows the server
+name, not the owning agent), and an MCP server with no `capabilities` block is granted **every**
+configured provider.
+
+- **Why:** fail-open scoping + confusing audit attribution; a server that omits its cap block silently
+  gets all credentials.
+- **How to apply:** deny-by-default when the gateway is enabled (no caps → no providers); scope the
+  token to the owning agent/session rather than the server name.
+- **Depends on:** cred.3.
+- **Where to start:** `agentd/src/main.rs:530,544`.
+
+**cred.3-ar-08 (P2) — inbound header scrubbing is a blocklist (fail-open)**
+
+The gateway forwards all caller headers except a scrub list; the model-key proxy (`egress.rs`) uses a
+whitelist. A compromised MCP server can smuggle extra headers (`X-Forwarded-*`, provider-honored keys)
+to the upstream alongside the injected credential.
+
+- **How to apply:** switch to a whitelist (content-type, accept, provider-necessary headers only),
+  matching the `egress.rs` pattern.
+- **Depends on:** cred.3.
+- **Where to start:** `agentd/src/credential/mod.rs:355`.
+
+**cred.3-ar-09 (P2) — mesh refresh collision blocks multi-instance**
+
+The refresh mutex serializes only within one agentd process. Multiple instances sharing one Google
+credential each refresh independently; single-use rotation makes them mutually invalidate each other's
+token. A shared credential service / single refresh-owner is a **prerequisite for `mesh.*`** (couples
+to mesh.3) and must be designed before `orch.1`/mesh land.
+
+- **How to apply:** design note now; the in-process broker is correct for single-instance v1 — record
+  that mesh requires a shared credential service so federation is an extension, not a migration.
+- **Depends on:** cred.3; blocks mesh.2/mesh.3.
+- **Where to start:** `agentd/src/credential/mod.rs:134` (per-process mutex only).
+
+**cred.3-ar-10 (P3) — "extends EgressProxy" framing is misleading; extract a shared forwarding-proxy core**
+
+`credential/mod.rs` shares no code with `egress.rs` — it is a parallel egress subsystem. The guard
+drift between the two (redirect policy, SSRF/host-allowlist, body-cap, header policy) **is** the root
+cause of ar-04 and ar-08. Extract a shared `LoopbackForwardingProxy` (loopback bind + ephemeral-identity
++ the full guard set) with a pluggable auth-injector so `egress.rs` and the credential gateway cannot
+diverge on security guards again. Also reconcile docs/CLAUDE.md that call cred.3 an EgressProxy extension.
+
+- **Depends on:** cred.3.
+- **Where to start:** new shared module factored from `agentd/src/egress.rs` + `agentd/src/credential/mod.rs`.
 
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment
