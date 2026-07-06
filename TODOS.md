@@ -531,7 +531,7 @@ checkpoint-restore window is still a disruption.
 - **Where to start:** `agentd/src/main.rs` (SIGHUP handler) + `agentd/src/credential/mod.rs`
   (reload path on `CredentialGateway`).
 
-**cred.3-ar-04 (P2) — SSRF: upstream_base IP-level block missing**
+**~~cred.3-ar-04 (P2) — SSRF: upstream_base IP-level block missing~~** ✓ Fixed in cred.3.2 (IP pinning via DNS resolution + `reqwest::ClientBuilder::resolve()` at startup).
 
 `ProviderConfig.upstream_base` is validated for `https://` at startup (cred.3 review fix)
 but there is no DNS-resolution check to block private/link-local/loopback IP ranges (e.g.
@@ -722,6 +722,90 @@ of the real key, effectively disabling credential injection without breaking the
   Test T35b covers the injection path.
 - **Why:** a DoS on credential injection for query-param auth.
 - **Where fixed:** `agentd/src/credential/mod.rs` — step 9 upstream URL build (query stripped).
+
+## Phase 10 — Credential manager — Open (deferred from cred.3.2 hardening, 2026-07-06)
+
+These three items are **NON-BLOCKING** for cred.4 and orch.1 — capture here, close as a light
+`cred.3.3` cleanup when convenient. Same discipline applies: fix + failing-without-fix test +
+adversarial verify of the real failure path.
+
+**cred.3.2-ar-01 (P3) — ar-10 partial: per-handler request logic still duplicated**
+
+`loopback_proxy.rs` now owns the SSRF guards, `is_ssrf_blocked()`, `extract_host()`, and
+`base_builder()` (ar-10, cred.3.1). But `egress.rs::handle_proxy_request` and
+`credential/mod.rs::handle_credential_request` still exist as separate request-handler
+bodies. Header-allow-list enforcement, body-cap, and path-handling logic are duplicated
+per-handler — the same drift risk that caused the original ar-10 finding can recur at the
+handler level.
+
+- **Why:** a future security fix in one handler's body-cap or header filter will not flow to
+  the other. SSRF root cause is fixed but handler-level guards are still two copies.
+- **How to apply:** extract a shared `forward_request(client, upstream_url, inbound_req,
+  auth_injector: impl Fn(…))` helper in `loopback_proxy.rs` with a pluggable auth injector
+  so both handlers delegate to a single place. Accept criteria: one function applies
+  redirect/SSRF/header/body-cap; both proxies route through it; a structural guard test
+  asserts both handlers call the shared function (pattern analogous to the drift guard for
+  `base_builder()`).
+- **Depends on:** cred.3.1 (loopback_proxy.rs established).
+- **Where to start:** `agentd/src/loopback_proxy.rs` (add helper) + `agentd/src/egress.rs` +
+  `agentd/src/credential/mod.rs` (delegate both handlers to the new helper).
+
+**cred.3.2-ar-02 (P3) — canonical status line (anti-recurrence for version/doc drift)**
+
+cred.3.2 fixed stale version headers in RUNBOOK.md and THREAT_MODEL.md, but did not add an
+anti-recurrence mechanism. CLAUDE.md "Current status" is a long prose log; there is no single
+authoritative `vX.Y.Z — shipped/unshipped` line that ROADMAP and RUNBOOK can reference. The
+v0.60 audit's #1 class of finding was security claimed-but-not-built; the source was doc drift.
+Without an anchor line the drift will recur.
+
+- **Why:** without a canonical current-version line, the prose log becomes the truth source
+  for "what's shipped" — it is long, redundant, and diverges from ROADMAP detail as entries
+  accumulate.
+- **How to apply:** add a single `## Current version: vX.Y.Z (shipped YYYY-MM-DD)` line at
+  the very top of the "Current status" section in CLAUDE.md, updated on every merge. ROADMAP
+  and RUNBOOK reference it as the single source of truth. No CI enforcement needed (human
+  discipline + the audit pattern). Accept criteria: the canonical line exists and is accurate
+  for the current HEAD.
+- **Depends on:** nothing.
+- **Where to start:** `CLAUDE.md` — "Current status" section header.
+
+**cred.3.2-ar-03 (P3) — api-key-header adapter runtime ATTACH-BEHAVIOR test missing**
+
+The cred.3.2 test suite covers the `api-key-header` adapter via a config roundtrip
+(`provider_cfg_api_key_header()` fixture), not via a live forwarding path. There is no test
+asserting that the credential gateway actually attaches the key as the correct HTTP header on
+a forwarded request. The oauth-bearer path has a behavioral integration test (T22); the
+api-key-header path does not.
+
+- **Why:** a regression in the header-injection step of `handle_credential_request()` for the
+  `ApiKeyHeader` adapter would not be caught by the current tests — the roundtrip test only
+  confirms the config struct serializes correctly.
+- **How to apply:** add a behavioral test that spins up a mock upstream (via `httpmock` or
+  a small `axum` test server), calls `GatewayState::handle_credential_request()` with an
+  `api-key-header` provider, and asserts the upstream receives the request with the correct
+  `Authorization` (or configured `header_name`) header set to the provisioned key. Same
+  adversarial discipline: temporarily remove the header-injection step, verify test FAILS,
+  restore, verify PASS.
+- **Depends on:** cred.3.2 (api-key-header adapter landed).
+- **Where to start:** `agentd/src/credential/mod.rs` — new test `test_api_key_header_attaches_on_forwarded_request`.
+
+**cred.4-ar-01 (P3) — Caps persistence is per-clean-exit only — in-flight counts lost on crash**
+
+Per-request `persist_cap()` fire-and-forget was removed (cred.4 pre-ship review) to eliminate a
+write-after-deregister race (a stale spawn_blocking task reinserts the row after `remove_agent_caps`
+clears it, permanently locking out the agent on next restart). As a result, cap counters are only
+persisted when the agent cleanly deregisters — a crash mid-session loses the in-flight count.
+
+- **Why:** the race was worse than the lost-on-crash cost. Permanent lockout is user-visible and
+  unrecoverable without manual DB edits; losing N counts on crash means the agent gets N extra
+  requests on next restart, which is not a security boundary (caps are advisory rate-limits, not
+  billing controls).
+- **How to apply:** implement a dedicated periodic-flush background task (e.g. `tokio::time::interval`
+  every 30 s) that snapshots all counters to `caps.redb` without racing with deregister. The task
+  must be cancelled before deregister writes the final clear, so the flush and clear are sequenced.
+- **Depends on:** cred.4 (caps infrastructure).
+- **Where to start:** `agentd/src/credential/mod.rs` — add a flush task in `CredentialGateway::start()`
+  that holds a `Weak<GatewayState>` and aborts when the state is dropped.
 
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment

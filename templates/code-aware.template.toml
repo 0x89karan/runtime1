@@ -33,6 +33,9 @@ suggested_caps = [
     { Net  = { hosts = [], ports = [443] } },
     { Mcp  = { server = "fs",  tools = [] } },
     { Mcp  = { server = "git", tools = [] } },
+    # To route GitHub API calls via the credential broker (cred.4), add:
+    # { Credential = { provider = { Custom = "github" } } }
+    # and add a [credential_gateway.providers.github] section (see github-agent.template.toml).
 ]
 
 # MCP server subprocess sandbox: capabilities below apply to the MCP subprocess, NOT the agent.

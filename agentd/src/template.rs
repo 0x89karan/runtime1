@@ -910,13 +910,13 @@ task = "t"
         let resolver = catalogue_resolver();
         let entries = resolver.list().unwrap();
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian", "langchain-worker", "cron-agent", "webhook-agent", "cos-orchestrator", "cos-inbox", "cos-curator"] {
+        for expected in &["scout", "librarian", "journaler", "coordinator", "code-aware", "watcher", "memory-custodian", "langchain-worker", "cron-agent", "webhook-agent", "cos-orchestrator", "cos-inbox", "cos-curator", "github-agent"] {
             assert!(
                 names.contains(expected),
                 "catalogue must contain template '{expected}'; found: {names:?}"
             );
         }
-        assert_eq!(entries.len(), 14, "catalogue must have exactly 14 templates; found: {names:?}");
+        assert_eq!(entries.len(), 15, "catalogue must have exactly 15 templates; found: {names:?}");
     }
 
     #[test]

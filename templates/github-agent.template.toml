@@ -1,0 +1,61 @@
+# templates/github-agent.template.toml — GitHub repository assistant
+# Uses the credential broker (cred.4) with a GitHub PAT routed via api-key-header +
+# header_value_prefix = "Bearer" so the Authorization header is correct for GitHub's API.
+#
+# Prerequisites:
+#   agentctl auth github   (or set GITHUB_TOKEN in the credential gateway env — see cred.4 docs)
+
+sample_tasks = [
+  "List the open pull requests in the configured repository.",
+  "Show the latest 10 commits on the main branch.",
+  "Search for issues mentioning 'crash' in the title.",
+  "Fetch the README.md from the repository root and summarize it.",
+]
+
+[template]
+name             = "github-agent"
+description      = "GitHub repository assistant via the credential broker (PAT + Bearer prefix)."
+showcases        = "cred.4 api-key-header adapter with header_value_prefix for Bearer tokens."
+gated_requires   = "GITHUB_TOKEN or credential broker github provider configured"
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[capabilities]
+mcp = [
+    { server = "http_fetch", tools = [] },
+]
+
+[tools]
+native = ["read_file"]
+
+# github_api — routes all requests through the credential broker.
+# The broker injects Authorization: Bearer <PAT> via header_value_prefix.
+# Set GITHUB_TOKEN in the runtime environment; the broker reads it via secret_key.
+[[tools.mcp_servers]]
+name    = "http_fetch"
+command = "python3"
+args    = ["../docker/http_mcp.py"]
+capabilities = [{ Net = { hosts = ["api.github.com"], ports = [443] } }, { Credential = { provider = { Custom = "github" } } }]
+
+[credential_gateway.providers.github]
+auth_style           = "api-key-header"
+upstream_base        = "https://api.github.com"
+header_name          = "Authorization"
+header_value_prefix  = "Bearer"
+secret_key           = "GITHUB_TOKEN"
+max_requests_per_agent = 500
+
+[card]
+name           = "GitHub Agent"
+description    = "Reads GitHub repositories, issues, and PRs via the credential broker."
+skills         = ["github", "code-review", "research"]
+suggested_caps = [{ Credential = { provider = { Custom = "github" } } }]
+
+[agent]
+id           = "github-agent"
+task         = ""
+max_turns    = 20
+token_budget = 100_000

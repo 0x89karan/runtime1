@@ -125,6 +125,7 @@ Phase 0 kinds (canonical — do not rename):
 | `credential_refresh_failed` | OAuth token refresh write to state_path failed; access token still returned for this request (provider, error, token_written: bool) (cred.3+) |
 | `credential_not_provisioned` | requested provider is not configured in [credential_gateway.providers] (provider, hint) (cred.3+) |
 | `credential_denied` | MCP server's allowed_providers list does not include the requested provider (agent_id, provider) (cred.3+) |
+| `credential_cap_exceeded` | per-agent per-provider request-count cap reached; request rejected with 429 (agent_id, provider, count, limit) (cred.4+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

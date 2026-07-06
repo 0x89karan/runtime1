@@ -344,6 +344,50 @@ curl -X POST http://127.0.0.1:9000/ \
 > Note: OAuth-based services (Gmail, Google Drive, etc.) use `docker/oauth_mcp.py` — see
 > the **oauth_mcp** section in Standard servers above for setup instructions.
 
+## GitHub API (credential broker)
+
+The `github-agent` template uses the **credential broker** (cred.4) to route GitHub
+PAT requests through the `api-key-header` adapter with `header_value_prefix = "Bearer"`,
+so the `Authorization: Bearer <PAT>` header is constructed and injected by the broker
+rather than passed as a plain env var to the MCP server subprocess.
+
+```toml
+# In agent.toml (or generated from github-agent.template.toml):
+[credential_gateway.providers.github]
+auth_style           = "api-key-header"
+upstream_base        = "https://api.github.com"
+header_name          = "Authorization"
+header_value_prefix  = "Bearer"
+secret_key           = "GITHUB_TOKEN"
+max_requests_per_agent = 500
+
+[[tools.mcp_servers]]
+name    = "http_fetch"
+command = "python3"
+args    = ["../docker/http_mcp.py"]
+capabilities = [
+    { Net = { hosts = ["api.github.com"], ports = [443] } },
+    { Credential = { provider = { Custom = "github" } } },
+]
+```
+
+Set `GITHUB_TOKEN` in your environment before starting agentd:
+
+```bash
+export GITHUB_TOKEN="ghp_your_personal_access_token"
+```
+
+The PAT needs `repo` and `read:org` scopes for most repository and PR operations.
+
+**Broker vs. direct env passthrough:** The credential gateway intercepts each request
+from `http_mcp.py`, injects `Authorization: Bearer <token>` from the broker's secret
+store, and enforces a per-agent cap (`max_requests_per_agent`). `GITHUB_TOKEN` is in
+`PASSENV_BLOCKLIST` so the raw key is never forwarded to the subprocess directly.
+
+**Spend cap:** `max_requests_per_agent = 500` limits total API calls per agent session.
+The cap is tracked in memory and cleared when the agent exits. It resets on agentd
+restart — it is not persisted across crashes (only clean exits reset the counter).
+
 ## Security notes
 
 - Header **values** are read from environment variables at startup and never

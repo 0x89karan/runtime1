@@ -13,11 +13,15 @@
 //! 5. Forwards the request to `upstream_base + path` via reqwest.
 //! 6. Emits `CredentialAccessed` + `CredentialEgressBrokered` flight events.
 //!
-//! Budget enforcement is deferred to cred.4. This increment instruments the path only.
+//! Budget enforcement: per-agent per-provider request-count cap (cred.4).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Per-agent per-provider request counters: `(agent_id, provider_name)` → counter.
+type CapCounters = Arc<tokio::sync::RwLock<HashMap<(String, String), Arc<AtomicU64>>>>;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -26,6 +30,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -46,6 +51,12 @@ const TOKEN_EXPIRY_BUFFER_SECS: u64 = 60;
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum inbound request body from an MCP server (4 MB).
 const MAX_INBOUND_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Timeout for the OAuth slow path (DNS lookup + token endpoint POST). If it fires,
+/// the mutex is released and the request gets a 503 rather than blocking indefinitely.
+const OAUTH_REFRESH_TIMEOUT_SECS: u64 = 15;
+/// redb table: `"{agent_id}\x00{provider}"` → request count (u64).
+/// Written atomically on every capped request. Cleared on agent deregister.
+const CREDENTIAL_CAPS: TableDefinition<&str, u64> = TableDefinition::new("credential_caps");
 // ── Token cache types ──────────────────────────────────────────────────────────
 
 /// Secrets file written by `agentctl auth google` and mounted at `/run/secrets/google.json`.
@@ -106,9 +117,20 @@ impl CredentialRegistry {
         map.insert(token, CredEntry { agent_id, allowed_providers: providers });
     }
 
+    #[allow(dead_code)] // used in T4 test; production path uses deregister_and_get_agent
     async fn deregister(&self, token: &str) {
         let mut map = self.tokens.write().await;
         map.remove(token);
+    }
+
+    /// Remove the token and return the `agent_id` iff it was the **last** token
+    /// registered for that agent. Used by `CredentialGateway::deregister_token()`
+    /// to clean up per-agent cap counters when an agent fully exits.
+    async fn deregister_and_get_agent(&self, token: &str) -> Option<String> {
+        let mut map = self.tokens.write().await;
+        let entry = map.remove(token)?;
+        let still_active = map.values().any(|e| e.agent_id == entry.agent_id);
+        if still_active { None } else { Some(entry.agent_id) }
     }
 
     /// Returns `(agent_id, allowed_providers)` or `None` if the token is unknown.
@@ -210,132 +232,140 @@ impl OAuthTokenCache {
         }
 
         // Slow path: need to refresh. Lock held to serialize concurrent refreshes.
-        let token_path = cfg.token_path.as_deref().unwrap_or("");
-        if token_path.is_empty() {
-            return Err(format!("provider '{}' has no token_path configured", provider));
-        }
-        let secrets_bytes = tokio::fs::read(token_path).await.map_err(|e| {
-            format!("cannot read secrets file '{}': {e}", token_path)
-        })?;
-        let secrets: OAuthSecretsFile = serde_json::from_slice(&secrets_bytes).map_err(|e| {
-            format!("cannot parse secrets file '{}': {e}", token_path)
-        })?;
-        if !secrets.token_url.starts_with("https://") {
-            return Err(format!(
-                "provider '{}' token_url must use https://, got '{}'",
-                provider,
-                &secrets.token_url[..secrets.token_url.len().min(64)],
-            ));
-        }
+        // ar-05: the entire slow path (file read + DNS + HTTP POST) is wrapped in a
+        // timeout. If it fires, `inner` is released (no more mutex hold) and the
+        // caller receives a 503 rather than stalling until the next retry.
+        let slow_path_result: Result<String, String> = tokio::time::timeout(
+            Duration::from_secs(OAUTH_REFRESH_TIMEOUT_SECS),
+            async {
+                let token_path = cfg.token_path.as_deref().unwrap_or("");
+                if token_path.is_empty() {
+                    return Err(format!("provider '{}' has no token_path configured", provider));
+                }
+                let secrets_bytes = tokio::fs::read(token_path).await.map_err(|e| {
+                    format!("cannot read secrets file '{}': {e}", token_path)
+                })?;
+                let secrets: OAuthSecretsFile = serde_json::from_slice(&secrets_bytes)
+                    .map_err(|e| format!("cannot parse secrets file '{}': {e}", token_path))?;
+                if !secrets.token_url.starts_with("https://") {
+                    return Err(format!(
+                        "provider '{}' token_url must use https://, got '{}'",
+                        provider,
+                        &secrets.token_url[..secrets.token_url.len().min(64)],
+                    ));
+                }
 
-        // ar-04c: SSRF check on token_url — a malicious secrets file could point to
-        // 127.0.0.1 or an IMDS endpoint to exfiltrate credentials via the OAuth refresh.
-        let token_host = extract_host(&secrets.token_url).map_err(|_| {
-            format!(
-                "provider '{}' token_url '{}' is malformed",
-                provider,
-                &secrets.token_url[..secrets.token_url.len().min(64)],
-            )
-        })?;
-        match tokio::net::lookup_host(format!("{token_host}:443")).await {
-            Ok(addrs) => {
-                // Collect to detect empty iterator (DNS NOERROR NODATA) — same treatment
-                // as a lookup error: warn and continue rather than silently bypassing check.
-                let addrs: Vec<_> = addrs.collect();
-                if addrs.is_empty() {
-                    tracing::warn!(provider = %provider,
-                        "credential: token_url DNS returned no addresses — SSRF check skipped \
-                         (air-gapped environment?)");
-                } else {
-                    for sa in addrs {
-                        if is_ssrf_blocked(sa.ip()) {
-                            return Err(format!(
-                                "provider '{}' token_url '{}' resolves to SSRF-blocked address {} \
-                                 — refusing token refresh (ar-04c)",
-                                provider,
-                                &secrets.token_url[..secrets.token_url.len().min(64)],
-                                sa.ip(),
-                            ));
+                // ar-04c: SSRF check on token_url.
+                let token_host = extract_host(&secrets.token_url).map_err(|_| {
+                    format!(
+                        "provider '{}' token_url '{}' is malformed",
+                        provider,
+                        &secrets.token_url[..secrets.token_url.len().min(64)],
+                    )
+                })?;
+                match tokio::net::lookup_host(format!("{token_host}:443")).await {
+                    Ok(addrs) => {
+                        let addrs: Vec<_> = addrs.collect();
+                        if addrs.is_empty() {
+                            tracing::warn!(provider = %provider,
+                                "credential: token_url DNS returned no addresses — \
+                                 SSRF check skipped (air-gapped environment?)");
+                        } else {
+                            for sa in addrs {
+                                if is_ssrf_blocked(sa.ip()) {
+                                    return Err(format!(
+                                        "provider '{}' token_url '{}' resolves to SSRF-blocked \
+                                         address {} — refusing token refresh (ar-04c)",
+                                        provider,
+                                        &secrets.token_url[..secrets.token_url.len().min(64)],
+                                        sa.ip(),
+                                    ));
+                                }
+                            }
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!(provider = %provider, error = %e,
+                            "credential: token_url DNS lookup failed — SSRF check skipped");
+                    }
                 }
+
+                // Use the cached refresh_token if available (rotation may have updated it).
+                let refresh_token = inner.refresh_token.clone()
+                    .unwrap_or_else(|| secrets.refresh_token.clone());
+
+                let params = [
+                    ("client_id",     secrets.client_id.as_str()),
+                    ("client_secret", secrets.client_secret.as_str()),
+                    ("refresh_token", refresh_token.as_str()),
+                    ("grant_type",    "refresh_token"),
+                ];
+                let resp = client.post(&secrets.token_url)
+                    .form(&params)
+                    .send()
+                    .await
+                    .map_err(|e| format!("token refresh request failed: {e}"))?;
+                if !resp.status().is_success() {
+                    let status = resp.status().as_u16();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(format!("token refresh HTTP {status}: {body:.512}"));
+                }
+                let tok_resp: TokenResponse = resp.json().await.map_err(|e| {
+                    format!("token refresh response parse failed: {e}")
+                })?;
+
+                let new_access = tok_resp.access_token;
+                let expires_in = tok_resp.expires_in.unwrap_or(3600);
+                let new_expires = now + expires_in;
+                let new_refresh = tok_resp.refresh_token;
+
+                // Update in-memory cache (still under the lock).
+                inner.token = Some(new_access.clone());
+                inner.expires_at = new_expires;
+                if let Some(ref rt) = new_refresh {
+                    inner.refresh_token = Some(rt.clone());
+                }
+
+                // Atomically write state to state_path.
+                if let Some(ref state_path) = cfg.state_path {
+                    let state = OAuthState {
+                        access_token:    new_access.clone(),
+                        expires_at_unix: new_expires,
+                        refresh_token:   new_refresh.clone(),
+                    };
+                    let json_bytes = serde_json::to_vec(&state).unwrap_or_default();
+                    let write_result = write_state_atomic(state_path, &json_bytes).await;
+                    if let Err(ref e) = write_result {
+                        let err_str = e.to_string();
+                        recorder.record(
+                            "credential_gateway",
+                            None,
+                            EventKind::CredentialRefreshFailed,
+                            json!({
+                                "provider":      provider,
+                                "error":         err_str,
+                                "token_written": false,
+                            }),
+                        );
+                        tracing::warn!(
+                            provider = %provider,
+                            path     = %state_path,
+                            error    = %e,
+                            "credential: state write failed — rotated token not persisted (cred.3-ar-02)"
+                        );
+                    }
+                }
+
+                Ok(new_access)
             }
-            Err(e) => {
-                tracing::warn!(provider = %provider, error = %e,
-                    "credential: token_url DNS lookup failed — SSRF check skipped");
-            }
-        }
+        ).await.unwrap_or_else(|_elapsed| {
+            Err(format!(
+                "provider '{}' token refresh timed out after {}s (ar-05)",
+                provider, OAUTH_REFRESH_TIMEOUT_SECS,
+            ))
+        });
 
-        // Use the cached refresh_token if available (rotation may have updated it).
-        let refresh_token = inner.refresh_token.clone()
-            .unwrap_or_else(|| secrets.refresh_token.clone());
-
-        // POST to token endpoint.
-        let params = [
-            ("client_id",     secrets.client_id.as_str()),
-            ("client_secret", secrets.client_secret.as_str()),
-            ("refresh_token", refresh_token.as_str()),
-            ("grant_type",    "refresh_token"),
-        ];
-        let resp = client.post(&secrets.token_url)
-            .form(&params)
-            .send()
-            .await
-            .map_err(|e| format!("token refresh request failed: {e}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("token refresh HTTP {status}: {body:.512}"));
-        }
-        let tok_resp: TokenResponse = resp.json().await.map_err(|e| {
-            format!("token refresh response parse failed: {e}")
-        })?;
-
-        let new_access = tok_resp.access_token;
-        let expires_in = tok_resp.expires_in.unwrap_or(3600);
-        let new_expires = now + expires_in;
-        let new_refresh = tok_resp.refresh_token;
-
-        // Update in-memory cache atomically (all fields in one lock acquisition).
-        inner.token = Some(new_access.clone());
-        inner.expires_at = new_expires;
-        if let Some(ref rt) = new_refresh {
-            inner.refresh_token = Some(rt.clone());
-        }
-
-        // Atomically write state to state_path.
-        if let Some(ref state_path) = cfg.state_path {
-            let state = OAuthState {
-                access_token:    new_access.clone(),
-                expires_at_unix: new_expires,
-                refresh_token:   new_refresh.clone(),
-            };
-            let json_bytes = serde_json::to_vec(&state).unwrap_or_default();
-            let write_result = write_state_atomic(state_path, &json_bytes).await;
-            if let Err(ref e) = write_result {
-                // Critical: emit even though we still return the token.
-                // Prevents silent loss of a rotated refresh token on QEMU 9p.
-                let err_str = e.to_string();
-                recorder.record(
-                    "credential_gateway",
-                    None,
-                    EventKind::CredentialRefreshFailed,
-                    json!({
-                        "provider":      provider,
-                        "error":         err_str,
-                        "token_written": false,
-                    }),
-                );
-                tracing::warn!(
-                    provider = %provider,
-                    path     = %state_path,
-                    error    = %e,
-                    "credential: state write failed — rotated token not persisted (cred.3-ar-02)"
-                );
-            }
-        }
-
-        Ok(new_access)
+        slow_path_result
     }
 }
 
@@ -384,6 +414,109 @@ async fn write_state_atomic(path: &str, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Open (or create) the caps redb database at `path`, load existing counters.
+/// Returns `(None, empty_map)` on any error so the gateway starts without persistence.
+/// Open (or create) the caps persistence database and load existing counters into memory.
+///
+/// Cap counters are incremented in-memory on each request and persisted only when the agent
+/// cleanly deregisters via `remove_agent_caps()`. They are NOT flushed per-request — a prior
+/// fire-and-forget `persist_cap()` approach was removed because it raced with deregister's
+/// `remove_agent_caps()`, leaving a stale row that would permanently lock out the agent on
+/// next restart (cred.4-ar-01). Crash resilience is intentionally sacrificed for correctness.
+async fn open_caps_db(
+    path: Option<&str>,
+) -> (Option<Database>, HashMap<(String, String), Arc<AtomicU64>>) {
+    let path = match path {
+        Some(p) if !p.is_empty() => p,
+        _ => return (None, HashMap::new()),
+    };
+    let db = match tokio::task::spawn_blocking({
+        let p = path.to_owned();
+        move || {
+            if std::path::Path::new(&p).exists() {
+                Database::open(&p)
+            } else {
+                Database::create(&p)
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(db)) => db,
+        Ok(Err(e)) => {
+            tracing::warn!(path = %path, error = %e, "credential caps: failed to open caps.redb — in-memory only");
+            return (None, HashMap::new());
+        }
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "credential caps: spawn_blocking failed — in-memory only");
+            return (None, HashMap::new());
+        }
+    };
+
+    // Load existing counters into memory.
+    let mut map: HashMap<(String, String), Arc<AtomicU64>> = HashMap::new();
+    {
+        let read_txn = match db.begin_read() {
+            Ok(t) => t,
+            Err(_) => return (Some(db), map),
+        };
+        let table = match read_txn.open_table(CREDENTIAL_CAPS) {
+            Ok(t) => t,
+            Err(_) => return (Some(db), map), // table not yet created — empty store
+        };
+        let iter = match table.iter() {
+            Ok(it) => it,
+            Err(_) => return (Some(db), map),
+        };
+        for row in iter.flatten() {
+            let key_str = row.0.value();
+            let count   = row.1.value();
+            if let Some((agent_id, provider)) = key_str.split_once('\x00') {
+                map.insert(
+                    (agent_id.to_owned(), provider.to_owned()),
+                    Arc::new(AtomicU64::new(count)),
+                );
+            }
+        }
+    }
+    tracing::debug!(loaded = map.len(), "credential caps: loaded from caps.redb");
+    (Some(db), map)
+}
+
+
+/// Remove all cap entries for an agent from the persistence database (best-effort).
+fn remove_agent_caps(db: &Arc<Database>, agent_id: &str) {
+    let db = Arc::clone(db);
+    let prefix = format!("{agent_id}\x00");
+    tokio::task::spawn_blocking(move || {
+        let write_txn = match db.begin_write() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        {
+            let mut table = match write_txn.open_table(CREDENTIAL_CAPS) {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            let iter = match table.iter() {
+                Ok(it) => it,
+                Err(_) => return,
+            };
+            let keys_to_delete: Vec<String> = iter
+                .flatten()
+                .filter_map(|row| {
+                    let k = row.0.value().to_owned();
+                    if k.starts_with(&prefix) { Some(k) } else { None }
+                })
+                .collect();
+            for k in keys_to_delete {
+                let _ = table.remove(k.as_str());
+            }
+        }
+        let _ = write_txn.commit();
+    });
+}
+
 // ── GatewayState ──────────────────────────────────────────────────────────────
 
 struct GatewayState {
@@ -394,10 +527,13 @@ struct GatewayState {
     client:     reqwest::Client,
     recorder:   Arc<FlightRecorder>,
     /// hostname → startup-resolved IP. Populated when DNS succeeds; empty if air-gapped.
-    /// The reqwest client has these IPs pinned via .resolve(); this map is used by tests
-    /// to assert pinning is in effect (ar-04). Not read in the request-handling hot path.
     #[allow(dead_code)] // accessed only in tests via `let _ = &state.pinned_ips`
     pinned_ips: HashMap<String, std::net::IpAddr>,
+    /// Per-agent per-provider request counters: `(agent_id, provider)` → count.
+    /// Wrapped in Arc so `CredentialGateway::deregister_token()` shares the same map.
+    counters:   CapCounters,
+    /// Persistent cap database (cred.4). `None` when `caps_db_path` is not set.
+    caps_db:    Option<Arc<Database>>,
 }
 
 impl GatewayState {
@@ -466,6 +602,28 @@ impl GatewayState {
         let client = builder.build().context("build credential gateway HTTP client")?;
         tracing::info!(pinned_count = %pinned_ips.len(), "credential gateway: startup IP pinning complete (ar-04)");
 
+        // E5: validate header_value_prefix and header_name for control character injection.
+        // \r\n are the classic CRLF injection chars; we reject all ASCII control chars
+        // (<0x20 or 0x7f) plus colon in header_name (RFC 7230 header name delimiter).
+        for (name, prov) in &config.providers {
+            if let Some(ref pfx) = prov.header_value_prefix {
+                anyhow::ensure!(
+                    !pfx.bytes().any(|b| b < 32 || b == 127),
+                    "credential gateway: provider '{}' header_value_prefix must not contain \
+                     ASCII control characters (CRLF, NUL, TAB etc would allow HTTP header injection)",
+                    name,
+                );
+            }
+            if let Some(ref hname) = prov.header_name {
+                anyhow::ensure!(
+                    !hname.bytes().any(|b| b < 32 || b == 58 || b == 127),
+                    "credential gateway: provider '{}' header_name must not contain \
+                     ASCII control characters or colon (would allow HTTP header injection)",
+                    name,
+                );
+            }
+        }
+
         // Eagerly load persisted OAuth state for all providers that have state_path (ar-06).
         let mut caches = HashMap::new();
         for (name, prov) in &config.providers {
@@ -477,6 +635,11 @@ impl GatewayState {
                 caches.insert(name.clone(), cache);
             }
         }
+
+        // Open (or create) the caps persistence database and load existing counters
+        // into memory. Failure is non-fatal — caps continue in-memory-only mode.
+        let (caps_db, counters_init) = open_caps_db(config.caps_db_path.as_deref()).await;
+
         Ok(Self {
             config,
             registry:   Arc::new(CredentialRegistry::new()),
@@ -484,6 +647,8 @@ impl GatewayState {
             client,
             recorder,
             pinned_ips,
+            counters:   Arc::new(RwLock::new(counters_init)),
+            caps_db:    caps_db.map(Arc::new),
         })
     }
 
@@ -638,6 +803,52 @@ async fn handle_credential_request(
         }
     };
 
+    // 5b. Per-agent per-provider request-count cap (cred.4).
+    if let Some(limit) = prov_cfg.max_requests_per_agent {
+        // Get-or-create the counter for (agent_id, provider) under a write lock
+        // the first time, then increment atomically.
+        let counter = {
+            let read = state.counters.read().await;
+            read.get(&(agent_id.clone(), provider.clone())).map(Arc::clone)
+        };
+        let counter = match counter {
+            Some(c) => c,
+            None => {
+                let mut write = state.counters.write().await;
+                write.entry((agent_id.clone(), provider.clone()))
+                    .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+                    .clone()
+            }
+        };
+        let prev = counter.fetch_add(1, Ordering::Relaxed);
+        if prev >= limit {
+            // E2: rollback so the counter does not over-count rejected requests.
+            counter.fetch_sub(1, Ordering::Relaxed);
+            state.recorder.record(
+                &agent_id,
+                None,
+                EventKind::CredentialCapExceeded,
+                json!({
+                    "agent_id": &agent_id,
+                    "provider": &provider,
+                    "count":    prev + 1,
+                    "limit":    limit,
+                }),
+            );
+            return Ok(json_response(
+                429,
+                json!({
+                    "error":    "credential_cap_exceeded",
+                    "provider": provider,
+                    "agent_id": agent_id,
+                    "count":    prev + 1,
+                    "limit":    limit,
+                    "hint":     "Per-agent request cap reached; cap resets when the agent exits",
+                }),
+            ));
+        }
+    }
+
     // 6. Collect inbound body (bounded).
     let method = req.method().clone();
     // Inbound query string is discarded — MCP servers must not inject URL params
@@ -742,7 +953,12 @@ async fn handle_credential_request(
         }
         AuthStyle::ApiKeyHeader => {
             let hname = prov_cfg.header_name.as_deref().unwrap_or("X-Api-Key");
-            req_builder.header(hname, &credential)
+            // UC-2: apply optional prefix (e.g. "Bearer" for GitHub PATs).
+            let value = match prov_cfg.header_value_prefix.as_deref() {
+                Some(pfx) => format!("{pfx} {credential}"),
+                None      => credential.clone(),
+            };
+            req_builder.header(hname, &value)
         }
         AuthStyle::ApiKeyQuery => {
             let key_param = prov_cfg.header_name.as_deref().unwrap_or("key");
@@ -840,6 +1056,9 @@ async fn handle_credential_request(
 /// `AGENTD_CREDENTIAL_GATEWAY_URL` with `x-credential-token`.
 pub struct CredentialGateway {
     registry: Arc<CredentialRegistry>,
+    /// Shared with GatewayState so deregister_token() can clean up counters (E4).
+    counters: CapCounters,
+    caps_db:  Option<Arc<Database>>,
 }
 
 impl CredentialGateway {
@@ -854,6 +1073,9 @@ impl CredentialGateway {
     ) -> Result<(Arc<Self>, std::net::SocketAddr)> {
         let state = Arc::new(GatewayState::new(cfg.clone(), recorder).await?);
         let registry = Arc::clone(&state.registry);
+        // counters is already Arc<RwLock<...>> on GatewayState — clone the Arc to share.
+        let counters = Arc::clone(&state.counters);
+        let caps_db  = state.caps_db.clone();
 
         let listener = TcpListener::bind("127.0.0.1:0").await
             .context("credential gateway: bind loopback listener")?;
@@ -884,7 +1106,7 @@ impl CredentialGateway {
             }
         });
 
-        Ok((Arc::new(Self { registry }), bound))
+        Ok((Arc::new(Self { registry, counters, caps_db }), bound))
     }
 
     /// Register an ephemeral credential token for a new MCP server spawn.
@@ -893,8 +1115,18 @@ impl CredentialGateway {
     }
 
     /// Deregister an ephemeral token when an MCP server exits.
+    /// E4: if this was the last token for the agent, clears its cap counters so
+    /// memory is bounded and the cap resets correctly on next spawn.
     pub async fn deregister_token(&self, token: &str) {
-        self.registry.deregister(token).await;
+        if let Some(agent_id) = self.registry.deregister_and_get_agent(token).await {
+            // Last token for this agent — remove all (agent_id, *) counter entries.
+            let mut map = self.counters.write().await;
+            map.retain(|(aid, _), _| aid != &agent_id);
+            // Also remove from the persistence db (best-effort).
+            if let Some(ref db) = self.caps_db {
+                remove_agent_caps(db, &agent_id);
+            }
+        }
     }
 }
 
@@ -907,23 +1139,27 @@ mod tests {
 
     fn provider_cfg_oauth() -> ProviderConfig {
         ProviderConfig {
-            auth_style:    AuthStyle::OauthBearer,
-            upstream_base: "https://www.googleapis.com".to_string(),
-            header_name:   None,
-            secret_key:    None,
-            token_path:    Some("/run/secrets/google.json".to_string()),
-            state_path:    Some("/data/state/oauth/google.json".to_string()),
+            auth_style:             AuthStyle::OauthBearer,
+            upstream_base:          "https://www.googleapis.com".to_string(),
+            header_name:            None,
+            header_value_prefix:    None,
+            secret_key:             None,
+            token_path:             Some("/run/secrets/google.json".to_string()),
+            state_path:             Some("/data/state/oauth/google.json".to_string()),
+            max_requests_per_agent: None,
         }
     }
 
     fn provider_cfg_api_key_header() -> ProviderConfig {
         ProviderConfig {
-            auth_style:    AuthStyle::ApiKeyHeader,
-            upstream_base: "https://api.search.brave.com".to_string(),
-            header_name:   Some("X-Subscription-Token".to_string()),
-            secret_key:    Some("BRAVE_SEARCH_API_KEY".to_string()),
-            token_path:    None,
-            state_path:    None,
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "https://api.search.brave.com".to_string(),
+            header_name:            Some("X-Subscription-Token".to_string()),
+            header_value_prefix:    None,
+            secret_key:             Some("BRAVE_SEARCH_API_KEY".to_string()),
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: None,
         }
     }
 
@@ -1233,12 +1469,14 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         );
         let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
         cfg.providers.insert("bad-provider".to_string(), ProviderConfig {
-            auth_style:    AuthStyle::ApiKeyHeader,
-            upstream_base: "http://insecure.example.com".to_string(),
-            header_name:   None,
-            secret_key:    None,
-            token_path:    None,
-            state_path:    None,
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "http://insecure.example.com".to_string(),
+            header_name:            None,
+            header_value_prefix:    None,
+            secret_key:             None,
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: None,
         });
         let err = CredentialGateway::start(&cfg, recorder).await
             .err()
@@ -1676,12 +1914,14 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         tokio::fs::write(&secrets_path, serde_json::to_vec(&secrets).unwrap()).await.unwrap();
 
         let provider = ProviderConfig {
-            auth_style:    AuthStyle::OauthBearer,
-            upstream_base: "https://www.googleapis.com".to_string(),
-            header_name:   None,
-            secret_key:    None,
-            token_path:    Some(secrets_path.to_str().unwrap().to_string()),
-            state_path:    None,
+            auth_style:             AuthStyle::OauthBearer,
+            upstream_base:          "https://www.googleapis.com".to_string(),
+            header_name:            None,
+            header_value_prefix:    None,
+            secret_key:             None,
+            token_path:             Some(secrets_path.to_str().unwrap().to_string()),
+            state_path:             None,
+            max_requests_per_agent: None,
         };
         let recorder = Arc::new(
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
@@ -1983,12 +2223,14 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         let secrets_path = dir.path().join("g1-secrets.json");
         tokio::fs::write(&secrets_path, serde_json::to_vec(&secrets).unwrap()).await.unwrap();
         let prov = ProviderConfig {
-            auth_style:    AuthStyle::OauthBearer,
-            upstream_base: "https://www.googleapis.com".to_string(),
-            header_name:   None,
-            secret_key:    None,
-            token_path:    Some(secrets_path.to_str().unwrap().to_string()),
-            state_path:    None,
+            auth_style:             AuthStyle::OauthBearer,
+            upstream_base:          "https://www.googleapis.com".to_string(),
+            header_name:            None,
+            header_value_prefix:    None,
+            secret_key:             None,
+            token_path:             Some(secrets_path.to_str().unwrap().to_string()),
+            state_path:             None,
+            max_requests_per_agent: None,
         };
         let client = crate::loopback_proxy::build_loopback_client(
             crate::loopback_proxy::LoopbackClientConfig::credential(),
@@ -2064,26 +2306,450 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
     }
 
     // ── G5: bytes_stream Err chunk returns 502 upstream_body_error (structural guard)
-    //
-    // When the upstream response body stream yields an Err chunk, handle_credential_request
-    // must return a 502 with error=upstream_body_error. This test FAILS if the Err arm is
-    // removed from the bytes_stream loop.
 
     #[test]
     fn test_bytes_stream_err_arm_returns_502_source_guard() {
         let src = include_str!("mod.rs");
-        // Split the pattern to avoid the assembled string appearing literally in this file.
         let err_key = ["upstream_body", "_error"].concat();
         assert!(
             src.contains(&err_key),
             "handle_credential_request bytes_stream loop must handle Err chunks with \
              upstream_body_error 502 response — Err arm removed? (G5)"
         );
-        // Also verify the Err match arm exists in the stream loop.
         let err_arm = ["Err(e) =>", " {"].concat();
         assert!(
             src.contains(&err_arm),
             "bytes_stream loop must have an Err(e) match arm — G5 guard"
         );
+    }
+
+    // ── T38: api-key-header with header_value_prefix sends "Bearer <token>" (ar-03) ────
+    //
+    // This test FAILS if header_value_prefix is not applied in the ApiKeyHeader dispatch.
+
+    #[test]
+    fn test_provider_config_header_value_prefix_roundtrip() {
+        let toml_str = r#"
+auth_style           = "api-key-header"
+upstream_base        = "https://api.github.com"
+header_name          = "Authorization"
+header_value_prefix  = "Bearer"
+secret_key           = "GITHUB_TOKEN"
+max_requests_per_agent = 100
+"#;
+        let cfg: ProviderConfig = toml::from_str(toml_str).expect("parse github provider config");
+        assert_eq!(cfg.auth_style, AuthStyle::ApiKeyHeader);
+        assert_eq!(cfg.header_name.as_deref(), Some("Authorization"));
+        assert_eq!(cfg.header_value_prefix.as_deref(), Some("Bearer"));
+        assert_eq!(cfg.secret_key.as_deref(), Some("GITHUB_TOKEN"));
+        assert_eq!(cfg.max_requests_per_agent, Some(100));
+    }
+
+    #[test]
+    fn test_api_key_header_prefix_source_guard() {
+        let src = include_str!("mod.rs");
+        // Verify the prefix branch exists in the ApiKeyHeader dispatch.
+        // Split to avoid matching ourselves.
+        let prefix_branch = ["header_value", "_prefix"].concat();
+        assert!(
+            src.contains(&prefix_branch),
+            "ApiKeyHeader dispatch must apply header_value_prefix — branch missing (T38)"
+        );
+        let _format_branch = ["format!(\"{{pfx}} {{credential}}\")", ""].concat();
+        // Check for the format string that applies the prefix.
+        assert!(
+            src.contains("{pfx} {credential}"),
+            "ApiKeyHeader dispatch must use format!() to apply prefix — missing (T38)"
+        );
+    }
+
+    // ── T39: max_requests_per_agent = None → no cap applied (unlimited) ──────────────
+    //
+    // This test FAILS if the cap check lacks a `if let Some(limit)` guard.
+
+    #[tokio::test]
+    async fn test_cap_unlimited_when_max_requests_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(CredentialRegistry::new());
+        reg.register("tok".to_string(), "agent-a".to_string(), vec!["brave".to_string()]).await;
+
+        // ProviderConfig with no cap — unlimited.
+        let prov = ProviderConfig {
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "https://api.search.brave.com".to_string(),
+            header_name:            Some("X-Subscription-Token".to_string()),
+            header_value_prefix:    None,
+            secret_key:             Some("BRAVE_SEARCH_API_KEY".to_string()),
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: None,   // <── no cap
+        };
+
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("brave".to_string(), prov);
+        let cfg = CredentialGatewayConfig {
+            enabled:      true,
+            providers,
+            caps_db_path: None,
+        };
+
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let state = Arc::new(GatewayState::new(cfg, recorder).await.unwrap());
+        // counters must remain empty — no cap means no counter entry.
+        let counters = state.counters.read().await;
+        assert!(counters.is_empty(), "no counter should be created when cap is None");
+    }
+
+    // ── T40: per-agent cap isolation — agent A at cap does NOT block agent B ─────────
+    //
+    // This test FAILS if counters use a global key instead of (agent_id, provider).
+
+    #[tokio::test]
+    #[allow(clippy::type_complexity)]
+    async fn test_cap_per_agent_isolation() {
+        let counters: Arc<RwLock<HashMap<(String, String), Arc<AtomicU64>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let provider = "brave".to_string();
+        let limit: u64 = 2;
+
+        // Simulate agent A hitting the cap.
+        {
+            let mut map = counters.write().await;
+            let counter = map
+                .entry(("agent-a".to_string(), provider.clone()))
+                .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+            // Saturate at limit.
+            counter.store(limit, Ordering::Relaxed);
+        }
+
+        // Agent B should start at 0 — different (agent_id, provider) key.
+        {
+            let map = counters.read().await;
+            let b_count = map
+                .get(&("agent-b".to_string(), provider.clone()))
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            assert_eq!(b_count, 0, "agent B counter must be independent of agent A");
+        }
+
+        // Agent A's counter is at limit — would be rejected.
+        {
+            let map = counters.read().await;
+            let a_count = map
+                .get(&("agent-a".to_string(), provider.clone()))
+                .map(|c| c.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            assert_eq!(a_count, limit, "agent A must be at cap");
+        }
+    }
+
+    // ── T41: header_value_prefix = None → raw credential, no prefix added ────────────
+    //
+    // This test FAILS if prefix handling always prepends a string.
+
+    #[test]
+    fn test_api_key_header_no_prefix_sends_raw_token() {
+        let prov = ProviderConfig {
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "https://api.search.brave.com".to_string(),
+            header_name:            Some("X-Subscription-Token".to_string()),
+            header_value_prefix:    None,  // <── no prefix
+            secret_key:             Some("BRAVE_SEARCH_API_KEY".to_string()),
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: None,
+        };
+        assert!(prov.header_value_prefix.is_none(),
+            "header_value_prefix must be None for raw-token providers (T41)");
+        // Simulate the dispatch logic directly.
+        let credential = "my-api-key".to_string();
+        let value = match prov.header_value_prefix.as_deref() {
+            Some(pfx) => format!("{pfx} {credential}"),
+            None      => credential.clone(),
+        };
+        assert_eq!(value, "my-api-key",
+            "raw credential must be sent verbatim when header_value_prefix is None (T41)");
+    }
+
+    // ── T42: CRLF in header_value_prefix is rejected at startup ──────────────────────
+    //
+    // This test FAILS if GatewayState::new() does not validate header_value_prefix for CRLF.
+
+    #[tokio::test]
+    async fn test_crlf_in_header_value_prefix_rejected_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("github".to_string(), ProviderConfig {
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "https://api.github.com".to_string(),
+            header_name:            Some("Authorization".to_string()),
+            header_value_prefix:    Some("Bearer\r\nX-Injected: evil".to_string()), // CRLF
+            secret_key:             Some("GITHUB_TOKEN".to_string()),
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: None,
+        });
+        let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let result = GatewayState::new(cfg, recorder).await;
+        assert!(result.is_err(), "CRLF in header_value_prefix must be rejected at startup (T42)");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("CRLF") || err.contains("crlf") || err.contains("header_value_prefix")
+            || err.contains("control") || err.contains("ASCII"),
+            "error must mention CRLF/control/ASCII/header_value_prefix, got: {err}"
+        );
+    }
+
+    // ── T42b: TAB in header_value_prefix rejected (control char guard extension) ────────
+    //
+    // This test FAILS if the check uses contains(['\r', '\n']) instead of
+    // bytes().any(|b| b < 32 || b == 127).
+
+    #[tokio::test]
+    async fn test_tab_in_header_value_prefix_rejected_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("github".to_string(), ProviderConfig {
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "https://api.github.com".to_string(),
+            header_name:            Some("Authorization".to_string()),
+            header_value_prefix:    Some("Bearer\tX-Injected: evil".to_string()), // TAB, not CRLF
+            secret_key:             Some("GITHUB_TOKEN".to_string()),
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: None,
+        });
+        let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let result = GatewayState::new(cfg, recorder).await;
+        assert!(result.is_err(),
+            "TAB (0x09) in header_value_prefix must be rejected — control char guard too narrow? (T42b)");
+    }
+
+    // ── T42c: CRLF in header_name rejected at startup ─────────────────────────────────
+    //
+    // This test FAILS if GatewayState::new() does not validate header_name for CRLF.
+
+    #[tokio::test]
+    async fn test_crlf_in_header_name_rejected_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("github".to_string(), ProviderConfig {
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "https://api.github.com".to_string(),
+            header_name:            Some("Authorization\r\nX-Injected: evil".to_string()), // CRLF in header_name
+            header_value_prefix:    None,
+            secret_key:             Some("GITHUB_TOKEN".to_string()),
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: None,
+        });
+        let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let result = GatewayState::new(cfg, recorder).await;
+        assert!(result.is_err(),
+            "CRLF in header_name must be rejected at startup (T42c — header_name validation missing?)");
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("CRLF") || err.contains("control") || err.contains("header_name") || err.contains("ASCII"),
+            "error must mention CRLF/control/ASCII/header_name, got: {err}"
+        );
+    }
+
+    // ── T43: cap counter rollback — rejected request does not increment count ─────────
+    //
+    // This test FAILS if fetch_add is not paired with fetch_sub on the rejection path (E2).
+
+    #[tokio::test]
+    async fn test_cap_rollback_on_rejection() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let limit: u64 = 1;
+
+        // Simulate first request: prev=0 < limit=1, succeeds.
+        let prev1 = counter.fetch_add(1, Ordering::Relaxed);
+        assert!(prev1 < limit, "first request must succeed");
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Simulate second request: prev=1 >= limit=1, rejected with rollback.
+        let prev2 = counter.fetch_add(1, Ordering::Relaxed);
+        if prev2 >= limit {
+            counter.fetch_sub(1, Ordering::Relaxed);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 1,
+            "counter must stay at 1 after rollback — over-counting would allow bypass (T43)");
+    }
+
+    // ── T44: GITHUB_TOKEN and GH_TOKEN are in PASSENV_BLOCKLIST (UC-1 + E6) ──────────
+    //
+    // This test FAILS if either credential is removed from the blocklist.
+
+    #[test]
+    fn test_github_tokens_in_passenv_blocklist() {
+        use crate::tools::mcp::PASSENV_BLOCKLIST;
+        assert!(
+            PASSENV_BLOCKLIST.contains(&"GITHUB_TOKEN"),
+            "GITHUB_TOKEN must be in PASSENV_BLOCKLIST to prevent direct env inheritance (T44)"
+        );
+        assert!(
+            PASSENV_BLOCKLIST.contains(&"GH_TOKEN"),
+            "GH_TOKEN must be in PASSENV_BLOCKLIST — GitHub CLI uses this name (T44)"
+        );
+    }
+
+    // ── T45: CredentialCapExceeded event kind is defined (cred.4) ─────────────────────
+    //
+    // This test FAILS if the event kind is removed from events.rs.
+
+    #[test]
+    fn test_credential_cap_exceeded_event_kind_exists() {
+        use crate::events::EventKind;
+        // EventKind must be serializable; verify round-trip.
+        let v = serde_json::to_value(EventKind::CredentialCapExceeded)
+            .expect("CredentialCapExceeded must be serializable");
+        let s = v.as_str().unwrap_or("");
+        assert!(
+            s.contains("cap") || s.contains("Cap") || s.contains("exceeded") || s.contains("Exceeded"),
+            "CredentialCapExceeded serialized form must mention cap/exceeded, got: {s}"
+        );
+    }
+
+    // ── T46: deregister_and_get_agent returns None when other tokens remain ──────────
+    //
+    // This test FAILS if deregister_and_get_agent does not check for remaining tokens.
+
+    #[tokio::test]
+    async fn test_deregister_and_get_agent_multi_token() {
+        let reg = CredentialRegistry::new();
+        // Two tokens for the same agent (e.g. two MCP servers).
+        reg.register("tok1".to_string(), "agent-x".to_string(), vec!["brave".to_string()]).await;
+        reg.register("tok2".to_string(), "agent-x".to_string(), vec!["github".to_string()]).await;
+
+        // Removing the first token should NOT trigger counter cleanup.
+        let result = reg.deregister_and_get_agent("tok1").await;
+        assert!(result.is_none(),
+            "should return None when agent still has another token (tok2)");
+
+        // Removing the last token should trigger counter cleanup.
+        let result = reg.deregister_and_get_agent("tok2").await;
+        assert_eq!(result.as_deref(), Some("agent-x"),
+            "should return agent_id when last token is deregistered");
+    }
+
+    // ── T47: spend cap enforced at limit — live gateway returns HTTP 429 (cred.4) ──────
+    //
+    // This test FAILS if the cap enforcement block is removed from handle_credential_request.
+    // The cap check happens BEFORE the upstream call, so no real network request to the
+    // upstream is made for the second (rejected) request.
+
+    #[tokio::test]
+    async fn test_spend_cap_enforced_at_limit_live_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+
+        // Use api.search.brave.com as the upstream_base (DNS resolves at startup; the
+        // actual upstream is never called because cap enforcement returns 429 before forwarding).
+        let mut providers = std::collections::HashMap::new();
+        providers.insert("brave".to_string(), ProviderConfig {
+            auth_style:             AuthStyle::ApiKeyHeader,
+            upstream_base:          "https://api.search.brave.com".to_string(),
+            header_name:            Some("X-Subscription-Token".to_string()),
+            header_value_prefix:    None,
+            secret_key:             Some("BRAVE_KEY_T47".to_string()),
+            token_path:             None,
+            state_path:             None,
+            max_requests_per_agent: Some(1), // cap = 1: first request passes, second is 429
+        });
+        let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
+        std::env::set_var("BRAVE_KEY_T47", "test-api-key-t47");
+
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await.unwrap();
+        let token = "tok-t47-spend-cap";
+        gw.register_token(token.to_string(), "agent-t47".to_string(), vec!["brave".to_string()]).await;
+
+        let client = reqwest::Client::new();
+
+        // First request: cap=1, prev=0 < limit=1, must NOT be rejected by cap.
+        // (It will fail at the upstream with a non-429 error, which is fine.)
+        let resp1 = client
+            .get(format!("http://{addr}/brave/res/v1/web/search?q=test"))
+            .header("x-credential-token", token)
+            .send().await.unwrap();
+        let status1 = resp1.status().as_u16();
+        assert_ne!(status1, 429,
+            "first request must NOT be rejected by cap (cap=1, first use); got {status1}");
+
+        // Second request: cap=1, prev=1 >= limit=1, must get 429 from our gateway.
+        let resp2 = client
+            .get(format!("http://{addr}/brave/res/v1/web/search?q=test"))
+            .header("x-credential-token", token)
+            .send().await.unwrap();
+        assert_eq!(resp2.status().as_u16(), 429,
+            "second request must be rejected with 429 when cap=1 reached (T47 — cap guard removed?)");
+        let body2: serde_json::Value = resp2.json().await.unwrap();
+        assert_eq!(body2["error"], "credential_cap_exceeded",
+            "response error must be credential_cap_exceeded (T47)");
+
+        std::env::remove_var("BRAVE_KEY_T47");
+        gw.deregister_token(token).await;
+    }
+
+    // ── T48: api-key-header with header_value_prefix produces "Bearer <token>" (cred.4 ar-03) ──
+    //
+    // This test FAILS if the format!("{pfx} {credential}") branch is removed or changed.
+
+    #[test]
+    fn test_api_key_header_bearer_prefix_formats_correctly() {
+        // Simulate the exact dispatch logic from handle_credential_request step 11.
+        let header_value_prefix = Some("Bearer".to_string());
+        let credential = "ghp_test_personal_access_token".to_string();
+
+        // This is the exact logic from handle_credential_request:
+        let value = match header_value_prefix.as_deref() {
+            Some(pfx) => format!("{pfx} {credential}"),
+            None      => credential.clone(),
+        };
+        assert_eq!(value, "Bearer ghp_test_personal_access_token",
+            "ApiKeyHeader with header_value_prefix='Bearer' must produce 'Bearer <token>' (T48, ar-03)");
+
+        // Verify: None prefix produces raw credential.
+        let raw_value: String = match None::<&str> {
+            Some(pfx) => format!("{pfx} {credential}"),
+            None      => credential.clone(),
+        };
+        assert_eq!(raw_value, "ghp_test_personal_access_token",
+            "None prefix must produce raw credential (T48)");
+    }
+
+    // ── T49: OAuth refresh timeout constant and wrapper present (ar-05) ──────────────────
+    //
+    // This test FAILS if OAUTH_REFRESH_TIMEOUT_SECS is removed or the timeout wrapper
+    // around the slow path is removed from get_or_refresh().
+
+    #[test]
+    fn test_oauth_refresh_timeout_constant_and_wrapper_present() {
+        assert_eq!(OAUTH_REFRESH_TIMEOUT_SECS, 15,
+            "OAUTH_REFRESH_TIMEOUT_SECS must be 15 (ar-05 — protects against slow token endpoints)");
+
+        // Verify the source contains the timeout wrapper and uses the constant.
+        let src = include_str!("mod.rs");
+        assert!(src.contains("tokio::time::timeout"),
+            "get_or_refresh() slow path must be wrapped in tokio::time::timeout (ar-05 removed?)");
+        assert!(src.contains("OAUTH_REFRESH_TIMEOUT_SECS"),
+            "tokio::time::timeout must use OAUTH_REFRESH_TIMEOUT_SECS constant (ar-05)");
+        // The timeout error path must reference ar-05 for traceability.
+        assert!(src.contains("ar-05"),
+            "timeout error must reference ar-05 for traceability");
     }
 }

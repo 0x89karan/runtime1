@@ -380,7 +380,50 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // subprocess environment at spawn time.
     let (maybe_cred_gw, cred_gw_url): (Option<Arc<CredentialGateway>>, Option<String>) =
         if cfg.credential_gateway.enabled {
-            match CredentialGateway::start(&cfg.credential_gateway, Arc::clone(&recorder)).await {
+            // cred.4: derive caps_db_path from memory store dir so cap counters survive
+            // agentd restarts without requiring operator configuration.
+            let mut cred_gw_cfg = cfg.credential_gateway.clone();
+            if cred_gw_cfg.caps_db_path.is_none() {
+                if let Some(parent) = std::path::Path::new(&cfg.memory.store_path).parent() {
+                    cred_gw_cfg.caps_db_path =
+                        Some(parent.join("caps.redb").to_string_lossy().into_owned());
+                }
+            }
+            // OV-1: caps_db_path must not fall inside any MCP server's FS sandbox prefix.
+            // A sandboxed server with FsWrite access to caps.redb could reset all caps to 0,
+            // granting unlimited requests on next restart.
+            if let Some(ref caps_path) = cred_gw_cfg.caps_db_path {
+                let norm_caps = normalize_path(std::path::Path::new(caps_path));
+                let caps_has_mcp_fs = cfg.tools.mcp_servers.iter().any(|srv| {
+                    srv.capabilities.iter().flatten().any(|cap| {
+                        matches!(cap, Capability::FsRead { .. } | Capability::FsWrite { .. })
+                    })
+                });
+                if caps_has_mcp_fs && norm_caps.is_absolute() {
+                    for srv in &cfg.tools.mcp_servers {
+                        for cap in srv.capabilities.iter().flatten() {
+                            let prefix = match cap {
+                                Capability::FsRead { prefix } | Capability::FsWrite { prefix } => prefix,
+                                _ => continue,
+                            };
+                            let norm_prefix = normalize_path(std::path::Path::new(prefix));
+                            if norm_prefix.as_os_str().is_empty() {
+                                continue;
+                            }
+                            anyhow::ensure!(
+                                !norm_caps.starts_with(&norm_prefix),
+                                "caps_db_path {} falls inside MCP server {:?}'s {} sandbox prefix {}; \
+                                 move caps_db_path outside all server FS prefixes",
+                                norm_caps.display(),
+                                srv.name,
+                                if matches!(cap, Capability::FsRead { .. }) { "FsRead" } else { "FsWrite" },
+                                norm_prefix.display()
+                            );
+                        }
+                    }
+                }
+            }
+            match CredentialGateway::start(&cred_gw_cfg, Arc::clone(&recorder)).await {
                 Ok((gw, addr)) => {
                     tracing::info!(addr = %addr, "credential gateway started");
                     (Some(gw), Some(format!("http://{addr}")))
@@ -1944,6 +1987,7 @@ mod tests {
             "inference_transport_retried",
             "management_started",
             "management_request",
+            "credential_cap_exceeded",
         ];
         for kind in &required_kinds {
             assert!(

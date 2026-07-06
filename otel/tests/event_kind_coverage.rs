@@ -84,6 +84,7 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::CredentialRefreshFailed => false,
         EventKind::CredentialNotProvisioned => false,
         EventKind::CredentialDenied => false,
+        EventKind::CredentialCapExceeded => false,
         EventKind::Error => false,
     }
 }

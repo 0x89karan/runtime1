@@ -264,6 +264,11 @@ pub struct ProviderConfig {
     /// Named header for `api-key-header` style (also scrubbed from caller requests).
     #[serde(default)]
     pub header_name:   Option<String>,
+    /// Optional prefix prepended as `"{prefix} {credential}"` for `api-key-header`
+    /// style. Required for APIs that expect `Authorization: Bearer <token>` instead
+    /// of a raw token value. Must not contain `\r` or `\n` (validated at startup).
+    #[serde(default)]
+    pub header_value_prefix: Option<String>,
     /// Env var that holds the API key for `api-key-header` / `api-key-query` styles.
     #[serde(default)]
     pub secret_key:    Option<String>,
@@ -273,6 +278,10 @@ pub struct ProviderConfig {
     /// Path for writing runtime token state (OAuth access + refresh rotation).
     #[serde(default)]
     pub state_path:    Option<String>,
+    /// Per-agent per-provider request-count cap enforced at the broker layer.
+    /// `None` (default) = unlimited. `0` = block all requests to this provider.
+    #[serde(default)]
+    pub max_requests_per_agent: Option<u64>,
 }
 
 /// Configuration for the in-process credential broker (cred.3+).
@@ -295,6 +304,12 @@ pub struct CredentialGatewayConfig {
     /// Provider adapters keyed by provider name (lowercase, kebab-case).
     #[serde(default)]
     pub providers: std::collections::HashMap<String, ProviderConfig>,
+    /// Path for the per-agent request-cap persistence database (`caps.redb`).
+    /// Defaults to `None` = in-memory only (resets on agentd restart).
+    /// Set by `main.rs` to `<memory_store_dir>/caps.redb` when the credential
+    /// gateway is enabled, so caps survive restarts without operator config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caps_db_path: Option<String>,
 }
 
 impl Config {

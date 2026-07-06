@@ -152,6 +152,9 @@ pub enum EventKind {
     /// Credential access denied — agent lacks Credential capability.
     /// data: { agent_id, provider }
     CredentialDenied,
+    /// Per-agent per-provider request-count cap exceeded; request rejected with 429.
+    /// data: { agent_id, provider, count, limit }
+    CredentialCapExceeded,
     Error,
 }
 
@@ -236,6 +239,7 @@ mod tests {
         assert_eq!(kind_str(EventKind::CredentialRefreshFailed), "credential_refresh_failed");
         assert_eq!(kind_str(EventKind::CredentialNotProvisioned), "credential_not_provisioned");
         assert_eq!(kind_str(EventKind::CredentialDenied), "credential_denied");
+        assert_eq!(kind_str(EventKind::CredentialCapExceeded), "credential_cap_exceeded");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

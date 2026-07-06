@@ -49,6 +49,10 @@ pub const PASSENV_BLOCKLIST: &[&str] = &[
     "OAUTH_ACCESS_TOKEN",
     "AGENTD_CREDENTIAL_TOKEN",
     "AGENTD_CREDENTIAL_GATEWAY_URL",
+    // GitHub credential vars — accessed via the credential broker, never directly.
+    // GH_TOKEN is the name used by the GitHub CLI; GITHUB_TOKEN is the standard PAT name.
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
 ];
 
 use super::{Tool, ToolContext};
