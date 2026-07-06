@@ -43,20 +43,22 @@ Working rules:
 
 ## Current build order (next up)
 
-Everything through Phase 7, the harness (`h7.*`), `obs.*`, `cos.1`, and multi-arch (`ma.1–3`) is
-shipped (v0.57.0). **Foundation-first** order for the remaining work — one increment per branch,
-`main` shippable between, each through `/autoplan` (or `/plan-eng-review`) → build → `/review` →
-`/qa` → `/ship`:
+Everything through Phase 7, the harness (`h7.*`), `obs.*`, `cos.1`, multi-arch (`ma.1–3`), and the
+credential broker (`cred.1`–`cred.3`) is shipped (v0.60.0). **Foundation-first** order for the
+remaining work — one increment per branch, `main` shippable between, each through `/autoplan`
+(or `/plan-eng-review`) → build → `/review` → `/qa` → `/ship`:
 
-1. **cred.1** — Mac unblock (secrets mount + README fix). *Ship first — unblocks live testing.*
-2. **cred.2** — unified secrets substrate (completes the folded-in dx.5).
-3. **`/plan-eng-review` → cred.3** — credential broker core, *before* the features that consume credentials.
-4. **orch.1** — interactive agent orchestrator (`/office-hours` + `/plan-eng-review` first).
-5. **h8.1** — Layer-2 semantic memory sidecar (its embedding API key rides the `cred.3` broker).
-6. **cred.4 / cred.5** — egress gateway + surfacing · **ma.4** — isolation-tier honesty (small, slot anytime).
-7. **dx.3 / dx.4** — Linux QEMU production + prebuilt images (when targeting Linux hardware).
-8. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
-9. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
+- ~~`cred.1` (v0.58.0) · `cred.2` (v0.59.0) · `cred.3` (v0.60.0)~~ ✅ shipped — credential broker core.
+- **⚠️ GATE — `cred.3.1`: credential-manager hardening** *(blocks everything below)*. The v0.60
+  whole-system audit found cred.3's direction sound but **not yet robust** (SSRF on `upstream_base`,
+  write-only token cache, fail-open scoping, signing-key exposure). Close this gate before cred.4 /
+  orch.1. Plan: `docs/plans/cred.3.1-hardening.md` · kickoff prompt: `docs/prompts/06-cred31-hardening.md`.
+1. **orch.1** — interactive agent orchestrator (`/office-hours` + `/plan-eng-review` first).
+2. **h8.1** — Layer-2 semantic memory sidecar (its embedding API key rides the `cred.3` broker).
+3. **cred.4 / cred.5** — egress gateway + surfacing · **ma.4** — isolation-tier honesty (small, slot anytime).
+4. **dx.3 / dx.4** — Linux QEMU production + prebuilt images (when targeting Linux hardware).
+5. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
+6. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 **Deferred:** Track MESH (`mesh.1–6`, multi-instance) and ROADMAP `h8.3` (multi-device migration).
 
