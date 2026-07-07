@@ -357,6 +357,15 @@ inbound query string always discarded (D3); `owning_agent_id()` helper with mult
 `loopback_proxy::base_builder()` extracted so `GatewayState::new()` shares the canonical builder settings
 (drift guard); self-referential source-scan assertions fixed in T28/T34/T35b; THREAT_MODEL §8.3 updated,
 §8.7 ratified de-claims; RUNBOOK.md v0.62.0 + §11.11; 1159 workspace tests (21 new).
+**cred.4b complete (v0.65.0).** Credential-agnostic MCP servers — completes ROADMAP cred.4 acceptance criterion
+("tool process holds no raw credential in memory-at-rest"): `_load_config()` broker short-circuit skips secrets
+file and credential env reads when `AGENTD_CREDENTIAL_GATEWAY_URL` is set, populating only routing config
+(`OAUTH_PROVIDER_NAME`, `ALLOWED_HOSTS`); all three broker-path handlers (`handle_oauth_start_auth`,
+`handle_oauth_check_auth`, `handle_oauth_call_api`) gate on `_BROKER_URL and _BROKER_TOKEN` (both required);
+URL-only misconfiguration returns `broker_token_missing` error; `OAUTH_PROVIDER_NAME` validated against
+`[a-zA-Z0-9_-]+` (path-traversal guard); `search_mcp.py` legacy `BRAVE_SEARCH_API_KEY` fallback emits
+deprecation warning once per process; 6 new self-tests (T24–T29) in `oauth_mcp.py` (total 29); ROADMAP
+cred.4 marked ✓; no Rust changes.
 
 ## How to work here
 

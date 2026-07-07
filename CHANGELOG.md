@@ -3,6 +3,26 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cred.4b] - 2026-07-07 (v0.65.0)
+
+### Changed — Credential-agnostic MCP servers
+
+- **`docker/oauth_mcp.py`** — `_load_config()` broker short-circuit: when
+  `AGENTD_CREDENTIAL_GATEWAY_URL` is set, only routing config (`OAUTH_PROVIDER_NAME`,
+  `ALLOWED_HOSTS`) is loaded; raw secrets file and credential env vars are never read
+  into this process.
+- **`docker/oauth_mcp.py`** — `handle_oauth_start_auth`, `handle_oauth_check_auth`, and
+  `handle_oauth_call_api` all gate on `_BROKER_URL and _BROKER_TOKEN` (both required).
+  URL-only misconfiguration (missing `AGENTD_CREDENTIAL_TOKEN`) returns a
+  `broker_token_missing` error across all three handlers.
+- **`docker/oauth_mcp.py`** — `OAUTH_PROVIDER_NAME` validated against `[a-zA-Z0-9_-]+`
+  at startup to prevent path-traversal in broker URL construction.
+- **`docker/search_mcp.py`** — legacy `BRAVE_SEARCH_API_KEY` direct-access path emits a
+  deprecation warning to stderr (once per process, not per request).
+- **6 new self-tests** (T24–T29) in `oauth_mcp.py` covering broker-mode paths (total 29/29).
+- **ROADMAP `cred.4` marked ✓** — acceptance criterion "tool process holds no raw credential
+  in memory-at-rest" is now fully satisfied. No Rust changes.
+
 ## [h8.1] - 2026-07-07 (v0.64.0)
 
 ### Added — Layer-2 semantic memory sidecar

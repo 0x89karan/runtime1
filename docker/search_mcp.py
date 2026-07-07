@@ -38,6 +38,7 @@ ERROR_BODY_CAP   = 512         # bytes read from HTTP error body
 # Credential broker (cred.3). Injected at spawn by agentd; absent → legacy path.
 _BROKER_URL   = os.environ.get("AGENTD_CREDENTIAL_GATEWAY_URL", "").rstrip("/")
 _BROKER_TOKEN = os.environ.get("AGENTD_CREDENTIAL_TOKEN", "")
+_deprecation_warned = False
 
 TOOLS = [{
     "name": "web_search",
@@ -124,6 +125,15 @@ def handle_web_search(args):
             "or configure [credential_gateway.providers.brave-search] in your agent config."
         )
 
+    global _deprecation_warned
+    if not _deprecation_warned:
+        _deprecation_warned = True
+        print(
+            "search_mcp: WARNING: BRAVE_SEARCH_API_KEY direct access is deprecated. "
+            "Configure [credential_gateway.providers.brave-search] in your agent config "
+            "to route through the credential broker instead.",
+            file=sys.stderr,
+        )
     return _fetch_search(f"{BRAVE_API_URL}?{params}", {
         "Accept":               "application/json",
         "X-Subscription-Token": api_key,

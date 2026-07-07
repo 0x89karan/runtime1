@@ -1226,7 +1226,7 @@ S3 (de-claim `SecretRewriter` from CLAUDE.md/THREAT_MODEL — never built); THRE
 Every gate item: fix + a test that fails without it + adversarial verification.
 **Acceptance:** all 10 items closed; `cargo test` green; clippy clean; docs true.
 
-### ▣ cred.4 — Egress gateway (the "MCP of MCP servers")
+### ✓ cred.4 — Egress gateway (the "MCP of MCP servers") [v0.63.0 spend caps + cred.4b credential-agnostic MCP]
 **Depends on:** cred.3 + cred.3.1 (hardening gate).
 **Goal:** tools never hold raw credentials.
 **Scope:** authenticating egress proxy — tools call upstream APIs through the broker

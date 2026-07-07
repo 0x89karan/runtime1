@@ -120,6 +120,19 @@ def _load_config() -> Optional[str]:
       2. OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REFRESH_TOKEN env vars
     URL/scope fields default to hardcoded Google values; env vars override.
     """
+    # Broker mode: never read raw credentials into this process.
+    # Only load routing config needed for oauth_call_api's broker path.
+    if _BROKER_URL:
+        _cfg["OAUTH_PROVIDER_NAME"] = (
+            os.environ.get("OAUTH_PROVIDER_NAME", "").strip() or "google"
+        )
+        pname = _cfg["OAUTH_PROVIDER_NAME"]
+        if not all(c.isalnum() or c in ('-', '_') for c in pname) or not pname.isascii():
+            return f"OAUTH_PROVIDER_NAME contains invalid characters (must be [a-z0-9A-Z0-9_-]): {pname!r}"
+        raw_hosts = os.environ.get("OAUTH_ALLOWED_HOSTS", "").strip() or GOOGLE_ALLOWED_HOSTS
+        _cfg["ALLOWED_HOSTS"] = {h.strip() for h in raw_hosts.split(",") if h.strip()}
+        return None
+
     file_client_id = ""
     file_client_secret = ""
     file_refresh_token = ""
@@ -446,6 +459,24 @@ def _ensure_fresh_token() -> Optional[str]:
 def handle_oauth_start_auth(_args: dict) -> tuple:
     global _session, _auth_state
 
+    if _BROKER_URL and _BROKER_TOKEN:
+        return None, json.dumps({
+            "error": "broker_managed",
+            "message": (
+                "OAuth is managed by the credential broker. "
+                "Credentials are provisioned via `agentctl auth google`. "
+                "Use oauth_call_api to make authenticated requests."
+            ),
+        })
+    if _BROKER_URL and not _BROKER_TOKEN:
+        return None, json.dumps({
+            "error": "broker_token_missing",
+            "message": (
+                "AGENTD_CREDENTIAL_GATEWAY_URL is set but AGENTD_CREDENTIAL_TOKEN is absent. "
+                "This is a spawn misconfiguration — both env vars must be injected together by agentd."
+            ),
+        })
+
     # If credentials were pre-provisioned via agentctl auth google (refresh token
     # present), the in-container OAuth dance is unnecessary.
     if _cfg.get("OAUTH_REFRESH_TOKEN"):
@@ -519,6 +550,17 @@ def handle_oauth_start_auth(_args: dict) -> tuple:
 def handle_oauth_check_auth(_args: dict) -> tuple:
     global _auth_state, _refresh_token, _access_token, _token_expiry, _token_scopes, _session
 
+    if _BROKER_URL and _BROKER_TOKEN:
+        return {"ready": True, "broker_managed": True}, None
+    if _BROKER_URL and not _BROKER_TOKEN:
+        return None, json.dumps({
+            "error": "broker_token_missing",
+            "message": (
+                "AGENTD_CREDENTIAL_GATEWAY_URL is set but AGENTD_CREDENTIAL_TOKEN is absent. "
+                "This is a spawn misconfiguration — both env vars must be injected together by agentd."
+            ),
+        })
+
     # If already authorized, return ready
     with _token_lock:
         if _auth_state == "authorized" and _access_token:
@@ -582,6 +624,15 @@ def handle_oauth_check_auth(_args: dict) -> tuple:
 
 def handle_oauth_call_api(args: dict) -> tuple:
     global _auth_state
+
+    if _BROKER_URL and not _BROKER_TOKEN:
+        return None, json.dumps({
+            "error": "broker_token_missing",
+            "message": (
+                "AGENTD_CREDENTIAL_GATEWAY_URL is set but AGENTD_CREDENTIAL_TOKEN is absent. "
+                "This is a spawn misconfiguration — both env vars must be injected together by agentd."
+            ),
+        })
 
     url    = args.get("url", "").strip()
     method = args.get("method", "GET").upper()
@@ -1194,8 +1245,113 @@ def _self_test():
     else:
         fail("23", f"expected credentials-not-configured error, got err={err23}")
 
+    # --- Test 24: _load_config in broker mode → no raw credentials in _cfg ---
+    _reset_state()
+    _cfg.clear()
+    global _BROKER_URL
+    _old_burl24 = _BROKER_URL
+    _BROKER_URL = "http://broker24.test"
+    for k in ("OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
+              "OAUTH_ALLOWED_HOSTS", "OAUTH_PROVIDER_NAME"):
+        os.environ.pop(k, None)
+    err24 = _load_config()
+    _BROKER_URL = _old_burl24
+    if (err24 is None
+            and "OAUTH_CLIENT_SECRET" not in _cfg
+            and "OAUTH_REFRESH_TOKEN" not in _cfg
+            and "OAUTH_PROVIDER_NAME" in _cfg):
+        ok("24: _load_config in broker mode → routing-only config, no raw credentials in _cfg")
+    else:
+        fail("24", f"err={err24} cfg_keys={list(_cfg.keys())}")
+
+    # --- Test 25: oauth_start_auth in broker mode → broker_managed error ---
+    _reset_state()
+    _old_burl25 = _BROKER_URL
+    global _BROKER_TOKEN
+    _old_btok25 = _BROKER_TOKEN
+    _BROKER_URL   = "http://broker25.test"
+    _BROKER_TOKEN = "tok25"
+    result25, err25 = handle_oauth_start_auth({})
+    _BROKER_URL   = _old_burl25
+    _BROKER_TOKEN = _old_btok25
+    if (result25 is None and err25 is not None
+            and json.loads(err25).get("error") == "broker_managed"):
+        ok("25: oauth_start_auth in broker mode → broker_managed error (no crash)")
+    else:
+        fail("25", f"result={result25} err={err25}")
+
+    # --- Test 26: oauth_check_auth in broker mode → ready=true broker_managed=true ---
+    _reset_state()
+    _old_burl26 = _BROKER_URL
+    _old_btok26 = _BROKER_TOKEN
+    _BROKER_URL   = "http://broker26.test"
+    _BROKER_TOKEN = "tok26"
+    result26, err26 = handle_oauth_check_auth({})
+    _BROKER_URL   = _old_burl26
+    _BROKER_TOKEN = _old_btok26
+    if (err26 is None and result26 is not None
+            and result26.get("ready") is True and result26.get("broker_managed") is True):
+        ok("26: oauth_check_auth in broker mode → {ready:true, broker_managed:true}")
+    else:
+        fail("26", f"result={result26} err={err26}")
+
+    # --- Test 27: oauth_call_api in broker mode with minimal _cfg → routes to broker ---
+    _reset_state()
+    _cfg.clear()
+    _cfg["ALLOWED_HOSTS"]       = {"www.googleapis.com"}
+    _cfg["OAUTH_PROVIDER_NAME"] = "google"
+    _old_burl27 = _BROKER_URL
+    _old_btok27 = _BROKER_TOKEN
+    _BROKER_URL   = "http://127.0.0.1:19998"
+    _BROKER_TOKEN = "tok27"
+    mock_resp27 = MagicMock()
+    mock_resp27.read.return_value = b'{"broker":"ok"}'
+    mock_resp27.status = 200
+    mock_resp27.__enter__ = lambda s: s
+    mock_resp27.__exit__ = MagicMock(return_value=False)
+    with patch("urllib.request.urlopen", return_value=mock_resp27):
+        result27, err27 = handle_oauth_call_api(
+            {"url": "https://www.googleapis.com/calendar/v3/calendars"}
+        )
+    _BROKER_URL   = _old_burl27
+    _BROKER_TOKEN = _old_btok27
+    if err27 is None and result27 is not None and result27.get("body") == '{"broker":"ok"}':
+        ok("27: oauth_call_api in broker mode with minimal _cfg → routes to broker correctly")
+    else:
+        fail("27", f"result={result27} err={err27}")
+
+    # --- Test 28: oauth_check_auth with URL-only (no TOKEN) → broker_token_missing error ---
+    _reset_state()
+    _old_burl28 = _BROKER_URL
+    _old_btok28 = _BROKER_TOKEN
+    _BROKER_URL   = "http://broker28.test"
+    _BROKER_TOKEN = ""
+    result28, err28 = handle_oauth_check_auth({})
+    _BROKER_URL   = _old_burl28
+    _BROKER_TOKEN = _old_btok28
+    if (result28 is None and err28 is not None
+            and json.loads(err28).get("error") == "broker_token_missing"):
+        ok("28: oauth_check_auth with URL-only (no TOKEN) → broker_token_missing (not false ready=True)")
+    else:
+        fail("28", f"result={result28} err={err28}")
+
+    # --- Test 29: oauth_call_api with URL-only (no TOKEN) → broker_token_missing error ---
+    _reset_state()
+    _old_burl29 = _BROKER_URL
+    _old_btok29 = _BROKER_TOKEN
+    _BROKER_URL   = "http://broker29.test"
+    _BROKER_TOKEN = ""
+    result29, err29 = handle_oauth_call_api({"url": "https://www.googleapis.com/calendar/v3/calendars"})
+    _BROKER_URL   = _old_burl29
+    _BROKER_TOKEN = _old_btok29
+    if (result29 is None and err29 is not None
+            and json.loads(err29).get("error") == "broker_token_missing"):
+        ok("29: oauth_call_api with URL-only (no TOKEN) → broker_token_missing (not auth_not_ready)")
+    else:
+        fail("29", f"result={result29} err={err29}")
+
     print(file=sys.stderr)
-    total = 23
+    total = 29
     if not failures:
         print(f"oauth_mcp.py: self-test PASSED ({total}/{total})", file=sys.stderr)
         sys.exit(0)

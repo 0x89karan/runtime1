@@ -789,6 +789,19 @@ api-key-header path does not.
 - **Depends on:** cred.3.2 (api-key-header adapter landed).
 - **Where to start:** `agentd/src/credential/mod.rs` — new test `test_api_key_header_attaches_on_forwarded_request`.
 
+**cred.4b-ar-01 (P3) — `_BROKER_URL` not validated to be loopback-only in Python MCP scripts**
+
+`_BROKER_URL` (`AGENTD_CREDENTIAL_GATEWAY_URL`) is used directly in `urllib.request.urlopen` in
+`oauth_mcp.py` without validating that the host resolves to a loopback address. The `_is_ssrf_blocked()`
+check applies only to agent-supplied target URLs, not to the broker URL itself. Practical risk is low
+(the env var is injected by agentd's spawn path, not by the model), but this is a defense-in-depth gap.
+
+- **Fix:** at startup in `_load_config()`, parse `_BROKER_URL` and assert `ipaddress.ip_address(host).is_loopback`
+  (or resolve via `socket.getaddrinfo` and check all returned addresses). Emit a startup error if the host
+  is non-loopback. Apply the same check to `search_mcp.py`.
+- **Where to start:** `docker/oauth_mcp.py` → `_load_config()` broker short-circuit block, after
+  populating `OAUTH_PROVIDER_NAME` and `ALLOWED_HOSTS`. Add `import ipaddress`.
+
 **cred.4-ar-01 (P3) — Caps persistence is per-clean-exit only — in-flight counts lost on crash**
 
 Per-request `persist_cap()` fire-and-forget was removed (cred.4 pre-ship review) to eliminate a
