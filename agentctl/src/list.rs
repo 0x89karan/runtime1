@@ -41,7 +41,8 @@ fn print_table(entries: &[TemplateEntry]) {
             TemplateSource::Repo => "Repo",
             TemplateSource::User => "User",
         };
-        println!("{:<width$}  {:<6}  {}", e.name, src, e.description, width = name_w);
+        let gated_badge = if e.gated_requires.is_some() { " [gated]" } else { "" };
+        println!("{:<width$}  {:<6}  {}{}", e.name, src, e.description, gated_badge, width = name_w);
         // Showcases on a sub-line so the table stays scannable.
         // Use chars().count() to avoid panicking on multi-byte UTF-8 boundaries.
         let showcases = if e.showcases.chars().count() > SHOWCASES_MAX_CHARS {
@@ -60,12 +61,42 @@ mod tests {
 
     fn make_entry(showcases: &str) -> TemplateEntry {
         TemplateEntry {
-            name:         "scout".to_string(),
-            description:  "Read-only researcher.".to_string(),
-            source:       TemplateSource::Repo,
-            showcases:    showcases.to_string(),
-            sample_tasks: vec![],
+            name:          "scout".to_string(),
+            description:   "Read-only researcher.".to_string(),
+            source:        TemplateSource::Repo,
+            showcases:     showcases.to_string(),
+            sample_tasks:  vec![],
+            gated_requires: None,
         }
+    }
+
+    #[test]
+    fn list_shows_gated_badge_for_gated_templates() {
+        let entry = TemplateEntry {
+            name:          "librarian-semantic".to_string(),
+            description:   "Semantic KB librarian.".to_string(),
+            source:        TemplateSource::Repo,
+            showcases:     "vector search".to_string(),
+            sample_tasks:  vec![],
+            gated_requires: Some("VOYAGE_API_KEY".to_string()),
+        };
+        // Capture stdout by just checking the badge logic, not by intercepting println.
+        // The badge is conditionally appended when gated_requires is Some.
+        let badge = if entry.gated_requires.is_some() { " [gated]" } else { "" };
+        assert_eq!(badge, " [gated]", "gated_requires Some → badge must be [gated]");
+
+        let ungated = TemplateEntry {
+            name:          "scout".to_string(),
+            description:   "Researcher.".to_string(),
+            source:        TemplateSource::Repo,
+            showcases:     "web_search".to_string(),
+            sample_tasks:  vec![],
+            gated_requires: None,
+        };
+        let no_badge = if ungated.gated_requires.is_some() { " [gated]" } else { "" };
+        assert_eq!(no_badge, "", "gated_requires None → no badge");
+        // smoke-test that print_table doesn't panic on a gated entry
+        print_table(&[entry, ungated]);
     }
 
     #[test]

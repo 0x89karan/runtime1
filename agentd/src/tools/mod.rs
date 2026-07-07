@@ -69,6 +69,35 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Register a tool, replacing any existing tool with the same name.
+    /// Used when `tool_override = true` on an MCP server — lets a remote KB tool
+    /// (`kb_put`/`kb_get`/`kb_search`) shadow the same-named native Layer-1 tool.
+    ///
+    /// Returns an error if the tool name is in PROTECTED_TOOLS — safety-critical
+    /// primitives that must not be shadowed by MCP servers.
+    /// Emits a warning when displacing a non-protected existing tool.
+    pub fn register_override(&mut self, tool: Box<dyn Tool>) -> Result<()> {
+        const PROTECTED_TOOLS: &[&str] = &["request_approval", "spawn_agent", "send_message"];
+        let name = tool.name().to_string();
+        if PROTECTED_TOOLS.contains(&name.as_str()) {
+            return Err(anyhow::anyhow!(
+                "tool_override cannot shadow safety-critical tool '{name}'; \
+                 remove tool_override from this MCP server or rename the tool"
+            ));
+        }
+        if self.tools.contains_key(&name) {
+            tracing::warn!(
+                tool = %name,
+                "tool_override: shadowing existing native tool '{}'; agents that used \
+                 this tool's native capability (e.g. KbRead/KbWrite) must now grant \
+                 the MCP server capability instead",
+                name
+            );
+        }
+        self.tools.insert(name, tool);
+        Ok(())
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs: Vec<ToolSpec> = self
             .tools
@@ -321,6 +350,69 @@ mod tests {
         let err = register_native(&mut reg, &["read_file".to_string()], None, None).unwrap_err();
         assert!(err.to_string().contains("read_file"));
         assert!(err.to_string().contains("already registered"));
+    }
+
+    // ── h8.1: register_override shadows native tool ───────────────────────────
+
+    struct StubTool {
+        name: &'static str,
+        desc: &'static str,
+    }
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str { self.name }
+        fn description(&self) -> &str { self.desc }
+        fn input_schema(&self) -> serde_json::Value { serde_json::json!({}) }
+        async fn invoke(&self, _: serde_json::Value, _: &ToolContext) -> anyhow::Result<String> {
+            Ok(format!("stub:{}", self.name))
+        }
+    }
+
+    #[test]
+    fn tool_override_shadows_native_kb_search() {
+        // T10: register_override removes native kb_search before inserting MCP tool.
+        let mut reg = ToolRegistry::new();
+        // Register a native stub named "kb_search".
+        reg.register(Box::new(StubTool { name: "kb_search", desc: "native" })).unwrap();
+        assert!(reg.tool_names().contains(&"kb_search".to_string()));
+        // Now override with a different stub (simulates MCP tool).
+        reg.register_override(Box::new(StubTool { name: "kb_search", desc: "mcp-override" })).unwrap();
+        // Tool still present, description updated to the override.
+        let specs = reg.specs();
+        let kb = specs.iter().find(|s| s.name == "kb_search").expect("kb_search must remain");
+        assert_eq!(kb.description, "mcp-override", "native tool must be replaced by the override");
+    }
+
+    #[test]
+    fn tool_override_false_duplicate_is_error() {
+        // T11: plain register() still errors on duplicate (default behavior unchanged).
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(StubTool { name: "kb_search", desc: "native" })).unwrap();
+        let err = reg.register(Box::new(StubTool { name: "kb_search", desc: "mcp" })).unwrap_err();
+        assert!(err.to_string().contains("already registered"), "got: {err}");
+    }
+
+    #[test]
+    fn tool_override_protected_tools_are_blocked() {
+        // Attempting to override request_approval, spawn_agent, or send_message must return an error.
+        for protected in &["request_approval", "spawn_agent", "send_message"] {
+            let mut reg = ToolRegistry::new();
+            let err = reg
+                .register_override(Box::new(StubTool { name: protected, desc: "malicious" }))
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("safety-critical"),
+                "protected tool '{protected}' override must error with 'safety-critical': got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_override_non_protected_tool_succeeds() {
+        // kb_search (non-protected) must succeed with register_override.
+        let mut reg = ToolRegistry::new();
+        reg.register_override(Box::new(StubTool { name: "kb_search", desc: "mcp" })).unwrap();
+        assert!(reg.tool_names().contains(&"kb_search".to_string()));
     }
 
     #[tokio::test]

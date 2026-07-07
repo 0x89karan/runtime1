@@ -57,6 +57,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 6. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 **Deferred:** Track MESH (`mesh.1–6`, multi-instance) and ROADMAP `h8.3` (multi-device migration).
+**Planned:** Track PERSONAL (`personal.1+`, operator workflow brain via gbrain — after h8.1).
 
 Why foundation-first: the broker (`cred.3`) lands before `h8.1`/`orch.1` because `h8.1` introduces a
 remote embedding API key that should ride the broker rather than become another ad-hoc secret;
@@ -1080,20 +1081,21 @@ stays multi-device migration.
 
 ## Phase 8 — Harness extensions
 
-**h8.1 — Layer 2 semantic memory** [HARNESS] *(depends on: cos.1 tested + working — a smarter
-memory under a product that doesn't exist proves nothing)*
-Attach a HelixDB instance (Rust, graph + vector, provenance links — best ethos fit) as
-an MCP sidecar, reachable via the HTTP/SSE transport shipped in p7.1. Embeddings from a
-remote API (Voyage AI canonical; Cohere/OpenAI viable), preserving the cognition-is-
-remote lock — no embedding weights on the `agentd` host. The Layer-1 BM25 store (p5.5)
-stays as-is; agents use either or both. Design: `docs/DESIGN-memory.md` §4 (two storage
-layers) + §9 Q1 (decided).
+**h8.1 — Layer 2 semantic memory** [HARNESS] ✅ *v0.64.0 — complete*
+`docker/semantic_kb_mcp.py` HTTP MCP sidecar (port 8020) backed by Qdrant (vector store)
++ Voyage AI embeddings (`voyage-3-lite` default, 512-dim). Exposes `kb_put` / `kb_get` /
+`kb_search` with the same interface as the Layer-1 BM25 tools (p5.5); `tool_override = true`
+lets agents upgrade to vector search without changing task prompts. `allow_insecure_local = true`
+permits Docker-internal `http://` URLs. `templates/librarian-semantic.template.toml` + Compose
+`--profile semantic` for zero-config start. 7 self-tests; SSRF guard on `QDRANT_URL`.
+(Note: HelixDB was evaluated but uses a graph-DSL API incompatible with the sidecar model;
+Qdrant selected for its simple REST vector API.)
 
 **h8.2 — `agentos:full` Docker distribution** [HARNESS]
 Formally packages the harness into a versioned Docker image pair. `agentos:core` contains
 only `agentd` + `agentctl` (the existing `Dockerfile`). `agentos:full` extends it with
 all standard MCP servers (h7.1), the OAuth sidecar (h7.2), event trigger servers (h7.3),
-HelixDB (h8.1), and the full template catalogue. Operators choose the image tier for
+Qdrant/semantic-kb (h8.1), and the full template catalogue. Operators choose the image tier for
 their use case; the core runtime is identical in both.
 
 **h8.3 — Multi-device agent migration** [HARNESS, horizon]
@@ -1102,6 +1104,37 @@ portable artifact and restore it on another device. The checkpoint format (p3.2)
 detachable memory volume (p5.3.5) provide the groundwork; the remaining work is a
 transfer protocol and identity continuity. Delivered as a command in `agentctl` — not a
 core runtime change. No plan doc yet; revisit when a concrete use case demands it.
+
+---
+
+## Track PERSONAL — Operator workflow brain
+
+The **operator memory** complement to the agent memory layers. While Layer 1 (BM25) and
+Layer 2 (vector, h8.1) are agent-owned — agents write during task execution — the personal
+track gives the *operator* a persistent semantic brain that spans projects, deployments, and
+sessions. Agents can read it (as a `canon` MCP source) but the operator controls what goes in.
+
+Architecture: **gbrain** (`github.com/garrytan/gbrain`) as the backend, exposed to agentOS
+agents via its MCP server (`gbrain serve` / remote HTTP transport). gbrain handles PGLite or
+Supabase storage, Voyage AI `voyage-code-3` embeddings, and cross-machine sync via a private
+artifacts repo — no need to rebuild this layer.
+
+Layer mapping:
+
+```
+Layer 1: in-process BM25 (per-agent session, native)
+Layer 2: Qdrant sidecar (persistent, per-deployment, agent write/read)   — h8.1
+Layer 3: gbrain (persistent, cross-deployment, operator-owned)           — personal.x
+```
+
+**personal.1 — gbrain MCP integration** [HARNESS] *(depends on: h8.1)*
+Wire gbrain into the agentOS Docker stack as an optional operator KB layer. Agents that hold
+`KbRead`-equivalent capability for the `personal` source can query it via `mcp__gbrain__search`
+/ `mcp__gbrain__query`. The operator runs `/setup-gbrain` once on the Mac host; the Docker
+stack mounts the gbrain socket or connects to a Supabase URL. A new `researcher.template.toml`
+demonstrates agents that combine Layer 2 runtime KB writes with Layer 3 operator knowledge
+lookups. No `agentd` Rust changes needed; pure HARNESS + template + docs work.
+No plan doc yet.
 
 ---
 

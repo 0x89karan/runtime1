@@ -27,7 +27,7 @@ pub fn load_spawn_templates() -> (Vec<SpawnTemplate>, Option<String>) {
     };
     let mut out = Vec::with_capacity(entries.len());
     let mut resolve_errors: Vec<String> = Vec::new();
-    for TemplateEntry { name, source, description, showcases, sample_tasks: _ } in entries {
+    for TemplateEntry { name, source, description, showcases, sample_tasks: _, gated_requires: _ } in entries {
         let (suggested_caps, full_sample_tasks) = match resolver.resolve(&name) {
             Ok((cfg, _)) => {
                 let caps = cfg.card.map(|c| c.suggested_caps).unwrap_or_default();

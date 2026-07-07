@@ -40,17 +40,18 @@ services:
       - ANTHROPIC_API_KEY
       #
       # TEMPLATE_NAME: which template to run. Try "scout" first — no OAuth setup required.
-      # Valid values: scout  librarian  coordinator  google-agent
+      # Valid values: scout  librarian  librarian-semantic  coordinator  google-agent
       #               cron-agent  watcher  webhook-agent
       # (journaler and memory-custodian require a persistent /run/memory volume — not supported here)
       # (code-aware and langchain-worker require runsc/gVisor — not in this image)
       - TEMPLATE_NAME
       #
       # AGENT_TASK: the task string passed to the agent. Examples by template:
-      #   scout:        "Research the latest Rust async runtimes and write a summary"
-      #   librarian:    "Organize the notes in /workspace into topics"
-      #   google-agent: "Summarize my last 5 unread emails"
-      #   journaler:    "Write a brief journal entry about today"
+      #   scout:              "Research the latest Rust async runtimes and write a summary"
+      #   librarian:          "Organize the notes in /workspace into topics"
+      #   librarian-semantic: "Index these docs and let me search them by meaning"
+      #   google-agent:       "Summarize my last 5 unread emails"
+      #   journaler:          "Write a brief journal entry about today"
       - AGENT_TASK
       #
       # HOME=/data: persists checkpoint/flight files on the named volume across --rm runs.
@@ -68,17 +69,63 @@ services:
       #
       # ── Web search (scout, librarian) ───────────────────────────────────────
       - BRAVE_SEARCH_API_KEY
+      # ── Semantic KB (librarian-semantic) ────────────────────────────────────
+      # Required for semantic kb_put / kb_search (Voyage AI embeddings).
+      # librarian-semantic will start but embedding calls will fail without this.
+      - VOYAGE_API_KEY
       # ── Debug ───────────────────────────────────────────────────────────────
       # DRY_RUN_ONLY=1: print rendered config and exit without running agentd
       - DRY_RUN_ONLY
     command: agent
     stdin_open: true
     tty: true
+    # When running --profile semantic, wait for semantic-kb-mcp to start before
+    # agentd attempts to connect. No-op when the semantic profile is inactive.
+    depends_on:
+      semantic-kb-mcp:
+        condition: service_started
+        required: false
     sysctls:
       net.ipv4.tcp_keepalive_time: 15
       net.ipv4.tcp_keepalive_intvl: 5
       net.ipv4.tcp_keepalive_probes: 3
 
+  # ── Semantic KB sidecar (h8.1) — started automatically with librarian-semantic ──
+  # Only needed when TEMPLATE_NAME=librarian-semantic (or another template with
+  # url = "http://semantic-kb-mcp:8020" in its [[tools.mcp_servers]]).
+  # Usage: docker compose --profile semantic up
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    profiles: [semantic]
+    volumes:
+      - qdrant-data:/qdrant/storage
+    # Qdrant is only reachable by services in this compose network — not exposed to the host.
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:6333/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  semantic-kb-mcp:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.semantic-kb-mcp
+    profiles: [semantic]
+    environment:
+      - VOYAGE_API_KEY
+      - VOYAGE_MODEL=${VOYAGE_MODEL:-voyage-3-lite}
+      - QDRANT_URL=http://qdrant:6333
+      # Optional inbound auth: set SIDECAR_SECRET to a shared token; the agent service
+      # must pass the same value via headers_env = { X-Sidecar-Token = "SIDECAR_SECRET" }
+      # in its [[tools.mcp_servers]] config. Leave unset to disable the check (Docker-network
+      # isolation is the default trust boundary).
+      - SIDECAR_SECRET
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
 volumes:
   cos-data:
   agent-data:
+  qdrant-data:

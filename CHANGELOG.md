@@ -3,6 +3,66 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [h8.1] - 2026-07-07 (v0.64.0)
+
+### Added — Layer-2 semantic memory sidecar
+
+- **`docker/semantic_kb_mcp.py`** — HTTP MCP sidecar backed by Qdrant + Voyage AI embeddings.
+  Exposes `kb_put` / `kb_get` / `kb_search` (vector-similarity). Self-tests T1–T18; no external
+  services needed (`VOYAGE_MOCK_EMBEDDINGS=1`). 18/18 self-tests pass.
+- **`allow_insecure_local`** — new `McpServerConfig` field; permits `http://` URLs for
+  Docker-internal peer services (emits `tracing::warn!` at startup; `https://` still required
+  for all others).
+- **`tool_override`** — new `McpServerConfig` field; MCP tools silently shadow same-named native
+  tools via `ToolRegistry::register_override()`. Restricted: `request_approval` and `spawn_agent`
+  are PROTECTED_TOOLS and cannot be shadowed (startup error).
+- **`templates/librarian-semantic.template.toml`** — first Layer-2 template; gated on
+  `VOYAGE_API_KEY`.
+- **`docker-compose.yml`** — `qdrant` (v1.13.6, pinned, with healthcheck) and `semantic-kb-mcp`
+  services under `profiles: [semantic]`.
+- **`docker/Dockerfile.semantic-kb-mcp`** — HEALTHCHECK + `/healthz` endpoint.
+- **`docs/MCP_SERVERS.md`** — Semantic KB section documenting the sidecar setup.
+
+### Security hardening (pre-landing review)
+
+- `_KEY_RE` tightened to exclude `?#@%+=` preventing URL injection via segment names interpolated
+  into Qdrant collection URLs.
+- Negative `Content-Length` guard: reject with 400 before body-size check.
+- `_qdrant()` response capped at `MAX_QDRANT_RESPONSE` (4 MB) preventing OOM from oversized responses.
+- `_ensure_collection` bare `except RuntimeError: pass` narrowed to re-raise non-404 errors.
+- IPv4-mapped IPv6 (`::ffff:172.17.0.x`) now accepted by `_is_private()` for Docker-internal hosts.
+- `SIDECAR_SECRET` optional inbound auth token (`X-Sidecar-Token` header, `secrets.compare_digest`).
+  Default off; Docker-network isolation is the boundary.
+- `register_override()` now returns `Result<()>` and emits `tracing::warn!` when displacing a tool;
+  `PROTECTED_TOOLS = ["request_approval", "spawn_agent"]` cannot be shadowed.
+- Startup cap-mismatch warning: when `tool_override=true`, agents with `KbRead`/`KbWrite` but no
+  matching `Mcp{server=...}` grant are warned at startup.
+
+### Tests
+- 2 new Rust tests: `tool_override_protected_tools_are_blocked`, `tool_override_non_protected_tool_succeeds`.
+- 5 new config tests: `http_server_allow_insecure_local_ok`, `http_server_insecure_local_rejected_without_flag`,
+  `http_insecure_local_rejects_embedded_credentials`, `tool_override_field_parses_true`,
+  `tool_override_field_defaults_false`.
+- 5 new Python self-tests: T8 (SSRF classification), T9 (oversize content), T10 (not-found),
+  T11 (empty key), T12 (segment URL injection).
+- 3 additional Python self-tests (coverage audit): T13 (SIDECAR_SECRET auth — correct/wrong/missing/empty),
+  T14 (GET /healthz returns 200 + `{status:ok}`), T15 (negative Content-Length returns JSON-RPC -32700).
+- 1 additional Python self-test (pre-landing): T16 (kb_search non-404 Qdrant error propagates as isError).
+- 2 additional Python self-tests (adversarial review): T17 (`params: null` body handled gracefully),
+  T18 (non-object JSON body returns -32700 parse error, not AttributeError crash).
+- Hardening fixes (pre-landing + security + adversarial review):
+  - Voyage AI response capped at `MAX_VOYAGE_RESPONSE` (4 MB) on both success and error paths
+  - Qdrant error response body capped at `MAX_QDRANT_RESPONSE` (4 MB) — closes OOM gap in error path
+  - `_handle_kb_search` bare `except RuntimeError` narrowed to re-raise non-404 errors
+  - `send_message` added to `PROTECTED_TOOLS` — MCP servers with `tool_override` cannot shadow inter-agent messaging
+  - `params: null` JSON-RPC body treated as `{}` (was `AttributeError` → TCP RST)
+  - Non-object JSON body (`[1,2,3]`, `42`) returns `-32700` parse error (was `AttributeError` → TCP RST)
+  - `docker-compose.yml` `agent` depends on `semantic-kb-mcp` (`required: false`) — fixes startup race
+  - `docs/MCP_SERVERS.md` self-test count corrected from 7 to 18
+- Total workspace tests: 1190 Rust + 18 Python self-tests.
+
+---
+
 ## [cred.3.2] - 2026-07-06 (v0.62.0)
 
 ### Security / hardening (Groups A–E + post-review hardening)

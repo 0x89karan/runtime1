@@ -650,6 +650,11 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .signal-rail::after { animation: none; }
 }
+.cred-badge {
+  background: rgba(53,196,187,.1);
+  color: var(--teal);
+  border: 1px solid rgba(53,196,187,.3);
+}
 </style>
 </head>
 <body>
@@ -658,7 +663,7 @@ body {
 <div class="page-header">
   <div>
     <div class="page-title">AgentOS — Runtime Architecture</div>
-    <div class="page-subtitle">v0.51.0 · sidecars, memory tiers, and operator surfaces</div>
+    <div class="page-subtitle">v0.63.0 · core vs. harness boundary · credential gateway · spend caps</div>
   </div>
   <div class="legend">
     <div class="legend-item">
@@ -674,7 +679,10 @@ body {
       <div class="legend-dot" style="background:var(--purple)"></div>observability sidecar
     </div>
     <div class="legend-dot" style="background:var(--planned-bdr); border: 1px dashed var(--planned-bdr); border-radius:1px; width:8px; height:8px; flex-shrink:0"></div>
-    <span style="font-family:var(--mono);font-size:10px;color:var(--text-muted)">h8.1 planned</span>
+    <span style="font-family:var(--mono);font-size:10px;color:var(--text-muted)">h8.1</span>
+    <div class="legend-item">
+      <div class="legend-dot" style="background:var(--surface-3);border:1px solid var(--border-bright)"></div>harness sidecar
+    </div>
   </div>
 </div>
 
@@ -703,7 +711,7 @@ body {
     </div>
     <div class="agentctl-box">
       <div class="ctl-name">agentctl</div>
-      <div class="ctl-cmds">watch · auth · inject · verify · spawn · list-templates</div>
+      <div class="ctl-cmds">watch · auth · approve · deny · inject · verify · spawn · list-templates</div>
       <div class="ctl-note" style="margin-top:6px;font-size:10px;color:var(--text-muted);">reads FUSE <span style="color:var(--text-dim)">or</span> falls back to</div>
       <div class="port-row">
         <div class="port-pill">:7999 mgmt API</div>
@@ -722,7 +730,7 @@ body {
 
     <!-- ── COLUMN 1: CORE ──────────────────────────────────── -->
     <div class="col">
-      <div class="col-label">Runtime Core</div>
+      <div class="col-label">AgentOS Core — agentd binary</div>
 
       <!-- Scheduler -->
       <div class="chip">
@@ -774,6 +782,27 @@ body {
         </div>
       </div>
 
+      <!-- Credential Gateway -->
+      <div class="chip">
+        <div class="chip-header">
+          <span class="chip-title">Credential Gateway</span>
+          <span class="chip-type type-native">native</span>
+        </div>
+        <div class="chip-body">
+          <div class="egress-row">
+            <span style="font-family:var(--mono);font-size:9px;color:var(--text-muted)">MCP call</span>
+            <span class="key-arrow">→</span>
+            <span class="key-badge cred-badge">UUID token</span>
+            <span class="key-arrow">→</span>
+            <span style="font-family:var(--mono);font-size:9px;color:var(--teal)">upstream API + cred</span>
+          </div>
+          <div class="chip-note" style="margin-top:4px;">second loopback listener · CredentialRegistry · OAuthTokenCache</div>
+          <div class="chip-note">adapters: <span class="hl">api-key-header</span> · <span class="hl">api-key-query</span> · <span class="hl">oauth-bearer</span></div>
+          <div class="chip-note">spend caps: <span class="amber">max_requests_per_agent</span> · persisted in <span class="amber">caps.redb</span></div>
+          <div class="chip-note">DNS pinning · PASSTHROUGH_HEADERS allowlist · no raw creds in MCP env</div>
+        </div>
+      </div>
+
       <!-- Native Tools -->
       <div class="chip">
         <div class="chip-header">
@@ -813,6 +842,10 @@ body {
             <div class="surface-row">
               <div class="surface-port">:8080</div>
               <div class="surface-desc"><em>Approval HTML</em> · approve/deny/timeout <span style="color:var(--text-dim)">(dx.2)</span></div>
+            </div>
+            <div class="surface-row">
+              <div class="surface-port">cred</div>
+              <div class="surface-desc"><em>Credential Gateway</em> · loopback-only · UUID tokens <span style="color:var(--text-dim)">(cred.3-4)</span></div>
             </div>
             <div class="surface-row">
               <div class="surface-fuse">FUSE</div>
@@ -913,16 +946,18 @@ body {
 
       <!-- Storage line -->
       <div class="storage-chip">
-        <div class="storage-path">memory.redb</div>
+        <div class="storage-path">memory.redb &nbsp;·&nbsp; caps.redb</div>
         <div class="storage-sub">/run/memory/ → Docker named vol  or  QEMU virtfs memory0</div>
-        <div class="storage-sub" style="margin-top:3px;">T1 + T2 share one redb instance · NAMESPACES table for O(k) listing</div>
+        <div class="storage-sub">T1 + T2 share memory.redb · caps.redb holds per-agent spend counters (cred.4)</div>
+        <div class="storage-sub" style="margin-top:3px;">NAMESPACES table for O(k) listing · OV-1: both paths outside MCP sandbox prefix</div>
       </div>
 
     </div><!-- /col memory -->
 
     <!-- ── COLUMN 3: SIDECARS + SURFACES ──────────────────── -->
     <div class="col">
-      <div class="col-label">MCP Sidecars</div>
+      <div class="col-label">Harness Sidecars</div>
+      <div class="chip-note" style="font-family:var(--mono);font-size:9px;color:var(--text-dim);margin-bottom:4px;">docker/*.py scripts · not compiled into agentd</div>
 
       <!-- stdio MCP servers -->
       <div class="chip">
@@ -934,7 +969,7 @@ body {
           <div class="mcp-list">
             <div class="mcp-row">
               <div class="mcp-name">oauth_mcp.py</div>
-              <div class="mcp-tools">oauth_start_auth · oauth_check_auth · oauth_call_api<br>PKCE · CSRF nonce · reads /run/secrets/google.json</div>
+              <div class="mcp-tools">oauth_start_auth · oauth_check_auth · oauth_call_api<br>PKCE · CSRF nonce · <span style="color:var(--text-dim)">credential-agnostic</span> · routes via credential gateway</div>
             </div>
             <div class="mcp-row">
               <div class="mcp-name">cron_mcp.py</div>
@@ -954,11 +989,11 @@ body {
             </div>
             <div class="mcp-row">
               <div class="mcp-name">http_mcp.py</div>
-              <div class="mcp-tools">fetch_url · HTTPS only · 4 MB cap · no redirects<br>requires Net capability</div>
+              <div class="mcp-tools">fetch_url · HTTPS only · 4 MB cap · no redirects<br>requires Net + Credential capabilities</div>
             </div>
             <div class="mcp-row">
               <div class="mcp-name">search_mcp.py</div>
-              <div class="mcp-tools">web_search · Brave Search API · graceful missing-key<br>requires Net capability</div>
+              <div class="mcp-tools">web_search · Brave Search API · graceful missing-key<br>credential-agnostic · routes via credential gateway</div>
             </div>
           </div>
         </div>
@@ -1061,7 +1096,13 @@ body {
     <div class="net-group">
       <div class="net-group-label">Search</div>
       <div class="net-item">api.search.brave.com</div>
-      <div class="net-item" style="color:var(--text-muted);font-size:9px;">via search_mcp.py</div>
+      <div class="net-item" style="color:var(--text-muted);font-size:9px;">via credential gateway → search_mcp.py</div>
+    </div>
+    <div class="net-group">
+      <div class="net-group-label">Credential Broker</div>
+      <div class="net-item">api.github.com</div>
+      <div class="net-item">api.search.brave.com</div>
+      <div class="net-item" style="color:var(--text-muted);font-size:9px;">via credential gateway · no raw creds in tool env</div>
     </div>
     <div class="net-group">
       <div class="net-group-label">HTTP MCP hosts</div>

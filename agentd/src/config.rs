@@ -587,6 +587,20 @@ pub struct McpServerConfig {
     /// Ignored for HTTP servers (use `headers_env` instead).
     #[serde(default)]
     pub passenv: Vec<String>,
+    /// Allow `http://` (plaintext) URLs for this HTTP MCP server.
+    /// Only set this for Docker-internal peer services where TLS is not needed
+    /// because traffic stays within the container network. Never use for
+    /// external URLs — tokens would be sent in clear text.
+    /// A startup warning is emitted when this flag is set.
+    #[serde(default)]
+    pub allow_insecure_local: bool,
+    /// When true, tools advertised by this MCP server silently shadow any
+    /// already-registered native tool with the same name. Use to let a remote
+    /// semantic KB (`kb_put`/`kb_get`/`kb_search`) transparently replace the
+    /// built-in Layer-1 BM25 tools. Operators must opt in explicitly; default
+    /// false means accidental name collisions produce a hard error.
+    #[serde(default)]
+    pub tool_override: bool,
 }
 
 impl McpServerConfig {
@@ -609,6 +623,34 @@ impl McpServerConfig {
                 self.name
             ),
             (Some(url), true) => {
+                if url.starts_with("http://") {
+                    if !self.allow_insecure_local {
+                        anyhow::bail!(
+                            "MCP server '{}': url must start with 'https://' (got {:?}) — \
+                             plaintext HTTP is not allowed (tokens would be sent in clear text). \
+                             For Docker-internal peer services set allow_insecure_local = true.",
+                            self.name, url
+                        );
+                    }
+                    // Reject credentials embedded in http:// URLs too — same invariant applies.
+                    let after_scheme = url.strip_prefix("http://").unwrap_or(url);
+                    let slash = after_scheme.find('/').unwrap_or(after_scheme.len());
+                    if after_scheme[..slash].contains('@') {
+                        anyhow::bail!(
+                            "MCP server '{}': embedding credentials in the URL is not allowed — \
+                             use 'headers_env' to inject auth headers from environment variables",
+                            self.name
+                        );
+                    }
+                    // allow_insecure_local=true: permitted but warn at startup.
+                    tracing::warn!(
+                        server = %self.name,
+                        url = url.as_str(),
+                        "allow_insecure_local=true: connecting to HTTP MCP server over plaintext — \
+                         only safe for Docker-internal peer services"
+                    );
+                    return Ok(());
+                }
                 if !url.starts_with("https://") {
                     anyhow::bail!(
                         "MCP server '{}': url must start with 'https://' (got {:?}) — \
@@ -1597,5 +1639,102 @@ skills = ["research", "write"]
         assert_eq!(ac.name.as_deref(), Some("My Assistant"));
         assert_eq!(ac.description, "A helpful assistant");
         assert_eq!(ac.skills, vec!["research", "write"]);
+    }
+
+    // ── h8.1: allow_insecure_local + tool_override tests ─────────────────────
+
+    #[test]
+    fn http_server_allow_insecure_local_ok() {
+        // T8: http:// URL accepted when allow_insecure_local = true.
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "semantic-kb"
+url = "http://semantic-kb-mcp:8020"
+allow_insecure_local = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let srv = &cfg.tools.mcp_servers[0];
+        assert!(srv.allow_insecure_local, "flag should round-trip");
+        assert!(srv.validate().is_ok(), "http:// with allow_insecure_local must not error");
+    }
+
+    #[test]
+    fn http_server_insecure_local_rejected_without_flag() {
+        // T9: http:// URL rejected by default (allow_insecure_local = false).
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "semantic-kb"
+url = "http://semantic-kb-mcp:8020"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.tools.mcp_servers[0].validate().unwrap_err();
+        assert!(
+            err.to_string().contains("allow_insecure_local"),
+            "error must mention allow_insecure_local, got: {err}"
+        );
+    }
+
+    #[test]
+    fn tool_override_field_defaults_false() {
+        // T11: tool_override defaults to false (accidental shadowing is an error).
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "semantic-kb"
+url = "https://example.com/mcp"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(!cfg.tools.mcp_servers[0].tool_override, "must default to false");
+    }
+
+    #[test]
+    fn tool_override_field_parses_true() {
+        // T10 (config side): tool_override = true round-trips correctly.
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "semantic-kb"
+url = "http://semantic-kb-mcp:8020"
+allow_insecure_local = true
+tool_override = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.tools.mcp_servers[0].tool_override, "flag should round-trip");
+    }
+
+    #[test]
+    fn http_insecure_local_rejects_embedded_credentials() {
+        // T11-creds: allow_insecure_local=true must still reject credentials embedded in the URL —
+        // violates the secrets-from-env constitutional invariant.
+        let raw = r#"
+[agent]
+id = "a"
+task = "t"
+
+[[tools.mcp_servers]]
+name = "semantic-kb"
+url = "http://user:secretpassword@qdrant:6333"
+allow_insecure_local = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let err = cfg.tools.mcp_servers[0].validate().unwrap_err();
+        assert!(
+            err.to_string().contains("embedding credentials"),
+            "expected embedded-credentials error, got: {err}"
+        );
     }
 }

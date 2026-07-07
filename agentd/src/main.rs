@@ -478,9 +478,16 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
 
             let n = specs.len();
             for spec in specs {
-                registry
-                    .register(Box::new(McpTool::new(Arc::clone(&backend), spec, server.name.clone())))
-                    .with_context(|| format!("registering tools from HTTP MCP server '{}'", server.name))?;
+                let tool = Box::new(McpTool::new(Arc::clone(&backend), spec, server.name.clone()));
+                if server.tool_override {
+                    registry
+                        .register_override(tool)
+                        .with_context(|| format!("registering (override) tools from HTTP MCP server '{}'", server.name))?;
+                } else {
+                    registry
+                        .register(tool)
+                        .with_context(|| format!("registering tools from HTTP MCP server '{}'", server.name))?;
+                }
             }
             tracing::info!(name = %server.name, tools = n, "HTTP MCP server connected");
             mcp_backends.push(backend);
@@ -709,9 +716,16 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         let client: Arc<dyn McpBackend> = client;
         let n = specs.len();
         for spec in specs {
-            registry
-                .register(Box::new(McpTool::new(Arc::clone(&client), spec, server.name.clone())))
-                .with_context(|| format!("registering tools from MCP server '{}'", server.name))?;
+            let tool = Box::new(McpTool::new(Arc::clone(&client), spec, server.name.clone()));
+            if server.tool_override {
+                registry
+                    .register_override(tool)
+                    .with_context(|| format!("registering (override) tools from MCP server '{}'", server.name))?;
+            } else {
+                registry
+                    .register(tool)
+                    .with_context(|| format!("registering tools from MCP server '{}'", server.name))?;
+            }
         }
         tracing::info!(name = %server.name, tools = n, "MCP server connected");
         mcp_backends.push(client);
@@ -789,6 +803,34 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         serde_json::json!({ "tools": tool_names }),
     );
     tracing::info!(tools = ?tool_names, "tools registered");
+
+    // Warn when tool_override is active on a server whose shadowed tools (kb_put/kb_get/kb_search)
+    // require KbRead/KbWrite, but the agent's cap-set has KbRead/KbWrite without a matching Mcp grant.
+    // Agents in that state would hit a CapabilityDenied because the MCP tool's required_capability_for
+    // returns Mcp{server=...}, not KbRead/KbWrite.
+    for server in cfg.tools.mcp_servers.iter().filter(|s| s.tool_override) {
+        for ac in &agent_cfgs {
+            if let Some(ref caps) = ac.capabilities {
+                let has_kb_cap = caps.iter().any(|c| {
+                    matches!(c, agentd::capability::Capability::KbRead { .. }
+                                | agentd::capability::Capability::KbWrite { .. })
+                });
+                let has_mcp_grant = caps.iter().any(|c| {
+                    matches!(c, agentd::capability::Capability::Mcp { server: srv, .. } if srv == &server.name)
+                });
+                if has_kb_cap && !has_mcp_grant {
+                    tracing::warn!(
+                        agent = %ac.id,
+                        server = %server.name,
+                        "tool_override: agent has KbRead/KbWrite but no Mcp grant for server '{}'; \
+                         native kb tools are shadowed — add '{{ Mcp = {{ server = \"{}\" }} }}' \
+                         to this agent's capabilities",
+                        server.name, server.name
+                    );
+                }
+            }
+        }
+    }
 
     // Emit AgentSpawned per agent before any API calls so startup events are
     // always present in the flight log even if gateway init fails.

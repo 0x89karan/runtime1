@@ -42,6 +42,7 @@ package installs). Use paths relative to the directory where agentd is invoked
 | `docker/cron_mcp.py`     | `wait_for_trigger` | none | `TRIGGER_CRON` or `TRIGGER_INTERVAL` |
 | `docker/fs_watch_mcp.py` | `wait_for_trigger` | `FsRead { prefix = "/..." }` | `TRIGGER_WATCH_PATH` |
 | `docker/webhook_mcp.py`  | `wait_for_trigger` | `Net { ports = [PORT] }` | `TRIGGER_WEBHOOK_PORT` (optional) |
+| `docker/semantic_kb_mcp.py` | `kb_put`, `kb_get`, `kb_search` | `KbRead`/`KbWrite { segment }` | `VOYAGE_API_KEY` |
 
 Self-test (no API key required):
 ```bash
@@ -51,6 +52,7 @@ python3 docker/search_mcp.py --test
 python3 docker/cron_mcp.py  --test
 python3 docker/fs_watch_mcp.py --test
 python3 docker/webhook_mcp.py  --test
+VOYAGE_MOCK_EMBEDDINGS=1 python3 docker/semantic_kb_mcp.py --test
 ```
 
 ### shell_exec
@@ -394,6 +396,8 @@ restart — it is not persisted across crashes (only clean exits reset the count
   written to disk or logged. Only the header **name** (e.g. `Authorization`)
   appears in error messages.
 - `url` must start with `https://` — plain `http://` is rejected at validation.
+  Set `allow_insecure_local = true` for Docker-internal peer services
+  (e.g. `http://semantic-kb-mcp:8020`); this emits a `tracing::warn` at startup.
 - HTTP servers are not subject to `mcp_require_capabilities` (that gate applies
   to stdio servers only, since HTTP servers handle isolation themselves).
 - **RFC-1918 / link-local addresses are not blocked.** `validate()` only checks
@@ -401,3 +405,67 @@ restart — it is not persisted across crashes (only clean exits reset the count
   `https://169.254.169.254/...` passes. In the single-tenant threat model the
   operator controls config, so the risk is low. Structural blocking of metadata
   endpoints is a future hardening item. (See TODOS.md p7.1-ar-02.)
+
+## Semantic KB (h8.1)
+
+`docker/semantic_kb_mcp.py` is a Layer-2 semantic memory sidecar. It exposes
+the same `kb_put` / `kb_get` / `kb_search` interface as the built-in BM25
+Layer-1 store (p5.5), but backed by Qdrant (vector database) + Voyage AI
+(embeddings). With `tool_override = true`, it silently replaces the native
+BM25 tools so agents can be upgraded to vector search without changing their
+task prompts.
+
+**Quick-start** (Docker Compose):
+
+```bash
+VOYAGE_API_KEY=sk-... AGENT_TASK="..." TEMPLATE_NAME=librarian-semantic \
+  docker compose --profile semantic up
+```
+
+This starts three containers: `agent` (agentd), `qdrant` (vector store), and
+`semantic-kb-mcp` (the sidecar). Qdrant data persists in the `qdrant-data` named volume.
+
+### Tools
+
+| Tool | Description | Required cap |
+|------|-------------|--------------|
+| `kb_put(segment, key, content, metadata?)` | Embed + store content | `KbWrite { segment }` |
+| `kb_get(segment, key)` | Retrieve by exact key | `KbRead { segment }` |
+| `kb_search(segment, query, limit?)` | Vector similarity search | `KbRead { segment }` |
+
+### Environment variables
+
+| Var | Default | Description |
+|-----|---------|-------------|
+| `VOYAGE_API_KEY` | *(required)* | Voyage AI embedding API key. |
+| `VOYAGE_MODEL` | `voyage-3-lite` | Model to use (also: `voyage-3`, `voyage-code-3`). |
+| `QDRANT_URL` | `http://qdrant:6333` | Qdrant base URL. Must resolve to a private/loopback address (SSRF guard at startup). |
+| `VOYAGE_MOCK_EMBEDDINGS` | `0` | Set to `1` to use zero vectors instead of calling Voyage AI (testing only). |
+| `PORT` | `8020` | HTTP port the MCP server listens on. |
+
+### TOML config snippet
+
+```toml
+[[tools.mcp_servers]]
+name                 = "semantic-kb"
+url                  = "http://semantic-kb-mcp:8020"
+allow_insecure_local = true   # Docker-internal plaintext HTTP is intentional
+tool_override        = true   # shadows native kb_put/kb_get/kb_search
+
+[capabilities]
+mcp = [{ server = "semantic-kb", tools = ["kb_put", "kb_get", "kb_search"] }]
+```
+
+Use the `librarian-semantic` template for a ready-made config:
+```bash
+TEMPLATE_NAME=librarian-semantic AGENT_TASK="..." VOYAGE_API_KEY=... \
+  docker compose --profile semantic up
+```
+
+### Self-test
+
+```bash
+VOYAGE_MOCK_EMBEDDINGS=1 python3 docker/semantic_kb_mcp.py --test
+```
+
+Runs 16 self-tests (T1–T16) without requiring Qdrant or a Voyage AI key.

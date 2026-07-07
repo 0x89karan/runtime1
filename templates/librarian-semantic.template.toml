@@ -1,0 +1,50 @@
+# sample_tasks must appear at the top level (before any table header).
+sample_tasks = [
+  "Store these research notes and let me search them by meaning later.",
+  "Find everything we know about attention mechanisms — search semantically, not just by keyword.",
+  "Index this document collection so I can ask natural-language questions about it.",
+]
+
+[template]
+name           = "librarian-semantic"
+description    = "Research librarian with Layer-2 semantic (vector) memory via Qdrant + Voyage AI."
+showcases      = "kb_put, kb_get, kb_search (vector similarity), long-term semantic retrieval"
+gated_requires = "VOYAGE_API_KEY"
+
+[capabilities]
+# kb_read/kb_write are intentionally absent: tool_override = true replaces the native
+# BM25 tools with McpTool wrappers, so access control flows through the mcp grant below.
+# (Note: kb_read/kb_write segment values are prefix-matched, not glob-expanded; "*" would
+# be a literal segment named "*", not a wildcard.)
+mcp      = [{ server = "semantic-kb", tools = [] }]
+fs_read  = ["/workspace"]
+
+[card]
+name           = "Librarian (Semantic)"
+description    = "Semantic research librarian backed by Qdrant vector search + Voyage AI embeddings."
+skills         = ["research", "semantic-search", "knowledge-management"]
+suggested_caps = [
+  { Mcp = { server = "semantic-kb", tools = ["kb_put", "kb_get", "kb_search"] } },
+  { FsRead  = { prefix = "/workspace" } },
+]
+
+# The semantic-kb MCP server runs as a Docker peer service (http://semantic-kb-mcp:8020).
+# allow_insecure_local = true permits Docker-internal plaintext HTTP.
+# tool_override = true means kb_put / kb_get / kb_search from this server silently shadow
+# the built-in BM25 Layer-1 tools — agents upgrade transparently.
+[[tools.mcp_servers]]
+name                 = "semantic-kb"
+url                  = "http://semantic-kb-mcp:8020"
+allow_insecure_local = true
+tool_override        = true
+
+[model]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+[agent]
+id           = "librarian-semantic"
+task         = ""
+max_turns    = 20
+token_budget = 100000

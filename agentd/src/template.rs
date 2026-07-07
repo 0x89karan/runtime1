@@ -254,6 +254,9 @@ pub struct TemplateEntry {
     pub showcases: String,
     /// Example task strings from `sample_tasks` in the template file.
     pub sample_tasks: Vec<String>,
+    /// If set, this template requires a specific env var (e.g. `VOYAGE_API_KEY`).
+    /// `agentctl list-templates` shows a `[gated]` badge for these entries.
+    pub gated_requires: Option<String>,
 }
 
 /// Resolves `*.template.toml` files from user and repo directories.
@@ -369,6 +372,7 @@ impl TemplateResolver {
                     source: source.clone(),
                     showcases: cfg.template.showcases.clone(),
                     sample_tasks: cfg.sample_tasks.clone(),
+                    gated_requires: cfg.template.gated_requires.clone(),
                 });
             }
         }
@@ -916,7 +920,7 @@ task = "t"
                 "catalogue must contain template '{expected}'; found: {names:?}"
             );
         }
-        assert_eq!(entries.len(), 15, "catalogue must have exactly 15 templates; found: {names:?}");
+        assert_eq!(entries.len(), 16, "catalogue must have exactly 16 templates; found: {names:?}");
     }
 
     #[test]
@@ -943,7 +947,7 @@ task = "t"
     #[test]
     fn catalogue_gated_templates_lower_to_valid_config() {
         let resolver = catalogue_resolver();
-        for name in &["journaler", "memory-custodian", "cos-orchestrator", "cos-inbox", "cos-curator"] {
+        for name in &["journaler", "memory-custodian", "cos-orchestrator", "cos-inbox", "cos-curator", "librarian-semantic"] {
             let (cfg, _) = resolver.resolve(name).unwrap();
             let config = cfg
                 .to_agent_config(Some("test task"), vec![])
@@ -1063,6 +1067,32 @@ task = "t"
             config.memory.store_path,
             "/run/memory/memory.redb",
             "journaler must use /run/memory/memory.redb store path"
+        );
+    }
+
+    #[test]
+    fn catalogue_librarian_semantic_mcp_server_flags() {
+        let resolver = catalogue_resolver();
+        let (cfg, _) = resolver
+            .resolve("librarian-semantic")
+            .expect("librarian-semantic must be resolvable");
+        assert_eq!(
+            cfg.template.gated_requires.as_deref(),
+            Some("VOYAGE_API_KEY"),
+            "librarian-semantic must be gated on VOYAGE_API_KEY"
+        );
+        let config = cfg
+            .to_agent_config(Some("index docs"), vec![])
+            .expect("librarian-semantic must lower to a valid Config");
+        let mcp = &config.tools.mcp_servers;
+        assert!(!mcp.is_empty(), "must have at least one mcp_server");
+        let server = mcp.iter().find(|s| s.name == "semantic-kb").expect("must have 'semantic-kb' server");
+        assert!(server.allow_insecure_local, "semantic-kb must have allow_insecure_local = true");
+        assert!(server.tool_override, "semantic-kb must have tool_override = true");
+        assert_eq!(
+            server.url.as_deref(),
+            Some("http://semantic-kb-mcp:8020"),
+            "semantic-kb url must match the Docker service address"
         );
     }
 }
