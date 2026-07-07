@@ -223,6 +223,32 @@ case "${1:-shell}" in
     exec agentd /data/agent.toml
     ;;
 
+  orchestrate)
+    # Start agentd with management API enabled (if not already running),
+    # then launch agentctl orchestrate pointed at the management port.
+    export AGENTD_MANAGEMENT_ENABLED=true
+    export AGENTD_MANAGEMENT_PORT="${AGENTD_MANAGEMENT_PORT:-7999}"
+    _MGMT_URL="http://127.0.0.1:${AGENTD_MANAGEMENT_PORT}"
+    if curl -sf "${_MGMT_URL}/healthz" >/dev/null 2>&1; then
+      # agentd already running — inject into it.
+      exec agentctl orchestrate --url "${_MGMT_URL}" "$@"
+    else
+      # Cold-start: launch agentd in background, wait for healthz, then attach.
+      agentd /etc/agentd/agents.toml &
+      AGENTD_PID=$!
+      # Forward SIGTERM/SIGINT to agentd so graceful checkpoint fires on docker stop.
+      trap "kill $AGENTD_PID 2>/dev/null; wait $AGENTD_PID 2>/dev/null; exit 0" TERM INT
+      timeout 15 sh -c "until curl -sf '${_MGMT_URL}/healthz' >/dev/null 2>&1; do sleep 0.5; done" || {
+        echo "ERROR: agentd did not start within 15 seconds" >&2
+        kill $AGENTD_PID 2>/dev/null || true
+        exit 1
+      }
+      agentctl orchestrate --url "${_MGMT_URL}" "$@"
+      kill $AGENTD_PID 2>/dev/null || true
+      wait $AGENTD_PID 2>/dev/null || true
+    fi
+    ;;
+
   *)
     exec "$@"
     ;;

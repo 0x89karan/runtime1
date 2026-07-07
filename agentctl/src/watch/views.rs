@@ -52,6 +52,7 @@ fn header_footer_layout(area: Rect) -> (Rect, Rect, Rect) {
 fn status_style(status: &str) -> Style {
     match status {
         s if s.starts_with("running")           => Style::default().fg(Color::Green),
+        s if s.starts_with("waiting")           => Style::default().fg(Color::Cyan),
         s if s.starts_with("deferred")          => Style::default().fg(Color::Yellow),
         s if s.starts_with("awaiting_child")    => Style::default().fg(Color::Cyan),
         s if s.starts_with("awaiting_approval") => Style::default().fg(Color::Magenta),

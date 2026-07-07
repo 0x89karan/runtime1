@@ -12,18 +12,25 @@ that lets an operator inject new agents into a running `agentd` scheduler
 
 ## Wire format
 
-Write a single JSON object to the file. All fields except `task` are optional.
+Write a single JSON object to the file. Two command variants are supported.
+
+### Spawn a new agent
 
 ```json
 {
-  "task":         "summarise the latest GitHub issues",
-  "id":           "issue-summariser",
-  "max_turns":    20,
-  "token_budget": 100000,
-  "priority":     0,
-  "capabilities": ["kb_read", "kb_write"]
+  "spawn": {
+    "task":         "summarise the latest GitHub issues",
+    "id":           "issue-summariser",
+    "max_turns":    20,
+    "token_budget": 100000,
+    "priority":     0,
+    "capabilities": ["kb_read", "kb_write"],
+    "orchestrated": false
+  }
 }
 ```
+
+Bare `{"task":"...", ...}` (without the `"spawn"` wrapper) is accepted for back-compat.
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
@@ -33,6 +40,25 @@ Write a single JSON object to the file. All fields except `task` are optional.
 | `token_budget` | u64 | scheduler default | Hard token ceiling. |
 | `priority` | u32 | 0 | Reserved; not yet used by the scheduler. |
 | `capabilities` | string[] | none | Extra capabilities to grant. |
+| `orchestrated` | bool | `false` | When `true`, agent parks after each response awaiting the next `inject`. Used by `agentctl orchestrate` (orch.1+). |
+
+### Inject a user turn into a waiting agent (orch.1+)
+
+```json
+{
+  "inject": {
+    "agent_id": "orch-default",
+    "text":     "now narrow it down to the three most important issues"
+  }
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `agent_id` | string | Target agent. Validated: `[a-zA-Z0-9_-]` only; must not be empty. |
+| `text` | string | User turn text. Must not be empty. Max 64 KiB. |
+
+Errors: `EINVAL` if `agent_id` or `text` is empty or `agent_id` contains illegal characters; `EBUSY` if the channel is full.
 
 ## Shell example
 

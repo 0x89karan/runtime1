@@ -126,6 +126,8 @@ struct SchedulerState {
     proxy_registry:   Option<Arc<crate::egress::ProxyRegistry>>,
     /// Universal-tier child processes (p7.6). Keyed by agent ID.
     universal_agents: HashMap<String, UniversalAgent>,
+    /// Orchestrated agents parked after completing a turn, awaiting next inject.
+    waiting: HashSet<String>,
 }
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
@@ -402,6 +404,7 @@ impl Scheduler {
             egress_addr,
             proxy_registry,
             universal_agents:   HashMap::new(),
+            waiting:            HashSet::new(),
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -624,6 +627,8 @@ impl Scheduler {
                                 EventKind::AgentFailed,
                                 json!({ "reason": "inference_error", "error": e.to_string() }),
                             );
+                            // Clear waiting so a dead orchestrated agent doesn't accept further injects.
+                            state.waiting.remove(&agent_id);
                             handle_agent_terminal(
                                 agent_id,
                                 Err(e),
@@ -1342,11 +1347,23 @@ fn enqueue_or_defer(
         }
         AgentEffect::Completed(answer) => {
             // AgentCompleted event already emitted by AgentTask::step_with_response().
-            handle_agent_terminal(agent_id, Ok(answer), state, sched, gateway, registry, recorder);
+            if state.waiting.contains(&agent_id) {
+                // Orchestrated agent: park it awaiting next inject rather than terminating.
+                recorder.record(
+                    &agent_id,
+                    None,
+                    EventKind::OrchestratorTurnComplete,
+                    json!({ "agent_id": &agent_id, "answer": &answer }),
+                );
+                // Agent remains in state.agents with terminal=true; Inject will reset it.
+            } else {
+                handle_agent_terminal(agent_id, Ok(answer), state, sched, gateway, registry, recorder);
+            }
         }
         AgentEffect::Failed(msg) => {
             // AgentFailed event already emitted by AgentTask (budget/max-turns/etc.).
             // Inference-error AgentFailed is emitted in run() before this call.
+            state.waiting.remove(&agent_id);
             handle_agent_terminal(
                 agent_id,
                 Err(anyhow::anyhow!("{msg}")),
@@ -1719,6 +1736,47 @@ fn dispatch_control_command(
             }
         }
         ControlCommand::Spawn(req) => dispatch_operator_spawn_inner(req, default_model, state, sched, gateway, registry, recorder),
+        ControlCommand::Inject { agent_id, text } => {
+            if state.agents.contains_key(&agent_id) {
+                if !state.waiting.contains(&agent_id) {
+                    // Agent is alive but actively running; injecting would corrupt message order.
+                    recorder.record(
+                        "agentd",
+                        None,
+                        EventKind::OrchestratorExited,
+                        json!({ "agent_id": &agent_id, "reason": "agent_not_waiting" }),
+                    );
+                    return;
+                }
+                // Remove waiting state before the mutable borrow of agents.
+                state.waiting.remove(&agent_id);
+                let text_len = text.len();
+                let task = state.agents.get_mut(&agent_id).unwrap();
+                task.resume_for_orchestration();
+                task.push_user_turn(text, recorder);
+                let priority = task.priority();
+                let caps     = task.cap_set_cloned();
+                let turn     = task.turn();
+                let effect   = task.step(recorder);
+                // task's borrow of state.agents ends here (NLL: last use above)
+                recorder.record(
+                    &agent_id,
+                    None,
+                    EventKind::OrchestratorInjected,
+                    json!({ "agent_id": &agent_id, "text_len": text_len }),
+                );
+                // Re-park so the next completion parks again instead of terminating.
+                state.waiting.insert(agent_id.clone());
+                enqueue_or_defer(effect, agent_id, turn, priority, caps, state, sched, gateway, registry, recorder);
+            } else {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::OrchestratorExited,
+                    json!({ "agent_id": &agent_id, "reason": "agent_not_found" }),
+                );
+            }
+        }
     }
 }
 
@@ -1823,6 +1881,20 @@ fn dispatch_operator_spawn_inner(
         let t  = sm.turn();
         (sm.step(recorder), t)
     };
+
+    if req.orchestrated {
+        state.waiting.insert(agent_id.clone());
+        recorder.record(
+            &agent_id,
+            None,
+            EventKind::OrchestratorDispatched,
+            json!({
+                "task_preview": crate::agent::truncate(&req.task, crate::agent::PREVIEW_CHARS),
+                "agent_id":     &agent_id,
+            }),
+        );
+    }
+
     enqueue_or_defer(effect, agent_id, turn, priority, cap_set, state, sched, gateway, registry, recorder);
 }
 
@@ -1950,6 +2022,8 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     AgentStatus::AwaitingApproval(approval_id.clone())
                 } else if state.deferred.iter().any(|d| &d.agent_id == id) {
                     AgentStatus::Deferred
+                } else if state.waiting.contains(id) {
+                    AgentStatus::Waiting
                 } else {
                     AgentStatus::Running
                 }
@@ -3242,6 +3316,7 @@ mod tests {
             egress_addr:        None,
             proxy_registry:     None,
             universal_agents:   HashMap::new(),
+            waiting:            HashSet::new(),
         }
     }
 

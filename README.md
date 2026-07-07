@@ -14,7 +14,7 @@ Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 
 ## Status
 
-**Phases 0–7 + ma.1 + ma.3 complete (v0.56.0).** `agentd` is a working Rust binary.
+**Phases 0–7 + cred + obs + orch.1 complete (v0.66.0).** `agentd` is a working Rust binary.
 Phases 0–2 built the full single/multi-agent loop, config, flight recorder,
 inference gateway, tools, MCP stdio client, cooperative scheduler, capability
 system, agent spawning, agent cards, rustls static binary, Buildroot rootfs +
@@ -32,15 +32,18 @@ inode pruning). Phase 6 added the template schema + on-disk catalogue
 `agentctl` operator CLI (`list-templates`, `spawn`, `watch`), a live TUI
 dashboard (Dashboard / AgentDetail / System / Topology / Memory / Spawn /
 Inspector views), and the sandbox-enforcement surface. Phase 7 adds connectivity
-and streaming: p7.1 ships the Streamable HTTP MCP transport (`McpHttpClient`,
-`McpBackend` trait, `url` + `headers_env` config, `mcp_http_connected` flight
-event) so agentd can connect to hosted MCP services like Linear and GitHub
-without running a local subprocess; p7.2 adds opt-in SSE streaming inference
-(`streaming = true` in `[model]`) so tokens print to stdout as they arrive.
-ma.1 (v0.55.0) adds aarch64 CI — `cross` + QEMU emulation, `Cross.toml` image
-pin, per-arch size guards, and `make clippy-aarch64`. ma.3 (v0.56.0) publishes
-a multi-arch Docker image (`linux/amd64` + `linux/arm64`) to
-`ghcr.io/0x89karan/runtime1` on every push to `main`.
+and streaming: Streamable HTTP MCP transport, SSE streaming inference, FUSE write
+control surface, approval gate, Ed25519 signed action receipts, HTTP forwarding
+proxy, gVisor/runsc universal-tier isolation, and the management HTTP API
+(`:7999`) with SSE fan-out and `agentctl watch --url`. The `cred` track added a
+credential broker gateway (`CredentialGateway` + `OAuthTokenCache`) so MCP tool
+processes hold no raw credentials. The `obs` track added an OTLP sidecar
+(`agentos-otel`) with span hierarchy, token metrics, and copy-truncate rotation
+detection. orch.1 (v0.66.0) adds the interactive orchestrator: `AgentStatus::Waiting`,
+`POST /api/v1/spawn`, `POST /api/v1/agents/:id/inject`, the `agentctl orchestrate`
+REPL, and `docker/entrypoint.sh orchestrate` mode. ma.1 + ma.2 + ma.3 ship aarch64
+CI, arm64 distro with HVF boot, and a multi-arch Docker image to
+`ghcr.io/0x89karan/runtime1`.
 See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 
 ## Repo structure
@@ -61,7 +64,7 @@ agentos/                   ← run `claude` here
 │   ├── agent.toml         single-agent example
 │   └── agents.toml        multi-agent example (p1.2+)
 ├── templates/             Phase 6: agent template catalogue (p6.1+)
-├── agentctl/              Phase 6: operator CLI — list-templates, spawn, watch (p6.2+)
+├── agentctl/              Phase 6+: operator CLI — list-templates, spawn, watch, inject, orchestrate, approve, deny, verify (p6.2+)
 ├── surfaces/              Phase 3: /agents FUSE virtual filesystem (p3.1+)
 ├── sandbox/               Phase 3: Landlock LSM + seccomp-bpf sandbox (p3.3+)
 └── distro/                Phase 2: Buildroot external tree + QEMU boot
@@ -88,9 +91,12 @@ cloud users get a native image — no Rosetta emulation.
 ```bash
 docker pull ghcr.io/0x89karan/runtime1:latest
 
-# Run with your Anthropic key (uses the cos/shell entrypoint)
+# Chain-of-scouts research agent
 export ANTHROPIC_API_KEY=sk-ant-...
 docker run --rm -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:latest cos
+
+# Interactive multi-turn orchestrator REPL (starts agentd + agentctl orchestrate)
+docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:latest orchestrate
 ```
 
 Versioned tags (`ghcr.io/0x89karan/runtime1:v0.56.0`) are also pushed. If the

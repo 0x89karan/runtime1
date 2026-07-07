@@ -229,6 +229,22 @@ impl Default for ManagementConfig {
     }
 }
 
+impl ManagementConfig {
+    /// Apply environment variable overrides. Called after TOML config is parsed.
+    /// `AGENTD_MANAGEMENT_ENABLED=true` enables the management API without editing TOML.
+    /// `AGENTD_MANAGEMENT_PORT=<n>` overrides the port.
+    pub fn apply_env_overrides(&mut self) {
+        if std::env::var("AGENTD_MANAGEMENT_ENABLED").as_deref() == Ok("true") {
+            self.enabled = true;
+        }
+        if let Ok(port_str) = std::env::var("AGENTD_MANAGEMENT_PORT") {
+            if let Ok(p) = port_str.parse::<u16>() {
+                self.port = p;
+            }
+        }
+    }
+}
+
 /// Authentication style for a credential provider adapter (cred.3+).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

@@ -1,0 +1,24 @@
+# templates/orchestrator.template.toml — Long-running interactive agent for orchestrate REPL.
+# Use with: agentctl orchestrate --agent-id orch-default
+# Or start via Docker: docker compose run --rm cos orchestrate
+
+sample_tasks = [
+    "Help me plan and execute a research project on a topic of my choice",
+    "Work with me interactively to debug and improve my codebase",
+    "Act as my assistant for a long-running writing or analysis session",
+]
+
+[template]
+name        = "orchestrator"
+description = "Long-running interactive agent for `agentctl orchestrate` REPL sessions"
+showcases   = "conversational task delegation, multi-turn reasoning, persistent memory"
+
+[model]
+model     = "claude-sonnet-5"
+streaming = true
+
+[agent]
+max_turns        = 200
+token_budget     = 200000
+priority         = 10
+checkpoint_interval_turns = 1

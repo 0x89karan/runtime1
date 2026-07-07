@@ -386,6 +386,30 @@ impl AgentTask {
         }
     }
 
+    /// Reset terminal flag so this agent can receive and process a new turn.
+    /// Used exclusively by the orchestration path after a Completed effect.
+    pub fn resume_for_orchestration(&mut self) {
+        self.terminal = false;
+    }
+
+    /// Push a new User turn for orchestration injection.
+    ///
+    /// Unlike `inject_messages` (which appends to the last User message),
+    /// this creates a new User message after the Assistant response, forming
+    /// the proper [User(task), Assistant(answer), User(inject)] sequence.
+    pub fn push_user_turn(&mut self, text: String, recorder: &FlightRecorder) {
+        recorder.record(
+            &self.agent_id,
+            Some(self.turn),
+            EventKind::MessageReceived,
+            json!({ "count": 1, "preview": truncate(&text, PREVIEW_CHARS) }),
+        );
+        self.messages.push(Msg {
+            role: Role::User,
+            blocks: vec![Block::Text { text }],
+        });
+    }
+
     fn step_need_infer(&mut self, recorder: &FlightRecorder) -> AgentEffect {
         // MaxTurns check fires BEFORE emitting InferenceRequest, matching Phase 0
         // behavior where the for-loop exits and records with max_turns-1 as turn.

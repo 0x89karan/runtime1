@@ -11,6 +11,8 @@
 //!   POST /api/v1/approvals/:id/deny              → 200 | 400 | 404 | 503
 //!   GET  /api/v1/memory/:ns?limit=&offset=       → 200 [{key, value}, ...] paginated
 //!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
+//!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
+//!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -283,6 +285,75 @@ async fn route(
                 .header("x-accel-buffering", "no")
                 .body(body)
                 .unwrap()
+        }
+
+        (Method::POST, "/api/v1/spawn") => {
+            if body.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "request body required");
+            }
+            let req: crate::control::OperatorSpawnRequest = match serde_json::from_slice(body) {
+                Ok(r) => r,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+            };
+            if req.task.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "task must not be empty");
+            }
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let id_hint = req.id.clone().unwrap_or_else(|| "operator-agent".to_string());
+            let cmd = ControlCommand::Spawn(req);
+            match tx.try_send(cmd) {
+                Ok(()) => json_response(StatusCode::OK, json!({"spawned": id_hint})),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry")
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running")
+                }
+            }
+        }
+
+        (Method::POST, path) if path.starts_with("/api/v1/agents/") && path.ends_with("/inject") => {
+            let agent_id = path
+                .strip_prefix("/api/v1/agents/")
+                .and_then(|s| s.strip_suffix("/inject"))
+                .unwrap_or("")
+                .trim();
+            if agent_id.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "agent_id must not be empty");
+            }
+            if !agent_id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')) {
+                return error_response(StatusCode::BAD_REQUEST, "agent_id must match [a-zA-Z0-9_-]");
+            }
+            if body.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "request body required");
+            }
+            let val: serde_json::Value = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+            };
+            let text = match val.get("text").and_then(|t| t.as_str()) {
+                Some(t) if !t.is_empty() => t.to_string(),
+                Some(_) => return error_response(StatusCode::BAD_REQUEST, "text must not be empty"),
+                None => return error_response(StatusCode::BAD_REQUEST, "field 'text' required"),
+            };
+            if text.len() > 65_536 {
+                return error_response(StatusCode::BAD_REQUEST, "text too large (max 64 KiB)");
+            }
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let cmd = ControlCommand::Inject { agent_id: agent_id.to_string(), text };
+            match tx.try_send(cmd) {
+                Ok(()) => json_response(StatusCode::OK, json!({"injected": agent_id})),
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry")
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running")
+                }
+            }
         }
 
         _ => error_response(StatusCode::NOT_FOUND, "not found"),

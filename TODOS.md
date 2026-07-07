@@ -161,7 +161,7 @@ promote to `docs/ROADMAP.md` (DX track) when picked up.
   artifact. Also: the `agent` compose service does not mount `~/.agentos-secrets` (only `cos`
   does) — add the mount (or document it) so the host-provisioned `google.json` reaches the agent.
 
-## orch.1 — Interactive agent orchestrator (on-demand dispatch + conversational follow-up) [planned]
+## orch.1 — Interactive agent orchestrator (on-demand dispatch + conversational follow-up) [shipped — v0.66.0]
 
 > **Renamed from `h8.3`** (2026-07-05) to resolve a collision with ROADMAP's `h8.3` (multi-device
 > migration) and to give the concept its correct name: the former "Track ORCH" (multi-instance) was
@@ -183,6 +183,69 @@ the CoS coordinator pattern are the building blocks. To be scoped via `/office-h
 - **Fold-in friction found while dogfooding:** the `agent` entrypoint wipes the checkpoint on
   every `docker compose run` (no memory across runs); Haiku's "Would you like me to dive
   deeper…?" phrasing misleads users into typing follow-ups that go nowhere (no loop reads them).
+
+## orch.1 — Actionable remediations (v0.66.0, shipped 2026-07-07)
+
+- **orch.1-ar-01 (P2) — Waiting agents excluded from checkpoint.**
+  `build_scheduler_checkpoint` filters with `!a.is_terminal()`; waiting agents have
+  `terminal=true` so they are silently dropped. On agentd restart mid-REPL, the entire
+  conversation history is lost. Fix: add `waiting: Vec<String>` to `SchedulerCheckpoint`,
+  include waiting agents with `terminal=false` in the filter, and skip re-seeding agents
+  that appear in the restored waiting set. (`scheduler.rs:2194`, `checkpoint.rs`)
+
+- **orch.1-ar-02 (P3) — `POST /api/v1/spawn` returns 200 before scheduler confirms.**
+  Spawn is fire-and-forget via `try_send`. If the scheduler rejects the ID
+  (`validate_child_id` failure, budget exceeded), the HTTP caller already received 200.
+  `orchestrate.rs` then uses this ID for injects/SSE filtering and silently misses.
+  Fix: synchronize with a one-shot response channel, or verify agent appears in snapshot
+  before proceeding. (`management.rs:307`)
+
+- **orch.1-ar-03 (P3) — `OrchestratorTurnComplete` carries full answer text.**
+  The `data.answer` field contains the full agent response (potentially tens of KB),
+  inflating SSE broadcast and flight.jsonl. Fix: cap at `PREVIEW_CHARS` in the event
+  payload; the full answer is in the preceding `AgentCompleted` event. (`scheduler.rs`)
+
+- **orch.1-ar-04 (P3) — Docker `wait $AGENTD_PID` hangs after `agentctl orchestrate` exits.**
+  When orchestrate closes, agentd continues running (management server keeps `control_tx`
+  alive). `wait $AGENTD_PID` in `entrypoint.sh` never returns; container requires
+  `docker kill`. Fix: trap EXIT in the entrypoint and send SIGTERM to `$AGENTD_PID`, or
+  remove the `wait` from the orchestrate mode. (`docker/entrypoint.sh`)
+  **[FIXED in v0.66.0: kill + SIGTERM trap added]**
+
+- **orch.1-ar-05 (P2) — `state.waiting` serves dual purpose (orchestrated flag + parked flag).**
+  At spawn time `waiting.insert` marks the agent as orchestrated. At inject time the inject
+  handler re-inserts into `waiting` BEFORE `enqueue_or_defer`, so the agent appears parked
+  while actively running inference. A second rapid inject via `POST /api/v1/agents/:id/inject`
+  passes the guard and queues a concurrent inference, corrupting message order. Fix: split into
+  `orchestrated: HashSet<String>` (spawn-time flag) + `waiting: HashSet<String>` (truly-parked
+  guard); only insert into `waiting` in the turn-completion park path. (`scheduler.rs:1769,1881`)
+
+- **orch.1-ar-06 (P3) — No SSE read timeout — REPL hangs on silent network failure.**
+  `agentctl orchestrate` uses `timeout(None)` on the blocking SSE client. A TCP stall without
+  FIN (network partition, agentd crash leaving socket in CLOSE_WAIT) causes `reader.lines()` to
+  block forever. Fix: emit `event: ping` heartbeat every 30s from the management SSE handler;
+  configure a 90s read timeout on the blocking client; bail with a clear error on timeout.
+  (`orchestrate.rs:50`, `management.rs` SSE handler)
+
+- **orch.1-ar-07 (P3) — `quit`/`exit` keywords injected as messages instead of exiting the REPL.**
+  Typing "quit" sends an inference request to the agent. Fix: treat `quit` and `exit` as
+  REPL meta-commands that break the loop, matching user expectations. (`orchestrate.rs` REPL loop)
+
+- **orch.1-ar-08 (P3) — Empty input in `agentctl orchestrate` causes silent hang.**
+  When the user presses Enter on an empty line, the REPL calls `continue`, which goes back
+  to `drain_until_turn_complete`. No inject was sent so the agent stays parked — no
+  `orchestrator_turn_complete` event arrives, and the REPL blocks forever. Fix: on empty
+  input, loop on `stdin.read_line` until a non-empty line is entered, without re-entering
+  `drain_until_turn_complete`. (`orchestrate.rs` REPL loop, line 108)
+
+- **orch.1-ar-09 (P2) — `templates/orchestrator.template.toml` uses wrong section name.**
+  The file uses `[meta]` and `[meta.capabilities]` instead of `[template]` and
+  `[capabilities]` (the schema `TemplateConfig` expects). As-is the file will not parse via
+  `agentctl list-templates` / `agentctl spawn orchestrator`. The entrypoint.sh `orchestrate`
+  mode avoids this by using `agentd /etc/agentd/agents.toml` directly. Fix: rename `[meta]`
+  → `[template]`, move capabilities to a top-level `[capabilities]` section, and convert
+  `[[sample_tasks]]` array-of-tables to a top-level inline array
+  `sample_tasks = ["...", "..."]`. (`templates/orchestrator.template.toml`)
 
 ## Phase 5 — Open (deferred from p5.9 hardening; all P2, none data-loss-class)
 

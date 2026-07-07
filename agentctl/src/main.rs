@@ -5,7 +5,9 @@ use clap::Parser;
 
 mod approve;
 mod auth;
+mod inject;
 mod list;
+mod orchestrate;
 mod spawn;
 mod verify;
 mod watch;
@@ -30,7 +32,11 @@ enum Commands {
     Deny(approve::DenyArgs),
     /// Provision OAuth credentials for use by Docker agents
     Auth(auth::AuthCmd),
+    /// Inject a new user turn into a waiting orchestrated agent
+    Inject(inject::InjectArgs),
     ListTemplates(list::Args),
+    /// Start an interactive orchestration REPL (orch.1+)
+    Orchestrate(orchestrate::OrchestrateArgs),
     Spawn(spawn::Args),
     Verify(verify::Args),
     Watch(watch::Args),
@@ -42,7 +48,9 @@ fn main() {
         Commands::Approve(args) => approve::run_approve(args),
         Commands::Deny(args) => approve::run_deny(args),
         Commands::Auth(cmd) => auth::run(cmd),
+        Commands::Inject(args) => inject::run(args),
         Commands::ListTemplates(args) => list::run(args),
+        Commands::Orchestrate(args) => orchestrate::run(args),
         Commands::Spawn(args) => spawn::run(args),
         Commands::Verify(args) => verify::run(args),
         Commands::Watch(args) => watch::run(args),

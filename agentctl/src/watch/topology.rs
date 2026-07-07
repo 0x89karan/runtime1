@@ -103,6 +103,7 @@ fn parse_message_edges(
 pub fn status_badge(status: &str) -> &'static str {
     match status {
         "running"        => "●running",
+        "waiting"        => "⏸waiting",
         "deferred"       => "◌deferred",
         "awaiting_child" => "◎awaiting",
         s if s.starts_with("awaiting_approval") => "⏸pending",

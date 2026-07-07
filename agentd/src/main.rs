@@ -95,8 +95,9 @@ async fn main() -> anyhow::Result<()> {
 async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathBuf>) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("loading config from {path:?}"))?;
-    let cfg: config::Config =
+    let mut cfg: config::Config =
         toml::from_str(&raw).with_context(|| format!("parsing config from {path:?}"))?;
+    cfg.management.apply_env_overrides();
 
     let run_id = uuid::Uuid::new_v4().to_string();
     let config_hash = {
@@ -871,7 +872,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     let fuse_mountpoint = PathBuf::from("/agents");
 
     // Control channel: FUSE writes on /agents/control → scheduler's run loop.
-    #[cfg(target_os = "linux")]
+    // Created unconditionally so the management API can route inject/spawn on non-Linux.
     let (control_tx, control_rx) = tokio::sync::mpsc::channel::<agentd::control::ControlCommand>(16);
 
     #[cfg(target_os = "linux")]
@@ -920,7 +921,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     #[cfg(not(target_os = "linux"))]
     let _ = no_fuse;
     #[cfg(not(target_os = "linux"))]
-    let _maybe_session: Option<()> = None;
+    let maybe_session: Option<()> = None;
 
     let gateway = match AnthropicGateway::from_env(&cfg.model.model)
         .context("initializing Anthropic gateway")
@@ -1067,10 +1068,8 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
 
     // ── p7.7 management HTTP API ─────────────────────────────────────────────
     if cfg.management.enabled {
-        #[cfg(target_os = "linux")]
+        // Wire control_tx unconditionally — management API needs it on all platforms (orch.1).
         let mgmt_control_tx = Some(control_tx.clone());
-        #[cfg(not(target_os = "linux"))]
-        let mgmt_control_tx: Option<tokio::sync::mpsc::Sender<agentd::control::ControlCommand>> = None;
 
         match agentd::management::start(
             &cfg.management.bind_addr,
@@ -1152,9 +1151,8 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     };
 
     // Wire the control receiver when at least one consumer is active: FUSE writes
-    // /agents/control, and the management API routes HTTP approve/deny commands.
+    // /agents/control, and the management API routes HTTP approve/deny/inject commands.
     // Without a consumer the scheduler would hang waiting for commands after all agents finish.
-    #[cfg(target_os = "linux")]
     let scheduler = if maybe_session.is_some() || cfg.management.enabled {
         scheduler.with_control(control_rx)
     } else {

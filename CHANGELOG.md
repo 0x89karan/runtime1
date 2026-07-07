@@ -3,6 +3,47 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [orch.1] - 2026-07-07 (v0.66.0)
+
+### Added — Interactive agent orchestrator
+
+- **`agentctl orchestrate`** — new REPL subcommand: spawn an orchestrated agent with an
+  initial task, receive its answer, continue the conversation across turns with a persistent
+  SSE connection (no per-turn reconnect race). Exits cleanly on EOF or Ctrl-D; re-prompts on
+  empty input.
+- **`agentctl inject <id> <text>`** — new CLI subcommand to inject a user turn into any
+  waiting agent from outside the REPL.
+- **`POST /api/v1/spawn`** on the management API — spawn an agent from JSON (`task`,
+  optional `id`, `max_turns`, `orchestrated` flag); returns the resolved agent ID.
+- **`POST /api/v1/agents/:id/inject`** — inject a user turn into a waiting agent over HTTP.
+  Returns 400 on invalid/empty input, 503+`Retry-After` on full channel.
+- **`AgentStatus::Waiting`** — new scheduler state for orchestrated agents parked between
+  turns. Reflected in `/agents/<id>/status` FUSE file, snapshot API, and `agentctl watch`
+  (shown as `⏸waiting`).
+- **`OrchestratorTurnComplete` SSE event** — fired when an orchestrated agent parks after
+  completing a turn; carries `agent_id` and `answer`. Used by `agentctl orchestrate` to know
+  when to prompt for the next input.
+- **`OrchestratorDispatched` / `OrchestratorInjected` / `OrchestratorExited`** — three new
+  flight events covering spawn, inject, and error paths.
+- **`templates/orchestrator.template.toml`** — new catalogue template with
+  `max_turns = 200`, `token_budget = 200000`, streaming enabled.
+- **`docker/entrypoint.sh orchestrate` mode** — auto-detects a running agentd via healthz;
+  cold-starts one if absent, waits 15 s, then execs `agentctl orchestrate`. Forwards
+  SIGTERM/SIGINT to agentd so graceful checkpoint fires on `docker stop`.
+- **`AGENTD_MANAGEMENT_ENABLED=true` env var** — enables the management HTTP API without
+  editing TOML; also respects `AGENTD_MANAGEMENT_PORT`.
+
+### Fixed
+
+- `agentctl orchestrate` resume path now requires `status == "waiting"` (previously
+  injected into running agents, causing silent REPL deadlock).
+- `drain_until_turn_complete` now handles `agent_completed` events and bails with a clear
+  error rather than hanging indefinitely if the agent exits without parking.
+- Management API `/api/v1/agents/:id/inject` validates `agent_id` against `[a-zA-Z0-9_-]`
+  (consistent with `validate_child_id` used on all other inject paths).
+- `entrypoint.sh orchestrate` cold-start path now kills agentd and installs a SIGTERM trap
+  before `wait`, preventing an indefinitely-blocked container after the REPL exits.
+
 ## [cred.4b] - 2026-07-07 (v0.65.0)
 
 ### Changed — Credential-agnostic MCP servers

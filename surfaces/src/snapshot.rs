@@ -141,6 +141,8 @@ impl Serialize for AgentSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentStatus {
     Running,
+    /// Orchestrated agent parked after completing a turn, awaiting next inject.
+    Waiting,
     Deferred,
     AwaitingChild(String),
     /// Agent called `request_approval` and is parked until resolved.
@@ -154,6 +156,7 @@ impl AgentStatus {
     pub fn as_str(&self) -> &str {
         match self {
             AgentStatus::Running               => "running",
+            AgentStatus::Waiting               => "waiting",
             AgentStatus::Deferred              => "deferred",
             AgentStatus::AwaitingChild(_)      => "awaiting_child",
             AgentStatus::AwaitingApproval(_)   => "awaiting_approval",

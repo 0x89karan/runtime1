@@ -85,6 +85,10 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::CredentialNotProvisioned => false,
         EventKind::CredentialDenied => false,
         EventKind::CredentialCapExceeded => false,
+        EventKind::OrchestratorDispatched => false,
+        EventKind::OrchestratorInjected => false,
+        EventKind::OrchestratorTurnComplete => false,
+        EventKind::OrchestratorExited => false,
         EventKind::Error => false,
     }
 }

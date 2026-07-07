@@ -10,6 +10,9 @@ pub struct OperatorSpawnRequest {
     pub token_budget: Option<u64>,
     pub priority:     Option<u32>,
     pub capabilities: Option<Vec<Capability>>,
+    /// When true, agent parks after each response awaiting the next inject (orchestration mode).
+    #[serde(default)]
+    pub orchestrated: bool,
 }
 
 /// Commands dispatched through the /agents/control write surface.
@@ -19,6 +22,7 @@ pub struct OperatorSpawnRequest {
 ///   `{"approve":{"id":"act_1"}}` — approve a pending action; optional `edits` replaces args
 ///   `{"reject":{"id":"act_1","reason":"..."}}` — reject a pending action with optional reason
 ///   `{"approve":{"id":"act_1","auto_approve_kind":"write_file"}}` — approve + policy hint
+///   `{"inject":{"agent_id":"...","text":"..."}}` — inject a new user turn into a waiting agent
 #[derive(Debug)]
 pub enum ControlCommand {
     Spawn(OperatorSpawnRequest),
@@ -32,6 +36,11 @@ pub enum ControlCommand {
     Reject {
         id:     String,
         reason: Option<String>,
+    },
+    /// Inject a new user turn into a waiting orchestrated agent.
+    Inject {
+        agent_id: String,
+        text:     String,
     },
 }
 
@@ -53,6 +62,10 @@ enum TaggedCommand {
         id:     String,
         #[serde(default)]
         reason: Option<String>,
+    },
+    Inject {
+        agent_id: String,
+        text:     String,
     },
 }
 
@@ -78,6 +91,12 @@ pub fn parse_control_command(bytes: &[u8]) -> anyhow::Result<ControlCommand> {
             TaggedCommand::Reject { id, reason } => {
                 anyhow::ensure!(!id.is_empty(), "reject: id must not be empty");
                 ControlCommand::Reject { id, reason }
+            }
+            TaggedCommand::Inject { agent_id, text } => {
+                anyhow::ensure!(!agent_id.is_empty(), "inject: agent_id must not be empty");
+                anyhow::ensure!(!text.is_empty(), "inject: text must not be empty");
+                anyhow::ensure!(text.len() <= 65_536, "inject text too large (max 64 KiB)");
+                ControlCommand::Inject { agent_id, text }
             }
         });
     }
@@ -200,5 +219,34 @@ mod tests {
     fn parse_reject_empty_id_is_error() {
         let bytes = br#"{"reject":{"id":""}}"#;
         assert!(parse_control_command(bytes).is_err());
+    }
+
+    #[test]
+    fn parse_inject_tagged() {
+        let bytes = br#"{"inject":{"agent_id":"scout-1","text":"continue the analysis"}}"#;
+        let cmd = parse_control_command(bytes).unwrap();
+        let ControlCommand::Inject { agent_id, text } = cmd else { panic!("expected Inject") };
+        assert_eq!(agent_id, "scout-1");
+        assert_eq!(text, "continue the analysis");
+    }
+
+    #[test]
+    fn inject_empty_agent_id_is_error() {
+        let bytes = br#"{"inject":{"agent_id":"","text":"hello"}}"#;
+        assert!(parse_control_command(bytes).is_err());
+    }
+
+    #[test]
+    fn inject_empty_text_is_error() {
+        let bytes = br#"{"inject":{"agent_id":"scout-1","text":""}}"#;
+        assert!(parse_control_command(bytes).is_err());
+    }
+
+    #[test]
+    fn inject_too_large_is_error() {
+        let big_text = "x".repeat(65_537);
+        let bytes = serde_json::json!({"inject": {"agent_id": "scout-1", "text": big_text}})
+            .to_string();
+        assert!(parse_control_command(bytes.as_bytes()).is_err());
     }
 }

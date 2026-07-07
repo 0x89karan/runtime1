@@ -366,6 +366,20 @@ URL-only misconfiguration returns `broker_token_missing` error; `OAUTH_PROVIDER_
 `[a-zA-Z0-9_-]+` (path-traversal guard); `search_mcp.py` legacy `BRAVE_SEARCH_API_KEY` fallback emits
 deprecation warning once per process; 6 new self-tests (T24–T29) in `oauth_mcp.py` (total 29); ROADMAP
 cred.4 marked ✓; no Rust changes.
+**orch.1 complete (v0.66.0).** Interactive agent orchestrator: `AgentStatus::Waiting` — new scheduler state
+for orchestrated agents parked between turns, reflected in FUSE `/agents/<id>/status`, snapshot API, and
+`agentctl watch` (shown as `⏸waiting`); `POST /api/v1/spawn` on the management API — spawn an agent from
+JSON (`task`, optional `id`, `max_turns`, `orchestrated` flag); `POST /api/v1/agents/:id/inject` — inject
+a user turn into a waiting agent over HTTP (400 on invalid input, 503+`Retry-After` on full channel);
+`OrchestratorTurnComplete` SSE event fired when an orchestrated agent parks after completing a turn;
+`OrchestratorDispatched` / `OrchestratorInjected` / `OrchestratorExited` flight events; `agentctl orchestrate`
+REPL subcommand — spawn an orchestrated agent with an initial task, receive its answer, continue the
+conversation across turns with a persistent SSE connection; `agentctl inject <id> <text>` subcommand (also
+wired to HTTP inject path); `templates/orchestrator.template.toml` — new catalogue template (`max_turns=200`,
+`token_budget=200000`, streaming enabled); `docker/entrypoint.sh orchestrate` mode — auto-detects a running
+agentd via healthz, cold-starts one if absent, waits 15 s, then execs `agentctl orchestrate`; forwards
+SIGTERM/SIGINT to agentd for graceful checkpoint on `docker stop`; `AGENTD_MANAGEMENT_ENABLED=true` env var
+enables management HTTP API without editing TOML.
 
 ## How to work here
 
@@ -516,6 +530,8 @@ agentctl/                operator CLI binary
     main.rs              arg dispatch
     list.rs              list-templates subcommand (p6.2)
     spawn.rs             spawn <template> subcommand (p6.2)
+    inject.rs            inject <id> <text> subcommand (p7.3+)
+    orchestrate.rs       orchestrate REPL — spawn + multi-turn SSE loop (orch.1+)
     watch/
       mod.rs             watch entry point; run_plain / run_tui
       app.rs             App state machine + View enum

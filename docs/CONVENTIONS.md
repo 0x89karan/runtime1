@@ -126,6 +126,10 @@ Phase 0 kinds (canonical — do not rename):
 | `credential_not_provisioned` | requested provider is not configured in [credential_gateway.providers] (provider, hint) (cred.3+) |
 | `credential_denied` | MCP server's allowed_providers list does not include the requested provider (agent_id, provider) (cred.3+) |
 | `credential_cap_exceeded` | per-agent per-provider request-count cap reached; request rejected with 429 (agent_id, provider, count, limit) (cred.4+) |
+| `orchestrator_dispatched` | orchestrator spawned an agent in waiting mode (agent_id, task_preview) (orch.1+) |
+| `orchestrator_injected` | orchestrator injected a new user turn into a waiting agent (agent_id, text_len: usize) (orch.1+) |
+| `orchestrator_turn_complete` | orchestrated agent completed a turn and parked, awaiting next inject (agent_id, answer) (orch.1+) |
+| `orchestrator_exited` | orchestrated agent exited; typically because the target agent was not found (agent_id, reason) (orch.1+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it
@@ -194,7 +198,7 @@ Each agent appears as a directory; memory and KB surfaces appeared in p5.7.
 
 | Path | Content | Format | Notes |
 |---|---|---|---|
-| `/agents/<id>/status` | agent lifecycle state | `running` \| `deferred` \| `awaiting_child:<id>` \| `awaiting_approval:<id>` \| `done` \| `failed` | |
+| `/agents/<id>/status` | agent lifecycle state | `running` \| `waiting` \| `deferred` \| `awaiting_child:<id>` \| `awaiting_approval:<id>` \| `done` \| `failed` | `waiting` = orchestrated agent parked between turns (orch.1+) |
 | `/agents/<id>/context_size` | token count | integer | |
 | `/agents/<id>/budget` | token budget | integer or `unlimited` | |
 | `/agents/<id>/flight` | recent flight events for this agent | JSONL tail (last 20 lines) | |

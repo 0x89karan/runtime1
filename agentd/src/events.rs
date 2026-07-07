@@ -155,6 +155,18 @@ pub enum EventKind {
     /// Per-agent per-provider request-count cap exceeded; request rejected with 429.
     /// data: { agent_id, provider, count, limit }
     CredentialCapExceeded,
+    /// Orchestrator spawned an agent in waiting mode.
+    /// data: { task_preview, agent_id }
+    OrchestratorDispatched,
+    /// Orchestrator injected a new user turn into a waiting agent.
+    /// data: { agent_id, text_len: usize }
+    OrchestratorInjected,
+    /// Orchestrated agent completed a turn and parked, awaiting next inject.
+    /// data: { agent_id, answer }
+    OrchestratorTurnComplete,
+    /// Orchestrated agent exited because the target agent was not found.
+    /// data: { agent_id, reason: "agent_not_found" }
+    OrchestratorExited,
     Error,
 }
 
@@ -240,6 +252,10 @@ mod tests {
         assert_eq!(kind_str(EventKind::CredentialNotProvisioned), "credential_not_provisioned");
         assert_eq!(kind_str(EventKind::CredentialDenied), "credential_denied");
         assert_eq!(kind_str(EventKind::CredentialCapExceeded), "credential_cap_exceeded");
+        assert_eq!(kind_str(EventKind::OrchestratorDispatched), "orchestrator_dispatched");
+        assert_eq!(kind_str(EventKind::OrchestratorInjected), "orchestrator_injected");
+        assert_eq!(kind_str(EventKind::OrchestratorTurnComplete), "orchestrator_turn_complete");
+        assert_eq!(kind_str(EventKind::OrchestratorExited), "orchestrator_exited");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

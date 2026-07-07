@@ -10,6 +10,17 @@ use super::reader::{
     Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox,
 };
 
+/// Spawn request sent to the management API (orch.1+).
+#[derive(Debug, serde::Serialize)]
+pub struct SpawnRequest {
+    pub task:         String,
+    pub id:           Option<String>,
+    pub max_turns:    Option<u32>,
+    pub token_budget: Option<u64>,
+    /// When true, agent parks after each response awaiting next inject.
+    pub orchestrated: bool,
+}
+
 /// Abstraction over FUSE filesystem and management HTTP API.
 pub trait DataSource: Send + Sync {
     /// Load the current scheduler snapshot, including all agent info and system stats.
@@ -24,6 +35,18 @@ pub trait DataSource: Send + Sync {
     /// Falls back to plain approve on implementations that don't support it (HTTP path).
     fn approve_with_kind(&self, id: &str, _kind: &str) -> Result<(), String> {
         self.approve(id)
+    }
+    /// Spawn a new orchestrated agent. Returns the resolved agent ID or an error.
+    fn spawn(&self, _req: &SpawnRequest) -> Result<String, String> {
+        Err("spawn not supported on this data source (use --url to connect to management API)".to_string())
+    }
+    /// Inject a new user turn into a waiting orchestrated agent.
+    fn inject(&self, _agent_id: &str, _text: &str) -> Result<(), String> {
+        Err("inject not supported on this data source (use --url to connect to management API)".to_string())
+    }
+    /// Returns the base URL for SSE event streaming, if supported.
+    fn event_stream_url(&self) -> Option<String> {
+        None
     }
 }
 
@@ -59,6 +82,11 @@ impl DataSource for FuseSource {
         } else {
             serde_json::json!({"reject": {"id": id}})
         };
+        write_control_command(&self.agents_dir, &payload.to_string())
+    }
+
+    fn inject(&self, agent_id: &str, text: &str) -> Result<(), String> {
+        let payload = serde_json::json!({"inject": {"agent_id": agent_id, "text": text}});
         write_control_command(&self.agents_dir, &payload.to_string())
     }
 }
@@ -103,6 +131,20 @@ impl HttpSource {
             Ok(())
         } else {
             Err(format!("HTTP {} — action stays pending", resp.status().as_u16()))
+        }
+    }
+
+    fn post_json(&self, path: &str, body: &Value) -> Result<Value, String> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let resp = self.mutation_client
+            .post(&url)
+            .json(body)
+            .send()
+            .map_err(|e| format!("HTTP error: {e}"))?;
+        if resp.status().is_success() {
+            resp.json::<Value>().map_err(|e| format!("JSON decode error: {e}"))
+        } else {
+            Err(format!("HTTP {}", resp.status().as_u16()))
         }
     }
 }
@@ -161,6 +203,22 @@ impl DataSource for HttpSource {
     fn deny(&self, id: &str, reason: Option<&str>) -> Result<(), String> {
         let body = reason.map(|r| serde_json::json!({"reason": r}));
         self.post_mutation(&format!("/api/v1/approvals/{id}/deny"), body.as_ref())
+    }
+
+    fn spawn(&self, req: &SpawnRequest) -> Result<String, String> {
+        let body = serde_json::to_value(req).map_err(|e| e.to_string())?;
+        let resp = self.post_json("/api/v1/spawn", &body)?;
+        let id = resp["spawned"].as_str().unwrap_or("operator-agent").to_string();
+        Ok(id)
+    }
+
+    fn inject(&self, agent_id: &str, text: &str) -> Result<(), String> {
+        let body = serde_json::json!({"text": text});
+        self.post_mutation(&format!("/api/v1/agents/{agent_id}/inject"), Some(&body))
+    }
+
+    fn event_stream_url(&self) -> Option<String> {
+        Some(format!("{}/api/v1/events", self.base_url.trim_end_matches('/')))
     }
 }
 

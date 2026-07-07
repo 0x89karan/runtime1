@@ -49,12 +49,13 @@ remaining work — one increment per branch, `main` shippable between, each thro
 (or `/plan-eng-review`) → build → `/review` → `/qa` → `/ship`:
 
 - ~~`cred.1` (v0.58.0) · `cred.2` (v0.59.0) · `cred.3` (v0.60.0) · `cred.3.1` (v0.61.0) · `cred.3.2` (v0.62.0)~~ ✅ shipped — credential broker core + hardening complete.
-1. **orch.1** — interactive agent orchestrator (`/office-hours` + `/plan-eng-review` first).
-2. **h8.1** — Layer-2 semantic memory sidecar (its embedding API key rides the `cred.3` broker).
-3. **cred.4 / cred.5** — egress gateway + surfacing · **ma.4** — isolation-tier honesty (small, slot anytime).
-4. **dx.3 / dx.4** — Linux QEMU production + prebuilt images (when targeting Linux hardware).
-5. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
-6. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
+- ~~`orch.1` (v0.66.0)~~ ✅ shipped — interactive orchestrator: `AgentStatus::Waiting` + `agentctl orchestrate` REPL + HTTP spawn/inject API.
+- ~~`h8.1` (v0.64.0)~~ ✅ shipped — Layer-2 semantic memory sidecar (Qdrant + Voyage AI).
+- ~~`cred.4` (v0.63.0) · `cred.4b` (v0.65.0)~~ ✅ shipped — spend caps + credential-agnostic MCP servers.
+1. **cred.5** — egress gateway surfacing · **ma.4** — isolation-tier honesty (small, slot anytime).
+2. **dx.3 / dx.4** — Linux QEMU production + prebuilt images (when targeting Linux hardware).
+3. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
+4. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 **Deferred:** Track MESH (`mesh.1–6`, multi-instance) and ROADMAP `h8.3` (multi-device migration).
 **Planned:** Track PERSONAL (`personal.1+`, operator workflow brain via gbrain — after h8.1).
