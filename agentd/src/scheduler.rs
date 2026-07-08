@@ -128,6 +128,8 @@ struct SchedulerState {
     universal_agents: HashMap<String, UniversalAgent>,
     /// Orchestrated agents parked after completing a turn, awaiting next inject.
     waiting: HashSet<String>,
+    /// Credential gateway for per-agent grant projection (cred.5). None when disabled.
+    cred_gw: Option<Arc<crate::credential::CredentialGateway>>,
 }
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
@@ -168,6 +170,8 @@ pub struct Scheduler {
     proxy_registry:      Option<Arc<crate::egress::ProxyRegistry>>,
     /// Universal-tier configs staged at construction; spawned in run() once egress_addr is known.
     universal_pending:   Vec<AgentConfig>,
+    /// Credential gateway for per-agent grant projection into the snapshot (cred.5).
+    cred_gw:             Option<Arc<crate::credential::CredentialGateway>>,
 }
 
 impl Scheduler {
@@ -295,6 +299,7 @@ impl Scheduler {
             recorder,
             snapshot,
             store,
+            cred_gw: None,
             restored,
             memory_store:        None,
             distill_on_complete: false,
@@ -350,6 +355,12 @@ impl Scheduler {
         self
     }
 
+    /// Attach the credential gateway so per-agent grant data flows into the snapshot.
+    pub fn with_credential_gateway(mut self, gw: Arc<crate::credential::CredentialGateway>) -> Self {
+        self.cred_gw = Some(gw);
+        self
+    }
+
     /// Return the bound egress proxy address, if configured.
     pub fn egress_addr(&self) -> Option<std::net::SocketAddr> {
         self.egress_addr
@@ -376,6 +387,7 @@ impl Scheduler {
             egress_addr,
             proxy_registry,
             universal_pending,
+            cred_gw,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
@@ -405,6 +417,7 @@ impl Scheduler {
             proxy_registry,
             universal_agents:   HashMap::new(),
             waiting:            HashSet::new(),
+            cred_gw,
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -2028,34 +2041,44 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     AgentStatus::Running
                 }
             };
-            AgentSnapshot {
-                id:             id.clone(),
-                status,
-                turn:           task.turn(),
-                context_tokens: task.context_tokens(),
-                token_budget:   task.token_budget(),
-                task_preview:   task.task_preview(80),
-                tools:          task.spec_names().to_vec(),
-                short_term_previews: task
-                    .short_term
-                    .iter()
-                    .take(MAX_SHORT_TERM_PREVIEWS)
-                    .map(|item| {
-                        let role = match &item.role {
-                            Role::User      => "user",
-                            Role::Assistant => "assistant",
-                        };
-                        // Strip embedded newlines so each preview is always one line
-                        // in the FUSE short_term virtual file (format is line-per-item).
-                        let preview = item.content_preview.replace(['\n', '\r'], " ");
-                        format!("t{} {}: {}", item.turn, role, preview)
-                    })
-                    .collect(),
-                parent_id: state.parent_map.get(id).cloned(),
-                accessible_server_names:   task.accessible_server_names(),
-                capabilities_unrestricted: task.is_capabilities_unrestricted(),
-                tier: None,
-                pid:  None,
+            {
+                let (cred_providers, cred_req, cred_denied, cred_access) =
+                    state.cred_gw.as_ref()
+                        .map(|gw| gw.agent_grant_for(id))
+                        .unwrap_or_default();
+                AgentSnapshot {
+                    id:             id.clone(),
+                    status,
+                    turn:           task.turn(),
+                    context_tokens: task.context_tokens(),
+                    token_budget:   task.token_budget(),
+                    task_preview:   task.task_preview(80),
+                    tools:          task.spec_names().to_vec(),
+                    short_term_previews: task
+                        .short_term
+                        .iter()
+                        .take(MAX_SHORT_TERM_PREVIEWS)
+                        .map(|item| {
+                            let role = match &item.role {
+                                Role::User      => "user",
+                                Role::Assistant => "assistant",
+                            };
+                            // Strip embedded newlines so each preview is always one line
+                            // in the FUSE short_term virtual file (format is line-per-item).
+                            let preview = item.content_preview.replace(['\n', '\r'], " ");
+                            format!("t{} {}: {}", item.turn, role, preview)
+                        })
+                        .collect(),
+                    parent_id: state.parent_map.get(id).cloned(),
+                    accessible_server_names:   task.accessible_server_names(),
+                    capabilities_unrestricted: task.is_capabilities_unrestricted(),
+                    tier: None,
+                    pid:  None,
+                    credential_providers:      cred_providers,
+                    credential_request_counts: cred_req,
+                    credential_denied_counts:  cred_denied,
+                    credential_last_access_at: cred_access,
+                }
             }
         })
         .collect();
@@ -2083,6 +2106,10 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 capabilities_unrestricted: true,
                 tier: Some(format!("universal:{iso_str}")),
                 pid:  ua.pid(),
+                credential_providers:      vec![],
+                credential_request_counts: HashMap::new(),
+                credential_denied_counts:  HashMap::new(),
+                credential_last_access_at: HashMap::new(),
             }
         })
         .collect();
@@ -2113,6 +2140,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         s.queue_depth         = state.deferred.len();
         s.pending_actions     = pending_actions;
         s.egress_addr         = state.egress_addr.map(|a| format!("http://{a}"));
+        s.credential_snapshot = state.cred_gw.as_ref().map(|gw| gw.snapshot());
     }
 }
 
@@ -3317,6 +3345,7 @@ mod tests {
             proxy_registry:     None,
             universal_agents:   HashMap::new(),
             waiting:            HashSet::new(),
+            cred_gw:            None,
         }
     }
 

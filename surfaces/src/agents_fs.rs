@@ -53,6 +53,9 @@ pub(crate) const OFF_SANDBOX:       u64 = 10;
 pub(crate) const OFF_TIER:          u64 = 11;
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const OFF_PID:           u64 = 12;
+/// /agents/<id>/credentials — per-agent credential grant JSON (cred.5).
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const OFF_CREDENTIALS:   u64 = 13;
 
 /// System directory and file inodes (not in inode_to_id; handled explicitly).
 #[cfg(any(test, target_os = "linux"))]
@@ -77,6 +80,9 @@ const INO_SYS_EGRESS_ADDR: u64 = 17;
 /// /agents/system/isolation — device-level isolation tier JSON (ma.4).
 #[cfg(any(test, target_os = "linux"))]
 const INO_SYS_ISOLATION: u64 = 18;
+/// /agents/system/credentials — gateway health + per-provider status JSON (cred.5).
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYS_CREDENTIALS: u64 = 19;
 
 // Invariant: all per-agent file offsets must fit within DIR_STEP - 1 slots.
 #[cfg(any(test, target_os = "linux"))]
@@ -89,6 +95,8 @@ const _: () = assert!(OFF_SANDBOX < DIR_STEP - 1, "OFF_SANDBOX must be < DIR_STE
 const _: () = assert!(OFF_TIER    < DIR_STEP - 1, "OFF_TIER must be < DIR_STEP - 1");
 #[cfg(any(test, target_os = "linux"))]
 const _: () = assert!(OFF_PID     < DIR_STEP - 1, "OFF_PID must be < DIR_STEP - 1");
+#[cfg(any(test, target_os = "linux"))]
+const _: () = assert!(OFF_CREDENTIALS < DIR_STEP - 1, "OFF_CREDENTIALS must be < DIR_STEP - 1");
 
 /// Last 64 KB of flight.jsonl to scan for per-agent events.
 #[cfg(any(test, target_os = "linux"))]
@@ -261,11 +269,11 @@ impl AgentsFs {
         let ino = self.next_dir_inode;
         self.next_dir_inode += DIR_STEP;
         self.dir_inodes.insert(agent_id.to_string(), ino);
-        // Register all 13 fixed inodes so inode_to_id lookups work.
+        // Register all 14 fixed inodes so inode_to_id lookups work.
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
             OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
-            OFF_SANDBOX, OFF_TIER, OFF_PID,
+            OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS,
         ] {
             self.inode_to_id.insert(ino + offset, agent_id.to_string());
         }
@@ -440,6 +448,18 @@ impl AgentsFs {
                     None      => b"(none)\n".to_vec(),
                 }
             }
+            OFF_CREDENTIALS => {
+                // cred.5: per-agent credential grant — providers, request/denied counts,
+                // and last-access timestamps as JSON.
+                let providers  = serde_json::to_string(&agent.credential_providers).unwrap_or_else(|_| "[]".to_string());
+                let req_counts = serde_json::to_string(&agent.credential_request_counts).unwrap_or_else(|_| "{}".to_string());
+                let den_counts = serde_json::to_string(&agent.credential_denied_counts).unwrap_or_else(|_| "{}".to_string());
+                let last_access = serde_json::to_string(&agent.credential_last_access_at).unwrap_or_else(|_| "{}".to_string());
+                format!(
+                    "{{\"providers\":{providers},\"request_counts\":{req_counts},\
+                     \"denied_counts\":{den_counts},\"last_access_at\":{last_access}}}\n"
+                ).into_bytes()
+            }
             // OFF_MEMORY_DIR and OFF_LONG_TERM_DIR are directories — not served here.
             _ => return None,
         };
@@ -499,6 +519,17 @@ impl AgentsFs {
                 let mut json = serde_json::to_string(&caps).unwrap_or_default();
                 json.push('\n');
                 json
+            }
+            INO_SYS_CREDENTIALS => {
+                // cred.5: gateway health + per-provider status JSON.
+                match &snap.credential_snapshot {
+                    Some(cs) => {
+                        let mut json = serde_json::to_string(cs).unwrap_or_default();
+                        json.push('\n');
+                        json
+                    }
+                    None => "{\"gateway_enabled\":false,\"configured_providers\":[],\"provider_health\":[]}\n".to_string(),
+                }
             }
             _ => return None,
         };
@@ -563,11 +594,11 @@ impl AgentsFs {
     /// into a `Vec<String>` before calling this (Rust borrow checker requires it).
     fn prune_dead_agent(&mut self, agent_id: &str) {
         if let Some(base) = self.dir_inodes.remove(agent_id) {
-            // Remove all 13 fixed per-agent inodes (dir + offsets 1–12).
+            // Remove all 14 fixed per-agent inodes (dir + offsets 1–13).
             for offset in [
                 0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
                 OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
-                OFF_SANDBOX, OFF_TIER, OFF_PID,
+                OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS,
             ] {
                 self.inode_to_id.remove(&(base + offset));
             }
@@ -668,6 +699,7 @@ fn file_name_for_offset(offset: u64) -> Option<&'static str> {
         OFF_SANDBOX       => Some("sandbox"),
         OFF_TIER          => Some("tier"),
         OFF_PID           => Some("pid"),
+        OFF_CREDENTIALS   => Some("credentials"),
         _ => None,
     }
 }
@@ -812,6 +844,7 @@ impl fuser::Filesystem for AgentsFs {
                     "provider"    => INO_SYS_PROVIDER,
                     "egress_addr" => INO_SYS_EGRESS_ADDR,
                     "isolation"   => INO_SYS_ISOLATION,
+                    "credentials" => INO_SYS_CREDENTIALS,
                     _ => { reply.error(libc::ENOENT); return; }
                 };
                 let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
@@ -945,6 +978,7 @@ impl fuser::Filesystem for AgentsFs {
         if (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
             || ino == INO_SYS_EGRESS_ADDR
             || ino == INO_SYS_ISOLATION
+            || ino == INO_SYS_CREDENTIALS
         {
             let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
             reply.attr(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile));
@@ -1110,6 +1144,7 @@ impl fuser::Filesystem for AgentsFs {
                     (INO_SYS_PROVIDER,     fuser::FileType::RegularFile, "provider".to_string()),
                     (INO_SYS_EGRESS_ADDR,  fuser::FileType::RegularFile, "egress_addr".to_string()),
                     (INO_SYS_ISOLATION,    fuser::FileType::RegularFile, "isolation".to_string()),
+                    (INO_SYS_CREDENTIALS,  fuser::FileType::RegularFile, "credentials".to_string()),
                 ]
             }
 
@@ -1146,8 +1181,9 @@ impl fuser::Filesystem for AgentsFs {
                     (dir_ino + OFF_TOOLS,   fuser::FileType::RegularFile, "tools".to_string()),
                     (dir_ino + OFF_PARENT,  fuser::FileType::RegularFile, "parent".to_string()),
                     (dir_ino + OFF_SANDBOX, fuser::FileType::RegularFile, "sandbox".to_string()),
-                    (dir_ino + OFF_TIER,    fuser::FileType::RegularFile, "tier".to_string()),
-                    (dir_ino + OFF_PID,     fuser::FileType::RegularFile, "pid".to_string()),
+                    (dir_ino + OFF_TIER,        fuser::FileType::RegularFile, "tier".to_string()),
+                    (dir_ino + OFF_PID,         fuser::FileType::RegularFile, "pid".to_string()),
+                    (dir_ino + OFF_CREDENTIALS, fuser::FileType::RegularFile, "credentials".to_string()),
                 ];
                 if self.memory.is_some() {
                     v.push((dir_ino + OFF_MEMORY_DIR, fuser::FileType::Directory, "memory".to_string()));
@@ -1246,6 +1282,7 @@ impl fuser::Filesystem for AgentsFs {
             (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
                 || ino == INO_SYS_EGRESS_ADDR
                 || ino == INO_SYS_ISOLATION
+                || ino == INO_SYS_CREDENTIALS
                 || ino == INO_APPROVALS
         };
         if is_file {
@@ -1369,6 +1406,7 @@ mod tests {
             pending_actions:     vec![],
             egress_addr:         None,
             isolation_caps:      None,
+            credential_snapshot: None,
         }))
     }
 
@@ -1390,6 +1428,7 @@ mod tests {
             pending_actions:     vec![],
             egress_addr:         None,
             isolation_caps:      None,
+            credential_snapshot: None,
         }))
     }
 
@@ -1408,6 +1447,10 @@ mod tests {
             capabilities_unrestricted: false,
             tier:                    None,
             pid:                     None,
+            credential_providers:      vec![],
+            credential_request_counts: std::collections::HashMap::new(),
+            credential_denied_counts:  std::collections::HashMap::new(),
+            credential_last_access_at: std::collections::HashMap::new(),
         }
     }
 
@@ -2350,6 +2393,7 @@ mod tests {
             pending_actions:     vec![],
             egress_addr:         None,
             isolation_caps:      None,
+            credential_snapshot: None,
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
@@ -2459,6 +2503,7 @@ mod tests {
             pending_actions:     vec![],
             egress_addr:         None,
             isolation_caps:      None,
+            credential_snapshot: None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
@@ -2485,6 +2530,7 @@ mod tests {
             pending_actions:     vec![],
             egress_addr:         None,
             isolation_caps:      None,
+            credential_snapshot: None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a2");
@@ -2522,6 +2568,7 @@ mod tests {
             pending_actions:     vec![],
             egress_addr:         None,
             isolation_caps:      None,
+            credential_snapshot: None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a3");
@@ -2761,9 +2808,79 @@ mod tests {
             (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
                 || ino == INO_SYS_EGRESS_ADDR
                 || ino == INO_SYS_ISOLATION
+                || ino == INO_SYS_CREDENTIALS
                 || ino == INO_APPROVALS
         };
-        assert!(is_pseudofile(INO_APPROVALS),    "INO_APPROVALS must satisfy open() predicate");
-        assert!(is_pseudofile(INO_SYS_ISOLATION), "INO_SYS_ISOLATION must satisfy open() predicate");
+        assert!(is_pseudofile(INO_APPROVALS),       "INO_APPROVALS must satisfy open() predicate");
+        assert!(is_pseudofile(INO_SYS_ISOLATION),   "INO_SYS_ISOLATION must satisfy open() predicate");
+        assert!(is_pseudofile(INO_SYS_CREDENTIALS), "INO_SYS_CREDENTIALS must satisfy open() predicate");
+    }
+
+    // ── INO_SYS_CREDENTIALS coverage (cred.5) ────────────────────────────────
+
+    #[test]
+    fn fuse_system_credentials_no_gateway() {
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None, None);
+        let content = fs.sys_file_content(INO_SYS_CREDENTIALS).unwrap();
+        assert!(!content.is_empty(), "INO_SYS_CREDENTIALS must not be empty when gateway absent");
+    }
+
+    #[test]
+    fn fuse_system_credentials_with_gateway() {
+        use crate::snapshot::{CredentialSnapshot, ProviderHealth};
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot {
+            agents:              vec![],
+            global_tokens_spent: 0,
+            in_flight:           0,
+            queue_depth:         0,
+            provider_model:      String::new(),
+            sandbox:             Default::default(),
+            pending_actions:     vec![],
+            egress_addr:         None,
+            isolation_caps:      None,
+            credential_snapshot: Some(CredentialSnapshot {
+                gateway_enabled:      true,
+                configured_providers: vec!["google".to_string()],
+                provider_health:      vec![
+                    ProviderHealth {
+                        name:            "google".to_string(),
+                        token_fresh:     true,
+                        last_refresh_at: Some(1720000000),
+                        expires_at:      Some(1720003600),
+                        last_error:      None,
+                    }
+                ],
+            }),
+        }));
+        let fs = AgentsFs::new(snap, None, None);
+        let content = fs.sys_file_content(INO_SYS_CREDENTIALS).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&content)
+            .expect("INO_SYS_CREDENTIALS must produce valid JSON when gateway present");
+        assert_eq!(json["gateway_enabled"].as_bool(), Some(true));
+        let health = &json["provider_health"];
+        assert_eq!(health[0]["name"].as_str(), Some("google"));
+        assert_eq!(health[0]["token_fresh"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn fuse_per_agent_credentials_file_produces_json() {
+        let mut ag = agent_snap("ag1", AgentStatus::Running);
+        ag.credential_providers         = vec!["google".to_string()];
+        ag.credential_request_counts    = HashMap::from([("google".to_string(), 3u64)]);
+        ag.credential_denied_counts     = HashMap::new();
+        ag.credential_last_access_at    = HashMap::from([("google".to_string(), 1720000000u64)]);
+
+        let snap = make_snap(vec![ag]);
+        let mut fs = AgentsFs::new(snap, None, None);
+        fs.alloc_dir("ag1");
+        let base = *fs.dir_inodes.get("ag1").unwrap();
+        let content = fs.file_content_for_ino(base + OFF_CREDENTIALS).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&content)
+            .expect("per-agent credentials file must produce valid JSON");
+        let providers = json["providers"].as_array().unwrap();
+        assert_eq!(providers[0].as_str(), Some("google"));
+        let req = json["request_counts"]["google"].as_u64().unwrap_or(0);
+        assert_eq!(req, 3);
     }
 }

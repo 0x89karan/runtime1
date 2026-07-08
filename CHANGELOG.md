@@ -3,6 +3,52 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cred.5] - 2026-07-08 (v0.68.0)
+
+### Added — Credential Control Plane visibility
+
+- **`CredentialSnapshot` + `ProviderHealth`** in `surfaces/src/snapshot.rs` — new
+  types carrying gateway-enabled status, configured provider names, and per-provider
+  health (token_fresh, last_refresh_at, expires_at, last_error). Derive `Serialize`;
+  `SchedulerSnapshot` gains `credential_snapshot: Option<CredentialSnapshot>`.
+- **Per-agent credential fields on `AgentSnapshot`** — four new fields:
+  `credential_providers: Vec<String>`, `credential_request_counts: HashMap<String,u64>`,
+  `credential_denied_counts: HashMap<String,u64>`,
+  `credential_last_access_at: HashMap<String,u64>`.
+- **5 new cred.5 observability maps on `CredentialGateway`** (all `std::sync::RwLock`):
+  `denied_counters`, `last_access`, `provider_expiry`, `provider_refresh_ts`,
+  `provider_last_error`. Updated atomically in the gateway request path.
+- **`CredentialRegistry` converted to `std::sync::RwLock`** — all 4 methods now sync;
+  enables `snapshot()` and `agent_grant_for()` to be called from the sync
+  `update_snapshot()` path without blocking.
+- **`INO_SYS_CREDENTIALS = 19`** — new FUSE virtual file `/agents/system/credentials`
+  emitting `CredentialSnapshot` JSON when the gateway is active; `"enabled": false`
+  sentinel when disabled.
+- **`OFF_CREDENTIALS = 13`** — new per-agent FUSE file `/agents/<id>/credentials`
+  emitting `{providers, request_counts, denied_counts, last_access_at}` JSON.
+- **`GET /api/v1/credentials`** on management HTTP API (`:7999`) — returns
+  `CredentialSnapshot` JSON or `{"enabled": false}` when gateway is off.
+- **`agentctl watch` `[c]` Credentials pane** — `View::Credentials` TUI view showing
+  gateway status, configured providers, per-provider `[fresh]`/`[stale]` badges,
+  expiry timestamp, last refresh, and last error.
+- **`render_plain` credentials section** — always emitted before the memory early-return;
+  shows `credentials: gateway not configured`, `credentials: gateway disabled`, or
+  per-provider health lines with token_fresh / expires_at / last_refresh / last_error.
+- **`DataSource` updated** — `FuseSource` reads `/agents/system/credentials`;
+  `HttpSource` fetches `/api/v1/credentials`; both parse into `SysCredentials`.
+- **3 new FUSE tests** — `fuse_system_credentials_no_gateway`,
+  `fuse_system_credentials_with_gateway`, `fuse_per_agent_credentials_file_produces_json`.
+- **4 new `render_plain` tests** — `render_plain_credentials_not_configured_shows_message`,
+  `render_plain_credentials_disabled_shows_disabled`,
+  `render_plain_credentials_fresh_token_appears`,
+  `render_plain_credentials_stale_token_shows_error`.
+- **4 new `credentials_from_json` tests** in `source.rs`.
+
+### Fixed
+
+- **Early-return ordering** — `render_plain` credentials block moved before the
+  `/agents/kb` directory check so credentials are always output in `--plain` mode.
+
 ## [ma.4] - 2026-07-08 (v0.67.0)
 
 ### Added — Isolation-tier detection + honest per-device reporting

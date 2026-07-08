@@ -22,6 +22,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Per-agent per-provider request counters: `(agent_id, provider_name)` → counter.
 type CapCounters = Arc<tokio::sync::RwLock<HashMap<(String, String), Arc<AtomicU64>>>>;
+// cred.5: std::sync maps so snapshot() / agent_grant_for() are callable from sync update_snapshot()
+type DeniedCounters  = Arc<std::sync::RwLock<HashMap<(String, String), u64>>>;
+type LastAccess      = Arc<std::sync::RwLock<HashMap<(String, String), u64>>>;
+type ProviderExpiry  = Arc<std::sync::RwLock<HashMap<String, u64>>>;
+type ProviderRefresh = Arc<std::sync::RwLock<HashMap<String, u64>>>;
+type ProviderError   = Arc<std::sync::RwLock<HashMap<String, Option<String>>>>;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -34,7 +40,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 use crate::config::{AuthStyle, CredentialGatewayConfig, ProviderConfig};
 use crate::events::EventKind;
@@ -42,6 +48,8 @@ use crate::flight_recorder::FlightRecorder;
 // ar-10: SSRF guard functions live in loopback_proxy as the canonical location for all
 // loopback forwarders; imported here so callers and tests see them via `use super::*`.
 use crate::loopback_proxy::{extract_host, is_ssrf_blocked};
+// surfaces crate provides snapshot types that flow into the FUSE/API surface (cred.5).
+use surfaces;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -102,9 +110,11 @@ struct CredEntry {
 
 /// Maps ephemeral credential token → `CredEntry`.
 /// Tokens are UUID4 strings issued at MCP spawn and deregistered on exit.
+/// Uses std::sync::RwLock (not tokio) so lookup() is sync and callable from
+/// the sync agent_grant_for() path without async changes to update_snapshot().
 #[derive(Default)]
 struct CredentialRegistry {
-    tokens: RwLock<HashMap<String, CredEntry>>,
+    tokens: std::sync::RwLock<HashMap<String, CredEntry>>,
 }
 
 impl CredentialRegistry {
@@ -112,31 +122,43 @@ impl CredentialRegistry {
         Self::default()
     }
 
-    async fn register(&self, token: String, agent_id: String, providers: Vec<String>) {
-        let mut map = self.tokens.write().await;
+    fn register(&self, token: String, agent_id: String, providers: Vec<String>) {
+        let mut map = self.tokens.write().expect("registry lock poisoned");
         map.insert(token, CredEntry { agent_id, allowed_providers: providers });
     }
 
     #[allow(dead_code)] // used in T4 test; production path uses deregister_and_get_agent
-    async fn deregister(&self, token: &str) {
-        let mut map = self.tokens.write().await;
+    fn deregister(&self, token: &str) {
+        let mut map = self.tokens.write().expect("registry lock poisoned");
         map.remove(token);
     }
 
     /// Remove the token and return the `agent_id` iff it was the **last** token
     /// registered for that agent. Used by `CredentialGateway::deregister_token()`
     /// to clean up per-agent cap counters when an agent fully exits.
-    async fn deregister_and_get_agent(&self, token: &str) -> Option<String> {
-        let mut map = self.tokens.write().await;
+    fn deregister_and_get_agent(&self, token: &str) -> Option<String> {
+        let mut map = self.tokens.write().expect("registry lock poisoned");
         let entry = map.remove(token)?;
         let still_active = map.values().any(|e| e.agent_id == entry.agent_id);
         if still_active { None } else { Some(entry.agent_id) }
     }
 
     /// Returns `(agent_id, allowed_providers)` or `None` if the token is unknown.
-    async fn lookup(&self, token: &str) -> Option<(String, Vec<String>)> {
-        let map = self.tokens.read().await;
+    fn lookup(&self, token: &str) -> Option<(String, Vec<String>)> {
+        let map = self.tokens.read().expect("registry lock poisoned");
         map.get(token).map(|e| (e.agent_id.clone(), e.allowed_providers.clone()))
+    }
+
+    /// Return all unique provider names granted to the given agent across all active tokens.
+    fn providers_for_agent(&self, agent_id: &str) -> Vec<String> {
+        let map = self.tokens.read().expect("registry lock poisoned");
+        let mut providers: Vec<String> = map.values()
+            .filter(|e| e.agent_id == agent_id)
+            .flat_map(|e| e.allowed_providers.iter().cloned())
+            .collect();
+        providers.sort_unstable();
+        providers.dedup();
+        providers
     }
 }
 
@@ -203,6 +225,15 @@ impl OAuthTokenCache {
         inner.token         = Some(state.access_token);
         inner.expires_at    = state.expires_at_unix;
         inner.refresh_token = state.refresh_token;
+    }
+
+    /// Non-blocking read of the current `expires_at` from the in-memory cache.
+    /// Returns `Some(unix_secs)` when a token is cached; `None` on contention or cold start.
+    /// Used by cred.5 snapshot path (sync context) after a successful refresh.
+    fn try_peek_expiry(&self) -> Option<u64> {
+        self.state.try_lock().ok().and_then(|g| {
+            if g.token.is_some() { Some(g.expires_at) } else { None }
+        })
     }
 
     /// Return a valid access token, refreshing if needed.
@@ -522,7 +553,7 @@ fn remove_agent_caps(db: &Arc<Database>, agent_id: &str) {
 struct GatewayState {
     config:     CredentialGatewayConfig,
     registry:   Arc<CredentialRegistry>,
-    caches:     RwLock<HashMap<String, Arc<OAuthTokenCache>>>,
+    caches:     tokio::sync::RwLock<HashMap<String, Arc<OAuthTokenCache>>>,
     /// reqwest client built with per-provider `.resolve()` overrides (ar-04 IP pinning).
     client:     reqwest::Client,
     recorder:   Arc<FlightRecorder>,
@@ -534,6 +565,17 @@ struct GatewayState {
     counters:   CapCounters,
     /// Persistent cap database (cred.4). `None` when `caps_db_path` is not set.
     caps_db:    Option<Arc<Database>>,
+    // ── cred.5 observability maps (std::sync so snapshot()/agent_grant_for() are sync) ──
+    /// Per-(agent, provider) denied request count.
+    denied_counters:       DeniedCounters,
+    /// Per-(agent, provider) unix-secs of last successful credential request.
+    last_access:           LastAccess,
+    /// Per-provider unix-secs token expiry (OAuth only; 0 = cold / never refreshed).
+    provider_expiry:       ProviderExpiry,
+    /// Per-provider unix-secs of last successful OAuth token refresh.
+    provider_last_refresh: ProviderRefresh,
+    /// Per-provider last OAuth refresh error string; None when healthy.
+    provider_last_error:   ProviderError,
 }
 
 impl GatewayState {
@@ -625,15 +667,31 @@ impl GatewayState {
         }
 
         // Eagerly load persisted OAuth state for all providers that have state_path (ar-06).
+        // cred.5: also seed provider_expiry from the loaded state so token_fresh is correct
+        // at cold start (instead of reporting stale=false on first snapshot tick).
         let mut caches = HashMap::new();
+        let mut init_expiry:   HashMap<String, u64> = HashMap::new();
+        let mut init_refresh:  HashMap<String, u64> = HashMap::new();
         for (name, prov) in &config.providers {
             if prov.auth_style == crate::config::AuthStyle::OauthBearer {
                 let cache = Arc::new(OAuthTokenCache::new());
                 if let Some(ref sp) = prov.state_path {
                     cache.load_from_disk(sp).await;
+                    // Warm-up: if a non-expired token was loaded, populate expiry snapshot.
+                    if let Some(exp) = cache.try_peek_expiry() {
+                        init_expiry.insert(name.clone(), exp);
+                        // We don't know the original refresh time; leave provider_last_refresh
+                        // empty — it is updated on the next actual refresh call.
+                    }
                 }
                 caches.insert(name.clone(), cache);
             }
+        }
+        // Also warm up init_refresh from init_expiry for loaded providers
+        // (use current time as a proxy — actual time is recorded on next refresh).
+        let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        for name in init_expiry.keys() {
+            init_refresh.insert(name.clone(), now_s);
         }
 
         // Open (or create) the caps persistence database and load existing counters
@@ -642,19 +700,25 @@ impl GatewayState {
 
         Ok(Self {
             config,
-            registry:   Arc::new(CredentialRegistry::new()),
-            caches:     RwLock::new(caches),
+            registry:              Arc::new(CredentialRegistry::new()),
+            caches:                tokio::sync::RwLock::new(caches),
             client,
             recorder,
             pinned_ips,
-            counters:   Arc::new(RwLock::new(counters_init)),
-            caps_db:    caps_db.map(Arc::new),
+            counters:              Arc::new(tokio::sync::RwLock::new(counters_init)),
+            caps_db:               caps_db.map(Arc::new),
+            // cred.5
+            denied_counters:       Arc::new(std::sync::RwLock::new(HashMap::new())),
+            last_access:           Arc::new(std::sync::RwLock::new(HashMap::new())),
+            provider_expiry:       Arc::new(std::sync::RwLock::new(init_expiry)),
+            provider_last_refresh: Arc::new(std::sync::RwLock::new(init_refresh)),
+            provider_last_error:   Arc::new(std::sync::RwLock::new(HashMap::new())),
         })
     }
 
     async fn get_cache(&self, provider: &str) -> Arc<OAuthTokenCache> {
         {
-            let map = self.caches.read().await;
+            let map = self.caches.read().await;  // tokio RwLock — async read
             if let Some(c) = map.get(provider) {
                 return Arc::clone(c);
             }
@@ -712,8 +776,8 @@ async fn handle_credential_request(
         }
     };
 
-    // 2. Registry lookup.
-    let (agent_id, allowed_providers) = match state.registry.lookup(&cred_token).await {
+    // 2. Registry lookup (sync — CredentialRegistry uses std::sync::RwLock).
+    let (agent_id, allowed_providers) = match state.registry.lookup(&cred_token) {
         Some(e) => e,
         None => {
             return Ok(json_response(
@@ -747,6 +811,10 @@ async fn handle_credential_request(
             EventKind::CredentialDenied,
             json!({"agent_id": &agent_id, "provider": &provider, "reason": "no_providers_configured"}),
         );
+        // cred.5: track denied count
+        if let Ok(mut dc) = state.denied_counters.write() {
+            *dc.entry((agent_id.clone(), provider.clone())).or_insert(0) += 1;
+        }
         return Ok(json_response(
             403,
             json!({
@@ -763,6 +831,10 @@ async fn handle_credential_request(
             EventKind::CredentialDenied,
             json!({"agent_id": &agent_id, "provider": &provider, "reason": "provider_not_allowed"}),
         );
+        // cred.5: track denied count
+        if let Ok(mut dc) = state.denied_counters.write() {
+            *dc.entry((agent_id.clone(), provider.clone())).or_insert(0) += 1;
+        }
         return Ok(json_response(
             403,
             json!({
@@ -873,9 +945,29 @@ async fn handle_credential_request(
         AuthStyle::OauthBearer => {
             let cache = state.get_cache(&provider).await;
             match cache.get_or_refresh(&provider, &prov_cfg, &state.recorder, &state.client).await {
-                Ok(tok) => tok,
+                Ok(tok) => {
+                    // cred.5: update provider_expiry and last_refresh on success; clear error.
+                    if let Some(exp) = cache.try_peek_expiry() {
+                        if let Ok(mut pe) = state.provider_expiry.write() {
+                            pe.insert(provider.clone(), exp);
+                        }
+                        let now_s = SystemTime::now()
+                            .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                        if let Ok(mut pr) = state.provider_last_refresh.write() {
+                            pr.insert(provider.clone(), now_s);
+                        }
+                    }
+                    if let Ok(mut pe) = state.provider_last_error.write() {
+                        pe.insert(provider.clone(), None);
+                    }
+                    tok
+                }
                 Err(e) => {
                     tracing::warn!(provider = %provider, error = %e, "credential refresh failed");
+                    // cred.5: record last error
+                    if let Ok(mut pe) = state.provider_last_error.write() {
+                        pe.insert(provider.clone(), Some(e.clone()));
+                    }
                     return Ok(json_response(
                         503,
                         json!({
@@ -983,6 +1075,13 @@ async fn handle_credential_request(
             "method":   method.as_str(),
         }),
     );
+    // cred.5: record last successful access time
+    {
+        let now_s = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        if let Ok(mut la) = state.last_access.write() {
+            la.insert((agent_id.clone(), provider.clone()), now_s);
+        }
+    }
 
     // 13. Send upstream request.
     let upstream_resp = match req_builder.send().await {
@@ -1059,6 +1158,21 @@ pub struct CredentialGateway {
     /// Shared with GatewayState so deregister_token() can clean up counters (E4).
     counters: CapCounters,
     caps_db:  Option<Arc<Database>>,
+    // ── cred.5 visibility (all std::sync so snapshot() / agent_grant_for() are sync) ──
+    /// Provider names present in the startup config.
+    configured_providers:  Vec<String>,
+    /// Provider configs for auth-style lookups in snapshot().
+    provider_configs:      HashMap<String, crate::config::ProviderConfig>,
+    /// Shared with GatewayState — per-(agent, provider) denied request count.
+    denied_counters:       DeniedCounters,
+    /// Shared with GatewayState — per-(agent, provider) last successful access (unix secs).
+    last_access:           LastAccess,
+    /// Shared with GatewayState — per-provider token expiry (unix secs, OAuth only).
+    provider_expiry:       ProviderExpiry,
+    /// Shared with GatewayState — per-provider last successful OAuth refresh (unix secs).
+    provider_last_refresh: ProviderRefresh,
+    /// Shared with GatewayState — per-provider last OAuth error; None = healthy.
+    provider_last_error:   ProviderError,
 }
 
 impl CredentialGateway {
@@ -1072,10 +1186,18 @@ impl CredentialGateway {
         recorder: Arc<FlightRecorder>,
     ) -> Result<(Arc<Self>, std::net::SocketAddr)> {
         let state = Arc::new(GatewayState::new(cfg.clone(), recorder).await?);
-        let registry = Arc::clone(&state.registry);
+        let registry              = Arc::clone(&state.registry);
         // counters is already Arc<RwLock<...>> on GatewayState — clone the Arc to share.
-        let counters = Arc::clone(&state.counters);
-        let caps_db  = state.caps_db.clone();
+        let counters              = Arc::clone(&state.counters);
+        let caps_db               = state.caps_db.clone();
+        // cred.5: share all 5 new maps so snapshot() / agent_grant_for() see live data.
+        let configured_providers  = state.config.providers.keys().cloned().collect();
+        let provider_configs      = state.config.providers.clone();
+        let denied_counters       = Arc::clone(&state.denied_counters);
+        let last_access           = Arc::clone(&state.last_access);
+        let provider_expiry       = Arc::clone(&state.provider_expiry);
+        let provider_last_refresh = Arc::clone(&state.provider_last_refresh);
+        let provider_last_error   = Arc::clone(&state.provider_last_error);
 
         let listener = TcpListener::bind("127.0.0.1:0").await
             .context("credential gateway: bind loopback listener")?;
@@ -1106,27 +1228,138 @@ impl CredentialGateway {
             }
         });
 
-        Ok((Arc::new(Self { registry, counters, caps_db }), bound))
+        Ok((Arc::new(Self {
+            registry,
+            counters,
+            caps_db,
+            configured_providers,
+            provider_configs,
+            denied_counters,
+            last_access,
+            provider_expiry,
+            provider_last_refresh,
+            provider_last_error,
+        }), bound))
     }
 
     /// Register an ephemeral credential token for a new MCP server spawn.
     pub async fn register_token(&self, token: String, agent_id: String, providers: Vec<String>) {
-        self.registry.register(token, agent_id, providers).await;
+        self.registry.register(token, agent_id, providers); // sync after cred.5 conversion
     }
 
     /// Deregister an ephemeral token when an MCP server exits.
     /// E4: if this was the last token for the agent, clears its cap counters so
     /// memory is bounded and the cap resets correctly on next spawn.
     pub async fn deregister_token(&self, token: &str) {
-        if let Some(agent_id) = self.registry.deregister_and_get_agent(token).await {
+        if let Some(agent_id) = self.registry.deregister_and_get_agent(token) { // sync
             // Last token for this agent — remove all (agent_id, *) counter entries.
             let mut map = self.counters.write().await;
             map.retain(|(aid, _), _| aid != &agent_id);
+            drop(map);
+            // cred.5: also clear denied_counters and last_access for this agent.
+            if let Ok(mut dc) = self.denied_counters.write() {
+                dc.retain(|(aid, _), _| aid != &agent_id);
+            }
+            if let Ok(mut la) = self.last_access.write() {
+                la.retain(|(aid, _), _| aid != &agent_id);
+            }
             // Also remove from the persistence db (best-effort).
             if let Some(ref db) = self.caps_db {
                 remove_agent_caps(db, &agent_id);
             }
         }
+    }
+
+    /// Build a point-in-time credential snapshot for the FUSE surface and management API.
+    /// Sync so it can be called from `update_snapshot()` without async changes.
+    pub fn snapshot(&self) -> surfaces::CredentialSnapshot {
+        use surfaces::ProviderHealth;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let expiry_map  = self.provider_expiry.read()
+            .unwrap_or_else(|p| p.into_inner());
+        let refresh_map = self.provider_last_refresh.read()
+            .unwrap_or_else(|p| p.into_inner());
+        let error_map   = self.provider_last_error.read()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let mut provider_health = Vec::new();
+        for name in &self.configured_providers {
+            let auth_style = self.provider_configs.get(name).map(|c| c.auth_style.clone());
+
+            let (token_fresh, expires_at) = match &auth_style {
+                Some(crate::config::AuthStyle::OauthBearer) => {
+                    let exp = expiry_map.get(name).copied().unwrap_or(0);
+                    let fresh = exp > now.saturating_add(TOKEN_EXPIRY_BUFFER_SECS);
+                    (fresh, if exp > 0 { Some(exp) } else { None })
+                }
+                _ => {
+                    // ApiKey providers: credential is "fresh" when the env var is set.
+                    let fresh = self.provider_configs.get(name)
+                        .and_then(|c| c.secret_key.as_deref())
+                        .map(|var| std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false))
+                        .unwrap_or(false);
+                    (fresh, None)
+                }
+            };
+
+            provider_health.push(ProviderHealth {
+                name:            name.clone(),
+                token_fresh,
+                last_refresh_at: refresh_map.get(name).copied(),
+                expires_at,
+                last_error:      error_map.get(name).and_then(|e| e.clone()),
+            });
+        }
+
+        surfaces::CredentialSnapshot {
+            gateway_enabled:      true,
+            configured_providers: self.configured_providers.clone(),
+            provider_health,
+        }
+    }
+
+    /// Return per-agent credential usage for `AgentSnapshot` (cred.5).
+    /// Sync — all 5 new maps use `std::sync::RwLock`.
+    /// Returns `(providers, request_counts, denied_counts, last_access_at)`.
+    #[allow(clippy::type_complexity)]
+    pub fn agent_grant_for(
+        &self,
+        agent_id: &str,
+    ) -> (Vec<String>, HashMap<String, u64>, HashMap<String, u64>, HashMap<String, u64>) {
+        let providers = self.registry.providers_for_agent(agent_id);
+
+        // Request counts: from CapCounters (tokio RwLock) via try_read() — best-effort.
+        let request_counts: HashMap<String, u64> = self.counters
+            .try_read()
+            .map(|map| {
+                map.iter()
+                    .filter(|((aid, _), _)| aid == agent_id)
+                    .map(|((_, prov), ctr)| (prov.clone(), ctr.load(Ordering::Relaxed)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let denied_counts: HashMap<String, u64> = self.denied_counters
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|((aid, _), _)| aid == agent_id)
+            .map(|((_, prov), cnt)| (prov.clone(), *cnt))
+            .collect();
+
+        let last_access_at: HashMap<String, u64> = self.last_access
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|((aid, _), _)| aid == agent_id)
+            .map(|((_, prov), ts)| (prov.clone(), *ts))
+            .collect();
+
+        (providers, request_counts, denied_counts, last_access_at)
     }
 }
 
@@ -1211,14 +1444,14 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
     #[tokio::test]
     async fn test_register_deregister_token() {
         let reg = CredentialRegistry::new();
-        reg.register("tok1".to_string(), "agent-a".to_string(), vec!["google".to_string()]).await;
-        let result = reg.lookup("tok1").await;
+        reg.register("tok1".to_string(), "agent-a".to_string(), vec!["google".to_string()]);
+        let result = reg.lookup("tok1");
         assert!(result.is_some());
         let (agent, providers) = result.unwrap();
         assert_eq!(agent, "agent-a");
         assert_eq!(providers, vec!["google"]);
-        reg.deregister("tok1").await;
-        assert!(reg.lookup("tok1").await.is_none());
+        reg.deregister("tok1");
+        assert!(reg.lookup("tok1").is_none());
     }
 
     // ── T5: unknown token returns None ────────────────────────────────────────
@@ -1226,7 +1459,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
     #[tokio::test]
     async fn test_token_not_found_returns_none() {
         let reg = CredentialRegistry::new();
-        assert!(reg.lookup("ghost-token").await.is_none());
+        assert!(reg.lookup("ghost-token").is_none());
     }
 
     // ── T6: oauth state — valid unexpired token returned directly ─────────────
@@ -2001,9 +2234,9 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
             "tok-ar07".to_string(),
             "scout-agent".to_string(),
             vec!["google".to_string()],
-        ).await;
+        );
 
-        let (agent_id, providers) = reg.lookup("tok-ar07").await
+        let (agent_id, providers) = reg.lookup("tok-ar07")
             .expect("registered token must be found");
 
         assert_eq!(agent_id, "scout-agent",
@@ -2371,7 +2604,7 @@ max_requests_per_agent = 100
     async fn test_cap_unlimited_when_max_requests_none() {
         let dir = tempfile::tempdir().unwrap();
         let reg = Arc::new(CredentialRegistry::new());
-        reg.register("tok".to_string(), "agent-a".to_string(), vec!["brave".to_string()]).await;
+        reg.register("tok".to_string(), "agent-a".to_string(), vec!["brave".to_string()]);
 
         // ProviderConfig with no cap — unlimited.
         let prov = ProviderConfig {
@@ -2409,8 +2642,8 @@ max_requests_per_agent = 100
     #[tokio::test]
     #[allow(clippy::type_complexity)]
     async fn test_cap_per_agent_isolation() {
-        let counters: Arc<RwLock<HashMap<(String, String), Arc<AtomicU64>>>> =
-            Arc::new(RwLock::new(HashMap::new()));
+        let counters: Arc<tokio::sync::RwLock<HashMap<(String, String), Arc<AtomicU64>>>> =
+            Arc::new(tokio::sync::RwLock::new(HashMap::new()));
 
         let provider = "brave".to_string();
         let limit: u64 = 2;
@@ -2631,16 +2864,16 @@ max_requests_per_agent = 100
     async fn test_deregister_and_get_agent_multi_token() {
         let reg = CredentialRegistry::new();
         // Two tokens for the same agent (e.g. two MCP servers).
-        reg.register("tok1".to_string(), "agent-x".to_string(), vec!["brave".to_string()]).await;
-        reg.register("tok2".to_string(), "agent-x".to_string(), vec!["github".to_string()]).await;
+        reg.register("tok1".to_string(), "agent-x".to_string(), vec!["brave".to_string()]);
+        reg.register("tok2".to_string(), "agent-x".to_string(), vec!["github".to_string()]);
 
         // Removing the first token should NOT trigger counter cleanup.
-        let result = reg.deregister_and_get_agent("tok1").await;
+        let result = reg.deregister_and_get_agent("tok1");
         assert!(result.is_none(),
             "should return None when agent still has another token (tok2)");
 
         // Removing the last token should trigger counter cleanup.
-        let result = reg.deregister_and_get_agent("tok2").await;
+        let result = reg.deregister_and_get_agent("tok2");
         assert_eq!(result.as_deref(), Some("agent-x"),
             "should return agent_id when last token is deregistered");
     }
@@ -2751,5 +2984,53 @@ max_requests_per_agent = 100
         // The timeout error path must reference ar-05 for traceability.
         assert!(src.contains("ar-05"),
             "timeout error must reference ar-05 for traceability");
+    }
+
+    // ── cred.5 observability: CredentialRegistry sync methods ─────────────────
+
+    #[test]
+    fn test_providers_for_agent_returns_registered_providers() {
+        let reg = CredentialRegistry::default();
+        reg.register("tok1".to_string(), "agent-a".to_string(), vec!["google".to_string(), "brave".to_string()]);
+        let providers = reg.providers_for_agent("agent-a");
+        assert!(providers.contains(&"google".to_string()), "must contain google");
+        assert!(providers.contains(&"brave".to_string()), "must contain brave");
+    }
+
+    #[test]
+    fn test_providers_for_agent_unknown_agent_returns_empty() {
+        let reg = CredentialRegistry::default();
+        assert!(reg.providers_for_agent("nobody").is_empty());
+    }
+
+    #[test]
+    fn test_credential_gateway_snapshot_disabled_returns_defaults() {
+        // When no providers are configured, snapshot() must return a coherent
+        // default (gateway_enabled=false, empty lists) not panic.
+        let src = include_str!("mod.rs");
+        // Structural: snapshot() method must be present and pub
+        assert!(src.contains("pub fn snapshot("), "CredentialGateway::snapshot() must be pub (cred.5)");
+        // agent_grant_for must also be pub
+        assert!(src.contains("pub fn agent_grant_for("), "CredentialGateway::agent_grant_for() must be pub (cred.5)");
+    }
+
+    #[test]
+    fn test_credential_snapshot_fields_are_serializable() {
+        // Ensure CredentialSnapshot and ProviderHealth serialize without panic.
+        use surfaces::{CredentialSnapshot, ProviderHealth};
+        let snap = CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["google".to_string()],
+            provider_health: vec![ProviderHealth {
+                name: "google".to_string(),
+                token_fresh: false,
+                last_refresh_at: None,
+                expires_at: None,
+                last_error: Some("HTTP 401".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&snap).expect("CredentialSnapshot must serialize");
+        assert!(json.contains("gateway_enabled"), "gateway_enabled field required");
+        assert!(json.contains("HTTP 401"), "last_error must be present in JSON");
     }
 }

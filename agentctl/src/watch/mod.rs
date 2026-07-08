@@ -184,10 +184,15 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, s
                                 _ => {}
                             }
                         }
-                        View::Memory    => handle_memory_key(key.code, &mut app),
-                        View::Spawn     => handle_spawn_key(key.code, &mut app),
-                        View::Inspector => handle_inspector_key(key.code, &mut app),
-                        View::Approvals => handle_approvals_key(key.code, &mut app, source.as_ref()),
+                        View::Memory      => handle_memory_key(key.code, &mut app),
+                        View::Spawn       => handle_spawn_key(key.code, &mut app),
+                        View::Inspector   => handle_inspector_key(key.code, &mut app),
+                        View::Approvals   => handle_approvals_key(key.code, &mut app, source.as_ref()),
+                        View::Credentials => {
+                            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                                app.view = View::Dashboard;
+                            }
+                        }
                     }
                     if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
                         break;
@@ -261,10 +266,15 @@ fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, s
                                             _ => {}
                                         }
                                     }
-                                    View::Memory    => handle_memory_key(key.code, &mut app2),
-                                    View::Spawn     => handle_spawn_key(key.code, &mut app2),
-                                    View::Inspector => handle_inspector_key(key.code, &mut app2),
-                                    View::Approvals => handle_approvals_key(key.code, &mut app2, source.as_ref()),
+                                    View::Memory      => handle_memory_key(key.code, &mut app2),
+                                    View::Spawn       => handle_spawn_key(key.code, &mut app2),
+                                    View::Inspector   => handle_inspector_key(key.code, &mut app2),
+                                    View::Approvals   => handle_approvals_key(key.code, &mut app2, source.as_ref()),
+                                    View::Credentials => {
+                                        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                                            app2.view = View::Dashboard;
+                                        }
+                                    }
                                 }
                                 if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
                                     break;
@@ -358,6 +368,9 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App) {
             app.approvals_view.mode        = ApprovalsMode::List;
             app.approvals_view.selected_idx = 0;
             app.approvals_view.result_msg  = None;
+        }
+        KeyCode::Char('c') => {
+            app.view = View::Credentials;
         }
         _ => {}
     }
@@ -697,7 +710,7 @@ mod tests {
     struct TestSource;
     impl DataSource for TestSource {
         fn load_snapshot(&self) -> Snapshot {
-            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None }
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("mock: no control".into()) }
@@ -721,7 +734,7 @@ mod tests {
                 isolation:       String::new(),
                 pid:             0,
             }).collect(),
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         }
     }
 

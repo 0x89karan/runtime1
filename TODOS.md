@@ -874,6 +874,20 @@ check applies only to agent-supplied target URLs, not to the broker URL itself. 
 - **Where to start:** `docker/oauth_mcp.py` → `_load_config()` broker short-circuit block, after
   populating `OAUTH_PROVIDER_NAME` and `ALLOWED_HOSTS`. Add `import ipaddress`.
 
+**cred.5-ar-01 (P3) — OAuth token-refresh error body included verbatim in provider_health.last_error**
+
+HTTP error responses from the token endpoint are stored in `provider_last_error` (up to 512 bytes,
+`mod.rs:342`) and surface in the FUSE `/agents/system/credentials` file and `GET /api/v1/credentials`.
+RFC 6749 §5.2 error responses never contain credential material, but a misconfigured provider could
+echo the request. Management API is loopback-only so blast radius is minimal; standard providers are
+safe. A future hardening pass could record only the HTTP status code and drop the body entirely.
+
+- **Why:** tradeoff decided in cred.5 QA (2026-07-08): operator debugging value > paranoid body drop for
+  an operator-only, loopback-gated surface. Non-standard providers remain a theoretical risk.
+- **How to apply:** in `handle_credential_request()` at the `Err(format!(...body...))` site, strip the body
+  and store only the HTTP status code string. Adjust tests that assert on body content.
+- **Depends on:** cred.5 (credential surface).
+
 **cred.4-ar-01 (P3) — Caps persistence is per-clean-exit only — in-flight counts lost on crash**
 
 Per-request `persist_cap()` fire-and-forget was removed (cred.4 pre-ship review) to eliminate a

@@ -34,6 +34,7 @@ pub fn render(f: &mut Frame, app: &App) {
         View::Spawn       => render_spawn(f, app),
         View::Inspector   => render_inspector(f, app),
         View::Approvals   => render_approvals(f, app),
+        View::Credentials => render_credentials(f, app),
     }
 }
 
@@ -149,7 +150,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     }
 
     // Footer
-    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  q quit ";
+    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  q quit ";
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_area,
@@ -1037,6 +1038,74 @@ fn render_approvals(f: &mut Frame, app: &App) {
     }
 }
 
+fn render_credentials(f: &mut Frame, app: &App) {
+    let (header_area, content_area, footer_area) = header_footer_layout(f.area());
+
+    let title = Span::styled(" Credentials ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    f.render_widget(Paragraph::new(Line::from(vec![title])), header_area);
+
+    match app.credentials.as_ref() {
+        None => {
+            let msg = Paragraph::new("Credential gateway not configured (no [credential_gateway] in agent.toml).")
+                .block(Block::default().borders(Borders::ALL).title("Status"));
+            f.render_widget(msg, content_area);
+        }
+        Some(creds) if !creds.gateway_enabled => {
+            let msg = Paragraph::new("Credential gateway disabled.")
+                .block(Block::default().borders(Borders::ALL).title("Status"));
+            f.render_widget(msg, content_area);
+        }
+        Some(creds) => {
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(vec![
+                Span::styled("Gateway: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("enabled", Style::default().fg(Color::Green)),
+            ]));
+            lines.push(Line::from(format!(
+                "Configured providers: {}",
+                if creds.configured_providers.is_empty() { "(none)".to_string() }
+                else { creds.configured_providers.join(", ") }
+            )));
+            lines.push(Line::from(""));
+
+            for ph in &creds.provider_health {
+                let fresh_style = if ph.token_fresh {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Yellow)
+                };
+                let fresh_label = if ph.token_fresh { "fresh" } else { "stale/missing" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {} ", sanitize(&ph.name)), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("[{fresh_label}]"), fresh_style),
+                ]));
+                if let Some(exp) = ph.expires_at {
+                    lines.push(Line::from(format!("    expires_at: {exp}")));
+                }
+                if let Some(last) = ph.last_refresh_at {
+                    lines.push(Line::from(format!("    last_refresh: {last}")));
+                }
+                if let Some(ref err) = ph.last_error {
+                    lines.push(Line::from(vec![
+                        Span::raw("    last_error: "),
+                        Span::styled(sanitize(err), Style::default().fg(Color::Red)),
+                    ]));
+                }
+            }
+
+            let para = Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title("Credential Gateway Health"));
+            f.render_widget(para, content_area);
+        }
+    }
+
+    let footer = Line::from(Span::styled(
+        " [Esc/q] back ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(footer), footer_area);
+}
+
 /// Render a plain-text snapshot to a string (for --plain mode, no ANSI).
 pub fn render_plain(app: &App) -> String {
     let mut out = String::new();
@@ -1103,6 +1172,32 @@ pub fn render_plain(app: &App) -> String {
     for a in &app.agents {
         let parent = a.parent_id.as_deref().unwrap_or("none");
         out.push_str(&format!("  topology: {} parent={} status={}\n", a.id, parent, a.status));
+    }
+    // Credentials section.
+    match app.credentials.as_ref() {
+        None => out.push_str("credentials: gateway not configured\n"),
+        Some(creds) if !creds.gateway_enabled => out.push_str("credentials: gateway disabled\n"),
+        Some(creds) => {
+            out.push_str("credentials:\n");
+            out.push_str(&format!("  providers: {}\n",
+                if creds.configured_providers.is_empty() { "(none)".to_string() }
+                else { creds.configured_providers.join(", ") }
+            ));
+            for ph in &creds.provider_health {
+                let freshness = if ph.token_fresh { "fresh" } else { "stale/missing" };
+                out.push_str(&format!("  {} token_fresh={} ({freshness})", sanitize(&ph.name), ph.token_fresh));
+                if let Some(exp) = ph.expires_at {
+                    out.push_str(&format!(" expires_at={exp}"));
+                }
+                if let Some(last) = ph.last_refresh_at {
+                    out.push_str(&format!(" last_refresh={last}"));
+                }
+                out.push('\n');
+                if let Some(ref err) = ph.last_error {
+                    out.push_str(&format!("    last_error: {}\n", sanitize(err)));
+                }
+            }
+        }
     }
     // Memory section — read live from FUSE; skip if Phase 5 absent.
     let kb_dir = app.agents_dir.join("kb");
@@ -1216,7 +1311,7 @@ mod tests {
     #[test]
     fn render_plain_no_agents_outputs_none_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: (none)"), "empty agent list must produce '(none)' line");
@@ -1225,7 +1320,7 @@ mod tests {
     #[test]
     fn render_plain_no_provider_omits_provider_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("provider:"), "no provider → no provider line");
@@ -1234,7 +1329,7 @@ mod tests {
     #[test]
     fn render_plain_no_budget_omits_tokens_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("tokens_spent:"), "no budget → no tokens_spent line");
@@ -1246,7 +1341,7 @@ mod tests {
     fn render_plain_error_appears_in_output() {
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
-            isolation: None, error: Some("permission denied".to_string()),
+            isolation: None, credentials: None, error: Some("permission denied".to_string()),
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("error: permission denied"));
@@ -1259,7 +1354,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
             provider: Some(SysProvider { model: "claude-opus-4".to_string(), backend: "anthropic".to_string() }),
-            isolation: None, error: None,
+            isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("provider: claude-opus-4 (anthropic)"));
@@ -1270,7 +1365,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![],
             budget: Some(SysBudget { spent: 99_000, total: 0 }),
-            queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("tokens_spent: 99000"));
@@ -1281,7 +1376,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![], budget: None,
             queue: Some(SysQueue { depth: 7 }),
-            sandbox: None, provider: None, isolation: None, error: None,
+            sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("queue_depth: 7"));
@@ -1295,7 +1390,7 @@ mod tests {
             agents: vec![
                 make_agent("scout-1", "running", 1500, vec!["read_file".to_string(), "write_file".to_string()]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: 1"));
@@ -1313,7 +1408,7 @@ mod tests {
                 make_agent("a", "done", 0, vec![]),
                 make_agent("b", "failed", 500, vec![]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: 2"));
@@ -1325,7 +1420,7 @@ mod tests {
     fn render_plain_agent_with_no_tools_shows_zero() {
         let snap = Snapshot {
             agents: vec![make_agent("agent-x", "running", 0, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("tools=0"));
@@ -1339,7 +1434,7 @@ mod tests {
         a.parent_id = None;
         let snap = Snapshot {
             agents: vec![a],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("topology:"), "topology header must appear");
@@ -1352,7 +1447,7 @@ mod tests {
         child.parent_id = Some("coordinator".to_string());
         let snap = Snapshot {
             agents: vec![child],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("parent=coordinator"), "child agent must show parent id");
@@ -1380,7 +1475,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, isolation: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("sandbox: any_sandboxed=true"), "any_sandboxed must appear");
@@ -1412,7 +1507,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, isolation: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("transport=http"), "HTTP transport must appear in render_plain output");
@@ -1435,7 +1530,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, isolation: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("isolation=gvisor"), "gvisor isolation must appear in render_plain output");
@@ -1450,7 +1545,7 @@ mod tests {
         for status in &["running", "deferred", "awaiting_child", "done", "failed", "unknown-xyz"] {
             let snap = Snapshot {
                 agents: vec![make_agent("a", status, 0, vec![])],
-                budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+                budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
             };
             let out = render_plain(&app_from_snap(snap));
             assert!(out.contains(&format!("[{status}]")),
@@ -1463,7 +1558,7 @@ mod tests {
     fn tmpdir() -> tempfile::TempDir { tempfile::tempdir().unwrap() }
 
     fn empty_snap() -> Snapshot {
-        Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None }
+        Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
     }
 
     fn app_with_dir(dir: &std::path::Path, snap: Snapshot) -> App {
@@ -1510,7 +1605,7 @@ mod tests {
         std::fs::write(mem.join("short_term"), "key insight here\nfact two\n").unwrap();
         let snap = Snapshot {
             agents: vec![make_agent("agent-1", "running", 0, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_with_dir(d.path(), snap));
         assert!(out.contains("key insight here"), "short_term item must appear in output");
@@ -1560,7 +1655,7 @@ mod tests {
                 make_agent("agent-a", "running", 0, vec![]),
                 make_agent("agent-b", "running", 0, vec![]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_with_dir(d.path(), snap));
         assert!(out.contains("agent-a"), "agent-a must appear in memory section");
@@ -1646,6 +1741,7 @@ mod tests {
                 landlock: true,
                 seccomp:  true,
             }),
+            credentials: None,
             error: None,
         };
         let out = render_plain(&app_from_snap(snap));
@@ -1668,6 +1764,7 @@ mod tests {
                 landlock: true,
                 seccomp:  false,
             }),
+            credentials: None,
             error: None,
         };
         let out = render_plain(&app_from_snap(snap));
@@ -1701,7 +1798,7 @@ mod tests {
         use crate::watch::reader::Snapshot;
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, isolation: None, error: None,
+            provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("isolation_tier:"),
@@ -1713,7 +1810,7 @@ mod tests {
         use crate::watch::reader::{Snapshot, SysIsolation};
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, error: None,
+            provider: None, credentials: None, error: None,
             isolation: Some(SysIsolation {
                 tier:     "capability".to_string(),
                 arch:     "aarch64".to_string(),
@@ -1734,7 +1831,7 @@ mod tests {
         use crate::watch::reader::{Snapshot, SysIsolation};
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, error: None,
+            provider: None, credentials: None, error: None,
             isolation: Some(SysIsolation {
                 tier:     "none".to_string(),
                 arch:     "x86_64".to_string(),
@@ -1746,5 +1843,89 @@ mod tests {
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("isolation_tier: none"),
             "none tier must appear in plain output; got:\n{out}");
+    }
+
+    // ── render_plain: credentials section ─────────────────────────────────────
+
+    #[test]
+    fn render_plain_credentials_not_configured_shows_message() {
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None,
+            provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("credentials: gateway not configured"),
+            "None credentials must show not-configured; got:\n{out}");
+    }
+
+    #[test]
+    fn render_plain_credentials_disabled_shows_disabled() {
+        use crate::watch::reader::SysCredentials;
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None,
+            provider: None, isolation: None, error: None,
+            credentials: Some(SysCredentials {
+                gateway_enabled:      false,
+                configured_providers: vec![],
+                provider_health:      vec![],
+            }),
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("credentials: gateway disabled"),
+            "Disabled credentials must show disabled; got:\n{out}");
+    }
+
+    #[test]
+    fn render_plain_credentials_fresh_token_appears() {
+        use crate::watch::reader::{SysCredentials, ProvHealthInfo};
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None,
+            provider: None, isolation: None, error: None,
+            credentials: Some(SysCredentials {
+                gateway_enabled:      true,
+                configured_providers: vec!["google".to_string()],
+                provider_health:      vec![
+                    ProvHealthInfo {
+                        name:            "google".to_string(),
+                        token_fresh:     true,
+                        last_refresh_at: Some(1720000000),
+                        expires_at:      Some(1720003600),
+                        last_error:      None,
+                    }
+                ],
+            }),
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("credentials:"), "must have credentials section");
+        assert!(out.contains("google"), "must list provider name");
+        assert!(out.contains("token_fresh=true"), "must show token_fresh");
+        assert!(out.contains("fresh"), "must show freshness label");
+        assert!(out.contains("expires_at="), "must show expiry");
+        assert!(out.contains("last_refresh="), "must show last refresh");
+    }
+
+    #[test]
+    fn render_plain_credentials_stale_token_shows_error() {
+        use crate::watch::reader::{SysCredentials, ProvHealthInfo};
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None,
+            provider: None, isolation: None, error: None,
+            credentials: Some(SysCredentials {
+                gateway_enabled:      true,
+                configured_providers: vec!["google".to_string()],
+                provider_health:      vec![
+                    ProvHealthInfo {
+                        name:            "google".to_string(),
+                        token_fresh:     false,
+                        last_refresh_at: None,
+                        expires_at:      None,
+                        last_error:      Some("token_expired".to_string()),
+                    }
+                ],
+            }),
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("stale/missing"), "stale token must show stale label");
+        assert!(out.contains("last_error: token_expired"), "must show last_error");
     }
 }

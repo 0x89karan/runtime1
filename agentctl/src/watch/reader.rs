@@ -294,18 +294,49 @@ pub fn read_sys_provider(agents_dir: &Path) -> Option<SysProvider> {
 
 /// Load a full snapshot: agent list + system files.
 pub struct Snapshot {
-    pub agents:    Vec<AgentInfo>,
-    pub budget:    Option<SysBudget>,
-    pub queue:     Option<SysQueue>,
-    pub sandbox:   Option<SysSandbox>,
-    pub provider:  Option<SysProvider>,
-    pub isolation: Option<SysIsolation>,
-    pub error:     Option<String>,
+    pub agents:      Vec<AgentInfo>,
+    pub budget:      Option<SysBudget>,
+    pub queue:       Option<SysQueue>,
+    pub sandbox:     Option<SysSandbox>,
+    pub provider:    Option<SysProvider>,
+    pub isolation:   Option<SysIsolation>,
+    pub credentials: Option<SysCredentials>,
+    pub error:       Option<String>,
 }
 
 /// Read /agents/system/isolation
 pub fn read_sys_isolation(agents_dir: &Path) -> Option<SysIsolation> {
     read_json(&agents_dir.join("system").join("isolation"))
+}
+
+/// Health of a single credential provider, deserialized from FUSE or HTTP.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ProvHealthInfo {
+    pub name:            String,
+    #[serde(default)]
+    pub token_fresh:     bool,
+    #[serde(default)]
+    pub last_refresh_at: Option<u64>,
+    #[serde(default)]
+    pub expires_at:      Option<u64>,
+    #[serde(default)]
+    pub last_error:      Option<String>,
+}
+
+/// Parsed content of /agents/system/credentials or GET /api/v1/credentials.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SysCredentials {
+    #[serde(default)]
+    pub gateway_enabled:      bool,
+    #[serde(default)]
+    pub configured_providers: Vec<String>,
+    #[serde(default)]
+    pub provider_health:      Vec<ProvHealthInfo>,
+}
+
+/// Read /agents/system/credentials
+pub fn read_sys_credentials(agents_dir: &Path) -> Option<SysCredentials> {
+    read_json(&agents_dir.join("system").join("credentials"))
 }
 
 pub fn load_snapshot(agents_dir: &Path) -> Snapshot {
@@ -317,11 +348,12 @@ pub fn load_snapshot(agents_dir: &Path) -> Snapshot {
         Err(e) => (vec![], Some(format!("{e:#}"))),
     };
     Snapshot {
-        budget:    read_sys_budget(agents_dir),
-        queue:     read_sys_queue(agents_dir),
-        sandbox:   read_sys_sandbox(agents_dir),
-        provider:  read_sys_provider(agents_dir),
-        isolation: read_sys_isolation(agents_dir),
+        budget:      read_sys_budget(agents_dir),
+        queue:       read_sys_queue(agents_dir),
+        sandbox:     read_sys_sandbox(agents_dir),
+        provider:    read_sys_provider(agents_dir),
+        isolation:   read_sys_isolation(agents_dir),
+        credentials: read_sys_credentials(agents_dir),
         agents,
         error,
     }

@@ -13,6 +13,7 @@
 //!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
+//!   GET  /api/v1/credentials                     → 200 CredentialSnapshot JSON (cred.5)
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -356,6 +357,23 @@ async fn route(
             }
         }
 
+        (Method::GET, "/api/v1/credentials") => {
+            let cred_snap = {
+                let guard = match state.snapshot.read() {
+                    Ok(g) => g,
+                    Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "snapshot lock poisoned"),
+                };
+                guard.credential_snapshot.clone()
+            };
+            match cred_snap {
+                Some(cs) => match serde_json::to_value(&cs) {
+                    Ok(v) => json_response(StatusCode::OK, v),
+                    Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                },
+                None => json_response(StatusCode::OK, json!({"enabled": false})),
+            }
+        }
+
         _ => error_response(StatusCode::NOT_FOUND, "not found"),
     }
 }
@@ -500,6 +518,10 @@ mod tests {
             capabilities_unrestricted: true,
             tier: None,
             pid: None,
+            credential_providers: vec![],
+            credential_request_counts: std::collections::HashMap::new(),
+            credential_denied_counts:  std::collections::HashMap::new(),
+            credential_last_access_at: std::collections::HashMap::new(),
         });
         let state = make_state(snap);
         let resp = route(state, Method::GET, "/api/v1/snapshot", "", &[]).await;
@@ -527,6 +549,10 @@ mod tests {
             capabilities_unrestricted: true,
             tier: None,
             pid: None,
+            credential_providers: vec![],
+            credential_request_counts: std::collections::HashMap::new(),
+            credential_denied_counts:  std::collections::HashMap::new(),
+            credential_last_access_at: std::collections::HashMap::new(),
         });
         let state = make_state(snap);
         let resp = route(state, Method::GET, "/api/v1/snapshot", "", &[]).await;
@@ -630,6 +656,10 @@ mod tests {
             capabilities_unrestricted: true,
             tier: None,
             pid: None,
+            credential_providers: vec![],
+            credential_request_counts: std::collections::HashMap::new(),
+            credential_denied_counts:  std::collections::HashMap::new(),
+            credential_last_access_at: std::collections::HashMap::new(),
         });
         let state = make_state(snap);
         let resp = route(state, Method::GET, "/api/v1/snapshot", "", &[]).await;
@@ -754,5 +784,44 @@ mod tests {
 
     async fn collect_body(resp: Response<BoxBody>) -> Bytes {
         resp.into_body().collect().await.unwrap().to_bytes()
+    }
+
+    // ── GET /api/v1/credentials (cred.5) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn credentials_gateway_disabled_returns_enabled_false() {
+        let snap = SchedulerSnapshot::default(); // credential_snapshot = None
+        let state = make_state(snap);
+        let resp = route(state, Method::GET, "/api/v1/credentials", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body(resp).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], false, "no credential_snapshot => enabled:false");
+    }
+
+    #[tokio::test]
+    async fn credentials_gateway_enabled_returns_snapshot() {
+        use surfaces::{CredentialSnapshot, ProviderHealth};
+        let mut snap = SchedulerSnapshot::default();
+        snap.credential_snapshot = Some(CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["google".to_string()],
+            provider_health: vec![ProviderHealth {
+                name: "google".to_string(),
+                token_fresh: true,
+                last_refresh_at: Some(1_700_000_000),
+                expires_at: Some(1_700_003_600),
+                last_error: None,
+            }],
+        });
+        let state = make_state(snap);
+        let resp = route(state, Method::GET, "/api/v1/credentials", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body(resp).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["gateway_enabled"], true);
+        assert_eq!(v["configured_providers"][0], "google");
+        assert_eq!(v["provider_health"][0]["token_fresh"], true);
+        assert_eq!(v["provider_health"][0]["last_error"], serde_json::Value::Null);
     }
 }

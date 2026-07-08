@@ -52,7 +52,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 - ~~`orch.1` (v0.66.0)~~ ✅ shipped — interactive orchestrator: `AgentStatus::Waiting` + `agentctl orchestrate` REPL + HTTP spawn/inject API.
 - ~~`h8.1` (v0.64.0)~~ ✅ shipped — Layer-2 semantic memory sidecar (Qdrant + Voyage AI).
 - ~~`cred.4` (v0.63.0) · `cred.4b` (v0.65.0)~~ ✅ shipped — spend caps + credential-agnostic MCP servers.
-1. **cred.5** — egress gateway surfacing · **ma.4** — isolation-tier honesty (small, slot anytime).
+1. ~~**cred.5** (v0.68.0) · **ma.4** (v0.67.0)~~ ✅ shipped — credential control plane visibility + isolation-tier honesty.
 2. **dx.3 / dx.4** — Linux QEMU production + prebuilt images (when targeting Linux hardware).
 3. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
 4. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
@@ -1236,7 +1236,7 @@ p7.5b forwarding proxy to all providers.
 **Acceptance:** a tool process holds no raw credential in env or memory-at-rest; outbound calls
 are authenticated at the broker; a denied provider is blocked.
 
-### ▣ cred.5 — Surfacing + hardening (optional)
+### ✓ cred.5 — Surfacing + hardening (optional)
 **Depends on:** cred.3.
 **Goal:** operator visibility + lifecycle polish.
 **Scope:** `/agents/credentials` FUSE view + `agentctl` credential pane (per-agent provider

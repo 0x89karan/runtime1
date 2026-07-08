@@ -6,8 +6,8 @@
 use serde_json::Value;
 
 use super::reader::{
-    self, AgentInfo, AgentSandbox, BudgetKind, PendingAction, ServerEnforcement,
-    Snapshot, SysBudget, SysIsolation, SysProvider, SysQueue, SysSandbox,
+    self, AgentInfo, AgentSandbox, BudgetKind, PendingAction, ProvHealthInfo, ServerEnforcement,
+    Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue, SysSandbox,
 };
 
 /// Spawn request sent to the management API (orch.1+).
@@ -155,13 +155,14 @@ impl DataSource for HttpSource {
         let val = match self.get_json("/api/v1/snapshot") {
             Ok(v)  => v,
             Err(e) => return Snapshot {
-                agents:    vec![],
-                budget:    None,
-                queue:     None,
-                sandbox:   None,
-                provider:  None,
-                isolation: None,
-                error:     Some(format!("HTTP error: {e:#}")),
+                agents:      vec![],
+                budget:      None,
+                queue:       None,
+                sandbox:     None,
+                provider:    None,
+                isolation:   None,
+                credentials: None,
+                error:       Some(format!("HTTP error: {e:#}")),
             },
         };
 
@@ -190,7 +191,10 @@ impl DataSource for HttpSource {
 
         let isolation = isolation_from_json(&val["isolation_caps"]);
 
-        Snapshot { agents, budget, queue, sandbox, provider, isolation, error: None }
+        let credentials = self.get_json("/api/v1/credentials").ok()
+            .and_then(|v| credentials_from_json(&v));
+
+        Snapshot { agents, budget, queue, sandbox, provider, isolation, credentials, error: None }
     }
 
     fn load_approvals(&self) -> Vec<PendingAction> {
@@ -351,6 +355,35 @@ fn server_enforcement_from_json(v: &Value) -> ServerEnforcement {
         namespace_mount:   v["namespace_mount"].as_bool().unwrap_or(false),
         landlock_net:      v["landlock_net"].as_bool().unwrap_or(false),
     }
+}
+
+fn credentials_from_json(v: &Value) -> Option<SysCredentials> {
+    if v.is_null() || (!v["gateway_enabled"].as_bool().unwrap_or(false) && v["enabled"] == Value::Bool(false)) {
+        return None;
+    }
+    let configured_providers: Vec<String> = v["configured_providers"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|p| p.as_str().map(str::to_string))
+        .collect();
+    let provider_health: Vec<ProvHealthInfo> = v["provider_health"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .map(|p| ProvHealthInfo {
+            name:            p["name"].as_str().unwrap_or("").to_string(),
+            token_fresh:     p["token_fresh"].as_bool().unwrap_or(false),
+            last_refresh_at: p["last_refresh_at"].as_u64(),
+            expires_at:      p["expires_at"].as_u64(),
+            last_error:      p["last_error"].as_str().map(str::to_string),
+        })
+        .collect();
+    Some(SysCredentials {
+        gateway_enabled: v["gateway_enabled"].as_bool().unwrap_or(false),
+        configured_providers,
+        provider_health,
+    })
 }
 
 // ── FUSE control channel write ──────────────────────────────────────────────
@@ -597,5 +630,66 @@ mod tests {
         // No system/ dir, no real HTTP server → should bail.
         let result = detect_source(None, tmp.path());
         assert!(result.is_err(), "should fail when neither FUSE nor HTTP is reachable");
+    }
+
+    // ── credentials_from_json ─────────────────────────────────────────────────
+
+    #[test]
+    fn credentials_from_json_null_returns_none() {
+        let v = serde_json::Value::Null;
+        assert!(credentials_from_json(&v).is_none(), "null → None");
+    }
+
+    #[test]
+    fn credentials_from_json_enabled_false_returns_none() {
+        let v = serde_json::json!({"enabled": false});
+        assert!(credentials_from_json(&v).is_none(), "enabled=false → None");
+    }
+
+    #[test]
+    fn credentials_from_json_gateway_enabled_parses_providers() {
+        let v = serde_json::json!({
+            "gateway_enabled": true,
+            "configured_providers": ["google", "brave"],
+            "provider_health": [
+                {
+                    "name": "google",
+                    "token_fresh": true,
+                    "last_refresh_at": 1720000000u64,
+                    "expires_at": 1720003600u64,
+                    "last_error": null,
+                },
+                {
+                    "name": "brave",
+                    "token_fresh": false,
+                    "last_refresh_at": null,
+                    "expires_at": null,
+                    "last_error": "key_missing",
+                }
+            ]
+        });
+        let creds = credentials_from_json(&v).expect("should parse");
+        assert!(creds.gateway_enabled);
+        assert_eq!(creds.configured_providers, vec!["google", "brave"]);
+        assert_eq!(creds.provider_health.len(), 2);
+        let g = &creds.provider_health[0];
+        assert_eq!(g.name, "google");
+        assert!(g.token_fresh);
+        assert_eq!(g.expires_at, Some(1720003600));
+        let b = &creds.provider_health[1];
+        assert!(!b.token_fresh);
+        assert_eq!(b.last_error.as_deref(), Some("key_missing"));
+    }
+
+    #[test]
+    fn credentials_from_json_empty_providers_returns_some() {
+        let v = serde_json::json!({
+            "gateway_enabled": true,
+            "configured_providers": [],
+            "provider_health": []
+        });
+        let creds = credentials_from_json(&v).expect("empty-but-enabled → Some");
+        assert!(creds.gateway_enabled);
+        assert!(creds.configured_providers.is_empty());
     }
 }

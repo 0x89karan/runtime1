@@ -1182,6 +1182,13 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         .with_egress_addr(egress_bound_addr)
         .with_proxy_registry(proxy_registry);
 
+    // cred.5: wire credential gateway so per-agent grant data flows into the snapshot.
+    let scheduler = if let Some(ref gw) = maybe_cred_gw {
+        scheduler.with_credential_gateway(Arc::clone(gw))
+    } else {
+        scheduler
+    };
+
     let streamed_agents = scheduler.streamed_agents();
     recorder.record(
         "agentd",

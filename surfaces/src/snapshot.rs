@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
@@ -69,6 +70,36 @@ pub struct SandboxSummary {
     pub degradations:   Vec<String>,
 }
 
+/// System-wide credential surface snapshot (cred.5).
+///
+/// Per-agent credential usage is embedded in `AgentSnapshot` fields (consistent
+/// with the `accessible_server_names` pattern); this struct carries system-wide
+/// gateway health and per-provider status only.
+#[derive(Clone, Default, Serialize)]
+pub struct CredentialSnapshot {
+    /// True when `credential_gateway.enabled = true` in config.
+    pub gateway_enabled:      bool,
+    /// Provider names configured at startup (from `cfg.providers.keys()`).
+    pub configured_providers: Vec<String>,
+    /// Per-provider health; one entry per configured provider.
+    pub provider_health:      Vec<ProviderHealth>,
+}
+
+/// Health of a single credential provider.
+#[derive(Clone, Serialize)]
+pub struct ProviderHealth {
+    pub name:            String,
+    /// True when a non-expired OAuth token is cached, or (for api-key providers)
+    /// when the key env-var was non-empty at startup.
+    pub token_fresh:     bool,
+    /// Unix secs of last successful token refresh. `None` for api-key providers.
+    pub last_refresh_at: Option<u64>,
+    /// Unix secs of token expiry from the in-memory cache. `None` for api-key providers.
+    pub expires_at:      Option<u64>,
+    /// Last refresh-error string; cleared on the next successful refresh. `None` when healthy.
+    pub last_error:      Option<String>,
+}
+
 /// A pending operator approval, projected from the scheduler into the snapshot.
 /// Used by the FUSE `/agents/approvals` file and the `agentctl` Approvals view.
 #[derive(Clone, Debug, Serialize)]
@@ -110,6 +141,9 @@ pub struct SchedulerSnapshot {
     /// None until isolation_caps::probe() runs (typically available immediately).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isolation_caps:      Option<IsolationCapsSummary>,
+    /// System-wide credential surface snapshot (cred.5). None when gateway is disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_snapshot: Option<CredentialSnapshot>,
 }
 
 #[derive(Clone)]
@@ -139,6 +173,15 @@ pub struct AgentSnapshot {
     pub tier: Option<String>,
     /// PID of the child process for universal-tier agents. None for native-tier agents.
     pub pid: Option<u32>,
+    // ── Credential grant fields (cred.5) — empty when no credential grant exists ──
+    /// Provider names this agent's ephemeral token grants access to.
+    pub credential_providers:      Vec<String>,
+    /// Successful credential request count per provider since last spawn.
+    pub credential_request_counts: HashMap<String, u64>,
+    /// Denied credential request count per provider since last spawn.
+    pub credential_denied_counts:  HashMap<String, u64>,
+    /// Unix secs of last successful credential request per provider.
+    pub credential_last_access_at: HashMap<String, u64>,
 }
 
 /// Manual Serialize: emits `status` as the flat string from `as_str()` (matching the FUSE
@@ -150,7 +193,7 @@ impl Serialize for AgentSnapshot {
             AgentStatus::AwaitingChild(s) | AgentStatus::AwaitingApproval(s) => Some(s.as_str()),
             _ => None,
         };
-        let field_count = 13 + usize::from(detail.is_some());
+        let field_count = 17 + usize::from(detail.is_some());
         let mut s = ser.serialize_struct("AgentSnapshot", field_count)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("status", self.status.as_str())?;
@@ -168,6 +211,10 @@ impl Serialize for AgentSnapshot {
         s.serialize_field("capabilities_unrestricted", &self.capabilities_unrestricted)?;
         s.serialize_field("tier", &self.tier)?;
         s.serialize_field("pid", &self.pid)?;
+        s.serialize_field("credential_providers", &self.credential_providers)?;
+        s.serialize_field("credential_request_counts", &self.credential_request_counts)?;
+        s.serialize_field("credential_denied_counts", &self.credential_denied_counts)?;
+        s.serialize_field("credential_last_access_at", &self.credential_last_access_at)?;
         s.end()
     }
 }
