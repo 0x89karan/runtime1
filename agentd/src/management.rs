@@ -802,18 +802,20 @@ mod tests {
     #[tokio::test]
     async fn credentials_gateway_enabled_returns_snapshot() {
         use surfaces::{CredentialSnapshot, ProviderHealth};
-        let mut snap = SchedulerSnapshot::default();
-        snap.credential_snapshot = Some(CredentialSnapshot {
-            gateway_enabled: true,
-            configured_providers: vec!["google".to_string()],
-            provider_health: vec![ProviderHealth {
-                name: "google".to_string(),
-                token_fresh: true,
-                last_refresh_at: Some(1_700_000_000),
-                expires_at: Some(1_700_003_600),
-                last_error: None,
-            }],
-        });
+        let snap = SchedulerSnapshot {
+            credential_snapshot: Some(CredentialSnapshot {
+                gateway_enabled: true,
+                configured_providers: vec!["google".to_string()],
+                provider_health: vec![ProviderHealth {
+                    name: "google".to_string(),
+                    token_fresh: true,
+                    last_refresh_at: Some(1_700_000_000),
+                    expires_at: Some(1_700_003_600),
+                    last_error: None,
+                }],
+            }),
+            ..Default::default()
+        };
         let state = make_state(snap);
         let resp = route(state, Method::GET, "/api/v1/credentials", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::OK);
