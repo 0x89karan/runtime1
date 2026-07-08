@@ -57,6 +57,8 @@ else
   QEMU_CPU   :=
 endif
 
+# Shared QEMU flags (no netdev — each target provides its own to avoid hostfwd
+# side-effects in 'make test' where the host port may already be in use).
 QEMU_FLAGS  := \
 	-nographic \
 	-m 256M \
@@ -66,10 +68,13 @@ QEMU_FLAGS  := \
 	-kernel $(OUTPUT_DIR)/$(KERNEL_IMAGE) \
 	-initrd $(OUTPUT_DIR)/rootfs.cpio.gz \
 	-append "console=$(CONSOLE) quiet ip=dhcp" \
-	-netdev user,id=net0 \
-	-device virtio-net-pci,netdev=net0 \
 	-virtfs local,path=$(HOME)/.agentos-secrets,mount_tag=secrets0,security_model=none,readonly=on,id=secrets0 \
 	-virtfs local,path=$(HOME)/.agentos-memory,mount_tag=memory0,security_model=none,id=memory0
+
+# 'make run' netdev: loopback hostfwd for management API (7999) and future approval UI (8080).
+# Bound to 127.0.0.1 — prevents accidental exposure on public IPs.
+# For remote agentctl watch: ssh -L 7999:localhost:7999 <host>
+RUN_NETDEV := user,id=net0,hostfwd=tcp:127.0.0.1:7999-:7999,hostfwd=tcp:127.0.0.1:8080-:8080
 
 .PHONY: all prereqs build run test clean distclean
 
@@ -129,7 +134,17 @@ overlay/etc/agentd/templates/.gitkeep:
 	cp ../templates/*.template.toml overlay/etc/agentd/templates/
 	touch $@
 
-$(OUTPUT_DIR)/$(KERNEL_IMAGE): $(BR_DIR) overlay/usr/bin/agentd overlay/usr/bin/agentctl overlay/etc/agentd/templates/.gitkeep
+# Copy Python MCP sidecars into the rootfs overlay so they run inside the VM.
+# All servers use only Python stdlib — no pip packages needed beyond python3 + openssl.
+overlay/usr/lib/agentos/docker/.gitkeep:
+	mkdir -p overlay/usr/lib/agentos/docker
+	cp ../docker/cron_mcp.py ../docker/oauth_mcp.py ../docker/http_mcp.py \
+	   ../docker/shell_mcp.py ../docker/search_mcp.py ../docker/fs_watch_mcp.py \
+	   ../docker/webhook_mcp.py overlay/usr/lib/agentos/docker/
+	chmod +x overlay/usr/lib/agentos/docker/*.py
+	touch $@
+
+$(OUTPUT_DIR)/$(KERNEL_IMAGE): $(BR_DIR) overlay/usr/bin/agentd overlay/usr/bin/agentctl overlay/etc/agentd/templates/.gitkeep overlay/usr/lib/agentos/docker/.gitkeep
 	mkdir -p build/output-$(ARCH) $(OUTPUT_DIR)
 	chmod +x overlay/init
 	cd $(BR_DIR) && make \
@@ -150,6 +165,8 @@ build: $(OUTPUT_DIR)/$(KERNEL_IMAGE)
 run: prereqs build
 	mkdir -p $(CURDIR)/$(OUTPUT_DIR)/run
 	$(QEMU) $(QEMU_FLAGS) \
+		-netdev $(RUN_NETDEV) \
+		-device virtio-net-pci,netdev=net0 \
 		-virtfs local,path=$(CURDIR)/$(OUTPUT_DIR)/run,mount_tag=output0,security_model=none,id=output0
 
 test: prereqs build
@@ -157,6 +174,8 @@ test: prereqs build
 	@rm -f $(CURDIR)/$(OUTPUT_DIR)/test-run/flight.jsonl
 	@echo "Booting AgentOS for acceptance test (timeout 120s)..."
 	@timeout 120 $(QEMU) $(QEMU_FLAGS) \
+		-netdev user,id=net0 \
+		-device virtio-net-pci,netdev=net0 \
 		-no-reboot \
 		-virtfs local,path=$(CURDIR)/$(OUTPUT_DIR)/test-run,mount_tag=output0,security_model=none,id=output0 \
 		-virtfs local,path=$(CURDIR)/$(OUTPUT_DIR)/test-memory,mount_tag=memory0,security_model=none,id=memory0 \
@@ -174,7 +193,8 @@ test: prereqs build
 		}
 
 clean:
-	rm -rf $(OUTPUT_DIR) overlay/usr/bin/agentd overlay/usr/bin/agentctl overlay/etc/agentd/templates/.gitkeep
+	rm -rf $(OUTPUT_DIR) overlay/usr/bin/agentd overlay/usr/bin/agentctl \
+	       overlay/etc/agentd/templates/.gitkeep overlay/usr/lib/
 
 distclean: clean
 	rm -rf build/

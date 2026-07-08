@@ -390,6 +390,8 @@ present (including runsc-only), `none` = none detected; `IsolationCapsSummary` s
 isolation row in `agentctl watch` System view (green=full, yellow=capability, red=none) + legend; plain-mode
 `isolation_tier:`/`isolation_arch:` lines; `ma.4-ar-01 (P3)` `require_isolation_tier` config key deferred to
 TODOS.md; 1218 workspace tests.
+**cred.5 complete (v0.68.0).** Credential control plane visibility: `CredentialSnapshot` + `ProviderHealth` types in `surfaces`; 5 new observability maps on `CredentialGateway`; `CredentialRegistry` converted to `std::sync::RwLock`; `OFF_CREDENTIALS=13` + `INO_SYS_CREDENTIALS=19` FUSE files; `GET /api/v1/credentials` management API; `agentctl watch [c]` credentials pane; `HttpSource` fetches `/api/v1/credentials`; 1244 workspace tests.
+**dx.3 complete (v0.69.0).** Linux QEMU production path: `distro/buildroot.config` adds `BR2_PACKAGE_PYTHON3=y` + `BR2_PACKAGE_OPENSSL=y`; `distro/Makefile` refactors netdev out of shared `QEMU_FLAGS` into per-target lines, adds `RUN_NETDEV` with loopback `hostfwd:7999/8080` for `make run`, Python MCP overlay build step, `clean` fix; `distro/overlay/init` parses kernel cmdline `agentd.config=<path>` for config selection; `distro/overlay/etc/agentd/cos.agents.toml` (new) QEMU-mode CoS config with `bind_addr="0.0.0.0"` management, absolute MCP paths, `/run/memory` + `/run/output`; `agentd/cos.agents.toml` gains `[management] enabled=true`; `distro/agentos-cos.service` (new) systemd unit (`User=agentos`, loopback hostfwd, `ExecStartPre` mkdir, `-accel kvm`, 512 MB); `docs/DEPLOYMENT.md` (new) two-page operator guide with complete `agentos.env` template, SSH tunnel instructions, troubleshooting.
 
 ## How to work here
 

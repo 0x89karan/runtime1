@@ -1,59 +1,34 @@
-# Chief of Staff — Daily Operating Brief
+# Chief of Staff — QEMU/Linux production mode
 #
-# Always-on orchestrator: wakes on a cron schedule, reads the last 24 h of Gmail,
-# assembles a structured Daily Operating Brief, persists entities to the KB, and
-# writes the brief to /run/output (or ./output in dev mode).
+# This file ships in the distro overlay at /etc/agentd/cos.agents.toml.
+# It is selected by the systemd agentos-cos.service unit via the kernel cmdline:
+#   -append "... agentd.config=/etc/agentd/cos.agents.toml"
 #
-# FIRST-RUN SETUP (OAuth browser dance — required once):
+# Key differences from agentd/cos.agents.toml (dev mode):
+#   - MCP server paths use /usr/lib/agentos/docker/ (absolute, in rootfs)
+#   - store_path = "/run/memory/memory.redb" (detachable 9p memory volume)
+#   - [management] bind_addr = "0.0.0.0" so QEMU hostfwd can reach the API from host
+#   - FsWrite capability uses /run/output (host-shared output volume)
+#   - Credentials come from agentos.env (parsed by /init from /run/secrets/agentos.env)
 #
-#   Terminal 1: cargo run -- agentd/cos.agents.toml
-#   Terminal 2: agentctl watch          # press [a] for Approvals pane
+# Required vars in ~/.agentos-secrets/agentos.env on the Linux host:
+#   ANTHROPIC_API_KEY, OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET,
+#   OAUTH_AUTH_URL, OAUTH_TOKEN_URL, OAUTH_SCOPES, OAUTH_ALLOWED_HOSTS,
+#   OAUTH_PROVIDER_NAME, TRIGGER_CRON (e.g. "0 8 * * *")
+#   OAUTH_REFRESH_TOKEN (after first OAuth dance — skips browser on restart)
 #
-#   1. oauth_start_auth returns an authorization URL.
-#   2. URL appears in Approvals pane — click it, sign in with Google, grant Gmail access.
-#   3. Refresh token saved to ~/.agentos-oauth/google.json (mode 0600).
-#   4. On future runs set: export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
-#
-# REQUIRED ENV VARS:
-#
-#   export ANTHROPIC_API_KEY="sk-ant-..."
-#   export OAUTH_CLIENT_ID="<client-id>.apps.googleusercontent.com"
-#   export OAUTH_CLIENT_SECRET="<client-secret>"
-#   # Pre-set for Google — copy exactly:
-#   export OAUTH_AUTH_URL="https://accounts.google.com/o/oauth2/v2/auth"
-#   export OAUTH_TOKEN_URL="https://oauth2.googleapis.com/token"
-#   export OAUTH_SCOPES="https://www.googleapis.com/auth/gmail.readonly"
-#   export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
-#   export OAUTH_PROVIDER_NAME="google"
-#   export TRIGGER_CRON="0 8 * * *"           # daily 08:00 UTC; change to taste
-#   # After first run (skip the browser dance):
-#   export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
-#
-# LAUNCH:
-#   cargo run -- agentd/cos.agents.toml
-#
-# BRIEF LOCATION (dev mode):
-#   ./output/brief-YYYY-MM-DD.md
-#
-# VERIFY TRUST STORY:
-#   grep -E "ya29\.|access_token|refresh_token" flight.jsonl  # → no matches (token never in agent)
-#   agentctl verify evidence.jsonl                              # → exit 0 (signed receipt chain)
-#   jq 'select(.kind=="egress_rejected")' flight.jsonl         # → any off-domain attempts
-#
-# LIFETIME LIMITS:
-#   Orchestrator max_turns = 200_000  (cron polling burns ~3456 turns/day — default 20 kills
-#                                      the agent in under 8 min before the first brief)
-#   Orchestrator token_budget = 5_000_000_000  (tokens_spent is lifetime-monotonic and never
-#                                               resets; 5B ≈ 50 k tokens/day × 365 days × 274×)
-#   → If you see budget_exceeded in flight.jsonl: rm checkpoint.json and restart agentd.
-#
-# CHILD ID NOTE:
-#   The orchestrator spawns children with date-stamped IDs (inbox-YYYY-MM-DD, curator-YYYY-MM-DD).
-#   This is required: static IDs like "inbox-agent" collide on the second cron cycle because
-#   terminated children remain in the scheduler's outcomes map.
+# See docs/DEPLOYMENT.md for the full setup guide.
 
 # ---------------------------------------------------------------------------
-# Shared model config (applies to all agents unless overridden per-agent)
+# Management HTTP API — exposed at :7999 inside the VM, hostfwd'd to the host
+# ---------------------------------------------------------------------------
+[management]
+enabled   = true
+port      = 7999
+bind_addr = "0.0.0.0"   # required: lets QEMU hostfwd reach the API from outside
+
+# ---------------------------------------------------------------------------
+# Shared model config
 # ---------------------------------------------------------------------------
 [model]
 provider   = "anthropic"
@@ -62,82 +37,61 @@ max_tokens = 8192
 streaming  = true
 
 # ---------------------------------------------------------------------------
-# Management HTTP API (dev mode — loopback only)
-# ---------------------------------------------------------------------------
-[management]
-enabled = true
-# bind_addr defaults to "127.0.0.1" — loopback only (safe for dev mode).
-# The QEMU overlay config uses "0.0.0.0" so hostfwd can reach the API from the host.
-
-# ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 [scheduler]
-# 0 = unlimited; set a ceiling only if you want a hard daily spend cap across all 3 agents.
 global_token_budget       = 0
 max_concurrent_inferences = 3
 max_spawn_depth           = 2
 
 # ---------------------------------------------------------------------------
-# Egress mediator — signed receipts for the trust story
+# Egress mediator — signed receipts written to the host-shared output volume
 # ---------------------------------------------------------------------------
 [egress]
-evidence_path = "evidence.jsonl"
-key_path      = "egress-key.pkcs8"
+evidence_path = "/run/output/evidence.jsonl"
+key_path      = "/run/output/egress-key.pkcs8"
 
 # ---------------------------------------------------------------------------
 # Shared memory — ops:* KB segment for brief persistence
 # ---------------------------------------------------------------------------
 [memory]
 enabled    = true
-# Dev mode: relative path. QEMU/distro mode: set to "/run/memory/memory.redb"
-store_path = "memory.redb"
+store_path = "/run/memory/memory.redb"
 max_entries_per_segment = 500
 max_entry_age_days      = 90
 
 [[memory.segments]]
 name  = "ops:briefs"
 class = "log"
-# Append-only log of daily briefs — each brief is a timestamped immutable entry.
 
 [[memory.segments]]
 name  = "ops:entities"
 class = "scratch"
-# Named entities (people, open items, commitments) — last-writer-wins with version counter.
 
 # ---------------------------------------------------------------------------
-# Shared MCP servers — ALL servers must be declared here; children receive a
-# filtered view via their capabilities field.
+# MCP servers — absolute paths into the rootfs (/usr/lib/agentos/docker/)
 # ---------------------------------------------------------------------------
 
-# cron_trigger: wakes the orchestrator on schedule
 [[tools.mcp_servers]]
 name    = "cron_trigger"
 command = "python3"
-# Dev mode (cargo run from repo root): ../docker/cron_mcp.py
-# Distro/QEMU mode:                   /usr/lib/agentos/docker/cron_mcp.py
-args    = ["../docker/cron_mcp.py"]
+args    = ["/usr/lib/agentos/docker/cron_mcp.py"]
 passenv = ["TRIGGER_CRON", "TRIGGER_INTERVAL", "TRIGGER_MAX_WAIT_S"]
-# No capabilities → deny-all spawn + network isolation (cron needs neither).
 
-# google_oauth: OAuth2+PKCE sidecar — the Gmail token NEVER leaves this process.
-# The inbox agent calls oauth_call_api; the raw token stays in the sidecar.
 [[tools.mcp_servers]]
 name    = "google_oauth"
 command = "python3"
-# Dev mode (cargo run from repo root): ../docker/oauth_mcp.py
-# Distro/QEMU mode:                   /usr/lib/agentos/docker/oauth_mcp.py
-args    = ["../docker/oauth_mcp.py"]
+args    = ["/usr/lib/agentos/docker/oauth_mcp.py"]
 passenv = [
   "OAUTH_CLIENT_ID",
   "OAUTH_CLIENT_SECRET",
-  "OAUTH_REFRESH_TOKEN",      # optional: skip browser dance after first auth
+  "OAUTH_REFRESH_TOKEN",
   "OAUTH_AUTH_URL",
   "OAUTH_TOKEN_URL",
   "OAUTH_SCOPES",
-  "OAUTH_ALLOWED_HOSTS",      # REQUIRED — SSRF guard blocks missing/wrong hosts
+  "OAUTH_ALLOWED_HOSTS",
   "OAUTH_PROVIDER_NAME",
-  "OAUTH_CALLBACK_PORT",      # REQUIRED in Docker — fixes callback port binding
+  "OAUTH_CALLBACK_PORT",
 ]
 capabilities = [
   { Net = { hosts = [
@@ -156,11 +110,7 @@ id          = "cos-orchestrator"
 name        = "Chief of Staff Orchestrator"
 description = "Cron-triggered coordinator: wakes daily, spawns Inbox + Curator, assembles and writes the Operating Brief."
 
-# CRITICAL: max_turns MUST be high. At 25 s/poll the orchestrator burns ~3456 turns/day
-# just waiting for the cron. Default (20) kills the agent before the first brief fires.
 max_turns    = 200_000
-# CRITICAL: tokens_spent is lifetime-monotonic (never resets across checkpoint restores).
-# 5 B tokens ≈ 50 k/day × 365 days × 274× headroom.
 token_budget = 5_000_000_000
 priority     = 10
 
@@ -171,11 +121,8 @@ capabilities = [
   { KbRead  = { segment = "ops:entities" } },
   { KbWrite = { segment = "ops:entities" } },
   { Mcp    = { server = "cron_trigger", tools = [] } },
-  # google_oauth is needed so the spawned inbox child inherits access to OAuth tools.
-  # Without this, filtered_specs omits google_oauth from the child's tool list.
   { Mcp    = { server = "google_oauth",  tools = [] } },
-  { FsWrite = { prefix = "./output" } },
-  # request_approval is a native tool with no required capability; always available.
+  { FsWrite = { prefix = "/run/output" } },
 ]
 
 task = """
@@ -278,7 +225,7 @@ anything from recent briefs that is still unresolved.
 
 STEP 6 — ASSEMBLE AND WRITE THE BRIEF
 Combine today's inbox summary with any unresolved context from the KB.
-Call write_file(path='./output/brief-{TODAY}.md', content=<the formatted brief below).
+Call write_file(path='/run/output/brief-{TODAY}.md', content=<the formatted brief below).
 
 Brief format:
 ```markdown
@@ -308,20 +255,6 @@ STEP 7 — LOOP BACK
 IMPORTANT: Do NOT emit a final answer. After writing the brief, IMMEDIATELY call
 cron_trigger.wait_for_trigger(timeout_s=20) to park until tomorrow's schedule.
 You are always-on. The loop never ends.
-
-## L1 Mode (optional — draft-reply approval gate)
-# Uncomment to enable draft-reply approval for the single most-urgent thread.
-# After STEP 3, before STEP 4:
-#
-# If response_needed is non-empty, take the top entry (highest urgency, earliest deadline).
-# Draft a brief reply (2-3 sentences, professional tone).
-# Call request_approval(
-#   kind='draft-reply', risk='medium',
-#   summary='Draft reply to: {subject}',
-#   args={'to': '{from}', 'draft': '{draft_text}'}
-# )
-# If approved: gmail send would go here (requires gmail.send OAuth scope — not enabled by default).
-# If denied: skip and continue to STEP 4.
 """
 
 [tools]
@@ -333,21 +266,3 @@ native = [
   "write_file",
   "request_approval",
 ]
-
-# ---------------------------------------------------------------------------
-# Agents 2 & 3: Inbox and Curator are spawned dynamically by the orchestrator.
-# They do not appear as [[agents]] entries — the orchestrator creates them at
-# runtime with spawn_agent, passing capabilities and task prompts inline.
-# The MCP servers above (cron_trigger, google_oauth) are available to all
-# children whose capabilities grant access.
-#
-# Inbox agent profile (for reference — spawned by orchestrator):
-#   caps:   Mcp{google_oauth}  (read-only Gmail; no Spawn, no FsWrite, no KB)
-#   model:  inherits orchestrator default (claude-sonnet-4-6)
-#   budget: 500_000 tokens
-#
-# Curator agent profile (for reference — spawned by orchestrator):
-#   caps:   KbWrite{ops:briefs}, KbWrite{ops:entities}
-#   model:  inherits orchestrator default (claude-sonnet-4-6)
-#   budget: 200_000 tokens
-# ---------------------------------------------------------------------------

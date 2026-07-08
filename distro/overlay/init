@@ -57,4 +57,10 @@ fi
 # agentd writes flight.jsonl to its cwd; /run/output is the host-visible mount.
 cd /run/output
 
-exec /usr/bin/agentd /etc/agentd/agent.toml
+# Select agentd config from kernel cmdline (agentd.config=<path>), fallback to agent.toml.
+# The systemd service unit passes agentd.config=/etc/agentd/cos.agents.toml via -append.
+# 'make run' and 'make test' pass no agentd.config= so they use the default agent.toml.
+_CFG=$(tr ' ' '\n' < /proc/cmdline | grep '^agentd\.config=' | head -1 | cut -d= -f2-)
+_CFG="${_CFG:-/etc/agentd/agent.toml}"
+
+exec /usr/bin/agentd "$_CFG"

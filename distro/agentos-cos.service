@@ -1,0 +1,69 @@
+# AgentOS Chief of Staff — QEMU-based systemd service
+#
+# Runs the AgentOS CoS agent inside a QEMU VM on a Linux x86_64 host with KVM.
+#
+# Prerequisites:
+#   - qemu-system-x86_64 installed
+#   - /dev/kvm accessible (for KVM acceleration; falls back to TCG if absent)
+#   - Pre-built rootfs at /opt/agentos/{bzImage,rootfs.cpio.gz}
+#     Build: make -C /path/to/agentOS/distro build
+#   - Dedicated system user 'agentos':
+#     sudo useradd -m -r -s /usr/sbin/nologin agentos
+#   - /home/agentos/.agentos-secrets/agentos.env with ALL required env vars
+#     (see docs/DEPLOYMENT.md for the complete template)
+#   - /home/agentos/.agentos-secrets/google.json (OAuth credentials)
+#     On Mac: agentctl auth google
+#     Then: scp ~/.agentos-secrets/google.json agentos@server:/home/agentos/.agentos-secrets/
+#
+# Install:
+#   sudo cp distro/agentos-cos.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now agentos-cos
+#
+# Monitor:
+#   sudo journalctl -u agentos-cos -f
+#   agentctl watch --url http://localhost:7999   (from the Linux host)
+#   # Remote: ssh -L 7999:localhost:7999 <server>, then agentctl watch --url http://localhost:7999
+#
+# Briefs:
+#   ls /home/agentos/.agentos-output/brief-*.md
+
+[Unit]
+Description=AgentOS Chief of Staff (QEMU/KVM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=10
+
+# Dedicated system user — create before enabling:
+#   sudo useradd -m -r -s /usr/sbin/nologin agentos
+User=agentos
+
+# QEMU invocation — 512 MB for agentd + Python3 MCP sidecars.
+# Kernel cmdline selects the CoS config; /init falls back to agent.toml if absent.
+# hostfwd binds to 127.0.0.1 (loopback) — prevents exposure on public IPs.
+# Remote agentctl watch: ssh -L 7999:localhost:7999 <server>
+ExecStart=/usr/bin/qemu-system-x86_64 \
+  -nographic \
+  -m 512M \
+  -accel kvm \
+  -kernel /opt/agentos/bzImage \
+  -initrd /opt/agentos/rootfs.cpio.gz \
+  -append "console=ttyS0 quiet ip=dhcp agentd.config=/etc/agentd/cos.agents.toml" \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:7999-:7999,hostfwd=tcp:127.0.0.1:8080-:8080 \
+  -device virtio-net-pci,netdev=net0 \
+  -virtfs local,path=/home/agentos/.agentos-secrets,mount_tag=secrets0,security_model=none,readonly=on,id=secrets0 \
+  -virtfs local,path=/home/agentos/.agentos-memory,mount_tag=memory0,security_model=none,id=memory0 \
+  -virtfs local,path=/home/agentos/.agentos-output,mount_tag=output0,security_model=none,id=output0
+
+# Ensure the writable directories exist before QEMU starts
+ExecStartPre=/bin/mkdir -p /home/agentos/.agentos-memory /home/agentos/.agentos-output
+
+ReadWritePaths=/home/agentos/.agentos-memory /home/agentos/.agentos-output
+ReadOnlyPaths=/home/agentos/.agentos-secrets
+
+[Install]
+WantedBy=multi-user.target

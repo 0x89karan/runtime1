@@ -3,6 +3,33 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [dx.3] - 2026-07-08 (v0.69.0)
+
+### Added — Linux QEMU production path
+
+- **`distro/buildroot.config`**: `BR2_PACKAGE_PYTHON3=y` + `BR2_PACKAGE_OPENSSL=y` — enables
+  Python3 and its ssl module so the stdlib-only MCP sidecars run inside the rootfs.
+- **`distro/Makefile`** — three changes:
+  - `RUN_NETDEV` variable: `user,id=net0,hostfwd=tcp:127.0.0.1:7999-:7999,...` wired only
+    into `make run` (not `make test`), preventing port conflicts on CI hosts.
+  - Python MCP overlay target: copies `docker/*.py` to `overlay/usr/lib/agentos/docker/`
+    at build time (source of truth stays in `docker/`; overlay is generated, not committed).
+  - `clean` target: removes `overlay/usr/lib/` alongside existing overlay artifacts.
+- **`distro/overlay/init`**: kernel cmdline `agentd.config=<path>` config selection —
+  parses `/proc/cmdline` for `agentd.config=`, falls back to `/etc/agentd/agent.toml`.
+  `make run`/`make test` unaffected (no `agentd.config=` in their cmdline).
+- **`distro/overlay/etc/agentd/cos.agents.toml`** (new): QEMU-mode CoS config with
+  absolute MCP paths, `/run/memory/memory.redb` store, `bind_addr = "0.0.0.0"` management
+  API, and `/run/output` FsWrite capability.
+- **`agentd/cos.agents.toml`**: `[management] enabled = true` so `agentctl watch` works in
+  dev mode. Default `bind_addr = "127.0.0.1"` (loopback — safe for local cargo run).
+- **`distro/agentos-cos.service`** (new): systemd unit for the Linux host. Runs
+  `qemu-system-x86_64` as `User=agentos` with `-accel kvm`, loopback hostfwd on ports
+  7999 and 8080, 512 MB RAM, and `ExecStartPre` to create writable dirs before boot.
+- **`docs/DEPLOYMENT.md`** (new): two-page operator guide covering Mac+Docker and Linux QEMU
+  paths, complete `agentos.env` template (including `TRIGGER_CRON`), SSH tunnel instructions
+  for remote `agentctl watch`, and troubleshooting commands.
+
 ## [cred.5] - 2026-07-08 (v0.68.0)
 
 ### Added — Credential Control Plane visibility

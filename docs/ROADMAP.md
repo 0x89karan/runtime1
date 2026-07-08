@@ -1029,31 +1029,7 @@ channel full); 404 on unknown ID; `ApprovalHttpApproved`/`ApprovalHttpDenied` fl
 removal in TUI; `status_detail` parsed from HTTP snapshot JSON; FUSE control channel always
 wired on Linux. Resolved p7.7-ar-01, p7.7-ar-02, p7.7-ar-04. 1096 workspace tests.
 
-**dx.3 — Linux QEMU production** *(depends on: dx.2)*
-Closes the loop: the pure OS vision running on a Linux server with hardware-accelerated
-KVM, systemd supervision, and the same secrets + approval model as the Mac Docker path.
-
-Scope:
-- `distro/Makefile`: add `secrets0` virtfs mount: `-virtfs
-  local,path=$(HOME)/.agentos-secrets,mount_tag=secrets0,security_model=mapped-xattr,readonly=on`.
-  Add `hostfwd=tcp::7999-:7999` and `hostfwd=tcp::8080-:8080` to the QEMU netdev line.
-- `distro/overlay/init` (PID-1 sh script): mount `secrets0` → `/run/secrets` alongside
-  existing `memory0` + `output0` mounts.
-- `agentd/cos.agents.toml`: verify all paths use `/run/secrets/` not env vars; add
-  `[management] enabled = true` so `agentctl watch` works from the Linux host.
-- `distro/agentos-cos.service` (new): systemd unit that launches the QEMU process,
-  `Restart=on-failure`, `WantedBy=multi-user.target`. Install path: `/etc/systemd/system/`.
-- `docs/DEPLOYMENT.md` (new, brief): two-page operator guide — Mac Docker path and
-  Linux QEMU path, from zero to `agentctl watch` showing a running CoS agent.
-
-Acceptance:
-- On a Linux x86-64 host with KVM: `systemctl start agentos-cos` → QEMU boots,
-  agentd starts, CoS cron agent runs.
-- `agentctl watch` on the Linux host (outside the VM) shows the Dashboard by talking
-  to `:7999` (QEMU hostfwd).
-- Browser at `http://server-ip:8080` shows pending approvals from inside the VM.
-- `~/.agentos-secrets/google.json` provisioned on Mac via `agentctl auth google`,
-  then `scp`'d to the Linux server — CoS brief runs with no OAuth dance on the server.
+~~**dx.3 — Linux QEMU production**~~ ✅ *(v0.69.0 — `distro/buildroot.config`: Python3+OpenSSL; `distro/Makefile`: RUN_NETDEV with loopback hostfwd:7999/8080, Python overlay target, clean fix; `distro/overlay/init`: kernel cmdline `agentd.config=` config selection; `distro/overlay/etc/agentd/cos.agents.toml`: QEMU-mode CoS config (bind_addr=0.0.0.0); `agentd/cos.agents.toml`: [management] enabled=true; `distro/agentos-cos.service`: systemd unit (User=agentos, loopback hostfwd, ExecStartPre mkdir); `docs/DEPLOYMENT.md`: two-page operator guide with complete agentos.env template and SSH tunnel instructions)*
 
 ---
 
