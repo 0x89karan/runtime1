@@ -697,7 +697,7 @@ mod tests {
     struct TestSource;
     impl DataSource for TestSource {
         fn load_snapshot(&self) -> Snapshot {
-            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, error: None }
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("mock: no control".into()) }
@@ -721,7 +721,7 @@ mod tests {
                 isolation:       String::new(),
                 pid:             0,
             }).collect(),
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         }
     }
 

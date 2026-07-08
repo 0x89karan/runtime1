@@ -165,13 +165,30 @@ impl UniversalAgent {
     }
 }
 
-/// Return the path to `runsc` if found on PATH, else None.
+/// Return the path to `runsc` if found on PATH and executable, else None.
 pub fn which_runsc() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     std::env::var_os("PATH")
         .iter()
         .flat_map(|p| std::env::split_paths(p))
         .map(|d| d.join("runsc"))
-        .find(|p| p.is_file())
+        .find(|p| {
+            if !p.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                p.metadata()
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        })
 }
 
 #[cfg(test)]

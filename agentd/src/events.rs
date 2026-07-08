@@ -167,6 +167,9 @@ pub enum EventKind {
     /// Orchestrated agent exited because the target agent was not found.
     /// data: { agent_id, reason: "agent_not_found" }
     OrchestratorExited,
+    /// Device-level isolation capabilities probed at startup.
+    /// data: { tier, arch, runsc: path|null, landlock: bool, seccomp: bool }
+    IsolationProbed,
     Error,
 }
 
@@ -256,6 +259,7 @@ mod tests {
         assert_eq!(kind_str(EventKind::OrchestratorInjected), "orchestrator_injected");
         assert_eq!(kind_str(EventKind::OrchestratorTurnComplete), "orchestrator_turn_complete");
         assert_eq!(kind_str(EventKind::OrchestratorExited), "orchestrator_exited");
+        assert_eq!(kind_str(EventKind::IsolationProbed), "isolation_probed");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

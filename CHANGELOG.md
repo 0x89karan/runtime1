@@ -3,6 +3,38 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [ma.4] - 2026-07-08 (v0.67.0)
+
+### Added — Isolation-tier detection + honest per-device reporting
+
+- **`agentd::isolation_caps::probe()`** — new module that probes device-level isolation
+  capabilities at startup and computes a coarse tier. Calls `which_runsc()` (gVisor),
+  `sandbox::landlock_available()` (Landlock ABI ≥ 1), and reads
+  `/proc/sys/kernel/seccomp/actions_avail` (x86_64 Linux only). Never panics; all
+  detection is fallback-safe.
+- **Tier taxonomy:** `full` = runsc AND landlock AND seccomp present; `capability` =
+  at least one present (including runsc-only); `none` = none detected.
+- **`IsolationCapsSummary`** on `SchedulerSnapshot` — Serialize-only struct carrying
+  `tier`, `arch`, `runsc` (path or null), `landlock`, `seccomp`.
+- **`INO_SYS_ISOLATION = 18`** — new FUSE virtual file `/agents/system/isolation` that
+  emits `IsolationCapsSummary` as JSON using `serde_json` (not hand-rolled).
+- **`IsolationProbed`** flight event emitted at startup with the full summary.
+- **`SysIsolation`** struct in `agentctl/src/watch/reader.rs` for JSON deserialization.
+- **`agentctl watch` System view** — color-coded isolation row: green=full,
+  yellow=capability, red=none; legend footer; `--plain` mode emits
+  `isolation_tier:` / `isolation_arch:` lines.
+- **`ma.4-ar-01 (P3)`** — `require_isolation_tier` config key deferred to TODOS.md.
+
+### Fixed
+
+- **Tier logic:** `classify_tier()` extracted as a pure function; middle branch fixed
+  from `landlock || seccomp` to `runsc || landlock || seccomp` so that gVisor-only
+  deployments report `capability` instead of incorrectly falling through to `none`.
+- **`which_runsc()`** now checks the executable bit (`mode & 0o111 != 0`) on Unix
+  in addition to `is_file()`; non-executable `runsc` files no longer register as present.
+- **`IsolationCapsSummary::default()`** now uses `std::env::consts::ARCH.to_string()`
+  instead of an empty string for the `arch` field.
+
 ## [orch.1] - 2026-07-07 (v0.66.0)
 
 ### Added — Interactive agent orchestrator

@@ -73,6 +73,26 @@ pub struct SysProvider {
     pub backend: String,
 }
 
+/// Parsed content of /agents/system/isolation — device-level isolation tier.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SysIsolation {
+    /// Coarse tier: "full" | "capability" | "none".
+    #[serde(default)]
+    pub tier:     String,
+    /// CPU architecture string (e.g. "x86_64", "aarch64").
+    #[serde(default)]
+    pub arch:     String,
+    /// Absolute path to runsc binary, or None when gVisor absent.
+    #[serde(default)]
+    pub runsc:    Option<String>,
+    /// True when Landlock ABI ≥ 1 is available.
+    #[serde(default)]
+    pub landlock: bool,
+    /// True when seccomp-bpf enforcement is available (x86_64 only).
+    #[serde(default)]
+    pub seccomp:  bool,
+}
+
 /// One pending approval request, parsed from a JSON line in /agents/approvals.
 #[derive(Deserialize, Debug, Clone)]
 pub struct PendingAction {
@@ -274,12 +294,18 @@ pub fn read_sys_provider(agents_dir: &Path) -> Option<SysProvider> {
 
 /// Load a full snapshot: agent list + system files.
 pub struct Snapshot {
-    pub agents:   Vec<AgentInfo>,
-    pub budget:   Option<SysBudget>,
-    pub queue:    Option<SysQueue>,
-    pub sandbox:  Option<SysSandbox>,
-    pub provider: Option<SysProvider>,
-    pub error:    Option<String>,
+    pub agents:    Vec<AgentInfo>,
+    pub budget:    Option<SysBudget>,
+    pub queue:     Option<SysQueue>,
+    pub sandbox:   Option<SysSandbox>,
+    pub provider:  Option<SysProvider>,
+    pub isolation: Option<SysIsolation>,
+    pub error:     Option<String>,
+}
+
+/// Read /agents/system/isolation
+pub fn read_sys_isolation(agents_dir: &Path) -> Option<SysIsolation> {
+    read_json(&agents_dir.join("system").join("isolation"))
 }
 
 pub fn load_snapshot(agents_dir: &Path) -> Snapshot {
@@ -291,10 +317,11 @@ pub fn load_snapshot(agents_dir: &Path) -> Snapshot {
         Err(e) => (vec![], Some(format!("{e:#}"))),
     };
     Snapshot {
-        budget:   read_sys_budget(agents_dir),
-        queue:    read_sys_queue(agents_dir),
-        sandbox:  read_sys_sandbox(agents_dir),
-        provider: read_sys_provider(agents_dir),
+        budget:    read_sys_budget(agents_dir),
+        queue:     read_sys_queue(agents_dir),
+        sandbox:   read_sys_sandbox(agents_dir),
+        provider:  read_sys_provider(agents_dir),
+        isolation: read_sys_isolation(agents_dir),
         agents,
         error,
     }
@@ -303,6 +330,61 @@ pub fn load_snapshot(agents_dir: &Path) -> Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sys_isolation_full_parses() {
+        let json = r#"{"tier":"full","arch":"x86_64","runsc":"/usr/bin/runsc","landlock":true,"seccomp":true}"#;
+        let s: SysIsolation = serde_json::from_str(json).unwrap();
+        assert_eq!(s.tier, "full");
+        assert_eq!(s.arch, "x86_64");
+        assert_eq!(s.runsc.as_deref(), Some("/usr/bin/runsc"));
+        assert!(s.landlock);
+        assert!(s.seccomp);
+    }
+
+    #[test]
+    fn sys_isolation_none_parses() {
+        let json = r#"{"tier":"none","arch":"aarch64","runsc":null,"landlock":false,"seccomp":false}"#;
+        let s: SysIsolation = serde_json::from_str(json).unwrap();
+        assert_eq!(s.tier, "none");
+        assert!(s.runsc.is_none());
+        assert!(!s.landlock);
+        assert!(!s.seccomp);
+    }
+
+    #[test]
+    fn sys_isolation_capability_landlock_only() {
+        let json = r#"{"tier":"capability","arch":"aarch64","runsc":null,"landlock":true,"seccomp":false}"#;
+        let s: SysIsolation = serde_json::from_str(json).unwrap();
+        assert_eq!(s.tier, "capability");
+        assert!(s.landlock);
+        assert!(!s.seccomp);
+    }
+
+    #[test]
+    fn read_sys_isolation_returns_none_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("system")).unwrap();
+        let result = read_sys_isolation(tmp.path());
+        assert!(result.is_none(), "missing isolation file must return None");
+    }
+
+    #[test]
+    fn read_sys_isolation_parses_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("system");
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(
+            sys.join("isolation"),
+            r#"{"tier":"capability","arch":"x86_64","runsc":null,"landlock":true,"seccomp":false}"#,
+        ).unwrap();
+        let result = read_sys_isolation(tmp.path());
+        assert!(result.is_some());
+        let iso = result.unwrap();
+        assert_eq!(iso.tier, "capability");
+        assert!(iso.landlock);
+        assert!(!iso.seccomp);
+    }
 
     #[test]
     fn sys_budget_parses_json() {
@@ -646,5 +728,15 @@ mod tests {
         let info = read_agent_info(tmp.path(), "a");
         assert!(matches!(info.budget, BudgetKind::Unlimited),
             "negative budget string must fall back to Unlimited");
+    }
+
+    #[test]
+    fn read_sys_isolation_returns_none_on_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("system");
+        std::fs::create_dir(&sys).unwrap();
+        std::fs::write(sys.join("isolation"), b"not valid json!!!").unwrap();
+        let result = read_sys_isolation(tmp.path());
+        assert!(result.is_none(), "malformed JSON must return None, not panic");
     }
 }

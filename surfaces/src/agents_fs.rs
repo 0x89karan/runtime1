@@ -74,6 +74,9 @@ pub(crate) const INO_APPROVALS: u64 = 16;
 /// /agents/system/egress_addr — bound HTTP proxy URL or "not configured" (p7.5b).
 #[cfg(any(test, target_os = "linux"))]
 const INO_SYS_EGRESS_ADDR: u64 = 17;
+/// /agents/system/isolation — device-level isolation tier JSON (ma.4).
+#[cfg(any(test, target_os = "linux"))]
+const INO_SYS_ISOLATION: u64 = 18;
 
 // Invariant: all per-agent file offsets must fit within DIR_STEP - 1 slots.
 #[cfg(any(test, target_os = "linux"))]
@@ -489,6 +492,14 @@ impl AgentsFs {
                     None       => "not configured\n".to_string(),
                 }
             }
+            INO_SYS_ISOLATION => {
+                let caps = snap.isolation_caps.as_ref()
+                    .cloned()
+                    .unwrap_or_default();
+                let mut json = serde_json::to_string(&caps).unwrap_or_default();
+                json.push('\n');
+                json
+            }
             _ => return None,
         };
         Some(content.into_bytes())
@@ -800,6 +811,7 @@ impl fuser::Filesystem for AgentsFs {
                     "sandbox"     => INO_SYS_SANDBOX,
                     "provider"    => INO_SYS_PROVIDER,
                     "egress_addr" => INO_SYS_EGRESS_ADDR,
+                    "isolation"   => INO_SYS_ISOLATION,
                     _ => { reply.error(libc::ENOENT); return; }
                 };
                 let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
@@ -930,7 +942,10 @@ impl fuser::Filesystem for AgentsFs {
             reply.attr(&TTL, &make_file_attr(INO_SYSTEM, 0, fuser::FileType::Directory));
             return;
         }
-        if (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) || ino == INO_SYS_EGRESS_ADDR {
+        if (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
+            || ino == INO_SYS_EGRESS_ADDR
+            || ino == INO_SYS_ISOLATION
+        {
             let sz = self.sys_file_content(ino).map(|c| c.len() as u64).unwrap_or(0);
             reply.attr(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile));
             return;
@@ -1094,6 +1109,7 @@ impl fuser::Filesystem for AgentsFs {
                     (INO_SYS_SANDBOX,      fuser::FileType::RegularFile, "sandbox".to_string()),
                     (INO_SYS_PROVIDER,     fuser::FileType::RegularFile, "provider".to_string()),
                     (INO_SYS_EGRESS_ADDR,  fuser::FileType::RegularFile, "egress_addr".to_string()),
+                    (INO_SYS_ISOLATION,    fuser::FileType::RegularFile, "isolation".to_string()),
                 ]
             }
 
@@ -1227,7 +1243,10 @@ impl fuser::Filesystem for AgentsFs {
         } else if let Some(kind) = self.dyn_ino_kind.get(&ino) {
             !matches!(kind, DynInoKind::KbSeg { .. })
         } else {
-            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino) || ino == INO_SYS_EGRESS_ADDR || ino == INO_APPROVALS
+            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
+                || ino == INO_SYS_EGRESS_ADDR
+                || ino == INO_SYS_ISOLATION
+                || ino == INO_APPROVALS
         };
         if is_file {
             reply.opened(0, fuser::consts::FOPEN_DIRECT_IO);
@@ -1349,6 +1368,7 @@ mod tests {
             sandbox:             Default::default(),
             pending_actions:     vec![],
             egress_addr:         None,
+            isolation_caps:      None,
         }))
     }
 
@@ -1369,6 +1389,7 @@ mod tests {
             sandbox:             SandboxSummary { any_sandboxed, ..Default::default() },
             pending_actions:     vec![],
             egress_addr:         None,
+            isolation_caps:      None,
         }))
     }
 
@@ -2328,6 +2349,7 @@ mod tests {
             },
             pending_actions:     vec![],
             egress_addr:         None,
+            isolation_caps:      None,
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
@@ -2436,6 +2458,7 @@ mod tests {
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
             pending_actions:     vec![],
             egress_addr:         None,
+            isolation_caps:      None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
@@ -2461,6 +2484,7 @@ mod tests {
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
             pending_actions:     vec![],
             egress_addr:         None,
+            isolation_caps:      None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a2");
@@ -2497,6 +2521,7 @@ mod tests {
             sandbox:             SandboxSummary { any_sandboxed: true, servers: vec![enf], degradations: vec![] },
             pending_actions:     vec![],
             egress_addr:         None,
+            isolation_caps:      None,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a3");
@@ -2621,7 +2646,7 @@ mod tests {
         // dispatch path (we can't call FUSE trait directly, but we can verify
         // that INO_CONTROL is the only ino that routes to write_buffers).
         let snap = make_snap(vec![agent_snap("a", AgentStatus::Running)]);
-        let mut fs = AgentsFs::new(snap, None, Some(Arc::new(|_: &[u8]| 0)));
+        let fs = AgentsFs::new(snap, None, Some(Arc::new(|_: &[u8]| 0)));
         // write_buffers is only populated by the FUSE write() handler for INO_CONTROL.
         // For other inodes, write() returns EROFS — we verify the buffer stays empty.
         assert!(fs.write_buffers.is_empty(), "write_buffers must start empty");
@@ -2679,6 +2704,44 @@ mod tests {
         assert_eq!(fs.process_control_flush(fh), 0, "release after flush must be noop");
     }
 
+    // ── INO_SYS_ISOLATION coverage (ma.4) ────────────────────────────────────
+
+    #[test]
+    fn sys_file_content_isolation_with_caps() {
+        use crate::snapshot::IsolationCapsSummary;
+        let snap = Arc::new(RwLock::new(SchedulerSnapshot {
+            isolation_caps: Some(IsolationCapsSummary {
+                runsc:    Some("/usr/bin/runsc".to_string()),
+                landlock: true,
+                seccomp:  true,
+                arch:     "x86_64".to_string(),
+                tier:     "full".to_string(),
+            }),
+            ..Default::default()
+        }));
+        let fs = AgentsFs::new(snap, None, None);
+        let content = fs.sys_file_content(INO_SYS_ISOLATION).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains("\"tier\":\"full\""),    "tier field");
+        assert!(s.contains("\"arch\":\"x86_64\""),  "arch field");
+        assert!(s.contains("\"runsc\":\"/usr/bin/runsc\""), "runsc field");
+        assert!(s.contains("\"landlock\":true"),    "landlock field");
+        assert!(s.contains("\"seccomp\":true"),     "seccomp field");
+    }
+
+    #[test]
+    fn sys_file_content_isolation_none_fallback() {
+        // When isolation_caps is None (startup race), content uses safe defaults.
+        let snap = make_snap(vec![]);
+        let fs = AgentsFs::new(snap, None, None);
+        let content = fs.sys_file_content(INO_SYS_ISOLATION).unwrap();
+        let s = String::from_utf8(content).unwrap();
+        assert!(s.contains("\"tier\":\"none\""),    "fallback tier must be none");
+        assert!(s.contains("\"landlock\":false"),   "fallback landlock must be false");
+        assert!(s.contains("\"seccomp\":false"),    "fallback seccomp must be false");
+        assert!(s.contains("\"runsc\":null"),       "fallback runsc must be null");
+    }
+
     // ── INO_APPROVALS coverage (con.1 regression guard) ──────────────────────
 
     #[test]
@@ -2694,10 +2757,13 @@ mod tests {
         // Regression guard: INO_APPROVALS must satisfy the open() is_file predicate.
         // Before con.1 the || ino == INO_APPROVALS arm was missing, causing open()
         // to return ENOENT for /agents/approvals.
-        let ino = INO_APPROVALS;
-        let is_pseudofile = (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
-            || ino == INO_SYS_EGRESS_ADDR
-            || ino == INO_APPROVALS;
-        assert!(is_pseudofile, "INO_APPROVALS must be in the open() is_file predicate");
+        let is_pseudofile = |ino: u64| {
+            (INO_SYS_BUDGET..=INO_SYS_PROVIDER).contains(&ino)
+                || ino == INO_SYS_EGRESS_ADDR
+                || ino == INO_SYS_ISOLATION
+                || ino == INO_APPROVALS
+        };
+        assert!(is_pseudofile(INO_APPROVALS),    "INO_APPROVALS must satisfy open() predicate");
+        assert!(is_pseudofile(INO_SYS_ISOLATION), "INO_SYS_ISOLATION must satisfy open() predicate");
     }
 }

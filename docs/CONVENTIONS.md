@@ -130,6 +130,7 @@ Phase 0 kinds (canonical — do not rename):
 | `orchestrator_injected` | orchestrator injected a new user turn into a waiting agent (agent_id, text_len: usize) (orch.1+) |
 | `orchestrator_turn_complete` | orchestrated agent completed a turn and parked, awaiting next inject (agent_id, answer) (orch.1+) |
 | `orchestrator_exited` | orchestrated agent exited; typically because the target agent was not found (agent_id, reason) (orch.1+) |
+| `isolation_probed` | device-level isolation capabilities probed at startup (tier, arch, runsc: path\|null, landlock: bool, seccomp: bool) (ma.4+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

@@ -10,6 +10,7 @@ pub mod evidence;
 pub mod events;
 pub mod flight_recorder;
 pub mod inference;
+pub mod isolation_caps;
 pub mod loopback_proxy;
 pub mod management;
 pub mod memory;

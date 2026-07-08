@@ -380,6 +380,16 @@ wired to HTTP inject path); `templates/orchestrator.template.toml` — new catal
 agentd via healthz, cold-starts one if absent, waits 15 s, then execs `agentctl orchestrate`; forwards
 SIGTERM/SIGINT to agentd for graceful checkpoint on `docker stop`; `AGENTD_MANAGEMENT_ENABLED=true` env var
 enables management HTTP API without editing TOML.
+**ma.4 complete (v0.67.0).** Isolation-tier detection + honest per-device reporting:
+`agentd/src/isolation_caps.rs` new module with `probe()` → `IsolationCapsSummary`; `sandbox::landlock_available()`
+new public function (ABI ≥ 1 check); `detect_seccomp()` reads `/proc/sys/kernel/seccomp/actions_avail` on
+x86_64 Linux only; tier taxonomy: `full` = runsc AND landlock AND seccomp, `capability` = any one or more
+present (including runsc-only), `none` = none detected; `IsolationCapsSummary` struct on `SchedulerSnapshot` (Serialize-only, skip_serializing_if None);
+`INO_SYS_ISOLATION = 18` FUSE virtual file `/agents/system/isolation`; `IsolationProbed` flight event at startup;
+`SysIsolation` struct in `agentctl/src/watch/reader.rs`; `isolation_from_json` in `source.rs`; color-coded
+isolation row in `agentctl watch` System view (green=full, yellow=capability, red=none) + legend; plain-mode
+`isolation_tier:`/`isolation_arch:` lines; `ma.4-ar-01 (P3)` `require_isolation_tier` config key deferred to
+TODOS.md; 1218 workspace tests.
 
 ## How to work here
 

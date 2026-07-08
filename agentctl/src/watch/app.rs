@@ -5,7 +5,7 @@ use agentd::capability::Capability;
 use super::approvals::ApprovalsViewState;
 use super::inspector::InspectorState;
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
-use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox};
+use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysIsolation, SysProvider, SysQueue, SysSandbox};
 use super::spawn::{load_spawn_templates, SpawnTemplate};
 use super::topology::{build_graph, TopologyGraph};
 
@@ -411,6 +411,8 @@ pub struct App {
     pub queue:           Option<SysQueue>,
     pub sandbox:         Option<SysSandbox>,
     pub provider:        Option<SysProvider>,
+    /// Device-level isolation capabilities, populated at startup by agentd.
+    pub isolation:       Option<SysIsolation>,
     pub error:           Option<String>,
     /// Topology graph, rebuilt on every tick.
     pub topology:        TopologyGraph,
@@ -445,6 +447,7 @@ impl App {
             queue:           None,
             sandbox:         None,
             provider:        None,
+            isolation:       None,
             error:           None,
             topology:        TopologyGraph::default(),
             topology_scroll: 0,
@@ -477,12 +480,13 @@ impl App {
         if self.selected_id.is_none() {
             self.selected_id = snap.agents.first().map(|a| a.id.clone());
         }
-        self.agents   = snap.agents;
-        self.budget   = snap.budget;
-        self.queue    = snap.queue;
-        self.sandbox  = snap.sandbox;
-        self.provider = snap.provider;
-        self.error    = snap.error;
+        self.agents    = snap.agents;
+        self.budget    = snap.budget;
+        self.queue     = snap.queue;
+        self.sandbox   = snap.sandbox;
+        self.provider  = snap.provider;
+        self.isolation = snap.isolation;
+        self.error     = snap.error;
         // Parse flight.jsonl for message edges only while the Topology view is
         // active — reading up to 512 KB on every tick in other views causes stutter.
         let log = if self.view == View::Topology { self.log_path.as_deref() } else { None };
@@ -612,12 +616,13 @@ mod tests {
 
     fn make_snapshot(ids: &[&str]) -> Snapshot {
         Snapshot {
-            agents:   ids.iter().map(|id| make_agent(id)).collect(),
-            budget:   None,
-            queue:    None,
-            sandbox:  None,
-            provider: None,
-            error:    None,
+            agents:    ids.iter().map(|id| make_agent(id)).collect(),
+            budget:    None,
+            queue:     None,
+            sandbox:   None,
+            provider:  None,
+            isolation: None,
+            error:     None,
         }
     }
 

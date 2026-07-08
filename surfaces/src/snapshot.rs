@@ -2,6 +2,36 @@ use std::sync::{Arc, RwLock};
 
 use serde::Serialize;
 
+/// Device-level isolation capability report, computed once at startup by
+/// `agentd::isolation_caps::probe()` and propagated into the snapshot.
+///
+/// Surfaces are Serialize-only; agentctl defines its own Deserialize struct.
+#[derive(Clone, Serialize)]
+pub struct IsolationCapsSummary {
+    /// Absolute path to the `runsc` binary, or None when gVisor is not installed.
+    pub runsc:     Option<String>,
+    /// True when the kernel supports any Landlock ABI (≥ 1, Linux ≥ 5.13).
+    pub landlock:  bool,
+    /// True when this build can enforce seccomp-bpf rules (x86_64 Linux only).
+    pub seccomp:   bool,
+    /// CPU architecture string from `std::env::consts::ARCH` (e.g. "x86_64", "aarch64").
+    pub arch:      String,
+    /// Coarse device-level tier: "full" | "capability" | "none".
+    pub tier:      String,
+}
+
+impl Default for IsolationCapsSummary {
+    fn default() -> Self {
+        Self {
+            runsc:    None,
+            landlock: false,
+            seccomp:  false,
+            arch:     std::env::consts::ARCH.to_string(),
+            tier:     "none".to_string(),
+        }
+    }
+}
+
 /// A point-in-time snapshot of all running agents, written by the scheduler
 /// and read by the FUSE handler. Uses std::sync::RwLock (not tokio) because
 /// the FUSE handler runs on a plain OS thread, not inside a tokio runtime.
@@ -76,6 +106,10 @@ pub struct SchedulerSnapshot {
     /// Bound address of the HTTP egress proxy, e.g. "http://127.0.0.1:9100".
     /// None when the proxy is not configured.
     pub egress_addr:         Option<String>,
+    /// Device-level isolation capabilities, populated at startup before FUSE mount.
+    /// None until isolation_caps::probe() runs (typically available immediately).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_caps:      Option<IsolationCapsSummary>,
 }
 
 #[derive(Clone)]

@@ -857,8 +857,25 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     let snapshot: Arc<RwLock<SchedulerSnapshot>> =
         Arc::new(RwLock::new(SchedulerSnapshot::default()));
 
-    // Set static snapshot fields (provider model + sandbox status) once at startup,
-    // before the FUSE mount, so the /agents/system/ files are accurate from first access.
+    // Probe device-level isolation capabilities before the FUSE mount so the
+    // /agents/system/isolation file is accurate from first access.
+    let isolation_caps = agentd::isolation_caps::probe();
+    recorder.record(
+        "agentd",
+        None,
+        EventKind::IsolationProbed,
+        serde_json::json!({
+            "tier":     isolation_caps.tier,
+            "arch":     isolation_caps.arch,
+            "runsc":    isolation_caps.runsc,
+            "landlock": isolation_caps.landlock,
+            "seccomp":  isolation_caps.seccomp,
+        }),
+    );
+
+    // Set static snapshot fields (provider model + sandbox status + isolation caps) once
+    // at startup, before the FUSE mount, so the /agents/system/ files are accurate from
+    // first access.
     if let Ok(mut snap) = snapshot.write() {
         snap.provider_model = cfg.model.model.clone();
         snap.sandbox = surfaces::SandboxSummary {
@@ -866,6 +883,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             servers:        server_enforcements,
             degradations:   degradation_set.into_iter().collect(),
         };
+        snap.isolation_caps = Some(isolation_caps);
     }
 
     #[cfg(target_os = "linux")]

@@ -247,6 +247,15 @@ the CoS coordinator pattern are the building blocks. To be scoped via `/office-h
   `[[sample_tasks]]` array-of-tables to a top-level inline array
   `sample_tasks = ["...", "..."]`. (`templates/orchestrator.template.toml`)
 
+## Track MA — Open (from ma.4)
+
+- **ma.4-ar-01 (P3) — `require_isolation_tier` config key not yet implemented.**
+  `probe()` runs and reports the tier honestly, but there is no config field to
+  fail startup when `probe().tier < declared_tier`. Add a `[isolation]` section to
+  `agentd.toml` with a `require_tier = "full" | "capability" | "none"` key; fail
+  startup with a descriptive error if the probed tier is weaker than required.
+  (`agentd/src/config.rs`, `agentd/src/isolation_caps.rs`, `agentd/src/main.rs`)
+
 ## Phase 5 — Open (deferred from p5.9 hardening; all P2, none data-loss-class)
 
 See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2s remain:

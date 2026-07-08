@@ -312,6 +312,37 @@ fn render_system(f: &mut Frame, app: &App) {
             Span::styled(format!(" {deg}"), Style::default().fg(Color::Yellow)),
         ]));
     }
+    // Isolation tier line (ma.4).
+    let (iso_text, iso_style) = match app.isolation.as_ref() {
+        None => (
+            "unknown".to_string(),
+            Style::default(),
+        ),
+        Some(iso) => {
+            let tier_style = match iso.tier.as_str() {
+                "full"       => Style::default().fg(Color::Green),
+                "capability" => Style::default().fg(Color::Yellow),
+                _            => Style::default().fg(Color::Red),
+            };
+            let runsc_str = sanitize(iso.runsc.as_deref().unwrap_or("none"));
+            let text = format!(
+                "{} (arch={} runsc={} landlock={} seccomp={})",
+                sanitize(&iso.tier), sanitize(&iso.arch), runsc_str, iso.landlock, iso.seccomp
+            );
+            (text, tier_style)
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  Isolation: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(iso_text, iso_style),
+    ]));
+    // Legend: capability = kernel-level sandbox only (Landlock and/or seccomp, no gVisor).
+    lines.push(Line::from(vec![
+        Span::styled(
+            "             (full=gVisor+landlock+seccomp  capability=kernel-only  none=unsandboxed)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -1021,6 +1052,15 @@ pub fn render_plain(app: &App) -> String {
     if let Some(q) = app.queue.as_ref() {
         out.push_str(&format!("queue_depth: {}\n", q.depth));
     }
+    if let Some(iso) = app.isolation.as_ref() {
+        out.push_str(&format!("isolation_tier: {}\n", sanitize(&iso.tier)));
+        out.push_str(&format!("isolation_arch: {}\n", sanitize(&iso.arch)));
+        if let Some(p) = &iso.runsc {
+            out.push_str(&format!("isolation_runsc: {}\n", sanitize(p)));
+        }
+        out.push_str(&format!("isolation_landlock: {}\n", iso.landlock));
+        out.push_str(&format!("isolation_seccomp: {}\n", iso.seccomp));
+    }
     if let Some(sb) = app.sandbox.as_ref() {
         out.push_str(&format!("sandbox: any_sandboxed={}\n", sb.any_sandboxed));
         for s in &sb.servers {
@@ -1176,7 +1216,7 @@ mod tests {
     #[test]
     fn render_plain_no_agents_outputs_none_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: (none)"), "empty agent list must produce '(none)' line");
@@ -1185,7 +1225,7 @@ mod tests {
     #[test]
     fn render_plain_no_provider_omits_provider_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("provider:"), "no provider → no provider line");
@@ -1194,7 +1234,7 @@ mod tests {
     #[test]
     fn render_plain_no_budget_omits_tokens_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("tokens_spent:"), "no budget → no tokens_spent line");
@@ -1206,7 +1246,7 @@ mod tests {
     fn render_plain_error_appears_in_output() {
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
-            error: Some("permission denied".to_string()),
+            isolation: None, error: Some("permission denied".to_string()),
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("error: permission denied"));
@@ -1219,7 +1259,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
             provider: Some(SysProvider { model: "claude-opus-4".to_string(), backend: "anthropic".to_string() }),
-            error: None,
+            isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("provider: claude-opus-4 (anthropic)"));
@@ -1230,7 +1270,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![],
             budget: Some(SysBudget { spent: 99_000, total: 0 }),
-            queue: None, sandbox: None, provider: None, error: None,
+            queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("tokens_spent: 99000"));
@@ -1241,7 +1281,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![], budget: None,
             queue: Some(SysQueue { depth: 7 }),
-            sandbox: None, provider: None, error: None,
+            sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("queue_depth: 7"));
@@ -1255,7 +1295,7 @@ mod tests {
             agents: vec![
                 make_agent("scout-1", "running", 1500, vec!["read_file".to_string(), "write_file".to_string()]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: 1"));
@@ -1273,7 +1313,7 @@ mod tests {
                 make_agent("a", "done", 0, vec![]),
                 make_agent("b", "failed", 500, vec![]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: 2"));
@@ -1285,7 +1325,7 @@ mod tests {
     fn render_plain_agent_with_no_tools_shows_zero() {
         let snap = Snapshot {
             agents: vec![make_agent("agent-x", "running", 0, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("tools=0"));
@@ -1299,7 +1339,7 @@ mod tests {
         a.parent_id = None;
         let snap = Snapshot {
             agents: vec![a],
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("topology:"), "topology header must appear");
@@ -1312,7 +1352,7 @@ mod tests {
         child.parent_id = Some("coordinator".to_string());
         let snap = Snapshot {
             agents: vec![child],
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("parent=coordinator"), "child agent must show parent id");
@@ -1340,7 +1380,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("sandbox: any_sandboxed=true"), "any_sandboxed must appear");
@@ -1372,7 +1412,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("transport=http"), "HTTP transport must appear in render_plain output");
@@ -1395,7 +1435,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("isolation=gvisor"), "gvisor isolation must appear in render_plain output");
@@ -1410,7 +1450,7 @@ mod tests {
         for status in &["running", "deferred", "awaiting_child", "done", "failed", "unknown-xyz"] {
             let snap = Snapshot {
                 agents: vec![make_agent("a", status, 0, vec![])],
-                budget: None, queue: None, sandbox: None, provider: None, error: None,
+                budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
             };
             let out = render_plain(&app_from_snap(snap));
             assert!(out.contains(&format!("[{status}]")),
@@ -1423,7 +1463,7 @@ mod tests {
     fn tmpdir() -> tempfile::TempDir { tempfile::tempdir().unwrap() }
 
     fn empty_snap() -> Snapshot {
-        Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, error: None }
+        Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None }
     }
 
     fn app_with_dir(dir: &std::path::Path, snap: Snapshot) -> App {
@@ -1470,7 +1510,7 @@ mod tests {
         std::fs::write(mem.join("short_term"), "key insight here\nfact two\n").unwrap();
         let snap = Snapshot {
             agents: vec![make_agent("agent-1", "running", 0, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_with_dir(d.path(), snap));
         assert!(out.contains("key insight here"), "short_term item must appear in output");
@@ -1520,7 +1560,7 @@ mod tests {
                 make_agent("agent-a", "running", 0, vec![]),
                 make_agent("agent-b", "running", 0, vec![]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, error: None,
         };
         let out = render_plain(&app_with_dir(d.path(), snap));
         assert!(out.contains("agent-a"), "agent-a must appear in memory section");
@@ -1585,6 +1625,57 @@ mod tests {
         assert_eq!(*state.active_scroll_mut(), 7, "LongTerm scroll must survive pane switch");
     }
 
+    // ── render_plain: isolation tier (ma.4) ──────────────────────────────────
+
+    #[test]
+    fn render_plain_isolation_tier_none_when_not_present() {
+        let out = render_plain(&app_from_snap(empty_snap()));
+        // No isolation_caps → no isolation_tier line.
+        assert!(!out.contains("isolation_tier:"), "no isolation field → no isolation_tier line");
+    }
+
+    #[test]
+    fn render_plain_isolation_tier_full_appears_in_output() {
+        use crate::watch::reader::SysIsolation;
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
+            isolation: Some(SysIsolation {
+                tier:     "full".to_string(),
+                arch:     "x86_64".to_string(),
+                runsc:    Some("/usr/bin/runsc".to_string()),
+                landlock: true,
+                seccomp:  true,
+            }),
+            error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("isolation_tier: full"), "full tier must appear in plain output");
+        assert!(out.contains("isolation_arch: x86_64"), "arch must appear");
+        assert!(out.contains("isolation_runsc: /usr/bin/runsc"), "runsc path must appear");
+        assert!(out.contains("isolation_landlock: true"), "landlock=true must appear");
+        assert!(out.contains("isolation_seccomp: true"), "seccomp=true must appear");
+    }
+
+    #[test]
+    fn render_plain_isolation_runsc_absent_when_none() {
+        use crate::watch::reader::SysIsolation;
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
+            isolation: Some(SysIsolation {
+                tier:     "capability".to_string(),
+                arch:     "aarch64".to_string(),
+                runsc:    None,
+                landlock: true,
+                seccomp:  false,
+            }),
+            error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("isolation_tier: capability"));
+        // runsc must not be printed when None.
+        assert!(!out.contains("isolation_runsc:"), "runsc line must be omitted when None");
+    }
+
     #[test]
     fn render_memory_search_active_highlighted() {
         use crate::watch::app::MemoryPaneState;
@@ -1601,5 +1692,59 @@ mod tests {
         state.search_active = false;
         assert!(!state.search_active);
         assert_eq!(state.search_query, "arch", "query must persist after closing search mode");
+    }
+
+    // ── render_plain: isolation tier ────────────────────────────────────────
+
+    #[test]
+    fn render_plain_isolation_none_omits_isolation_lines() {
+        use crate::watch::reader::Snapshot;
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None,
+            provider: None, isolation: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(!out.contains("isolation_tier:"),
+            "absent isolation must omit isolation_tier line");
+    }
+
+    #[test]
+    fn render_plain_isolation_capability_appears() {
+        use crate::watch::reader::{Snapshot, SysIsolation};
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None,
+            provider: None, error: None,
+            isolation: Some(SysIsolation {
+                tier:     "capability".to_string(),
+                arch:     "aarch64".to_string(),
+                runsc:    None,
+                landlock: true,
+                seccomp:  false,
+            }),
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("isolation_tier: capability"),
+            "capability tier must appear in plain output; got:\n{out}");
+        assert!(out.contains("isolation_arch: aarch64"),
+            "arch must appear in plain output; got:\n{out}");
+    }
+
+    #[test]
+    fn render_plain_isolation_none_tier_appears() {
+        use crate::watch::reader::{Snapshot, SysIsolation};
+        let snap = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None,
+            provider: None, error: None,
+            isolation: Some(SysIsolation {
+                tier:     "none".to_string(),
+                arch:     "x86_64".to_string(),
+                runsc:    None,
+                landlock: false,
+                seccomp:  false,
+            }),
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("isolation_tier: none"),
+            "none tier must appear in plain output; got:\n{out}");
     }
 }

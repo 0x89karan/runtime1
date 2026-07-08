@@ -177,6 +177,22 @@ pub fn landlock_v4_available() -> bool {
     }
 }
 
+/// Returns true if the running kernel supports any Landlock version (ABI ≥ 1, Linux ≥ 5.13).
+///
+/// Use this to probe whether Landlock enforcement is possible at all, regardless of
+/// which specific features (network port rules, etc.) are available.
+/// On non-Linux, always returns false.
+pub fn landlock_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        linux::query_landlock_abi_version() >= 1
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 /// Compile sandbox rules into a `CompiledSandbox` ready for `apply_compiled`.
 ///
 /// May allocate (opens file descriptors, builds Vec); must NOT be called inside
@@ -1143,5 +1159,13 @@ mod tests {
     fn landlock_v4_available_returns_false_on_non_linux() {
         assert!(!landlock_v4_available(),
             "landlock_v4_available must be false on non-Linux");
+    }
+
+    /// On non-Linux platforms `landlock_available()` must always return `false`.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn landlock_available_returns_false_on_non_linux() {
+        assert!(!landlock_available(),
+            "landlock_available must be false on non-Linux");
     }
 }

@@ -1062,8 +1062,7 @@ Acceptance:
 Design + `/autoplan`-ready increments live in **`docs/DEPLOYMENT-TOPOLOGY.md`**; fold them in here
 when picked up. Two tracks — substrate reach, not the flagship (the CoS harness stays that):
 
-- **Track MA (multi-arch):** ~~`ma.1` aarch64 binary target~~ ✅ *(v0.55.0 — cross+QEMU CI, Cross.toml, size guard, make clippy-aarch64)* · ~~`ma.2` arm64 distro + `qemu-system-aarch64 -accel hvf` boot~~ ✅ *(v0.57.0 — aarch64 Buildroot config, PL011 UART, HVF/KVM/TCG auto-detect, ARCH= Makefile, distro-aarch64 CI dry-run)* · ~~`ma.3` multi-arch container images~~ ✅ *(v0.56.0 — ghcr.io linux/amd64+linux/arm64 manifest, QEMU buildx, GHA cache, gated on both Rust CI jobs)* · `ma.4`
-  isolation-tier detection + honest per-device reporting. **Decide multi-arch before dx.3/dx.4 freeze
+- **Track MA (multi-arch):** ~~`ma.1` aarch64 binary target~~ ✅ *(v0.55.0 — cross+QEMU CI, Cross.toml, size guard, make clippy-aarch64)* · ~~`ma.2` arm64 distro + `qemu-system-aarch64 -accel hvf` boot~~ ✅ *(v0.57.0 — aarch64 Buildroot config, PL011 UART, HVF/KVM/TCG auto-detect, ARCH= Makefile, distro-aarch64 CI dry-run)* · ~~`ma.3` multi-arch container images~~ ✅ *(v0.56.0 — ghcr.io linux/amd64+linux/arm64 manifest, QEMU buildx, GHA cache, gated on both Rust CI jobs)* · ~~`ma.4` isolation-tier detection + honest per-device reporting~~ ✅ *(v0.67.0 — probe() in isolation_caps.rs, IsolationCapsSummary in surfaces, INO_SYS_ISOLATION FUSE file, isolation_probed flight event, agentctl watch System view color-coded tier)* **Decide multi-arch before dx.3/dx.4 freeze
   x86-only** — parameterize the deployment by `$ARCH` from the start rather than retrofit.
 - **Track MESH (multi-instance):** `mesh.1` instance registry (on p7.7) · `mesh.2` federated A2A across
   instances · `mesh.3` shared memory sidecar (on h8.1 — compute/memory separation) · `mesh.4`

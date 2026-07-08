@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::reader::{
     self, AgentInfo, AgentSandbox, BudgetKind, PendingAction, ServerEnforcement,
-    Snapshot, SysBudget, SysProvider, SysQueue, SysSandbox,
+    Snapshot, SysBudget, SysIsolation, SysProvider, SysQueue, SysSandbox,
 };
 
 /// Spawn request sent to the management API (orch.1+).
@@ -59,6 +59,7 @@ pub struct FuseSource {
 
 impl DataSource for FuseSource {
     fn load_snapshot(&self) -> Snapshot {
+        // reader::load_snapshot already populates isolation via read_sys_isolation().
         reader::load_snapshot(&self.agents_dir)
     }
 
@@ -154,12 +155,13 @@ impl DataSource for HttpSource {
         let val = match self.get_json("/api/v1/snapshot") {
             Ok(v)  => v,
             Err(e) => return Snapshot {
-                agents:   vec![],
-                budget:   None,
-                queue:    None,
-                sandbox:  None,
-                provider: None,
-                error:    Some(format!("HTTP error: {e:#}")),
+                agents:    vec![],
+                budget:    None,
+                queue:     None,
+                sandbox:   None,
+                provider:  None,
+                isolation: None,
+                error:     Some(format!("HTTP error: {e:#}")),
             },
         };
 
@@ -186,7 +188,9 @@ impl DataSource for HttpSource {
             backend: "anthropic".to_string(),
         });
 
-        Snapshot { agents, budget, queue, sandbox, provider, error: None }
+        let isolation = isolation_from_json(&val["isolation_caps"]);
+
+        Snapshot { agents, budget, queue, sandbox, provider, isolation, error: None }
     }
 
     fn load_approvals(&self) -> Vec<PendingAction> {
@@ -300,6 +304,19 @@ fn agent_sandbox_from_json(v: &Value) -> Option<AgentSandbox> {
         })
         .collect();
     Some(AgentSandbox { servers })
+}
+
+fn isolation_from_json(v: &Value) -> Option<SysIsolation> {
+    if v.is_null() {
+        return None;
+    }
+    Some(SysIsolation {
+        tier:     v["tier"].as_str().unwrap_or("none").to_string(),
+        arch:     v["arch"].as_str().unwrap_or("").to_string(),
+        runsc:    v["runsc"].as_str().map(str::to_string),
+        landlock: v["landlock"].as_bool().unwrap_or(false),
+        seccomp:  v["seccomp"].as_bool().unwrap_or(false),
+    })
 }
 
 fn sandbox_from_json(v: &Value) -> Option<SysSandbox> {
@@ -512,6 +529,56 @@ mod tests {
         assert!(result.is_err(), "approve should fail when server is unreachable");
         let result = src.deny("act_0", Some("reason"));
         assert!(result.is_err(), "deny should fail when server is unreachable");
+    }
+
+    #[test]
+    fn isolation_from_json_full_tier() {
+        let v = serde_json::json!({
+            "tier": "full",
+            "arch": "x86_64",
+            "runsc": "/usr/bin/runsc",
+            "landlock": true,
+            "seccomp": true,
+        });
+        let iso = isolation_from_json(&v).expect("must parse full tier");
+        assert_eq!(iso.tier, "full");
+        assert_eq!(iso.arch, "x86_64");
+        assert_eq!(iso.runsc.as_deref(), Some("/usr/bin/runsc"));
+        assert!(iso.landlock);
+        assert!(iso.seccomp);
+    }
+
+    #[test]
+    fn isolation_from_json_null_returns_none() {
+        let v = serde_json::Value::Null;
+        assert!(isolation_from_json(&v).is_none(), "null → None");
+    }
+
+    #[test]
+    fn isolation_from_json_none_tier_and_null_runsc() {
+        let v = serde_json::json!({
+            "tier": "none",
+            "arch": "aarch64",
+            "runsc": null,
+            "landlock": false,
+            "seccomp": false,
+        });
+        let iso = isolation_from_json(&v).unwrap();
+        assert_eq!(iso.tier, "none");
+        assert!(iso.runsc.is_none());
+        assert!(!iso.landlock);
+    }
+
+    #[test]
+    fn isolation_from_json_empty_object_uses_defaults() {
+        // An empty JSON object (non-null) must return Some with all unwrap_or defaults.
+        let v = serde_json::json!({});
+        let iso = isolation_from_json(&v).expect("empty object should return Some");
+        assert_eq!(iso.tier, "none");
+        assert_eq!(iso.arch, "");
+        assert!(!iso.landlock);
+        assert!(!iso.seccomp);
+        assert!(iso.runsc.is_none());
     }
 
     #[test]
