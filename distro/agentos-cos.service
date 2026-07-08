@@ -4,7 +4,7 @@
 #
 # Prerequisites:
 #   - qemu-system-x86_64 installed
-#   - /dev/kvm accessible (for KVM acceleration; falls back to TCG if absent)
+#   - /dev/kvm accessible (KVM required; no TCG fallback in this unit)
 #   - Pre-built rootfs at /opt/agentos/{bzImage,rootfs.cpio.gz}
 #     Build: make -C /path/to/agentOS/distro build
 #   - Dedicated system user 'agentos':

@@ -1,5 +1,9 @@
-# Pre-built agentd binary (copied in by `make build`; not tracked)
+# Pre-built binaries (copied in by `make build`; not tracked)
 overlay/usr/bin/agentd
+overlay/usr/bin/agentctl
+
+# Python MCP sidecars (copied into overlay by `make build`; not tracked)
+overlay/usr/lib/
 
 # Buildroot download cache and build tree
 build/

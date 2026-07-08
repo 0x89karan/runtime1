@@ -15,6 +15,9 @@ token_budget = 2000
 provider = "anthropic"
 model_id = "claude-haiku-4-5-20251001"
 
+[management]
+enabled = true
+
 [tools]
 native = ["all"]
 

@@ -136,7 +136,10 @@ overlay/etc/agentd/templates/.gitkeep:
 
 # Copy Python MCP sidecars into the rootfs overlay so they run inside the VM.
 # All servers use only Python stdlib — no pip packages needed beyond python3 + openssl.
-overlay/usr/lib/agentos/docker/.gitkeep:
+# Prerequisites list all source files so `make build` re-copies on any change.
+PYTHON_MCP_SRCS := $(wildcard ../docker/*_mcp.py)
+
+overlay/usr/lib/agentos/docker/.gitkeep: $(PYTHON_MCP_SRCS)
 	mkdir -p overlay/usr/lib/agentos/docker
 	cp ../docker/cron_mcp.py ../docker/oauth_mcp.py ../docker/http_mcp.py \
 	   ../docker/shell_mcp.py ../docker/search_mcp.py ../docker/fs_watch_mcp.py \
