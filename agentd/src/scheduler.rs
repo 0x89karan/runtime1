@@ -126,7 +126,9 @@ struct SchedulerState {
     proxy_registry:   Option<Arc<crate::egress::ProxyRegistry>>,
     /// Universal-tier child processes (p7.6). Keyed by agent ID.
     universal_agents: HashMap<String, UniversalAgent>,
-    /// Orchestrated agents parked after completing a turn, awaiting next inject.
+    /// Agent IDs registered as orchestrated — should park between turns instead of terminating.
+    orchestrated: HashSet<String>,
+    /// Agent IDs currently parked (terminal=true) between REPL turns, awaiting next inject.
     waiting: HashSet<String>,
     /// Credential gateway for per-agent grant projection (cred.5). None when disabled.
     cred_gw: Option<Arc<crate::credential::CredentialGateway>>,
@@ -134,14 +136,16 @@ struct SchedulerState {
 
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
 struct SchedulerRestored {
-    awaiting:          Vec<AwaitingEntry>,
-    mailboxes:         HashMap<String, Vec<MailMessage>>,
-    tokens_spent:      u64,
-    child_seq:         u64,
-    spawn_depths:      HashMap<String, u32>,
-    parent_map:        HashMap<String, String>,
-    pending_approvals: Vec<ParkedApprovalEntry>,
-    approval_seq:      u64,
+    awaiting:           Vec<AwaitingEntry>,
+    mailboxes:          HashMap<String, Vec<MailMessage>>,
+    tokens_spent:       u64,
+    child_seq:          u64,
+    spawn_depths:       HashMap<String, u32>,
+    parent_map:         HashMap<String, String>,
+    pending_approvals:  Vec<ParkedApprovalEntry>,
+    approval_seq:       u64,
+    waiting_agents:     Vec<String>,
+    orchestrated_agents: Vec<String>,
 }
 
 pub struct Scheduler {
@@ -199,15 +203,17 @@ impl Scheduler {
 
         if let Some(cp) = checkpoint {
             let SchedulerCheckpoint {
-                agents:            cp_agent_list,
-                awaiting:          cp_awaiting,
-                mailboxes:         cp_mailboxes,
-                tokens_spent:      cp_tokens,
-                child_seq:         cp_child_seq,
-                spawn_depths:      cp_spawn_depths,
-                parent_map:        cp_parent_map,
-                pending_approvals: cp_pending_approvals,
-                approval_seq:      cp_approval_seq,
+                agents:              cp_agent_list,
+                awaiting:            cp_awaiting,
+                mailboxes:           cp_mailboxes,
+                tokens_spent:        cp_tokens,
+                child_seq:           cp_child_seq,
+                spawn_depths:        cp_spawn_depths,
+                parent_map:          cp_parent_map,
+                pending_approvals:   cp_pending_approvals,
+                approval_seq:        cp_approval_seq,
+                waiting_agents:      cp_waiting_agents,
+                orchestrated_agents: cp_orchestrated_agents,
                 ..
             } = cp;
 
@@ -254,14 +260,16 @@ impl Scheduler {
             }
 
             restored = Some(SchedulerRestored {
-                awaiting:          cp_awaiting,
-                mailboxes:         cp_mailboxes,
-                tokens_spent:      cp_tokens,
-                child_seq:         cp_child_seq,
-                spawn_depths:      cp_spawn_depths,
-                parent_map:        cp_parent_map,
-                pending_approvals: cp_pending_approvals,
-                approval_seq:      cp_approval_seq,
+                awaiting:            cp_awaiting,
+                mailboxes:           cp_mailboxes,
+                tokens_spent:        cp_tokens,
+                child_seq:           cp_child_seq,
+                spawn_depths:        cp_spawn_depths,
+                parent_map:          cp_parent_map,
+                pending_approvals:   cp_pending_approvals,
+                approval_seq:        cp_approval_seq,
+                waiting_agents:      cp_waiting_agents,
+                orchestrated_agents: cp_orchestrated_agents,
             });
         } else {
             let mut universal_pending_local: Vec<AgentConfig> = Vec::new();
@@ -416,6 +424,7 @@ impl Scheduler {
             egress_addr,
             proxy_registry,
             universal_agents:   HashMap::new(),
+            orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
             cred_gw,
         };
@@ -444,6 +453,9 @@ impl Scheduler {
                     created_at: std::time::Instant::now(),
                 });
             }
+            // Restore orchestrated/waiting sets so parked agents are not re-stepped.
+            state.orchestrated.extend(r.orchestrated_agents);
+            state.waiting.extend(r.waiting_agents);
         }
 
         // Spawn universal-tier agents before the native seed loop.
@@ -514,6 +526,9 @@ impl Scheduler {
             state.mailboxes.entry(id.clone()).or_default();
             if parked_agent_ids.contains(&id) {
                 continue; // Already awaiting approval — do not re-step.
+            }
+            if state.waiting.contains(&id) {
+                continue; // Restored orchestrated agent parked between turns — do not re-step.
             }
             let priority = state.agents[&id].priority();
             let cap_set = state.agents[&id].cap_set_cloned();
@@ -640,8 +655,7 @@ impl Scheduler {
                                 EventKind::AgentFailed,
                                 json!({ "reason": "inference_error", "error": e.to_string() }),
                             );
-                            // Clear waiting so a dead orchestrated agent doesn't accept further injects.
-                            state.waiting.remove(&agent_id);
+                            // handle_agent_terminal() consolidates waiting/orchestrated cleanup.
                             handle_agent_terminal(
                                 agent_id,
                                 Err(e),
@@ -933,6 +947,10 @@ fn handle_agent_terminal(
     registry: &Arc<ToolRegistry>,
     recorder: &Arc<FlightRecorder>,
 ) {
+    // Always clear orchestration membership on termination — prevents phantom entries.
+    state.waiting.remove(&agent_id);
+    state.orchestrated.remove(&agent_id);
+
     if let Some(awaiting) = state.awaiting.remove(&agent_id) {
         // This agent is a child — inject its result into the waiting parent.
         let parent_id = awaiting.parent_id;
@@ -1360,15 +1378,26 @@ fn enqueue_or_defer(
         }
         AgentEffect::Completed(answer) => {
             // AgentCompleted event already emitted by AgentTask::step_with_response().
-            if state.waiting.contains(&agent_id) {
+            if state.orchestrated.contains(&agent_id) {
                 // Orchestrated agent: park it awaiting next inject rather than terminating.
+                // Cap the answer preview at 512 chars so the SSE event stays small.
+                // Use chars().count() for the guard (not len()) to match the char-based take().
+                let answer_preview: String = if answer.chars().count() > 512 {
+                    let mut s: String = answer.chars().take(512).collect();
+                    s.push_str("\n[output truncated — full text streamed above]");
+                    s
+                } else {
+                    answer.clone()
+                };
                 recorder.record(
                     &agent_id,
                     None,
                     EventKind::OrchestratorTurnComplete,
-                    json!({ "agent_id": &agent_id, "answer": &answer }),
+                    json!({ "agent_id": &agent_id, "answer": &answer_preview }),
                 );
+                // Park: add to waiting so inject path can re-activate.
                 // Agent remains in state.agents with terminal=true; Inject will reset it.
+                state.waiting.insert(agent_id);
             } else {
                 handle_agent_terminal(agent_id, Ok(answer), state, sched, gateway, registry, recorder);
             }
@@ -1376,7 +1405,7 @@ fn enqueue_or_defer(
         AgentEffect::Failed(msg) => {
             // AgentFailed event already emitted by AgentTask (budget/max-turns/etc.).
             // Inference-error AgentFailed is emitted in run() before this call.
-            state.waiting.remove(&agent_id);
+            // handle_agent_terminal() now consolidates waiting/orchestrated cleanup.
             handle_agent_terminal(
                 agent_id,
                 Err(anyhow::anyhow!("{msg}")),
@@ -1778,8 +1807,12 @@ fn dispatch_control_command(
                     EventKind::OrchestratorInjected,
                     json!({ "agent_id": &agent_id, "text_len": text_len }),
                 );
-                // Re-park so the next completion parks again instead of terminating.
-                state.waiting.insert(agent_id.clone());
+                // Do NOT pre-insert into state.waiting here. The agent is now
+                // in-flight (inference pending). The guard at line 1783 must reject
+                // concurrent injects until AgentEffect::Completed re-parks the agent
+                // via state.waiting.insert in the orchestrated branch. Pre-inserting
+                // here would allow a second inject to bypass the guard and produce
+                // two consecutive User turns in the same context, corrupting it.
                 enqueue_or_defer(effect, agent_id, turn, priority, caps, state, sched, gateway, registry, recorder);
             } else {
                 recorder.record(
@@ -1867,6 +1900,11 @@ fn dispatch_operator_spawn_inner(
     state.mailboxes.entry(agent_id.clone()).or_default();
     state.parent_map.insert(agent_id.clone(), "operator".to_string());
 
+    // Notify the HTTP spawn handler (ar-02). Best-effort: ignore send errors.
+    if let Some(tx) = req.confirm_tx {
+        let _ = tx.send(agent_id.clone());
+    }
+
     recorder.record(
         &agent_id,
         None,
@@ -1896,7 +1934,8 @@ fn dispatch_operator_spawn_inner(
     };
 
     if req.orchestrated {
-        state.waiting.insert(agent_id.clone());
+        // Mark as orchestrated so it parks instead of terminating on completion.
+        state.orchestrated.insert(agent_id.clone());
         recorder.record(
             &agent_id,
             None,
@@ -2228,11 +2267,13 @@ async fn poll_universal_agents(
 /// The deferred queue is intentionally omitted: those agents remain in `state.agents`
 /// in NeedInfer state, so step() re-derives their InferenceRequest on restore.
 fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
+    // Include waiting orchestrated agents (terminal=true) in addition to active agents.
+    // Their terminal flag is preserved so the seed loop skips them on restore.
     let agents: Vec<crate::checkpoint::AgentCheckpoint> = state
         .agents
-        .values()
-        .filter(|a| !a.is_terminal())
-        .map(|a| a.to_checkpoint())
+        .iter()
+        .filter(|(id, a)| !a.is_terminal() || state.waiting.contains(id.as_str()))
+        .map(|(_, a)| a.to_checkpoint())
         .collect();
 
     let awaiting: Vec<AwaitingEntry> = state
@@ -2259,16 +2300,18 @@ fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
         .collect();
 
     SchedulerCheckpoint {
-        format_version:    crate::checkpoint::FORMAT_VERSION,
+        format_version:      crate::checkpoint::FORMAT_VERSION,
         agents,
         awaiting,
-        mailboxes:         state.mailboxes.clone(),
-        tokens_spent:      state.tokens_spent,
-        child_seq:         state.child_seq,
-        spawn_depths:      state.spawn_depths.clone(),
-        parent_map:        state.parent_map.clone(),
+        mailboxes:           state.mailboxes.clone(),
+        tokens_spent:        state.tokens_spent,
+        child_seq:           state.child_seq,
+        spawn_depths:        state.spawn_depths.clone(),
+        parent_map:          state.parent_map.clone(),
         pending_approvals,
-        approval_seq:      state.approval_seq,
+        approval_seq:        state.approval_seq,
+        waiting_agents:      state.waiting.iter().cloned().collect(),
+        orchestrated_agents: state.orchestrated.iter().cloned().collect(),
     }
 }
 
@@ -3344,6 +3387,7 @@ mod tests {
             egress_addr:        None,
             proxy_registry:     None,
             universal_agents:   HashMap::new(),
+            orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
             cred_gw:            None,
         }
@@ -3523,16 +3567,18 @@ mod tests {
 
     fn minimal_scheduler_checkpoint(ids: &[&str]) -> SchedulerCheckpoint {
         SchedulerCheckpoint {
-            format_version:    crate::checkpoint::FORMAT_VERSION,
-            agents:            ids.iter().map(|id| minimal_agent_checkpoint(id)).collect(),
-            awaiting:          vec![],
-            mailboxes:         HashMap::new(),
-            tokens_spent:      20,
-            child_seq:         3,
-            spawn_depths:      ids.iter().map(|id| (id.to_string(), 0u32)).collect(),
-            parent_map:        HashMap::new(),
-            pending_approvals: vec![],
-            approval_seq:      0,
+            format_version:      crate::checkpoint::FORMAT_VERSION,
+            agents:              ids.iter().map(|id| minimal_agent_checkpoint(id)).collect(),
+            awaiting:            vec![],
+            mailboxes:           HashMap::new(),
+            tokens_spent:        20,
+            child_seq:           3,
+            spawn_depths:        ids.iter().map(|id| (id.to_string(), 0u32)).collect(),
+            parent_map:          HashMap::new(),
+            pending_approvals:   vec![],
+            approval_seq:        0,
+            waiting_agents:      vec![],
+            orchestrated_agents: vec![],
         }
     }
 
@@ -3624,16 +3670,18 @@ mod tests {
         // We check them by running a fresh scheduler seeded with a checkpoint that has non-zero values,
         // then immediately completing the agent before it can touch these values.
         let cp = SchedulerCheckpoint {
-            format_version:    crate::checkpoint::FORMAT_VERSION,
-            agents:            vec![minimal_agent_checkpoint("agent")],
-            awaiting:          vec![],
-            mailboxes:         HashMap::new(),
-            tokens_spent:      42,
-            child_seq:         7,
-            spawn_depths:      [("agent".to_string(), 0u32)].into_iter().collect(),
-            parent_map:        HashMap::new(),
-            pending_approvals: vec![],
-            approval_seq:      0,
+            format_version:      crate::checkpoint::FORMAT_VERSION,
+            agents:              vec![minimal_agent_checkpoint("agent")],
+            awaiting:            vec![],
+            mailboxes:           HashMap::new(),
+            tokens_spent:        42,
+            child_seq:           7,
+            spawn_depths:        [("agent".to_string(), 0u32)].into_iter().collect(),
+            parent_map:          HashMap::new(),
+            pending_approvals:   vec![],
+            approval_seq:        0,
+            waiting_agents:      vec![],
+            orchestrated_agents: vec![],
         };
         let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
         let (rec, _tmp) = recorder();
@@ -4400,6 +4448,203 @@ mod tests {
         assert!(
             log.contains("\"retries\":1"),
             "retries field must be 1 in the event payload"
+        );
+    }
+
+    // ── orch.2 tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn waiting_agents_restore_from_checkpoint() {
+        // ar-01: waiting_agents in checkpoint restores state.waiting.
+        let mut cp = minimal_scheduler_checkpoint(&["w1"]);
+        cp.waiting_agents = vec!["w1".to_string()];
+        cp.agents[0].terminal = true; // waiting agents are checkpointed as terminal
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("w1", "orchestrated task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+        // The scheduler holds agent w1 (restored as terminal).
+        assert!(sched.agents.contains_key("w1"), "waiting agent must be present in agents map");
+        assert!(sched.agents["w1"].is_terminal(), "restored waiting agent must be terminal");
+        // Verify the waiting_agents field flows through to restored (consumed by run()).
+        let r = sched.restored.as_ref().unwrap();
+        assert!(r.waiting_agents.contains(&"w1".to_string()), "waiting set must be restored in SchedulerRestored");
+    }
+
+    #[test]
+    fn orchestrated_agents_restore_from_checkpoint() {
+        // ar-01: orchestrated_agents in checkpoint restores state.orchestrated.
+        let mut cp = minimal_scheduler_checkpoint(&["orch-1"]);
+        cp.orchestrated_agents = vec!["orch-1".to_string()];
+        cp.waiting_agents     = vec!["orch-1".to_string()];
+        cp.agents[0].terminal = true;
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("orch-1", "orchestrated task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+        assert!(sched.agents.contains_key("orch-1"));
+        // Verify restored fields carry through to sched.restored (consumed by run()).
+        let r = sched.restored.as_ref().unwrap();
+        assert!(r.orchestrated_agents.contains(&"orch-1".to_string()), "orchestrated set must be restored");
+        assert!(r.waiting_agents.contains(&"orch-1".to_string()), "waiting set must be restored");
+    }
+
+    #[test]
+    fn handle_agent_terminal_clears_both_sets() {
+        // C2 / ar-05: handle_agent_terminal removes from both waiting and orchestrated.
+        let mut state = minimal_state("a");
+        state.waiting.insert("a".to_string());
+        state.orchestrated.insert("a".to_string());
+        let (rec, _tmp) = recorder();
+        let gw: Arc<dyn crate::inference::InferenceGateway + Send + Sync> =
+            Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        handle_agent_terminal(
+            "a".to_string(),
+            Ok("done".to_string()),
+            &mut state,
+            &SchedulerConfig::default(),
+            &gw,
+            &registry,
+            &rec,
+        );
+        assert!(!state.waiting.contains("a"), "waiting must be cleared by handle_agent_terminal");
+        assert!(!state.orchestrated.contains("a"), "orchestrated must be cleared by handle_agent_terminal");
+    }
+
+    #[test]
+    fn build_checkpoint_includes_waiting_agents() {
+        // ar-01: build_scheduler_checkpoint includes waiting orchestrated agents.
+        let (rec, _tmp) = recorder();
+        let mut state = minimal_state("orch");
+        // Mark as terminal (as happens after a turn completes in orchestrated mode).
+        let sm = state.agents.get_mut("orch").unwrap();
+        let _ = sm.step(&rec); // advance to a state; we force terminal via waiting insert
+        state.waiting.insert("orch".to_string());
+        state.orchestrated.insert("orch".to_string());
+        // Terminal flag would normally be set by AgentTask completing — test that
+        // filter includes waiting agents regardless of terminal status.
+        let cp = build_scheduler_checkpoint(&state);
+        assert!(
+            cp.waiting_agents.contains(&"orch".to_string()),
+            "waiting_agents must be included in checkpoint"
+        );
+        assert!(
+            cp.orchestrated_agents.contains(&"orch".to_string()),
+            "orchestrated_agents must be included in checkpoint"
+        );
+        // The agent itself must appear in the agents list even if terminal.
+        assert!(
+            cp.agents.iter().any(|a| a.agent_id == "orch"),
+            "waiting orchestrated agent must appear in checkpoint agents list"
+        );
+    }
+
+    #[test]
+    fn answer_truncation_caps_at_512_chars() {
+        // G5 / ar-03: OrchestratorTurnComplete answer_preview must never exceed 512 chars.
+        // Uses chars().count() guard so multi-byte characters are counted correctly.
+        let (rec, tmp) = recorder();
+        let gw: Arc<dyn crate::inference::InferenceGateway + Send + Sync> =
+            Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let mut state = minimal_state("orch-trunc");
+        state.orchestrated.insert("orch-trunc".to_string());
+
+        // Build a 600-char ASCII answer (well above the 512-char cap).
+        let long_answer: String = "A".repeat(600);
+        assert_eq!(long_answer.chars().count(), 600, "precondition: 600 chars");
+
+        enqueue_or_defer(
+            AgentEffect::Completed(long_answer.clone()),
+            "orch-trunc".to_string(),
+            0,
+            0,
+            None,
+            &mut state,
+            &SchedulerConfig::default(),
+            &gw,
+            &registry,
+            &rec,
+        );
+
+        // The agent must be parked (waiting), not terminated.
+        assert!(state.waiting.contains("orch-trunc"), "agent must be parked after Completed");
+
+        // The flight log must contain orchestrator_turn_complete with a truncated answer.
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            log.contains("\"orchestrator_turn_complete\""),
+            "orchestrator_turn_complete must be emitted"
+        );
+        assert!(
+            log.contains("[output truncated"),
+            "answer must contain truncation suffix when >512 chars"
+        );
+        // The raw 600-char answer must NOT appear in its entirety in the log.
+        assert!(
+            !log.contains(&long_answer),
+            "full 600-char answer must not appear verbatim in the flight log"
+        );
+    }
+
+    #[test]
+    fn inject_guard_rejects_non_waiting_agent() {
+        // G4 / ar-05: Inject into an agent that is NOT in state.waiting must
+        // emit OrchestratorExited with reason "agent_not_waiting" and NOT
+        // add the agent to the run queue or corrupt its context.
+        use crate::control::ControlCommand;
+
+        let (rec, tmp) = recorder();
+        let gw: Arc<dyn crate::inference::InferenceGateway + Send + Sync> =
+            Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let mut state = minimal_state("active-agent");
+        // Agent exists in state.agents but is NOT in state.waiting (actively running).
+        assert!(!state.waiting.contains("active-agent"), "precondition: not waiting");
+        assert!(state.agents.contains_key("active-agent"), "precondition: agent exists");
+
+        let in_flight_before = state.in_flight;
+        dispatch_control_command(
+            ControlCommand::Inject { agent_id: "active-agent".to_string(), text: "hello".to_string() },
+            &model_cfg(),
+            &mut state,
+            &SchedulerConfig::default(),
+            &gw,
+            &registry,
+            &rec,
+        );
+
+        // Guard must NOT have scheduled inference (in_flight unchanged).
+        assert_eq!(state.in_flight, in_flight_before, "inject into non-waiting agent must not enqueue inference");
+        // Agent must still not be in waiting.
+        assert!(!state.waiting.contains("active-agent"), "agent must not be inserted into waiting by the guard");
+
+        // Flight log must contain orchestrator_exited with agent_not_waiting reason.
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            log.contains("\"orchestrator_exited\""),
+            "OrchestratorExited must be emitted when injecting into non-waiting agent"
+        );
+        assert!(
+            log.contains("\"agent_not_waiting\""),
+            "reason agent_not_waiting must appear in the event payload"
         );
     }
 }

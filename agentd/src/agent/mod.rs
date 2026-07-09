@@ -214,7 +214,7 @@ impl AgentTask {
             total_output:    cp.total_output,
             turn:            cp.turn,
             stored_response: cp.stored_response,
-            terminal:        false,
+            terminal:        cp.terminal,
             short_term:      cp.short_term,
             last_pressure:   MemoryPressure::None,
             task_fp:         task_fingerprint(&task_text),
@@ -1742,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn from_checkpoint_uses_fresh_specs_and_clears_terminal() {
+    fn from_checkpoint_uses_fresh_specs() {
         use crate::checkpoint::AgentCheckpoint;
         use crate::inference::ToolSpec;
 
@@ -1767,7 +1767,7 @@ mod tests {
             total_output:    50,
             turn:            3,
             stored_response: None,
-            terminal:        true, // saved as true — must be reset to false
+            terminal:        false,
             short_term:      vec![],
         };
         let task = AgentTask::from_checkpoint(cp, vec![fresh_spec]);
@@ -1775,8 +1775,32 @@ mod tests {
         assert_eq!(task.turn, 3);
         assert_eq!(task.total_input, 100);
         assert_eq!(task.total_output, 50);
-        assert!(!task.terminal, "terminal must be false after restore");
+        assert!(!task.terminal, "non-terminal checkpoint restores as non-terminal");
         assert_eq!(task.specs[0].name, "new_tool", "specs must come from fresh registry");
+    }
+
+    #[test]
+    fn from_checkpoint_restores_terminal_true() {
+        use crate::checkpoint::AgentCheckpoint;
+        // Orchestrated agents are checkpointed with terminal=true so the seed loop
+        // does not step them on restore. from_checkpoint must preserve this state;
+        // resume_for_orchestration() clears it when the next inject arrives.
+        let cp = AgentCheckpoint {
+            agent_id:        "orch-01".to_string(),
+            cfg:             agent_cfg(200, 200_000),
+            model_cfg:       model_cfg(),
+            messages:        vec![],
+            specs:           vec![],
+            total_input:     42,
+            total_output:    10,
+            turn:            1,
+            stored_response: None,
+            terminal:        true,
+            short_term:      vec![],
+        };
+        let task = AgentTask::from_checkpoint(cp, vec![]);
+        assert!(task.terminal, "orchestrated waiting agent must restore as terminal=true");
+        assert_eq!(task.agent_id, "orch-01");
     }
 
     #[test]

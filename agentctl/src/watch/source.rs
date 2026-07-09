@@ -99,6 +99,8 @@ pub struct HttpSource {
     pub base_url:    String,
     client:          reqwest::blocking::Client,
     mutation_client: reqwest::blocking::Client,
+    /// Spawn waits up to 2 s for scheduler confirmation; this client must exceed that.
+    spawn_client:    reqwest::blocking::Client,
 }
 
 impl HttpSource {
@@ -112,7 +114,14 @@ impl HttpSource {
             .timeout(std::time::Duration::from_millis(500))
             .build()
             .unwrap_or_default();
-        Self { base_url, client, mutation_client }
+        // Spawn blocks until the scheduler confirms the agent ID (2 s server timeout).
+        // This client must exceed that window to avoid spurious 500ms timeouts that
+        // leave the agent running on the server while the caller sees a failure.
+        let spawn_client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        Self { base_url, client, mutation_client, spawn_client }
     }
 
     fn get_json(&self, path: &str) -> anyhow::Result<Value> {
@@ -135,19 +144,6 @@ impl HttpSource {
         }
     }
 
-    fn post_json(&self, path: &str, body: &Value) -> Result<Value, String> {
-        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
-        let resp = self.mutation_client
-            .post(&url)
-            .json(body)
-            .send()
-            .map_err(|e| format!("HTTP error: {e}"))?;
-        if resp.status().is_success() {
-            resp.json::<Value>().map_err(|e| format!("JSON decode error: {e}"))
-        } else {
-            Err(format!("HTTP {}", resp.status().as_u16()))
-        }
-    }
 }
 
 impl DataSource for HttpSource {
@@ -215,8 +211,27 @@ impl DataSource for HttpSource {
 
     fn spawn(&self, req: &SpawnRequest) -> Result<String, String> {
         let body = serde_json::to_value(req).map_err(|e| e.to_string())?;
-        let resp = self.post_json("/api/v1/spawn", &body)?;
-        let id = resp["spawned"].as_str().unwrap_or("operator-agent").to_string();
+        // Use spawn_client (3 s) — server holds the connection open for up to 2 s
+        // waiting for the scheduler to confirm the agent ID. The short mutation_client
+        // (500 ms) would time out before the confirmation arrives.
+        let url = format!("{}/api/v1/spawn", self.base_url.trim_end_matches('/'));
+        let resp = self.spawn_client
+            .post(&url)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("spawn HTTP error: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().unwrap_or_default();
+            return Err(if detail.is_empty() {
+                format!("HTTP {}", status.as_u16())
+            } else {
+                format!("HTTP {}: {}", status.as_u16(), detail.trim())
+            });
+        }
+        let val: serde_json::Value = resp.json().map_err(|e| format!("JSON decode error: {e}"))?;
+        // Server returns 201 + {"agent_id": "..."} after confirmation (ar-02).
+        let id = val["agent_id"].as_str().unwrap_or("operator-agent").to_string();
         Ok(id)
     }
 

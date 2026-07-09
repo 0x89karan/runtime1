@@ -16,6 +16,8 @@ showcases   = "event-driven pattern — waits for webhooks via webhook_mcp.py"
 
 [capabilities]
 net_ports = [9000]
+# Mcp grant required for the agent to see tools served by webhook_mcp.py.
+mcp       = [{ server = "webhook_trigger", tools = [] }]
 
 [card]
 name        = "Webhook Agent"

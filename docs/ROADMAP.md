@@ -1053,6 +1053,20 @@ denotes the *intra-instance* interactive dispatcher — **`orch.1`** (conversati
 p7.3 `inject`; see `TODOS.md` and the build order). Formerly mis-filed as `h8.3`; ROADMAP's `h8.3`
 stays multi-device migration.
 
+### ✓ orch.2 — Orchestrator hardening (v0.70.0)
+**Depends on:** orch.1.
+**Goal:** close 6 orch.1 action remediations + 2 pre-conditions discovered during review.
+**Scope:**
+- **ar-01** (checkpoint): orchestrated waiting agents checkpointed with `terminal=true`; `from_checkpoint` restores actual terminal flag; seed loop guard prevents immediate deletion; `waiting_agents`/`orchestrated_agents` in `SchedulerCheckpoint` (FORMAT_VERSION 4).
+- **ar-02** (spawn confirmation): oneshot channel from management API to scheduler; `POST /api/v1/spawn` returns 201 + `{"agent_id":"..."}` after confirmed insertion (2 s timeout → 503).
+- **ar-03** (answer cap): `OrchestratorTurnComplete.answer` capped at 512 chars with inline `[output truncated — full text streamed above]` note.
+- **ar-05** (state split): `state.waiting` split into `orchestrated: HashSet<String>` (persistent membership) + `waiting: HashSet<String>` (currently parked); `handle_agent_terminal` consolidates both removals (eliminates C2 phantom-entry leak).
+- **ar-06** (SSE keepalive): 30 s `": ping"` SSE comment from management server; `agentctl orchestrate` gets improved timeout error message with resume command.
+- **ar-07** (quit/exit): `agentctl orchestrate` checks for `quit`/`exit` input before inject and prints session-pause message with resume command.
+- **audit-O1**: 3 event-trigger templates (`cron-agent`, `watcher`, `webhook-agent`) gain `mcp` capability grant (deny-by-default was hiding all tools silently).
+- **audit-C3** (fsync durability): `write_mode_600` adds `sync_all()` after flush; `CheckpointStore::save()` fsyncs parent directory after rename.
+**Acceptance:** `cargo build && cargo clippy -- -D warnings && cargo test` all green; FORMAT_VERSION 4 checkpoints round-trip; waiting orchestrated agents survive restart.
+
 ---
 
 ## Phase 8 — Harness extensions

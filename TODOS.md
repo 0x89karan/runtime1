@@ -49,7 +49,7 @@ Wave 2 = C1,C3,C4,C5,C8,S5,S6,S7 · Wave 3 (docs, one pass) = D1–D5,S4 · Wave
   `agent/` prefix.** `KbRead{segment:"agent"}` satisfies `agent/anyone`; nothing reserves the prefix →
   breaks the locked "private memory never grantable" rule. Fix: reserve `agent/` as non-grantable in
   `capability.rs:219` + reject `[[memory.segments]]` under `agent/` at startup. **Supersedes F-10 severity.**
-- **audit-C3 (P2) — checkpoint not durable (no fsync around rename).** = F-05 (already tracked).
+- **~~audit-C3 (P2) — checkpoint not durable (no fsync around rename).~~** = F-05. **[FIXED in v0.70.0 (orch.2): `sync_all()` + parent-dir fsync in `CheckpointStore::save()`]**
 - **audit-C4 (P2) [new] — restored checkpoint deleted before the restored run re-checkpoints** → crash
   before next save loses the recovery point. Fix: keep as `.inflight` backup until a clean post-restore
   save supersedes it. `main.rs:980`.
@@ -62,9 +62,8 @@ Wave 2 = C1,C3,C4,C5,C8,S5,S6,S7 · Wave 3 (docs, one pass) = D1–D5,S4 · Wave
 - **audit-C9 (P2) — distillation off-budget + emits event on write failure.** = F-12 (tracked).
 
 ### Tier 3 — packaging / CI / operability
-- **audit-O1 (P1) [new] — three catalogue templates unusable: `cron-agent`, `watcher`, `webhook-agent`
-  declare MCP servers but grant no `Mcp{}` capability** → deny-by-default lowering hides the tools. Fix:
-  add `[capabilities].mcp` for `cron_trigger`/`fs_watch`/`webhook_trigger`. `template.rs:213` + the 3 templates.
+- **~~audit-O1 (P1) [new] — three catalogue templates unusable: `cron-agent`, `watcher`, `webhook-agent`~~**
+  **[FIXED in v0.70.0 (orch.2): added `[capabilities].mcp` entries to all three templates]**
 - **audit-O2 (P1) — `make test` broken (duplicate `memory0` 9p mount).** = ma.2-ar-01 (tracked; re-rate P1).
 - **audit-O3 (P2, invariant) — distro boot not CI-gated (dry-run only)** → violates "every arch boot is
   CI-tested or it rots"; PID-1 failure drops to interactive shell (hangs headless QEMU); Docker only
@@ -186,24 +185,14 @@ the CoS coordinator pattern are the building blocks. To be scoped via `/office-h
 
 ## orch.1 — Actionable remediations (v0.66.0, shipped 2026-07-07)
 
-- **orch.1-ar-01 (P2) — Waiting agents excluded from checkpoint.**
-  `build_scheduler_checkpoint` filters with `!a.is_terminal()`; waiting agents have
-  `terminal=true` so they are silently dropped. On agentd restart mid-REPL, the entire
-  conversation history is lost. Fix: add `waiting: Vec<String>` to `SchedulerCheckpoint`,
-  include waiting agents with `terminal=false` in the filter, and skip re-seeding agents
-  that appear in the restored waiting set. (`scheduler.rs:2194`, `checkpoint.rs`)
+- **~~orch.1-ar-01 (P2) — Waiting agents excluded from checkpoint.~~**
+  **[FIXED in v0.70.0 (orch.2): FORMAT_VERSION 4, `waiting_agents`/`orchestrated_agents` in `SchedulerCheckpoint`, seed loop guard, `terminal` preserved through `from_checkpoint`]**
 
-- **orch.1-ar-02 (P3) — `POST /api/v1/spawn` returns 200 before scheduler confirms.**
-  Spawn is fire-and-forget via `try_send`. If the scheduler rejects the ID
-  (`validate_child_id` failure, budget exceeded), the HTTP caller already received 200.
-  `orchestrate.rs` then uses this ID for injects/SSE filtering and silently misses.
-  Fix: synchronize with a one-shot response channel, or verify agent appears in snapshot
-  before proceeding. (`management.rs:307`)
+- **~~orch.1-ar-02 (P3) — `POST /api/v1/spawn` returns 200 before scheduler confirms.~~**
+  **[FIXED in v0.70.0 (orch.2): oneshot confirm channel in `OperatorSpawnRequest`; POST returns 201 + `{"agent_id":"..."}` after 2s wait]**
 
-- **orch.1-ar-03 (P3) — `OrchestratorTurnComplete` carries full answer text.**
-  The `data.answer` field contains the full agent response (potentially tens of KB),
-  inflating SSE broadcast and flight.jsonl. Fix: cap at `PREVIEW_CHARS` in the event
-  payload; the full answer is in the preceding `AgentCompleted` event. (`scheduler.rs`)
+- **~~orch.1-ar-03 (P3) — `OrchestratorTurnComplete` carries full answer text.~~**
+  **[FIXED in v0.70.0 (orch.2): answer capped at 512 chars (char-safe) in `OrchestratorTurnComplete` event]**
 
 - **orch.1-ar-04 (P3) — Docker `wait $AGENTD_PID` hangs after `agentctl orchestrate` exits.**
   When orchestrate closes, agentd continues running (management server keeps `control_tx`
@@ -212,24 +201,18 @@ the CoS coordinator pattern are the building blocks. To be scoped via `/office-h
   remove the `wait` from the orchestrate mode. (`docker/entrypoint.sh`)
   **[FIXED in v0.66.0: kill + SIGTERM trap added]**
 
-- **orch.1-ar-05 (P2) — `state.waiting` serves dual purpose (orchestrated flag + parked flag).**
-  At spawn time `waiting.insert` marks the agent as orchestrated. At inject time the inject
-  handler re-inserts into `waiting` BEFORE `enqueue_or_defer`, so the agent appears parked
-  while actively running inference. A second rapid inject via `POST /api/v1/agents/:id/inject`
-  passes the guard and queues a concurrent inference, corrupting message order. Fix: split into
-  `orchestrated: HashSet<String>` (spawn-time flag) + `waiting: HashSet<String>` (truly-parked
-  guard); only insert into `waiting` in the turn-completion park path. (`scheduler.rs:1769,1881`)
+- **~~orch.1-ar-05 (P2) — `state.waiting` serves dual purpose (orchestrated flag + parked flag).~~**
+  **[FIXED in v0.70.0 (orch.2): split into `orchestrated` (permanent) + `waiting` (parked); `handle_agent_terminal` clears both]**
 
 - **orch.1-ar-06 (P3) — No SSE read timeout — REPL hangs on silent network failure.**
-  `agentctl orchestrate` uses `timeout(None)` on the blocking SSE client. A TCP stall without
-  FIN (network partition, agentd crash leaving socket in CLOSE_WAIT) causes `reader.lines()` to
-  block forever. Fix: emit `event: ping` heartbeat every 30s from the management SSE handler;
-  configure a 90s read timeout on the blocking client; bail with a clear error on timeout.
-  (`orchestrate.rs:50`, `management.rs` SSE handler)
+  **[PARTIALLY FIXED in v0.70.0 (orch.2): management SSE handler now sends `: ping\n\n` every 30 s (mitigates
+  load-balancer idle timeouts). Client-side: `orchestrate.rs` SSE client uses `.timeout(None)` — no OS-level
+  read deadline. On a true network partition without TCP FIN/RST (e.g., direct TCP to :7999 over an unreliable
+  link), `reader.lines()` blocks indefinitely. The SSH-tunnel path documented in DEPLOYMENT.md delivers RST on
+  drop, partially mitigating the risk. See orch.2-ar-04 (below) for the remaining fix.]**
 
-- **orch.1-ar-07 (P3) — `quit`/`exit` keywords injected as messages instead of exiting the REPL.**
-  Typing "quit" sends an inference request to the agent. Fix: treat `quit` and `exit` as
-  REPL meta-commands that break the loop, matching user expectations. (`orchestrate.rs` REPL loop)
+- **~~orch.1-ar-07 (P3) — `quit`/`exit` keywords injected as messages instead of exiting the REPL.~~**
+  **[FIXED in v0.70.0 (orch.2): `orchestrate.rs` checks for `quit`/`exit` before inject and breaks with a resume message]**
 
 - **orch.1-ar-08 (P3) — Empty input in `agentctl orchestrate` causes silent hang.**
   When the user presses Enter on an empty line, the REPL calls `continue`, which goes back
@@ -247,6 +230,38 @@ the CoS coordinator pattern are the building blocks. To be scoped via `/office-h
   `[[sample_tasks]]` array-of-tables to a top-level inline array
   `sample_tasks = ["...", "..."]`. (`templates/orchestrator.template.toml`)
 
+## orch.2 — Actionable remediations (v0.70.0, shipped 2026-07-09)
+
+- **orch.2-ar-01 (P2) — `POST /api/v1/spawn` 503 is non-authoritative.** When the scheduler
+  does not service `control_rx` within the 2s confirmation window, the management server returns
+  503 (Retry-After: 1), but the `ControlCommand::Spawn` remains queued. The scheduler processes
+  it after the HTTP handler returns, starting the agent anyway. Retrying with the same explicit
+  agent ID will then hit the collision guard and get another 503 (agent exists). Fix: add a
+  cancellation sentinel to the spawn command, or poll the snapshot for the agent before retrying.
+  (`agentd/src/management.rs:321`, `agentd/src/scheduler.rs:1898`)
+
+- **orch.2-ar-02 (P3) — `max_turns` has no effect on pure-text orchestrated agents.**
+  `self.turn` is only incremented by `provide_tool_results`; agents that respond with text
+  (no tool calls) never increment the turn counter, so `max_turns` never fires. Only
+  `token_budget` terminates them. Fix: increment a separate REPL-turn counter in
+  `push_user_turn()`, or document that `max_turns` counts tool-call rounds only. (`agentd/src/agent/mod.rs`)
+
+- **orch.2-ar-03 (P3) — Broadcast lag can silently drop `OrchestratorTurnComplete`.**
+  When the broadcast buffer (1024 slots) fills, lagged SSE clients receive
+  `data: {"lagged": N}`. If `OrchestratorTurnComplete` was among the dropped events,
+  `drain_until_turn_complete` blocks forever (no handler for the lagged sentinel).
+  Fix: handle `"lagged"` in the drain loop by polling `/api/v1/snapshot` for
+  `agent.status == "waiting"`, or increase the broadcast buffer to 16384. (`agentd/src/management.rs`)
+
+- **orch.2-ar-04 (P3) — `agentctl orchestrate` SSE client has no read timeout (orch.1-ar-06 partial).**
+  The blocking `reqwest::Client` used for the persistent SSE connection in `orchestrate.rs:52` is built
+  with `.timeout(None)`. The server-side `: ping` keepalive (added in orch.2) prevents LB idle-timeouts
+  and causes the OS to detect connection loss via TCP keepalives after ~2 min on most systems. However,
+  on a true network partition without TCP FIN/RST, `reader.lines()` in `drain_until_turn_complete` blocks
+  the OS `read()` call indefinitely — no deadline. Fix: add a TCP keepalive socket option (via `socket2`
+  on the blocking client) so the kernel detects partition; or expose a per-read deadline via a separate
+  reader thread + channel with a 90 s `recv_timeout`. (`agentctl/src/orchestrate.rs:52`)
+
 ## Track MA — Open (from ma.4)
 
 - **ma.4-ar-01 (P3) — `require_isolation_tier` config key not yet implemented.**
@@ -260,9 +275,7 @@ the CoS coordinator pattern are the building blocks. To be scoped via `/office-h
 
 See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2s remain:
 
-- **F-05 (P2) — `checkpoint.save()` has no `fsync` before/after rename.** 4.6 F-012
-  unfixed: a crash mid-rename can leave a zero-length/partial checkpoint. Add
-  data fsync + parent-dir fsync around the atomic rename.
+- **~~F-05 (P2) — `checkpoint.save()` has no `fsync` before/after rename.~~** **[FIXED in v0.70.0 (orch.2/audit-C3)]**
 - **F-06 (P2) — FUSE dynamic-inode counter never reclaimed / unguarded.** Long-lived
   mounts can exhaust the counter; no overflow guard on the mount thread.
 - **F-07b (P2) — `inject_messages` can append `Text` onto a ToolResult-only User turn.**

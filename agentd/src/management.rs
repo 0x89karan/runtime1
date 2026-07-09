@@ -262,18 +262,30 @@ async fn route(
             let mut rx = state.broadcast_tx.subscribe();
 
             // Build an SSE stream: each broadcast line becomes `data: <line>\n\n`.
+            // A 30 s keepalive comment (`: ping`) is injected to prevent load-balancer timeouts.
             let stream = async_stream::stream! {
+                let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+                keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                keepalive.tick().await; // consume the first tick immediately
                 loop {
-                    match rx.recv().await {
-                        Ok(line) => {
-                            let sse = format!("data: {}\n\n", line.trim_end_matches('\n'));
-                            yield Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(sse)));
+                    tokio::select! {
+                        msg = rx.recv() => {
+                            match msg {
+                                Ok(line) => {
+                                    let sse = format!("data: {}\n\n", line.trim_end_matches('\n'));
+                                    yield Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(sse)));
+                                }
+                                Err(broadcast::error::RecvError::Lagged(n)) => {
+                                    let sse = format!("data: {{\"lagged\": {n}}}\n\n");
+                                    yield Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(sse)));
+                                }
+                                Err(broadcast::error::RecvError::Closed) => break,
+                            }
                         }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            let sse = format!("data: {{\"lagged\": {n}}}\n\n");
-                            yield Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(sse)));
+                        _ = keepalive.tick() => {
+                            // SSE comment — clients ignore it; keeps TCP alive through proxies.
+                            yield Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from_static(b": ping\n\n")));
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
                     }
                 }
             };
@@ -292,7 +304,7 @@ async fn route(
             if body.is_empty() {
                 return error_response(StatusCode::BAD_REQUEST, "request body required");
             }
-            let req: crate::control::OperatorSpawnRequest = match serde_json::from_slice(body) {
+            let mut req: crate::control::OperatorSpawnRequest = match serde_json::from_slice(body) {
                 Ok(r) => r,
                 Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
             };
@@ -302,16 +314,24 @@ async fn route(
             let Some(tx) = &state.control_tx else {
                 return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
             };
-            let id_hint = req.id.clone().unwrap_or_else(|| "operator-agent".to_string());
+            // Wire a confirmation channel so we can return the resolved agent ID (ar-02).
+            let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<String>();
+            req.confirm_tx = Some(confirm_tx);
             let cmd = ControlCommand::Spawn(req);
             match tx.try_send(cmd) {
-                Ok(()) => json_response(StatusCode::OK, json!({"spawned": id_hint})),
+                Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry")
+                    return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry");
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                    error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running")
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running");
                 }
+            }
+            // Await confirmation (2 s) then return 201 with the assigned agent_id.
+            match tokio::time::timeout(std::time::Duration::from_secs(2), confirm_rx).await {
+                Ok(Ok(agent_id)) => json_response(StatusCode::CREATED, json!({"agent_id": agent_id})),
+                Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
+                Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for agent creation"),
             }
         }
 

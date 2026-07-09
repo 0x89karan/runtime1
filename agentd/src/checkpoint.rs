@@ -13,7 +13,7 @@ use crate::{
     memory::MemItem,
 };
 
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// Create `path` with mode 0600 on Unix, then write `data`.
 ///
@@ -46,7 +46,9 @@ async fn write_mode_600(path: &std::path::Path, data: &[u8]) -> std::io::Result<
         Err(e) => return Err(e),
     };
     f.write_all(data).await?;
-    f.flush().await
+    f.flush().await?;
+    // Durability guarantee (audit-C3): ensure kernel flushes file data before rename.
+    f.sync_all().await
 }
 
 #[cfg(not(unix))]
@@ -67,7 +69,10 @@ pub struct AgentCheckpoint {
     pub turn:            u32,
     /// None = NeedInfer; Some = ResponseStored.
     pub stored_response: Option<InferenceResponse>,
-    /// Always false when saved — guards against the terminal-race described in OV-2.
+    /// False for normal agents (only non-terminal agents are checkpointed).
+    /// True for orchestrated waiting agents (parked between REPL turns) — they are
+    /// checkpointed as terminal so the scheduler does not step them on restore;
+    /// they re-enter via `resume_for_orchestration()` when the next inject arrives.
     pub terminal:        bool,
     /// Tier-2 eviction buffer: turns paged out of active context.
     /// `#[serde(default)]` makes v1 checkpoints (no field) load as empty vec.
@@ -115,6 +120,14 @@ pub struct SchedulerCheckpoint {
     /// Monotonic counter used to generate "act_{seq}" approval IDs.
     #[serde(default)]
     pub approval_seq:   u64,
+    /// Agent IDs that were parked waiting for an orchestrator inject at checkpoint time.
+    /// On restore these IDs are re-inserted into `state.waiting`. Absent in v1–v3 → empty.
+    #[serde(default)]
+    pub waiting_agents: Vec<String>,
+    /// Agent IDs that were spawned as orchestrated (persistent across turns).
+    /// On restore these IDs are re-inserted into `state.orchestrated`. Absent in v1–v3 → empty.
+    #[serde(default)]
+    pub orchestrated_agents: Vec<String>,
 }
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
@@ -162,6 +175,13 @@ impl CheckpointStore {
         tokio::fs::rename(&tmp, &self.path)
             .await
             .context("rename checkpoint tmp -> checkpoint.json")?;
+        // Durability guarantee (audit-C3): fsync the parent directory so the directory
+        // entry for the renamed file is flushed before we return.
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await; // best-effort; never crash a checkpoint
+            }
+        }
         Ok(())
     }
 
@@ -244,16 +264,18 @@ mod tests {
 
     fn minimal_scheduler_checkpoint() -> SchedulerCheckpoint {
         SchedulerCheckpoint {
-            format_version:    FORMAT_VERSION,
-            agents:            vec![minimal_agent_checkpoint("agent-a")],
-            awaiting:          vec![],
-            mailboxes:         HashMap::new(),
-            tokens_spent:      15,
-            child_seq:         0,
-            spawn_depths:      [("agent-a".to_string(), 0)].into_iter().collect(),
-            parent_map:        HashMap::new(),
-            pending_approvals: vec![],
-            approval_seq:      0,
+            format_version:     FORMAT_VERSION,
+            agents:             vec![minimal_agent_checkpoint("agent-a")],
+            awaiting:           vec![],
+            mailboxes:          HashMap::new(),
+            tokens_spent:       15,
+            child_seq:          0,
+            spawn_depths:       [("agent-a".to_string(), 0)].into_iter().collect(),
+            parent_map:         HashMap::new(),
+            pending_approvals:  vec![],
+            approval_seq:       0,
+            waiting_agents:     vec![],
+            orchestrated_agents: vec![],
         }
     }
 
@@ -540,6 +562,75 @@ mod tests {
         assert!(name.ends_with(".tmp"), "tmp_path must end in .tmp: {name}");
         let pid = std::process::id().to_string();
         assert!(name.contains(&pid), "tmp_path must embed the process id: {name}");
+    }
+
+    // ── orchestration checkpoint fields (orch.2) ──────────────────────────────
+
+    #[test]
+    fn waiting_orchestrated_fields_roundtrip() {
+        let mut cp = minimal_scheduler_checkpoint();
+        cp.waiting_agents = vec!["orch-1".to_string()];
+        cp.orchestrated_agents = vec!["orch-1".to_string()];
+        cp.agents.push({
+            let mut a = minimal_agent_checkpoint("orch-1");
+            a.terminal = true; // parked waiting agent
+            a
+        });
+        let json = serde_json::to_string(&cp).unwrap();
+        let back: SchedulerCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.waiting_agents, vec!["orch-1"]);
+        assert_eq!(back.orchestrated_agents, vec!["orch-1"]);
+        assert!(back.agents[1].terminal, "parked agent must round-trip as terminal=true");
+    }
+
+    #[test]
+    fn v3_checkpoint_loads_without_orchestration_fields() {
+        // Pre-orch.2 checkpoints (format_version=3) have no waiting_agents or
+        // orchestrated_agents. They must deserialize to empty vecs via #[serde(default)].
+        let json = serde_json::json!({
+            "format_version": 3,
+            "agents": [],
+            "awaiting": [],
+            "mailboxes": {},
+            "tokens_spent": 0,
+            "child_seq": 0,
+            "spawn_depths": {},
+            "parent_map": {},
+            "pending_approvals": [],
+            "approval_seq": 0
+            // "waiting_agents" and "orchestrated_agents" are intentionally absent
+        });
+        let cp: SchedulerCheckpoint =
+            serde_json::from_str(&serde_json::to_string(&json).unwrap()).unwrap();
+        assert!(cp.waiting_agents.is_empty(), "missing waiting_agents must be empty vec");
+        assert!(cp.orchestrated_agents.is_empty(), "missing orchestrated_agents must be empty vec");
+    }
+
+    #[test]
+    fn from_checkpoint_terminal_true_round_trips() {
+        // An AgentCheckpoint with terminal=true must deserialize back with terminal=true.
+        let mut cp = minimal_agent_checkpoint("orch-parked");
+        cp.terminal = true;
+        let json = serde_json::to_string(&cp).unwrap();
+        let back: AgentCheckpoint = serde_json::from_str(&json).unwrap();
+        assert!(back.terminal, "terminal=true must survive checkpoint round-trip");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_save_includes_fsync() {
+        // Verify that save() completes successfully when sync_all() is called —
+        // the filesystem-level durability guarantee (audit-C3). We can't directly
+        // observe whether sync_all() flushed to hardware, but we can verify the
+        // save/load cycle works and the file is readable after save().
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let mut cp = minimal_scheduler_checkpoint();
+        cp.waiting_agents = vec!["w1".to_string()];
+        cp.orchestrated_agents = vec!["w1".to_string()];
+        store.save(&cp).await.expect("save with sync_all must succeed");
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.waiting_agents, vec!["w1"]);
+        assert_eq!(loaded.orchestrated_agents, vec!["w1"]);
     }
 
     /// write failure (via read-only directory) propagates as Err.

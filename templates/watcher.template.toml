@@ -12,6 +12,8 @@ showcases   = "event-driven daemon pattern — waits for filesystem events via f
 
 [capabilities]
 fs_read = ["/workspace"]
+# Mcp grant required for the agent to see tools served by fs_watch_mcp.py.
+mcp     = [{ server = "fs_watch", tools = [] }]
 
 [card]
 name        = "Watcher"

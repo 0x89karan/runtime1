@@ -1,6 +1,6 @@
 use crate::capability::Capability;
 
-/// An agent spawn request sent via the /agents/control FUSE surface.
+/// An agent spawn request sent via the /agents/control FUSE surface or management HTTP API.
 /// All fields except `task` are optional; missing values fall back to AgentConfig defaults.
 #[derive(Debug, serde::Deserialize)]
 pub struct OperatorSpawnRequest {
@@ -13,6 +13,10 @@ pub struct OperatorSpawnRequest {
     /// When true, agent parks after each response awaiting the next inject (orchestration mode).
     #[serde(default)]
     pub orchestrated: bool,
+    /// Optional confirmation channel (not serialized). The scheduler sends the assigned
+    /// agent ID after insertion. Used by the HTTP API to return 201 + agent_id synchronously.
+    #[serde(skip)]
+    pub confirm_tx: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 /// Commands dispatched through the /agents/control write surface.

@@ -47,8 +47,10 @@ pub fn run(args: OrchestrateArgs) -> anyhow::Result<()> {
     // Open the SSE connection ONCE before the first inject.  Keeping it alive across
     // turns closes the race where a fast agent fires OrchestratorTurnComplete before the
     // next wait_for_turn_complete call can reconnect and subscribe.
+    // The management server sends a `: ping` keepalive every 30 s (ar-06) so TCP is
+    // never idle long enough to be dropped by a load balancer or OS keepalive.
     let client = reqwest::blocking::Client::builder()
-        .timeout(None) // SSE stream has no read timeout
+        .timeout(None)
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
     let resp = client
@@ -115,6 +117,14 @@ pub fn run(args: OrchestrateArgs) -> anyhow::Result<()> {
         };
 
         let Some(next) = next else { break };
+        // ar-07: "quit" / "exit" pause the session without injecting into the agent.
+        if next == "quit" || next == "exit" {
+            eprintln!(
+                "[orchestrate] session paused. Resume with:\n  agentctl orchestrate --agent-id {} --url <URL>",
+                agent_id
+            );
+            break;
+        }
         source.inject(&agent_id, &next)
             .map_err(|e| anyhow::anyhow!("inject failed: {e}"))?;
     }
@@ -163,7 +173,25 @@ fn drain_until_turn_complete<R: std::io::Read>(
         if kind == "agent_completed" && v["agent"].as_str().unwrap_or("") == agent_id {
             anyhow::bail!("agent exited without completing orchestrated turn (check flight log)");
         }
+
+        // orchestrator_exited fires when an inject is rejected (e.g. agent already
+        // in-flight from a concurrent inject). Without this guard the REPL hangs
+        // forever waiting for an orchestrator_turn_complete that will never arrive.
+        if kind == "orchestrator_exited" {
+            let event_agent = v["data"]["agent_id"].as_str().unwrap_or("");
+            if event_agent == agent_id {
+                let reason = v["data"]["reason"].as_str().unwrap_or("unknown");
+                anyhow::bail!(
+                    "inject rejected (reason: {reason}) — agent may still be running.\n  \
+                     Resume with: agentctl orchestrate --agent-id {agent_id} --url <URL>"
+                );
+            }
+        }
     }
 
-    anyhow::bail!("SSE stream ended without turn complete signal for agent '{agent_id}'")
+    anyhow::bail!(
+        "SSE stream ended without turn complete signal for agent '{agent_id}'. \
+         If the stream timed out, the agent may still be running — resume with:\n  \
+         agentctl orchestrate --agent-id {agent_id} --url <URL>"
+    )
 }

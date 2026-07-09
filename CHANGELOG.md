@@ -3,6 +3,71 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [orch.2] - 2026-07-08 (v0.70.0)
+
+### Fixed — Orchestrator hardening (closes 6 orch.1 ARs + 2 pre-conditions)
+
+- **ar-01 — Checkpoint/restore for waiting orchestrated agents**: `SchedulerCheckpoint`
+  (FORMAT_VERSION 3→4) gains `waiting_agents: Vec<String>` + `orchestrated_agents: Vec<String>`
+  fields (`#[serde(default)]` for backward compat). `from_checkpoint` now restores the actual
+  `terminal` flag from the checkpoint instead of hardcoding `false`. Seed loop gains an early
+  `continue` guard for agents in `state.waiting` so restored waiting agents are not immediately
+  deleted by `handle_agent_terminal`.
+
+- **ar-02 — Spawn confirmation**: `OperatorSpawnRequest` gains `confirm_tx: Option<oneshot::Sender<String>>`
+  (`#[serde(skip)]`). `dispatch_operator_spawn_inner` sends the resolved agent ID after insert.
+  `POST /api/v1/spawn` awaits the oneshot with a 2 s timeout and returns **201 Created** +
+  `{"agent_id":"..."}` on success; 503 on timeout.
+
+- **ar-03 — Answer cap**: `OrchestratorTurnComplete.answer` capped at 512 chars with inline
+  `[output truncated — full text streamed above]` note when the answer is longer.
+
+- **ar-05 — State split (dual-purpose race)**: `state.waiting: HashSet<String>` split into
+  `orchestrated` (permanent orchestrated membership) and `waiting` (currently parked). `dispatch_operator_spawn_inner`
+  inserts into `orchestrated` (not `waiting`) on creation. `AgentCompleted` checks `orchestrated.contains`
+  and inserts into `waiting` when parking. `handle_agent_terminal` now removes from **both** sets —
+  consolidates 3 call-site removals and fixes the C2 phantom-entry leak where `state.orchestrated`
+  was never cleared at termination.
+
+- **ar-06 — SSE keepalive (partial)**: Management server `GET /api/v1/events` sends `": ping\n\n"`
+  (SSE comment) every 30 s via `tokio::time::interval` + `tokio::select!`. Mitigates LB idle-timeout
+  drops and triggers OS TCP keepalives on quiet links. Client-side: `orchestrate.rs` uses
+  `.timeout(None)` — a true network partition without TCP RST still causes an indefinite `reader.lines()`
+  hang; tracked as `orch.2-ar-04` (P3). `agentctl orchestrate` error message on stream-end now
+  includes a resume command hint.
+
+- **ar-07 — Quit/exit handling**: `agentctl orchestrate` REPL checks for `quit` / `exit` input
+  before injecting into the agent and prints a session-pause message with the resume command.
+
+- **audit-O1 — Template MCP capability grants**: `templates/cron-agent.template.toml`,
+  `templates/watcher.template.toml`, and `templates/webhook-agent.template.toml` each gain an
+  `mcp` capability entry for their trigger server; deny-by-default was silently hiding all tools.
+
+- **audit-C3 — Checkpoint fsync durability**: `write_mode_600` calls `f.sync_all().await` after
+  flush; `CheckpointStore::save()` fsyncs the parent directory after the tmp→final rename.
+
+### Changed
+- `HttpSource::spawn()` now reads `agent_id` from the response body (was `spawned`) to match the
+  new 201 response body. `post_json` now surfaces the response body text on non-2xx for diagnostics.
+
+### Post-review fixes (adversarial review pass)
+- **spawn_client timeout**: `HttpSource` gains a dedicated `spawn_client` (3 s) for `POST /api/v1/spawn`.
+  The previous `mutation_client` (500 ms) timed out before the management server's 2 s scheduler
+  confirmation window, causing agentctl to see a spurious failure while the server created the agent
+  anyway. (`agentctl/src/watch/source.rs`)
+- **drain loop hang on orchestrator_exited**: `drain_until_turn_complete` now handles `orchestrator_exited`
+  events and returns an error immediately rather than blocking forever when an inject is rejected
+  (e.g., concurrent inject from a second REPL session). (`agentctl/src/orchestrate.rs`)
+
+### Tests
+- 7 new tests total: `waiting_agents_restore_from_checkpoint`, `orchestrated_agents_restore_from_checkpoint`,
+  `handle_agent_terminal_clears_both_sets`, `build_checkpoint_includes_waiting_agents` (scheduler.rs);
+  `from_checkpoint_restores_terminal_true` (agent/mod.rs);
+  `answer_truncation_caps_at_512_chars`, `inject_guard_rejects_non_waiting_agent` (scheduler.rs coverage).
+  Total: 1255 workspace tests.
+
+---
+
 ## [dx.3] - 2026-07-08 (v0.69.0)
 
 ### Added — Linux QEMU production path
