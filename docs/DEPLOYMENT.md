@@ -7,23 +7,33 @@ Both run the same Chief of Staff agent and speak the same `agentctl watch` surfa
 
 ## Path 1 — Mac + Docker
 
-**Prerequisites:** Docker Desktop, `ANTHROPIC_API_KEY`
+**Prerequisites:** Docker Desktop
 
 ```bash
+# 0. Provision secrets (one-time — survives terminal restarts)
+mkdir -p ~/.agentos-secrets ~/.agentos-output
+printf 'ANTHROPIC_API_KEY=sk-ant-...\n' >> ~/.agentos-secrets/agentos.env
+chmod 600 ~/.agentos-secrets/agentos.env
+
 # 1. One-time Google OAuth (writes ~/.agentos-secrets/google.json)
 agentctl auth google
 
 # 2. Start the CoS stack
 docker compose up -d cos
 
-# 3. Monitor from the Mac host (connects to localhost:7999)
-agentctl watch
+# 3. Monitor (runs inside the container — FUSE and API are container-local)
+docker compose exec cos agentctl watch
 
 # 4. Approve Gmail OAuth (first run only)
 #    Press [a] in agentctl watch — click the approval URL in your browser
 ```
 
-Briefs appear in `~/.agentos-output/brief-YYYY-MM-DD.md`.
+Briefs appear in `~/.agentos-output/brief-YYYY-MM-DD.md` (the container writes to
+`/data/output`, which is bind-mounted to this host directory).
+
+> **Note:** `agentctl watch` on the Mac host won't work directly — port 7999 is
+> loopback-only inside the container and not published to the host. Use
+> `docker compose exec cos agentctl watch` to run inside the container.
 
 ---
 

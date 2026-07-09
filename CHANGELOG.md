@@ -3,6 +3,37 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [dx.4b] - 2026-07-09 (v0.71.0)
+
+### Fixed — Mac + Docker CoS first-run failures (F1–F4)
+
+- **F4 — BLOCKER: `Net{ports}` → deny-all on Docker Desktop / pre-6.7 kernels**: `caps_to_rules_inner`
+  had a bug where declaring `Net{ports=[443]}` on a kernel without Landlock ABI V4 (Docker Desktop,
+  Linux < 6.7) pushed `SandboxRule::IsolateNetwork` despite the operator explicitly declaring network
+  access. The Gmail token refresh failed with "Not authenticated", the agent fell back to an in-container
+  browser OAuth dance, and the run hung indefinitely. Fixed: the V4-unavailable arm now emits a loud
+  `tracing::warn!` and `continue`s — no `IsolateNetwork` is pushed, so the server gets unrestricted
+  network access (best-effort allow, matching FS degrade behaviour). Three new tests:
+  `net_ports_v4_unavailable_degrades_to_allow_not_deny`, `net_ports_v4_available_emits_allow_connect_both_ports`,
+  `no_net_cap_still_isolates_on_no_v4_kernel`. Old `caps_to_rules_net_with_ports_pre_v4_falls_back_to_isolate_network`
+  test removed (it was asserting the wrong behaviour).
+
+- **F1 — Missing `ANTHROPIC_API_KEY` setup in DEPLOYMENT.md Path 1**: The guide never told users
+  to write the key into `~/.agentos-secrets/agentos.env`. Users who had it in a different shell
+  saw the container exit immediately with "ANTHROPIC_API_KEY is not set". Added an explicit
+  "step 0" (`mkdir -p ~/.agentos-secrets ~/.agentos-output; printf 'ANTHROPIC_API_KEY=...\n' >> ~/.agentos-secrets/agentos.env; chmod 600`) before `docker compose up`.
+
+- **F2 — `agentctl watch` unreachable from Mac host**: Port 7999 is loopback-only inside the
+  container and is not published to the host. Step 3 in DEPLOYMENT.md Path 1 now reads
+  `docker compose exec cos agentctl watch` (runs inside the container where the FUSE mount and
+  management API are live). Added an explanatory note for clarity.
+
+- **F3 — Briefs written to container-only `/data/output`, not visible on host**: The `cos`
+  service had no bind mount for output. Added
+  `${AGENTOS_OUTPUT_DIR:-${HOME}/.agentos-output}:/data/output` to the `cos` service volumes in
+  `docker-compose.yml` so the CoS entrypoint's `/data/output` write path lands on the Mac host.
+  DEPLOYMENT.md updated to match (`mkdir -p ~/.agentos-output` in setup; brief location note).
+
 ## [orch.2] - 2026-07-08 (v0.70.0)
 
 ### Fixed — Orchestrator hardening (closes 6 orch.1 ARs + 2 pre-conditions)

@@ -8,6 +8,8 @@ services:
       - cos-data:/data
       # Secrets provisioned by `agentctl auth google` on the Mac host (read-only)
       - ${AGENTOS_SECRETS_DIR:-${HOME}/.agentos-secrets}:/run/secrets:ro
+      # Briefs land on the host (cos entrypoint rewrites output prefix to /data/output)
+      - ${AGENTOS_OUTPUT_DIR:-${HOME}/.agentos-output}:/data/output
     environment:
       - ANTHROPIC_API_KEY
       # Google OAuth credentials are read from /run/secrets/google.json (the volume above).

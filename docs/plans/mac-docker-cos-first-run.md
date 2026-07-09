@@ -1,100 +1,269 @@
-# Mac + Docker CoS first-run fixes (dogfood findings, 2026-07-09)
+# Mac + Docker CoS First-Run Fixes (F1–F4)
 
-**Source:** first real end-to-end run of the Chief of Staff on Docker Desktop (Mac, arm64).
-The container starts and the cron loop fires, but the flagship Gmail path **does not work**,
-and three DX papercuts block a clean first run. Findings F1–F4 below.
-
-**The headline:** F4 means "run the CoS on your Mac via Docker" — the primary dev path — is
-**broken for anything networked** (Gmail, web fetch, search). F1–F3 are DX/doc fixes.
-
-Two groups; the build session can ship as one or two increments (F4 is core + needs eng-review):
-- **Group A — Docker first-run DX (F1, F2, F3):** docs + compose. Small, no eng-review.
-- **Group B — sandbox Net-fallback (F4):** core sandbox behavior + a security decision. The actual blocker.
-
-Meta-rule (as always): for every code item — fix + a test that fails without it + adversarial
-verification of the real failure path, not "applied." No partial doc updates that leave a stale claim.
+**Branch:** cos-first-run-fixes  
+**Status:** Planning  
+**Source:** Live dogfood run on Mac + Docker Desktop — four failures on the primary dev path.
 
 ---
 
-## Group B — F4 (headline, BLOCKING): `Net{ports}` falls back to deny-all on kernels without Landlock ABI V4
+## Problem
 
-**Symptom:** the CoS inbox agent reports "Not authenticated" and tries the (dead) in-container OAuth
-flow, even with a valid `~/.agentos-secrets/google.json`. It hangs.
-
-**Root cause (verified from logs + code):** `google_oauth` declares `Net{ hosts=[…], ports=[443] }`
-(`agentd/cos.agents.toml:17-23`). On Docker Desktop's kernel there is **no Landlock ABI V4** (needs
-Linux ≥ 6.7), so `caps_to_rules_inner` (`agentd/src/main.rs:1344-1349`) falls back to
-`SandboxRule::IsolateNetwork` — **deny-all network** — for that sidecar. It gets an empty netns and
-cannot reach `oauth2.googleapis.com`, so the token refresh fails → "not authenticated" → dead flow.
-Log: `WARN agentd: Net{ports} declared but Landlock ABI V4 is unavailable … falling back to
-IsolateNetwork (deny-all)`.
-
-**Impact:** breaks **every sandboxed MCP server that needs network** — `google_oauth`, `http_fetch`,
-`web_search` — on any pre-6.7-Landlock kernel, which includes **Docker Desktop on Mac** (the primary
-dev setup). The flagship's Gmail integration is unusable there. This is the flip side of the whole-
-system audit's S6 (sandbox degradation): there it was fail-open; here it fails **closed in a way that
-breaks the declared-needed access**. Same root: inconsistent degradation policy.
-
-**Fix (DECISION for `/plan-eng-review`):** do **not** deny-all a server that declared it needs network.
-When `Net{ports}` is declared but Landlock V4 is unavailable, degrade **best-effort-allow + a loud
-warn** ("per-port network enforcement unavailable on this kernel; allowing network unenforced") —
-consistent with how Landlock *filesystem* rules already degrade best-effort. Alternatively, gate the
-deny-all behind an explicit `[tools] strict_network_isolation = true` (default off). Pick one via
-eng-review; the default must keep networked tools working on common kernels.
-
-**Acceptance:** on a kernel without Landlock V4 (Docker Desktop), a `Net{ports}` MCP server has working
-outbound network to its declared hosts; the CoS `google_oauth` sidecar refreshes and reads Gmail; a
-warn is logged. Test: `caps_to_rules_inner(&[Net{…}], v4_available=false)` yields an allow/no-net-isolation
-rule set (or the strict-flag path), **not** `IsolateNetwork`.
-
-**Where:** `agentd/src/main.rs:1314-1349` (`caps_to_rules` / `caps_to_rules_inner`), `sandbox/src/lib.rs`.
+The first real end-to-end run of the Chief of Staff on Docker Desktop (Mac) surfaces four
+breakages. F4 is a **blocker**: the flagship Gmail path cannot work on any Docker Desktop /
+pre-Linux-6.7 kernel because `Net{ports}` degrades to deny-all network. F1–F3 are DX
+papercuts that make the path fail silently or give incorrect instructions.
 
 ---
 
-## Group A — Docker first-run DX
+## F4 — BLOCKING: Net{ports} → deny-all on no-V4 kernels
 
-### F1 — DEPLOYMENT.md doesn't say where to put `ANTHROPIC_API_KEY`; shell export is fragile
-**Symptom:** cos exits immediately with `ERROR: ANTHROPIC_API_KEY is not set` when the operator
-`export`ed the key in a different shell than `docker compose up` (compose only passes through the
-env of the invoking shell).
-**Fix:** DEPLOYMENT.md Path 1 must instruct putting the key in `~/.agentos-secrets/agentos.env`
-(shell-independent; cos mounts it and the entrypoint sources it) — not rely on a shell export. The
-entrypoint's error already recommends this; the *docs* don't.
-**Acceptance:** following Path 1 verbatim, the key reaches cos regardless of which terminal runs compose.
-**Where:** `docs/DEPLOYMENT.md` Path 1.
+### Root cause
 
-### F2 — `agentctl watch` from the host can't reach the Docker CoS
-**Symptom:** `agentctl watch` on the Mac → "Management API at 127.0.0.1:7999 is unreachable."
-**Root cause:** the `cos` service publishes no port, and the management API is loopback-bound *inside*
-the container (a deliberate single-tenant lock). So host-side watch cannot connect.
-**Fix:** DEPLOYMENT.md Path 1 must use `docker compose exec cos agentctl watch` (watch from inside the
-container). Publishing `:7999` won't help without binding `0.0.0.0` (which fights the loopback guard),
-so `exec` is the correct answer for the Docker path.
-**Acceptance:** Path 1's monitoring step works as written on Docker.
-**Where:** `docs/DEPLOYMENT.md` Path 1 step 3.
+`caps_to_rules_inner` (`agentd/src/main.rs:1322–1375`):
 
-### F3 — brief output path mismatch
-**Symptom:** DEPLOYMENT.md says briefs land in `~/.agentos-output/brief-*.md` on the host, but the
-Docker cos writes to `/data/output/` **inside** the container (no host bind mount) — so nothing appears
-on the host.
-**Fix (prefer a):** (a) bind-mount `${HOME}/.agentos-output:/data/output` on the `cos` service so
-briefs land on the host as the docs claim; or (b) correct DEPLOYMENT.md to read them via
-`docker compose exec cos cat /data/output/…`.
-**Acceptance:** briefs appear where DEPLOYMENT.md says they do.
-**Where:** `docker-compose.yml` (cos volumes) + `docs/DEPLOYMENT.md`.
+```rust
+// Line 1330: correctly skips IsolateNetwork when Net is declared
+if !has_net { rules.push(SandboxRule::IsolateNetwork); }
+
+// Line 1340–1348: BUT adds IsolateNetwork again in the ports arm
+Capability::Net { ports, .. } => {
+    if !v4_available {
+        // deny-all as "safe fallback"
+        rules.push(SandboxRule::IsolateNetwork);  // ← BUG
+        continue;
+    }
+    ...
+}
+```
+
+When `Net{ports=[443]}` is declared and the kernel has no Landlock V4 (Docker Desktop,
+any Linux < 6.7), the server ends up with `IsolateNetwork` despite having declared it
+needs outbound access. Token refresh fails → "Not authenticated" → agent tries in-container
+browser OAuth → hangs indefinitely.
+
+### Decision (F4 fallback policy)
+
+**Best-effort ALLOW + loud warn** (not deny-all, not a strict-flag).
+
+Rationale:
+- The operator declaring `Net{ports=[443]}` explicitly stated "this tool needs network".
+  Denying ALL network silently inverts their intent. The current behavior is the exact
+  opposite of what the capability declaration means.
+- Landlock FS degrades best-effort (allows unrestricted FS reads rather than denying).
+  Network should follow the same pattern.
+- A `[tools] strict_network_isolation=true` flag adds complexity with unclear user value —
+  operators on pre-6.7 kernels are typically Docker Desktop users, not hardened production
+  environments. Default must keep networked tools working.
+- The warn message must be loud (stderr + flight event) so operators know port-level
+  enforcement didn't apply.
+
+### Fix
+
+`agentd/src/main.rs` — change the V4-unavailable arm in `caps_to_rules_inner`:
+
+```rust
+if !v4_available {
+    // Landlock V4 unavailable (kernel < 6.7): per-port enforcement impossible.
+    // Best-effort ALLOW: do not push IsolateNetwork. The server gets unrestricted
+    // network rather than deny-all, preserving the operator's declared intent.
+    // (FS rules degrade the same way: best-effort allow, not deny.)
+    tracing::warn!(
+        "Net{{ports={:?}}} declared but Landlock ABI V4 unavailable (kernel < 6.7); \
+         per-port enforcement skipped — server has unrestricted network access. \
+         Upgrade to Linux ≥ 6.7 for port-level isolation.",
+        ports
+    );
+    // No rule pushed: network is unrestricted (best-effort allow).
+    continue;
+}
+```
+
+### Test
+
+`agentd/src/main.rs` — in `#[cfg(test)]` for `caps_to_rules_inner`:
+
+```rust
+#[test]
+fn net_ports_v4_unavailable_degrades_to_allow_not_deny() {
+    let caps = vec![Capability::Net { ports: vec![443] }];
+    let rules = caps_to_rules_inner(&caps, false);  // v4_available = false
+    // Must NOT contain IsolateNetwork — deny-all would break networked tools on Docker Desktop.
+    assert!(!rules.iter().any(|r| matches!(r, SandboxRule::IsolateNetwork)),
+        "Net{{ports}} on no-V4 kernel must degrade to allow, not deny-all: {:?}", rules);
+}
+
+#[test]
+fn net_ports_v4_available_emits_allow_connect() {
+    let caps = vec![Capability::Net { ports: vec![443, 80] }];
+    let rules = caps_to_rules_inner(&caps, true);
+    let has_connect_443 = rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 443 }));
+    let has_connect_80  = rules.iter().any(|r| matches!(r, SandboxRule::AllowNetConnect { port: 80 }));
+    assert!(has_connect_443 && has_connect_80);
+    assert!(!rules.iter().any(|r| matches!(r, SandboxRule::IsolateNetwork)));
+}
+
+#[test]
+fn no_net_cap_still_isolates_v4_unavailable() {
+    // A server with no Net capability should still get IsolateNetwork regardless of V4.
+    let caps = vec![Capability::FsRead { prefix: "/tmp".into() }];
+    let rules = caps_to_rules_inner(&caps, false);
+    assert!(rules.iter().any(|r| matches!(r, SandboxRule::IsolateNetwork)));
+}
+```
 
 ---
 
-## Cross-cutting note
+## F1 — ANTHROPIC_API_KEY location not documented in Path 1
 
-All four surfaced on the *first* real end-to-end Mac Docker run — the path had never been exercised
-end-to-end. Consider a **Docker CoS smoke** (or a documented manual first-run gate) so this path
-doesn't silently rot: `docker compose up cos` → assert healthz + one networked tool call succeeds with
-a stub/dry-run credential.
+### Root cause
 
-## Done =
+DEPLOYMENT.md Path 1, step 2 says `docker compose up -d cos` but never explains that
+`ANTHROPIC_API_KEY` must be in the shell env where `docker compose` is invoked. Users
+who have it in `~/.zshrc` but open a new terminal, or who have it exported in a different
+shell, see the cos service exit immediately with "ANTHROPIC_API_KEY is not set".
 
-F4: a `Net{ports}` MCP server works on a no-Landlock-V4 kernel (best-effort-allow + warn, or the
-strict-flag path), with a test; the Mac Docker CoS reaches Gmail. F1–F3: DEPLOYMENT.md Path 1 is
-accurate (key → `agentos.env`, watch via `exec`, briefs where documented) and briefs land on the host.
-Every code item has a failing-without-it test + adversarial verification. `/review` + `/qa` clean.
+The correct and durable path: put it in `~/.agentos-secrets/agentos.env`. The entrypoint
+(`docker/entrypoint.sh:11–21`) already reads this file and exports its contents before
+checking `ANTHROPIC_API_KEY`. The cos service already mounts `~/.agentos-secrets:/run/secrets:ro`.
+
+### Fix
+
+DEPLOYMENT.md Path 1 — add a "step 0" before `docker compose up`:
+
+```
+# 0. Provision secrets (one-time — survives terminal restarts)
+mkdir -p ~/.agentos-secrets
+printf 'ANTHROPIC_API_KEY=sk-ant-...\n' >> ~/.agentos-secrets/agentos.env
+chmod 600 ~/.agentos-secrets/agentos.env
+```
+
+Remove the implication that a shell export suffices. Mention that the file wins over
+any shell env var (entrypoint precedence).
+
+### Test
+
+Shell test: verify entrypoint reads agentos.env before `check_api_key`:
+
+In `docker/entrypoint.sh`, the ANTHROPIC_API_KEY check already depends on the file-read
+block (lines 11–21). No code change needed for F1 — doc-only fix. Verify by reading
+the entrypoint and confirming the parse block runs before `check_api_key`.
+
+---
+
+## F2 — `agentctl watch` from Mac host → "127.0.0.1:7999 unreachable"
+
+### Root cause
+
+The `cos` service in docker-compose.yml does not publish port 7999 to the host. The
+management API binds to `127.0.0.1:7999` inside the container. `agentctl watch` (run
+on the Mac host) tries `http://localhost:7999` → connection refused.
+
+The correct command is `docker compose exec cos agentctl watch` (runs `agentctl watch`
+inside the container where the FUSE mount and management API are live).
+
+### Fix
+
+DEPLOYMENT.md Path 1, step 3:
+
+```bash
+# 3. Monitor (runs inside the container — FUSE and API are container-local)
+docker compose exec cos agentctl watch
+```
+
+Add a note: "Running `agentctl watch` directly on the Mac host won't work — port 7999
+is loopback-only inside the container and not published. Use `exec` to run inside."
+
+### Test
+
+No code change needed — doc-only fix. Verify that docker-compose.yml has no `ports:` on
+the `cos` service (confirmed: only volumes).
+
+---
+
+## F3 — Briefs written to /data inside container, not to ~/.agentos-output on host
+
+### Root cause
+
+DEPLOYMENT.md Path 1 says "Briefs appear in `~/.agentos-output/brief-YYYY-MM-DD.md`".
+But the `cos` service volume is `cos-data:/data` with no host bind mount. The CoS agent
+writes briefs inside the container at `/data/output/` (or wherever `cd /data/output` lands).
+They are never visible on the Mac host.
+
+### Fix (prefer A — host bind mount)
+
+A. **docker-compose.yml**: add a bind mount to the `cos` service:
+
+```yaml
+cos:
+  volumes:
+    - cos-data:/data
+    - ${HOME}/.agentos-secrets:/run/secrets:ro
+    - ${HOME}/.agentos-output:/data/output  # briefs land on the host
+```
+
+And update DEPLOYMENT.md Path 1 to match: "Briefs appear in `~/.agentos-output/brief-YYYY-MM-DD.md`
+(the CoS writes to `/data/output` inside the container, which is bind-mounted to this host path)."
+
+This makes `mkdir -p ~/.agentos-output` part of the setup.
+
+Note: the cos entrypoint `cd`s to `/data/output` before running agentd (confirmed in the
+init script; same pattern as the distro path). The bind mount wires the container path
+directly to the host.
+
+B. (Fallback, doc-only): Correct the docs to say `docker compose exec cos ls /data/output/`.
+Prefer A — bind mount is better DX.
+
+### Test
+
+No unit test (infra-only). Verify via smoke test: after bind mount, brief files appear on
+the host after a CoS run.
+
+---
+
+## Docker CoS smoke test (CI guard)
+
+Add a minimal Docker smoke test so this path stops rotting silently. It had never been run
+end-to-end before the dogfood run.
+
+**What to test:**
+- `docker compose build cos` succeeds
+- `docker compose up -d cos` starts and passes `GET /healthz` (via `docker compose exec cos
+  curl -sf localhost:7999/healthz`)
+- At least one networked MCP tool call succeeds with a stub credential
+  (or: management API responds to `/api/v1/snapshot`, confirming agentd is running)
+
+**Where:** `.github/workflows/ci.yml` — new `docker-cos-smoke` job, gated on `build-and-test`.
+
+---
+
+## Acceptance criteria
+
+- **F4:** `caps_to_rules_inner(&[Net{ports:[443]}], v4_available=false)` returns NO `IsolateNetwork`
+  rule. Docker Desktop CoS reaches Gmail (token refresh succeeds).
+- **F1:** DEPLOYMENT.md Path 1 has explicit `agentos.env` setup step before `docker compose up`.
+  No mention of shell export for API key.
+- **F2:** DEPLOYMENT.md Path 1 step 3 uses `docker compose exec cos agentctl watch`.
+  Old plain `agentctl watch` instruction removed.
+- **F3:** docker-compose.yml `cos` service has `~/.agentos-output:/data/output` bind mount.
+  DEPLOYMENT.md matches. Briefs land on the host after a real CoS run.
+- `/review` + `/qa` clean.
+
+---
+
+## Files to change
+
+| File | Change |
+|------|--------|
+| `agentd/src/main.rs` | `caps_to_rules_inner`: V4-unavailable → best-effort allow + warn (+ 3 tests) |
+| `docs/DEPLOYMENT.md` | F1: add agentos.env step; F2: exec-based watch; F3: output path |
+| `docker-compose.yml` | F3: `~/.agentos-output:/data/output` bind mount on `cos` |
+| `.github/workflows/ci.yml` | Docker CoS smoke test job |
+
+## NOT in scope
+
+- Per-port enforcement on older kernels via an alternative mechanism (iptables/nftables) — future increment
+- Publishing port 7999 to the host (loopback-only is a security property, not a bug)
+- `strict_network_isolation` config flag — rejected in F4 decision (complexity with no present user value)
+- Changing DEPLOYMENT.md Path 2 (Linux QEMU) — separate path, not affected by these bugs
+
+<!-- GSTACK REVIEW REPORT -->
