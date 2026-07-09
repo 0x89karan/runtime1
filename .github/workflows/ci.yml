@@ -215,18 +215,35 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push multi-arch image
+      - name: Build and push agentos:core
         uses: docker/build-push-action@v6
         with:
           context: .
+          target: runtime-core
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
           tags: |
+            ghcr.io/0x89karan/runtime1:core
+            ghcr.io/0x89karan/runtime1:v${{ steps.version.outputs.version }}-core
+          cache-from: type=gha,scope=buildkit-core
+          cache-to: type=gha,mode=max,scope=buildkit-core
+
+      - name: Build and push agentos:full (and :latest)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime-full
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/0x89karan/runtime1:full
             ghcr.io/0x89karan/runtime1:latest
+            ghcr.io/0x89karan/runtime1:v${{ steps.version.outputs.version }}-full
             ghcr.io/0x89karan/runtime1:v${{ steps.version.outputs.version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=buildkit-full
+          cache-to: type=gha,mode=max,scope=buildkit-full
 
   distro-aarch64:
     runs-on: ubuntu-latest

@@ -40,25 +40,26 @@ RUN touch agentd/src/main.rs agentd/src/lib.rs agentctl/src/main.rs \
           surfaces/src/lib.rs sandbox/src/lib.rs otel/src/main.rs \
  && cargo build --release --bin agentd --bin agentctl --bin agentos-otel
 
-# ── Stage 2: runtime ─────────────────────────────────────────────────────────
-FROM alpine:3.20
+# ── Stage 2a: runtime-core — Rust binaries only ──────────────────────────────
+# Use this tier for custom MCP setups or HTTP-only MCP endpoints.
+# Build: docker build --target runtime-core
+# Pull:  docker pull ghcr.io/0x89karan/runtime1:core
+FROM alpine:3.20 AS runtime-core
 
-RUN apk add --no-cache fuse3 bash jq python3
+RUN apk add --no-cache fuse3 bash jq
 
 # Allow non-root users to mount FUSE filesystems
 RUN echo "user_allow_other" >> /etc/fuse.conf
 
 COPY --from=builder /src/target/release/agentd       /usr/local/bin/agentd
-COPY --from=builder /src/target/release/agentctl    /usr/local/bin/agentctl
+COPY --from=builder /src/target/release/agentctl     /usr/local/bin/agentctl
 COPY --from=builder /src/target/release/agentos-otel /usr/local/bin/agentos-otel
 
-# Default agent config and templates
-COPY docker/agent.toml         /etc/agentd/agent.toml
-COPY docker/agents.toml        /etc/agentd/agents.toml
-COPY docker/weather-agent.toml /etc/agentd/weather-agent.toml
-COPY docker/*.py               /etc/agentd/
-COPY agentd/cos.agents.toml    /etc/agentd/cos.agents.toml
-COPY templates/                /etc/agentd/templates/
+# Base agent configs and full template catalogue
+COPY docker/agent.toml      /etc/agentd/agent.toml
+COPY docker/agents.toml     /etc/agentd/agents.toml
+COPY agentd/cos.agents.toml /etc/agentd/cos.agents.toml
+COPY templates/             /etc/agentd/templates/
 
 RUN mkdir -p /agents /workspace /run/memory /data
 
@@ -69,3 +70,15 @@ RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["shell"]
+
+# ── Stage 2b: runtime-full — adds Python MCP harness ─────────────────────────
+# Extends core with all standard MCP servers (h7.1–h7.3, h8.1) and OAuth sidecar.
+# Build: docker build (no --target, or --target runtime-full)
+# Pull:  docker pull ghcr.io/0x89karan/runtime1:full  (also :latest)
+FROM runtime-core AS runtime-full
+
+RUN apk add --no-cache python3
+
+# Standard MCP servers and supplemental agent configs
+COPY docker/*.py               /etc/agentd/
+COPY docker/weather-agent.toml /etc/agentd/weather-agent.toml

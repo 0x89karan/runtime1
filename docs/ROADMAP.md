@@ -54,7 +54,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 - ~~`cred.4` (v0.63.0) · `cred.4b` (v0.65.0)~~ ✅ shipped — spend caps + credential-agnostic MCP servers.
 1. ~~**cred.5** (v0.68.0) · **ma.4** (v0.67.0)~~ ✅ shipped — credential control plane visibility + isolation-tier honesty.
 2. ~~**dx.3** (v0.69.0) · **dx.4** (v0.71.0)~~ ✅ shipped — Linux QEMU production path + prebuilt images + device auth (`agentctl auth google --device`) + install.sh.
-3. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
+3. ~~**h8.2** (v0.73.0)~~ ✅ shipped — `agentos:core` (Rust-only) + `agentos:full` (Python harness) image split; CI publishes both tiers with shared GHA layer cache.
 4. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 **Deferred:** Track MESH (`mesh.1–6`, multi-instance) and ROADMAP `h8.3` (multi-device migration).
@@ -1069,6 +1069,42 @@ stays multi-device migration.
 
 ---
 
+## Track UX — Operator cockpit (Converse · Observe · Spawn)
+
+Turn `agentctl watch` from a read-only dashboard into the surface the operator *drives*. Closes the
+reach/usability gap (surfaced by a Hermes Agent comparison) and is the operator half of the CoS
+direction. The management API (`:7999`, orch.1/orch.2) already carries the whole backbone — spawn,
+inject, SSE — so this is mostly an `agentctl`-client effort. Full plan: **`docs/plans/ux-cockpit.md`**;
+build-session prompt: `docs/prompts/09-ux-cockpit.md`.
+
+**Locked decisions (2026-07-10):** (1) *Unified* live cockpit — one screen (k9s agent table + pinned
+chat rail + live event stream + input box + `:` palette), not more `[key]` tabs; this needs an
+async-loop refactor first (**ux.0**), preserving current behavior (p1.1-style). (2) *Publish
+host-loopback* — the Docker `cos` deployment binds management to `0.0.0.0` in-container and publishes
+`127.0.0.1:7999:7999`; **agentd default bind stays `127.0.0.1`**.
+
+Backbone: one `tokio::select!` loop, three producers (keys + `/api/v1/events` SSE + ~30 ms render
+tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
+
+- **ux.0** — Async single-loop foundation + host-loopback reachability. No new feature; existing
+  views update live from SSE; `watch --url localhost:7999` works from the Mac host. `/plan-eng-review`
+  the refactor.
+- **ux.2** — Observe (closes **cos-ux-01**): `last_activity`/`last_error`/`idle_secs` on the snapshot;
+  agent-table `LAST-TOOL` + row-red-on-error + `idle→amber` stuck signal; live summary-first event
+  stream (JSON on expand, filter chips, freeze, row-scopes-stream); AgentDetail timeline.
+- **ux.1** — Converse: fold `orchestrate.rs` into the cockpit as the chat rail (`[c]`); streaming
+  green; retarget any agent via the selected row; `follow`/`▼ N new`; inline errors, never hang.
+- **ux.3** — Spawn custom on the fly (closes **p7.3-ar-02**): repoint the Spawn view from
+  exec-a-2nd-agentd to `POST /api/v1/spawn` into the running instance; `⟨custom⟩` mode (deny-by-default
+  caps + tool/connector select); modal-over-live-dashboard; preview before launch; auto-drop into the
+  new agent; `:` command palette.
+
+Sequencing: **ux.0 → ux.2 → ux.1 → ux.3**, one increment per branch, `main` shippable at each step.
+Companion (separate plan, not started): curated MCP connectors via the credential broker (Calendar,
+GitHub, Linear, Slack, Notion) — integrate-don't-bundle.
+
+---
+
 ## Phase 8 — Harness extensions
 
 **h8.1 — Layer 2 semantic memory** [HARNESS] ✅ *v0.64.0 — complete*
@@ -1081,7 +1117,7 @@ permits Docker-internal `http://` URLs. `templates/librarian-semantic.template.t
 (Note: HelixDB was evaluated but uses a graph-DSL API incompatible with the sidecar model;
 Qdrant selected for its simple REST vector API.)
 
-**h8.2 — `agentos:full` Docker distribution** [HARNESS]
+**h8.2 — `agentos:full` Docker distribution** [HARNESS] ✅ v0.73.0
 Formally packages the harness into a versioned Docker image pair. `agentos:core` contains
 only `agentd` + `agentctl` (the existing `Dockerfile`). `agentos:full` extends it with
 all standard MCP servers (h7.1), the OAuth sidecar (h7.2), event trigger servers (h7.3),

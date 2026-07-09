@@ -84,24 +84,31 @@ tail -f flight.jsonl              # watch the flight log
 
 ## Docker quickstart
 
-A pre-built multi-arch image (`linux/amd64` + `linux/arm64`) is published to
-`ghcr.io/0x89karan/runtime1` on every push to `main`. Apple Silicon and ARM
-cloud users get a native image — no Rosetta emulation.
+Two image tiers are published to `ghcr.io/0x89karan/runtime1` on every push to
+`main` (multi-arch: `linux/amd64` + `linux/arm64`):
+
+| Tier | Tag | Contents | When to use |
+|------|-----|----------|-------------|
+| **core** | `:core`, `:vX.Y.Z-core` | `agentd` + `agentctl` + `agentos-otel` + fuse3/bash/jq. No Python. | Custom MCP configs or HTTP-only MCP endpoints |
+| **full** | `:full`, `:latest`, `:vX.Y.Z` | core + python3 + all standard MCP servers (shell, http, search, oauth, cron, fs_watch, webhook, semantic-kb) + template catalogue | Ready-to-run with the full harness |
 
 ```bash
-docker pull ghcr.io/0x89karan/runtime1:latest
+# Full tier (batteries-included) — same as :latest
+docker pull ghcr.io/0x89karan/runtime1:full
+
+# Core tier (Rust runtime only)
+docker pull ghcr.io/0x89karan/runtime1:core
 
 # Chain-of-scouts research agent
 export ANTHROPIC_API_KEY=sk-ant-...
-docker run --rm -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:latest cos
+docker run --rm -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full cos
 
 # Interactive multi-turn orchestrator REPL (starts agentd + agentctl orchestrate)
-docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:latest orchestrate
+docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate
 ```
 
-Versioned tags (`ghcr.io/0x89karan/runtime1:v0.56.0`) are also pushed. If the
-package is private, set it to Public once: GitHub repo → Packages → agentos →
-Package Settings → Change visibility → Public.
+If the package is private, set it to Public once: GitHub repo → Packages →
+agentos → Package Settings → Change visibility → Public.
 
 ## Docker quickstart (cos + Google)
 

@@ -3,6 +3,30 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [h8.2] - 2026-07-10 (v0.73.0)
+
+### Added — `agentos:full` Docker image tier
+
+- **E1 — Tiered Dockerfile**: single `Dockerfile` gains two named runtime stages
+  (`runtime-core` and `runtime-full`) sharing one builder stage. `runtime-core`
+  contains only the three Rust binaries (`agentd`, `agentctl`, `agentos-otel`) plus
+  `fuse3`/`bash`/`jq`; no Python. `runtime-full` extends `runtime-core` with
+  `python3` and all standard MCP servers (`shell_mcp.py`, `http_mcp.py`,
+  `search_mcp.py`, `oauth_mcp.py`, `cron_mcp.py`, `fs_watch_mcp.py`,
+  `webhook_mcp.py`, `semantic_kb_mcp.py`) + `weather-agent.toml`. Operators
+  target the desired tier via `docker build --target runtime-core|runtime-full`.
+
+- **E2 — CI publishes both tiers**: `publish-docker` in `ci.yml` now runs two
+  sequential `docker/build-push-action@v6` steps sharing the GHA layer cache.
+  Tags published per push to `main`:
+  - `:core` + `:vX.Y.Z-core` — Rust-only tier
+  - `:full` + `:latest` + `:vX.Y.Z-full` + `:vX.Y.Z` — batteries-included tier
+  `runtime-core` layers are fully cached before the `runtime-full` step, so the
+  second step adds only the Python `apk add` + file copies (~5 min on arm64 QEMU).
+
+- **E3 — README tier table**: Docker quickstart updated with a core/full comparison
+  table (tags, contents, when to use each).
+
 ## [dx.4] - 2026-07-09 (v0.72.0)
 
 ### Added — Pre-built distro images + device auth flow
