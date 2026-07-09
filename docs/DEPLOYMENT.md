@@ -39,9 +39,31 @@ Briefs appear in `~/.agentos-output/brief-YYYY-MM-DD.md` (the container writes t
 
 ## Path 2 — Linux QEMU
 
-**Prerequisites:** `qemu-system-x86_64`, `/dev/kvm` accessible, Python3 (on build host only)
+**Prerequisites:** `qemu-system-x86_64`, `/dev/kvm` accessible (x86_64 only)
 
-### Step 1 — Build the rootfs (on the Linux host)
+### Fast path — download prebuilt images (recommended)
+
+No build toolchain required. Installs the latest release in ~2 min.
+
+```bash
+# Step 0 — install agentctl (needed for Google auth)
+TAG=$(curl -fsSL https://api.github.com/repos/0x89karan/runtime1/releases/latest \
+  | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' | head -1)
+curl -fsSL -o /usr/local/bin/agentctl \
+  "https://github.com/0x89karan/runtime1/releases/download/${TAG}/agentctl-${TAG}-x86_64-linux-musl"
+chmod +x /usr/local/bin/agentctl
+
+# Step 1 — install prebuilt images
+curl -fsSL https://github.com/0x89karan/runtime1/releases/latest/download/install.sh -o install.sh
+# Review the script before running it:
+bash install.sh
+```
+
+If verification fails, re-run the `bash install.sh` command. Do not proceed if SHA256 fails.
+
+Skip to **Step 2** (create user) after install completes.
+
+### Slow path — build from source (developer option)
 
 ```bash
 git clone https://github.com/0x89karan/runtime1.git
@@ -98,10 +120,27 @@ sudo chown agentos:agentos /home/agentos/.agentos-secrets/agentos.env
 
 ### Step 4 — Provision Google credentials (one-time)
 
-Run the PKCE OAuth flow on your Mac (where you have a browser):
+**Option A — headless server (no browser needed, recommended for Linux VPS):**
 
 ```bash
-# On Mac:
+# Requires OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET in env or agentos.env.
+agentctl auth google --device
+# Prints a URL and a short code. Visit the URL on any device (phone, Mac, etc.)
+# and enter the code. Authorization is complete in ~30 seconds.
+# Credentials are written to ~/.agentos-secrets/google.json
+```
+
+If you ran this as your own user (not `agentos`), copy the credentials:
+
+```bash
+sudo cp ~/.agentos-secrets/google.json /home/agentos/.agentos-secrets/google.json
+sudo chown agentos:agentos /home/agentos/.agentos-secrets/google.json
+```
+
+**Option B — Mac/Linux with browser:**
+
+```bash
+# On Mac (or any machine with a browser):
 agentctl auth google          # opens browser, writes ~/.agentos-secrets/google.json
 
 # Copy to the Linux host:
@@ -112,7 +151,8 @@ Extract the refresh token and add it to `agentos.env` to skip future browser dan
 
 ```bash
 # On the Linux host:
-REFRESH=$(sudo -u agentos jq -r .refresh_token /home/agentos/.agentos-secrets/google.json)
+REFRESH=$(sudo -u agentos python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['refresh_token'])" \
+  /home/agentos/.agentos-secrets/google.json)
 echo "OAUTH_REFRESH_TOKEN=${REFRESH}" | sudo tee -a /home/agentos/.agentos-secrets/agentos.env
 ```
 
@@ -168,8 +208,8 @@ agentctl deny <id> --reason ... # deny with reason
 |-----------|------|--------|
 | Anthropic API key | `agentos.env` | Manual — copy from console.anthropic.com |
 | Google OAuth app | `agentos.env` | Manual — create at console.cloud.google.com |
-| Google refresh token | `agentos.env` | `agentctl auth google` → extract → scp |
-| `google.json` | `.agentos-secrets/google.json` | `agentctl auth google` → scp to Linux host |
+| Google refresh token | `agentos.env` | `agentctl auth google [--device]` → extract → add to env |
+| `google.json` | `.agentos-secrets/google.json` | `agentctl auth google --device` (headless) or `agentctl auth google` → scp |
 
 The `google.json` file is used by `oauth_mcp.py` as an alternative to env vars (checked first
 when `AGENTD_CREDENTIAL_GATEWAY_URL` is set — credential broker path, available in future).

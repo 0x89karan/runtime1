@@ -41,6 +41,7 @@ jobs:
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/agentd  dist/agentd-${TAG}-x86_64-linux-musl
           cp target/x86_64-unknown-linux-musl/release/agentctl dist/agentctl-${TAG}-x86_64-linux-musl
+          cp install.sh dist/install.sh
           chmod +x dist/*
           sha256sum dist/* > dist/SHA256SUMS
 
@@ -50,5 +51,85 @@ jobs:
           files: |
             dist/agentd-*
             dist/agentctl-*
+            dist/install.sh
             dist/SHA256SUMS
           generate_release_notes: true
+
+  build-distro-x86_64:
+    name: Build x86_64 distro image
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 musl-tools \
+            libelf-dev libssl-dev bc bison flex
+
+      - name: Build agentd + agentctl (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p agentd -p agentctl
+
+      - name: Cache Buildroot build tree
+        uses: actions/cache@v4
+        with:
+          path: distro/build
+          key: buildroot-2024.02.9-v2-${{ hashFiles('distro/buildroot.config', 'distro/kernel-extras.config') }}
+
+      - name: Build distro image
+        run: |
+          mkdir -p overlay/usr/bin
+          cp "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-musl/release/agentd"   overlay/usr/bin/agentd
+          cp "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-musl/release/agentctl" overlay/usr/bin/agentctl
+          chmod +x overlay/usr/bin/agentd overlay/usr/bin/agentctl
+          make build
+        working-directory: distro
+
+      - name: Boot smoke test
+        run: |
+          set -euo pipefail
+          echo "Running QEMU boot smoke test..."
+          timeout 60 qemu-system-x86_64 \
+            -nographic -m 128M \
+            -kernel distro/output/bzImage \
+            -initrd distro/output/rootfs.cpio.gz \
+            -append "console=ttyS0 quiet" \
+            -no-reboot 2>&1 | head -80 | tee /tmp/qemu-smoke.log || true
+          # init prints AGENTOS_INIT_STARTED before anything else — proves kernel
+          # booted, mounted the initrd, and exec'd our /init (not just the kernel).
+          if ! grep -q "AGENTOS_INIT_STARTED" /tmp/qemu-smoke.log 2>/dev/null; then
+            echo "FAIL: agentOS /init did not start"
+            cat /tmp/qemu-smoke.log
+            exit 1
+          fi
+          echo "Boot smoke test: PASS"
+
+      - name: Package distro artifacts
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          cp distro/output/bzImage    "dist/agentos-${VERSION}-x86_64-bzImage"
+          cp distro/output/rootfs.cpio.gz "dist/agentos-${VERSION}-x86_64-rootfs.cpio.gz"
+          cd dist
+          sha256sum \
+            "agentos-${VERSION}-x86_64-bzImage" \
+            "agentos-${VERSION}-x86_64-rootfs.cpio.gz" \
+            > "agentos-${VERSION}-x86_64-SHA256SUMS"
+
+      - name: Attach distro artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/agentos-*-x86_64-bzImage
+            dist/agentos-*-x86_64-rootfs.cpio.gz
+            dist/agentos-*-x86_64-SHA256SUMS

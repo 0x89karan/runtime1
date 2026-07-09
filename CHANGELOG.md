@@ -3,6 +3,39 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [dx.4] - 2026-07-09 (v0.72.0)
+
+### Added — Pre-built distro images + device auth flow
+
+- **E1 — Pre-built x86_64 distro images**: `release.yml` gains `build-distro-x86_64` job that
+  builds the Buildroot rootfs with the release `agentd` binary, runs a QEMU boot smoke test, and
+  attaches `agentos-VERSION-x86_64-bzImage`, `agentos-VERSION-x86_64-rootfs.cpio.gz`, and
+  `agentos-VERSION-x86_64-SHA256SUMS` (separate from binary `SHA256SUMS`) to the GitHub Release.
+  Buildroot cache key shared with `qemu-boot.yml`; `timeout-minutes: 90`; full apt-get dep list
+  (`libelf-dev libssl-dev bc bison flex`).
+
+- **E2 — `agentctl auth google --device`** (RFC 8628 Device Authorization Grant): new
+  `agentctl/src/auth/google_device.rs` module implements the device code flow. Prints a URL +
+  short code; polls Google's token endpoint until authorized, expired, or 30 min monotonic
+  deadline. RFC-compliant error handling: `authorization_pending` → retry; `slow_down` → +5 s
+  additive backoff (not doubling, per §3.5); `expired_token` / `invalid_grant` → clear error
+  message. `access_type=offline` in device auth POST ensures a `refresh_token` is returned.
+  `option_env!("OAUTH_CLIENT_ID"/"OAUTH_CLIENT_SECRET")` compile-time embed with runtime
+  `env` override. Terminal escape sequences stripped from URL/code display.
+
+- **E3 — DEPLOYMENT.md fast path**: `docs/DEPLOYMENT.md` Path 2 now leads with a fast path
+  (download prebuilt images via `install.sh`; no Buildroot required) and a separate "slow path"
+  (build from source). Step 4 offers device flow as the primary headless option with instructions
+  for credential ownership when running as the `agentos` service user.
+
+- **E4 — `install.sh` convenience installer**: `install.sh` at repo root; detects arch (errors
+  clearly for non-x86_64 with Docker path hint); resolves latest tag via grep/sed (no jq dep);
+  downloads bzImage + rootfs + distro-specific SHA256SUMS; verifies checksums before writing;
+  copies to `/opt/agentos/` with sudo; prints credential ownership reminder for the service user.
+
+- **DRY refactor**: `auth::util` new module with `secrets_file_path()` and `write_secrets_file()`
+  shared by PKCE (`google.rs`) and device flow (`google_device.rs`).
+
 ## [dx.4b] - 2026-07-09 (v0.71.0)
 
 ### Fixed — Mac + Docker CoS first-run failures (F1–F4)

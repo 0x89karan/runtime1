@@ -1,6 +1,7 @@
 // PKCE OAuth2 authorization-code flow for Google.
 // Writes ~/.agentos-secrets/google.json (mode 0600, atomic).
 // Requires OAUTH_CLIENT_ID + OAUTH_CLIENT_SECRET from env or CLI flags.
+// Use --device for headless/no-browser environments (RFC 8628 device flow).
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -8,8 +9,6 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    os::unix::fs::PermissionsExt,
-    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -25,22 +24,30 @@ const DEFAULT_PORT: u16 = 8585;
 pub struct Args {
     /// Google OAuth client ID (or set OAUTH_CLIENT_ID)
     #[arg(long, env = "OAUTH_CLIENT_ID")]
-    client_id: Option<String>,
+    pub(super) client_id: Option<String>,
 
     /// Google OAuth client secret (or set OAUTH_CLIENT_SECRET)
     #[arg(long, env = "OAUTH_CLIENT_SECRET")]
-    client_secret: Option<String>,
+    pub(super) client_secret: Option<String>,
 
-    /// Local port for the OAuth callback server
+    /// Local port for the OAuth callback server (PKCE flow only)
     #[arg(long, default_value_t = DEFAULT_PORT)]
     port: u16,
 
     /// Overwrite existing token file without prompting
     #[arg(long)]
-    force: bool,
+    pub(super) force: bool,
+
+    /// Use device authorization flow (RFC 8628) — for headless servers without a browser
+    #[arg(long)]
+    device: bool,
 }
 
 pub fn run(args: Args) -> Result<()> {
+    if args.device {
+        return super::google_device::run(args.client_id, args.client_secret, args.force);
+    }
+
     let port = args.port;
 
     let client_id = args.client_id.unwrap_or_default();
@@ -71,7 +78,7 @@ pub fn run(args: Args) -> Result<()> {
         );
     }
 
-    let secrets_file = secrets_file_path()?;
+    let secrets_file = super::util::secrets_file_path()?;
 
     if secrets_file.exists() && !args.force {
         bail!(
@@ -155,7 +162,7 @@ pub fn run(args: Args) -> Result<()> {
         GOOGLE_TOKEN_URL,
     )?;
 
-    write_secrets_file(&secrets_file, &client_id, &client_secret, &refresh_token)?;
+    super::util::write_secrets_file(&secrets_file, &client_id, &client_secret, &refresh_token)?;
 
     println!();
     println!("  Authorization complete.");
@@ -166,17 +173,6 @@ pub fn run(args: Args) -> Result<()> {
     println!();
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Path helpers
-// ---------------------------------------------------------------------------
-
-fn secrets_file_path() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home)
-        .join(".agentos-secrets")
-        .join("google.json"))
 }
 
 // ---------------------------------------------------------------------------
@@ -495,43 +491,6 @@ fn exchange_code(
     Ok(token)
 }
 
-// ---------------------------------------------------------------------------
-// Atomic write
-// ---------------------------------------------------------------------------
-
-fn write_secrets_file(
-    path: &Path,
-    client_id: &str,
-    client_secret: &str,
-    refresh_token: &str,
-) -> Result<()> {
-    let json = serde_json::json!({
-        "client_id":     client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-    });
-    let content = serde_json::to_string_pretty(&json).unwrap();
-
-    let dir = path.parent().context("Invalid secrets file path")?;
-    if !dir.exists() {
-        eprintln!("Creating {} ...", dir.display());
-        fs::create_dir_all(dir)
-            .with_context(|| format!("Failed to create {}", dir.display()))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("Failed to set permissions on {}", dir.display()))?;
-    }
-    let tmp_path = dir.join(format!(".google.json.tmp.{}", std::process::id()));
-
-    // Write + chmod before rename to ensure permissions are correct if rename fails.
-    fs::write(&tmp_path, &content).with_context(|| format!("Write failed: {}", tmp_path.display()))?;
-    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod failed: {}", tmp_path.display()))?;
-    fs::rename(&tmp_path, path)
-        .with_context(|| format!("Rename failed: {} -> {}", tmp_path.display(), path.display()))?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,7 +566,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agentos-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("google.json");
-        write_secrets_file(&path, "cid", "csecret", "rtoken").unwrap();
+        crate::auth::util::write_secrets_file(&path, "cid", "csecret", "rtoken").unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["client_id"], "cid");
@@ -622,7 +581,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("agentos-test-mode-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("google.json");
-        write_secrets_file(&path, "cid", "csecret", "rtoken").unwrap();
+        crate::auth::util::write_secrets_file(&path, "cid", "csecret", "rtoken").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "secrets file must be 0600");
         std::fs::remove_dir_all(&dir).ok();
@@ -788,7 +747,7 @@ mod tests {
     #[test]
     fn secrets_file_path_under_home() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let path = secrets_file_path().unwrap();
+        let path = crate::auth::util::secrets_file_path().unwrap();
         assert!(
             path.starts_with(&home),
             "secrets path must be under $HOME, got {:?}",
@@ -805,7 +764,7 @@ mod tests {
         // base must NOT exist before the call
         let _ = std::fs::remove_dir_all(&base);
         let path = base.join("google.json");
-        write_secrets_file(&path, "a", "b", "c").unwrap();
+        crate::auth::util::write_secrets_file(&path, "a", "b", "c").unwrap();
         assert!(path.exists(), "file must be created");
         std::fs::remove_dir_all(&base).ok();
     }

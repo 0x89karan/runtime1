@@ -5,6 +5,9 @@
 
 set -e
 
+# Sentinel read by the CI smoke test — proves init ran (not just the kernel).
+echo "AGENTOS_INIT_STARTED"
+
 mount -t proc    none /proc
 mount -t sysfs   none /sys
 mount -t devtmpfs none /dev 2>/dev/null || mdev -s

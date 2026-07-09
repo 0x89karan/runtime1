@@ -53,7 +53,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 - ~~`h8.1` (v0.64.0)~~ ✅ shipped — Layer-2 semantic memory sidecar (Qdrant + Voyage AI).
 - ~~`cred.4` (v0.63.0) · `cred.4b` (v0.65.0)~~ ✅ shipped — spend caps + credential-agnostic MCP servers.
 1. ~~**cred.5** (v0.68.0) · **ma.4** (v0.67.0)~~ ✅ shipped — credential control plane visibility + isolation-tier honesty.
-2. **dx.3 / dx.4** — Linux QEMU production + prebuilt images (when targeting Linux hardware).
+2. ~~**dx.3** (v0.69.0) · **dx.4** (v0.71.0)~~ ✅ shipped — Linux QEMU production path + prebuilt images + device auth (`agentctl auth google --device`) + install.sh.
 3. **h8.2** — `agentos:full` packaging (after h8.1, so "full" is actually full).
 4. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
