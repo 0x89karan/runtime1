@@ -1,0 +1,720 @@
+<title>Running the Chain of Scouts</title>
+<style>
+  :root {
+    --bg: #0B0F17;
+    --surface: #131923;
+    --border: #1E2B3F;
+    --text: #C8D8EE;
+    --muted: #5C7396;
+    --accent: #F0A030;
+    --accent-dim: rgba(240,160,48,0.12);
+    --code-bg: #070B11;
+    --code-text: #A8C4E0;
+    --tag-bg: rgba(240,160,48,0.15);
+    --tag-text: #F0A030;
+    --note-bg: rgba(28,42,64,0.6);
+    --rail: rgba(240,160,48,0.25);
+    --step-num: rgba(240,160,48,0.18);
+    --success: #3CB882;
+    --link: #7EB8F0;
+    --inline-code-bg: rgba(255,255,255,0.07);
+    --inline-code-text: #A8C4E0;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F0F4FA;
+      --surface: #FFFFFF;
+      --border: #D4DEF0;
+      --text: #0F1D2E;
+      --muted: #5C7080;
+      --code-bg: #070B11;
+      --code-text: #A8C4E0;
+      --tag-bg: rgba(240,160,48,0.15);
+      --tag-text: #C07A10;
+      --note-bg: rgba(200,218,240,0.35);
+      --rail: rgba(200,130,20,0.3);
+      --step-num: rgba(200,130,20,0.12);
+      --link: #1A6AC0;
+      --inline-code-bg: rgba(0,0,0,0.06);
+      --inline-code-text: #1A4A80;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #0B0F17;
+    --surface: #131923;
+    --border: #1E2B3F;
+    --text: #C8D8EE;
+    --muted: #5C7396;
+    --accent: #F0A030;
+    --accent-dim: rgba(240,160,48,0.12);
+    --code-bg: #070B11;
+    --code-text: #A8C4E0;
+    --tag-bg: rgba(240,160,48,0.15);
+    --tag-text: #F0A030;
+    --note-bg: rgba(28,42,64,0.6);
+    --rail: rgba(240,160,48,0.25);
+    --step-num: rgba(240,160,48,0.18);
+    --link: #7EB8F0;
+    --inline-code-bg: rgba(255,255,255,0.07);
+    --inline-code-text: #A8C4E0;
+  }
+
+  :root[data-theme="light"] {
+    --bg: #F0F4FA;
+    --surface: #FFFFFF;
+    --border: #D4DEF0;
+    --text: #0F1D2E;
+    --muted: #5C7080;
+    --accent: #D48A10;
+    --code-bg: #070B11;
+    --code-text: #A8C4E0;
+    --tag-bg: rgba(240,160,48,0.15);
+    --tag-text: #C07A10;
+    --note-bg: rgba(200,218,240,0.35);
+    --rail: rgba(200,130,20,0.3);
+    --step-num: rgba(200,130,20,0.12);
+    --link: #1A6AC0;
+    --inline-code-bg: rgba(0,0,0,0.06);
+    --inline-code-text: #1A4A80;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    padding: 48px 20px 80px;
+    min-height: 100vh;
+  }
+
+  .page {
+    max-width: 660px;
+    margin: 0 auto;
+  }
+
+  /* Header */
+  .header {
+    margin-bottom: 48px;
+    padding-bottom: 28px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header-eyebrow {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .header-eyebrow::before {
+    content: '';
+    display: inline-block;
+    width: 20px;
+    height: 1px;
+    background: var(--accent);
+    opacity: 0.6;
+  }
+
+  h1 {
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.2;
+    color: var(--text);
+    text-wrap: balance;
+    margin-bottom: 10px;
+  }
+
+  .header-sub {
+    font-size: 14px;
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  /* Prerequisites */
+  .prereqs {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border);
+    padding: 18px 22px;
+    margin-bottom: 48px;
+  }
+
+  .prereqs-label {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+
+  .prereqs ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .prereqs li {
+    font-size: 14px;
+    color: var(--text);
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .prereqs li::before {
+    content: '—';
+    color: var(--muted);
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+
+  .prereqs li strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  /* Section */
+  .section-label {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .section-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* Steps */
+  .steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    margin-bottom: 48px;
+  }
+
+  .step {
+    position: relative;
+    padding: 0 0 0 52px;
+    padding-bottom: 36px;
+  }
+
+  .step:last-child {
+    padding-bottom: 0;
+  }
+
+  /* Vertical connecting line */
+  .step:not(:last-child)::after {
+    content: '';
+    position: absolute;
+    left: 16px;
+    top: 40px;
+    bottom: 0;
+    width: 1px;
+    background: var(--border);
+  }
+
+  .step-num {
+    position: absolute;
+    left: 0;
+    top: 2px;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent);
+    background: var(--accent-dim, rgba(240,160,48,0.12));
+    border: 1px solid var(--rail);
+    border-radius: 2px;
+    letter-spacing: 0;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .step-title {
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text);
+    letter-spacing: -0.01em;
+    line-height: 32px;
+    margin-bottom: 10px;
+  }
+
+  .step-tag {
+    display: inline-block;
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--tag-text);
+    background: var(--tag-bg);
+    padding: 2px 7px;
+    border-radius: 2px;
+    margin-left: 8px;
+    vertical-align: middle;
+    font-weight: 600;
+    line-height: 20px;
+  }
+
+  .step p {
+    font-size: 14px;
+    color: var(--text);
+    margin-bottom: 12px;
+    line-height: 1.65;
+  }
+
+  .step p:last-child {
+    margin-bottom: 0;
+  }
+
+  .step ol, .step ul {
+    font-size: 14px;
+    color: var(--text);
+    margin: 8px 0 12px 0;
+    padding-left: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .step ol {
+    list-style: decimal;
+  }
+
+  .step li {
+    line-height: 1.6;
+    padding-left: 4px;
+  }
+
+  /* Code blocks */
+  .code-block {
+    margin: 12px 0;
+    border-radius: 3px;
+    overflow: hidden;
+    border: 1px solid #1A2535;
+  }
+
+  .code-header {
+    background: #0D1520;
+    padding: 6px 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid #1A2535;
+  }
+
+  .code-dots {
+    display: flex;
+    gap: 5px;
+  }
+
+  .code-dots span {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #2A3C55;
+  }
+
+  .code-lang {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: #3A5A7A;
+    text-transform: uppercase;
+    margin-left: auto;
+  }
+
+  .code-block pre {
+    background: var(--code-bg);
+    padding: 16px 18px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .code-block code {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.65;
+    color: var(--code-text);
+    white-space: pre;
+    tab-size: 2;
+  }
+
+  /* Inline code */
+  code {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 12.5px;
+    background: var(--inline-code-bg);
+    color: var(--inline-code-text);
+    padding: 1px 5px;
+    border-radius: 2px;
+  }
+
+  .code-block code {
+    background: none;
+    padding: 0;
+    border-radius: 0;
+    font-size: 13px;
+    color: var(--code-text);
+  }
+
+  /* Syntax-ish colors */
+  .k { color: #7AB8F0; }  /* keywords/flags */
+  .s { color: #8ED4A8; }  /* strings */
+  .c { color: #3A5A7A; }  /* comments */
+  .v { color: #F0A030; }  /* variables */
+  .p { color: #6090C0; }  /* punctuation */
+  .cmd { color: #C8D8EE; } /* commands */
+  .flag { color: #7AB8F0; } /* flags */
+  .path { color: #8ED4A8; }
+
+  /* Note box */
+  .note {
+    background: var(--note-bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    padding: 16px 20px;
+    margin-top: 0;
+    margin-bottom: 48px;
+  }
+
+  .note-label {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin-bottom: 10px;
+    font-weight: 600;
+  }
+
+  .note ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+
+  .note li {
+    font-size: 13.5px;
+    color: var(--muted);
+    padding-left: 16px;
+    position: relative;
+    line-height: 1.6;
+  }
+
+  .note li::before {
+    content: '›';
+    position: absolute;
+    left: 0;
+    color: var(--accent);
+    opacity: 0.6;
+  }
+
+  .note li strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  /* What to expect box */
+  .expect {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 20px 22px;
+    margin: 12px 0;
+  }
+
+  .expect-label {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+
+  .timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .timeline-item {
+    display: flex;
+    gap: 14px;
+    align-items: flex-start;
+    font-size: 13.5px;
+  }
+
+  .timeline-time {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 11px;
+    color: var(--accent);
+    flex-shrink: 0;
+    padding-top: 2px;
+    font-variant-numeric: tabular-nums;
+    min-width: 48px;
+  }
+
+  .timeline-desc {
+    color: var(--muted);
+    line-height: 1.5;
+  }
+
+  .timeline-desc strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  a { color: var(--link); }
+
+  @media (max-width: 480px) {
+    body { padding: 32px 16px 60px; }
+    h1 { font-size: 22px; }
+    .step { padding-left: 44px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+
+<div class="page">
+
+  <div class="header">
+    <div class="header-eyebrow">AgentOS · Docker</div>
+    <h1>Running the Chain of Scouts</h1>
+    <p class="header-sub">Three-agent Gmail orchestrator: cron trigger → inbox reader → KB curator → daily brief.</p>
+  </div>
+
+  <div class="prereqs">
+    <div class="prereqs-label">Before you start</div>
+    <ul>
+      <li><strong>Docker Desktop</strong> installed and running on your Mac</li>
+      <li><strong>Anthropic API key</strong> (<code>sk-ant-...</code>)</li>
+      <li><strong>Google Cloud account</strong> — free tier works</li>
+      <li><strong>Rust + Cargo</strong> — to build <code>agentctl</code> once</li>
+    </ul>
+  </div>
+
+  <!-- One-time setup -->
+  <div class="section-label">One-time setup</div>
+
+  <div class="steps">
+
+    <div class="step">
+      <div class="step-num">01</div>
+      <div class="step-title">Build agentctl <span class="step-tag">once</span></div>
+      <p>You need <code>agentctl</code> on your Mac to complete the Google OAuth flow. Build it from the repo root:</p>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots"><span></span><span></span><span></span></div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><code><span class="c"># From repo root</span>
+<span class="cmd">cargo build</span> <span class="flag">--release --bin</span> agentctl
+
+<span class="c"># Optionally add to PATH</span>
+<span class="cmd">sudo cp</span> <span class="path">target/release/agentctl</span> <span class="path">/usr/local/bin/agentctl</span></code></pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">02</div>
+      <div class="step-title">Create Google OAuth credentials <span class="step-tag">once</span></div>
+      <p>The CoS needs read-only Gmail access. Create an OAuth app in Google Cloud:</p>
+      <ol>
+        <li>Go to <a href="#">console.cloud.google.com</a> → select or create a project</li>
+        <li><strong>APIs &amp; Services → Library</strong> → search <em>Gmail API</em> → Enable</li>
+        <li><strong>APIs &amp; Services → Credentials → Create Credentials → OAuth client ID</strong></li>
+        <li>Application type: <strong>Desktop app</strong> — name it anything</li>
+        <li>Under <em>Authorized redirect URIs</em>, add: <code>http://127.0.0.1:8585</code></li>
+        <li>Copy the <strong>Client ID</strong> and <strong>Client Secret</strong></li>
+      </ol>
+      <p><code>8585</code> must be free when you run the auth flow (step 3). If it's already in use, run <code>agentctl auth google --port &lt;N&gt;</code> and register <code>http://127.0.0.1:&lt;N&gt;</code> as the redirect URI instead — a mismatch here is the usual cause of <code>ERR_CONNECTION_REFUSED</code> in the browser.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-num">03</div>
+      <div class="step-title">Authorize Gmail access <span class="step-tag">once</span></div>
+      <p>Run the PKCE OAuth flow on your Mac. A browser window will open — sign in with your Google account and grant Gmail read access. The refresh token is saved locally.</p>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots"><span></span><span></span><span></span></div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><code><span class="cmd">agentctl auth google</span> <span class="flag">\
+  --client-id</span>     <span class="s">"YOUR_CLIENT_ID.apps.googleusercontent.com"</span> <span class="flag">\
+  --client-secret</span> <span class="s">"YOUR_CLIENT_SECRET"</span></code></pre>
+      </div>
+      <p>On success, credentials are written to <code>~/.agentos-secrets/google.json</code>. The container mounts this file read-only — no credentials are passed via environment variables.</p>
+    </div>
+
+    <div class="step">
+      <div class="step-num">04</div>
+      <div class="step-title">Create local directories <span class="step-tag">once</span></div>
+      <p>Two host directories are mounted into the container: one for runtime state (checkpoint, memory DB, evidence log), one for the brief output.</p>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots"><span></span><span></span><span></span></div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><code><span class="cmd">mkdir -p</span> <span class="path">~/.agentos-output ~/.agentos-data</span></code></pre>
+      </div>
+    </div>
+
+  </div><!-- /steps one-time -->
+
+  <!-- Running it -->
+  <div class="section-label">Run it</div>
+
+  <div class="steps">
+
+    <div class="step">
+      <div class="step-num">05</div>
+      <div class="step-title">Pull the image</div>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots"><span></span><span></span><span></span></div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><code><span class="cmd">docker pull</span> ghcr.io/0x89karan/runtime1:full</code></pre>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">06</div>
+      <div class="step-title">Start the CoS</div>
+      <p>Set your Anthropic key and run. <code>TRIGGER_INTERVAL=every 2m</code> fires the cron quickly for testing — change it to a cron expression like <code>0 8 * * *</code> for production use.</p>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots"><span></span><span></span><span></span></div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><code><span class="k">export</span> <span class="v">ANTHROPIC_API_KEY</span>=sk-ant-...
+
+<span class="cmd">docker run</span> <span class="flag">--rm -it \
+  --name agentos-cos \
+  --privileged \
+  -e</span> ANTHROPIC_API_KEY <span class="flag">\
+  -e</span> <span class="s">"TRIGGER_INTERVAL=every 2m"</span> <span class="flag">\
+  -v</span> <span class="path">~/.agentos-secrets:/run/secrets:ro</span> <span class="flag">\
+  -v</span> <span class="path">~/.agentos-output:/data/output</span> <span class="flag">\
+  -v</span> <span class="path">~/.agentos-data:/data</span> <span class="flag">\
+  </span>ghcr.io/0x89karan/runtime1:full cos</code></pre>
+      </div>
+      <p>The container boots agentd, patches the config, and parks the orchestrator agent in a cron wait loop. Logs stream to your terminal.</p>
+
+      <div class="expect">
+        <div class="expect-label">What happens in the first 3 minutes</div>
+        <div class="timeline">
+          <div class="timeline-item">
+            <div class="timeline-time">0:00</div>
+            <div class="timeline-desc"><strong>agentd starts.</strong> MCP servers (cron, oauth) connect. Orchestrator agent begins its loop.</div>
+          </div>
+          <div class="timeline-item">
+            <div class="timeline-time">~0:30</div>
+            <div class="timeline-desc"><strong>Cron fires.</strong> Orchestrator spawns the Inbox agent with a 500k-token budget.</div>
+          </div>
+          <div class="timeline-item">
+            <div class="timeline-time">~1:00</div>
+            <div class="timeline-desc"><strong>Inbox agent reads Gmail.</strong> Calls the OAuth sidecar → fetches last 24h of messages → returns structured JSON.</div>
+          </div>
+          <div class="timeline-item">
+            <div class="timeline-time">~1:30</div>
+            <div class="timeline-desc"><strong>Curator agent persists to KB.</strong> Writes briefs + entities to the redb memory store.</div>
+          </div>
+          <div class="timeline-item">
+            <div class="timeline-time">~2:00</div>
+            <div class="timeline-desc"><strong>Brief written.</strong> Orchestrator writes <code>brief-YYYY-MM-DD.md</code> and parks for next trigger.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="step">
+      <div class="step-num">07</div>
+      <div class="step-title">Watch the agents <span class="step-tag">optional</span></div>
+      <p>In a second terminal, watch the live cockpit — per-agent status, last tool call, and the flight log — from inside the running container:</p>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots"><span></span><span></span><span></span></div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><code><span class="cmd">docker exec</span> <span class="flag">-it</span> agentos-cos <span class="cmd">agentctl</span> watch</code></pre>
+      </div>
+      <p>Requires the <code>--name agentos-cos</code> from step 6. Press <code>q</code> to exit the cockpit (the agents keep running).</p>
+    </div>
+
+    <div class="step">
+      <div class="step-num">08</div>
+      <div class="step-title">Read the brief</div>
+      <p>In a second terminal, once the first cycle completes:</p>
+      <div class="code-block">
+        <div class="code-header">
+          <div class="code-dots"><span></span><span></span><span></span></div>
+          <div class="code-lang">bash</div>
+        </div>
+        <pre><code><span class="c"># List briefs</span>
+<span class="cmd">ls -la</span> <span class="path">~/.agentos-output/</span>
+
+<span class="c"># Read today's brief</span>
+<span class="cmd">cat</span> <span class="path">~/.agentos-output/brief-$(date +%Y-%m-%d).md</span></code></pre>
+      </div>
+    </div>
+
+  </div><!-- /steps run -->
+
+  <div class="note">
+    <div class="note-label">Troubleshooting</div>
+    <ul>
+      <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker run</code>. Re-<code>export</code> it in this terminal, or use the <code>agentos.env</code> approach below.</li>
+      <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> the redirect URI doesn't match. Confirm <code>http://127.0.0.1:8585</code> is registered in the Google OAuth app and that <code>8585</code> was free.</li>
+      <li><strong>No brief after a few minutes:</strong> check the cron fired and Gmail was reached — <code>jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail</code>. An empty result means the trigger hasn't fired yet.</li>
+      <li><strong>Can't <code>docker exec</code> to watch:</strong> the container must have been started with <code>--name agentos-cos</code> (step 6).</li>
+    </ul>
+  </div>
+
+  <div class="note">
+    <div class="note-label">Notes</div>
+    <ul>
+      <li><strong>Schedule:</strong> <code>TRIGGER_INTERVAL="every 2m"</code> (used above) is for testing and only accepts <code>every N(s|m|h)</code>. For a daily brief use the <em>separate</em> cron variable: <code>-e "TRIGGER_CRON=0 8 * * *"</code> (08:00 UTC). A cron expression in <code>TRIGGER_INTERVAL</code> will not parse.</li>
+      <li><strong>API key across shells:</strong> <code>-e ANTHROPIC_API_KEY</code> forwards it from the shell you <code>export</code>ed in — run <code>docker run</code> in that <em>same</em> terminal, or put <code>ANTHROPIC_API_KEY=sk-ant-...</code> in <code>~/.agentos-secrets/agentos.env</code> (the entrypoint sources it) so it survives across shells.</li>
+      <li><strong>Talk to it interactively:</strong> instead of the autonomous cron brief, run the orchestrator REPL — <code>docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate</code>.</li>
+      <li><strong>Stopping:</strong> Ctrl+C triggers a graceful checkpoint. State is preserved in <code>~/.agentos-data</code> — the next run resumes from where it left off.</li>
+      <li><strong>Google auth on subsequent runs:</strong> The refresh token in <code>google.json</code> handles re-authorization automatically. No browser needed.</li>
+      <li><strong>If OAuth fails:</strong> Re-run <code>agentctl auth google</code> with the same flags — it overwrites the token file.</li>
+      <li><strong>Logs &amp; receipts:</strong> everything the agents do is recorded in <code>~/.agentos-data/flight.jsonl</code> — inspect it with <code>jq</code>. The signed action receipts are separate: verify the chain with <code>agentctl verify ~/.agentos-data/evidence.jsonl</code>.</li>
+      <li><strong>Building agentctl:</strong> macOS has no prebuilt binary, so step 1's <code>cargo build</code> is required; on Linux you can download <code>agentctl</code> from GitHub Releases instead.</li>
+    </ul>
+  </div>
+
+  <div style="margin-top:8px;font-family:'JetBrains Mono','SF Mono',Consolas,monospace;font-size:11px;color:var(--muted);text-align:center;letter-spacing:0.04em;">
+    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.73.0
+  </div>
+
+</div>

@@ -7,33 +7,96 @@ Both run the same Chief of Staff agent and speak the same `agentctl watch` surfa
 
 ## Path 1 — Mac + Docker
 
-**Prerequisites:** Docker Desktop
+> **Canonical source for the Mac + Docker quickstart.** The rendered guide
+> `docs/cos-guide.html` (published at
+> https://claude.ai/code/artifact/936e816a-d052-4799-85ff-8acfe71ee544) is a view of this section —
+> **when these steps change, update `docs/cos-guide.html` and redeploy the artifact** so the two do
+> not drift.
+
+**Prerequisites:** Docker Desktop · Anthropic API key (`sk-ant-…`) · Google Cloud account (free tier)
+· Rust + Cargo (macOS has no prebuilt `agentctl`, so you build it once; Linux can download the
+release binary instead).
+
+### One-time setup
 
 ```bash
-# 0. Provision secrets (one-time — survives terminal restarts)
-mkdir -p ~/.agentos-secrets ~/.agentos-output
-printf 'ANTHROPIC_API_KEY=sk-ant-...\n' >> ~/.agentos-secrets/agentos.env
-chmod 600 ~/.agentos-secrets/agentos.env
+# 1. Build agentctl (needed on your Mac to run the Google OAuth flow)
+cargo build --release --bin agentctl
+sudo cp target/release/agentctl /usr/local/bin/agentctl   # optional: add to PATH
 
-# 1. One-time Google OAuth (writes ~/.agentos-secrets/google.json)
-agentctl auth google
+# 2. Google OAuth — console.cloud.google.com → enable the Gmail API →
+#    Create Credentials → OAuth client ID → Desktop app.
+#    Authorized redirect URI: http://127.0.0.1:8585   (must be FREE; if not, use
+#    `agentctl auth google --port <N>` and register http://127.0.0.1:<N> instead).
+#    Copy the Client ID + Client Secret.
 
-# 2. Start the CoS stack
-docker compose up -d cos
+# 3. Authorize Gmail (a browser opens; writes ~/.agentos-secrets/google.json)
+agentctl auth google \
+  --client-id     "YOUR_CLIENT_ID.apps.googleusercontent.com" \
+  --client-secret "YOUR_CLIENT_SECRET"
 
-# 3. Monitor (runs inside the container — FUSE and API are container-local)
-docker compose exec cos agentctl watch
-
-# 4. Approve Gmail OAuth (first run only)
-#    Press [a] in agentctl watch — click the approval URL in your browser
+# 4. Host directories (runtime state + brief output)
+mkdir -p ~/.agentos-output ~/.agentos-data
 ```
 
-Briefs appear in `~/.agentos-output/brief-YYYY-MM-DD.md` (the container writes to
-`/data/output`, which is bind-mounted to this host directory).
+### Run
 
-> **Note:** `agentctl watch` on the Mac host won't work directly — port 7999 is
-> loopback-only inside the container and not published to the host. Use
-> `docker compose exec cos agentctl watch` to run inside the container.
+```bash
+# 5. Pull the published image (agentos:full bundles the MCP servers + OAuth sidecar the CoS needs)
+docker pull ghcr.io/0x89karan/runtime1:full
+
+# 6. Start the CoS — keep the `export` and `docker run` in the SAME terminal
+export ANTHROPIC_API_KEY=sk-ant-...
+docker run --rm -it \
+  --name agentos-cos \
+  --privileged \
+  -e ANTHROPIC_API_KEY \
+  -e "TRIGGER_INTERVAL=every 2m" \
+  -v ~/.agentos-secrets:/run/secrets:ro \
+  -v ~/.agentos-output:/data/output \
+  -v ~/.agentos-data:/data \
+  ghcr.io/0x89karan/runtime1:full cos
+
+# 7. Watch the agents (second terminal; needs the --name from step 6)
+docker exec -it agentos-cos agentctl watch
+
+# 8. Read the brief (after the first cycle, ~2-3 min)
+cat ~/.agentos-output/brief-$(date +%Y-%m-%d).md
+```
+
+**Schedule:** `TRIGGER_INTERVAL="every 2m"` is for testing and only accepts `every N(s|m|h)`. For a
+daily brief use the **separate** cron variable: `-e "TRIGGER_CRON=0 8 * * *"` (08:00 UTC) — a cron
+expression in `TRIGGER_INTERVAL` will not parse.
+
+**API key across shells:** `-e ANTHROPIC_API_KEY` forwards it from the shell you `export`ed in. Run
+`docker run` in that same terminal, or put `ANTHROPIC_API_KEY=sk-ant-...` in
+`~/.agentos-secrets/agentos.env` (the entrypoint sources it) so it survives new terminals.
+
+**Talk to it interactively** instead of the autonomous cron brief:
+`docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate`.
+
+**Stopping:** `Ctrl+C` checkpoints gracefully; state persists in `~/.agentos-data`, so the next run
+resumes.
+
+**Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed action-receipt
+chain with `agentctl verify ~/.agentos-data/evidence.jsonl`.
+
+<details><summary><strong>Build from source instead of the published image (dev)</strong></summary>
+
+`docker compose up -d cos` builds the image from your local checkout and runs the same CoS; monitor
+with `docker compose exec cos agentctl watch`. Use this when you're changing `agentd`/`agentctl` and
+want your local build rather than the released image.
+</details>
+
+### Troubleshooting
+
+- **Container exits with "ANTHROPIC_API_KEY is not set":** the key wasn't in the shell that ran
+  `docker run`. Re-`export` it here, or use the `agentos.env` approach above.
+- **Browser shows `ERR_CONNECTION_REFUSED` during auth:** redirect-URI mismatch — confirm
+  `http://127.0.0.1:8585` is registered in the Google OAuth app and that `8585` was free.
+- **No brief after a few minutes:** check the cron fired and Gmail was reached —
+  `jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail`.
+- **Can't `docker exec` to watch:** the container must have been started with `--name agentos-cos`.
 
 ---
 
