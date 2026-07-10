@@ -1099,9 +1099,25 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   caps + tool/connector select); modal-over-live-dashboard; preview before launch; auto-drop into the
   new agent; `:` command palette.
 
-Sequencing: **ux.0 → ux.2 → ux.1 → ux.3**, one increment per branch, `main` shippable at each step.
-Companion (separate plan, not started): curated MCP connectors via the credential broker (Calendar,
-GitHub, Linear, Slack, Notion) — integrate-don't-bundle.
+**Cathedral expansions (accepted 2026-07-10, CEO review — SCOPE EXPANSION):** the "CoS you live with."
+- **ux.4** — Proactive push: SSE sink → local notifier + *optional* signed webhook to one operator-owned
+  endpoint (approval/error/brief/skill events). New **outbound egress** → routes through the credential
+  broker (cred.3) + THREAT_MODEL note; deny-by-default. `/plan-eng-review` (security-sensitive).
+- **ux.6** — Evidence view: surface the signed Ed25519 receipt chain (`evidence.jsonl`) + inline
+  `agentctl verify` + per-agent "chain verified" badge. Provable accountability.
+- **ux.5** — Local web cockpit: self-contained host-loopback SPA over the management API/SSE (same
+  converse/observe/spawn surface in a browser; still single-tenant, still loopback). ⚠ Browser ≠ FUSE
+  boundary — needs an Origin/Host allowlist (DNS-rebinding guard) to land first.
+- **ux.7** — Run replay: reconstruct + scrub an agent's run from `flight.jsonl` + checkpoints.
+
+Sequencing (CEO-locked 2026-07-10, observability-first; spec-review-corrected): core **ux.0 → ux.2 →
+ux.1 → ux.3** (NOT gated on connectors), then expansions **ux.6 (evidence, TUI) → ux.4 (push) → ux.5
+(web cockpit) → ux.7 (replay)**, then **skills (Phase 11) last**. One increment per branch across
+sessions, `main` shippable at each step. `cos-ux-01` is a silent-failure defect, so the observability
+floor (ux.0+ux.2) leads. **Connectors is a parallel track** (separate plan, not written) — the intended
+next value, but it must not block the cockpit path on undefined work; it slots in when ready. Skills
+compose tool calls, so they're worth most after connectors. Companion connectors: curated MCP servers
+via the credential broker (Calendar, GitHub, Linear, Slack, Notion) — integrate-don't-bundle.
 
 ---
 
@@ -1270,3 +1286,43 @@ grants, last access, token expiry); rotation policy; alternate `CredentialStore`
 keychain / vault).
 **Acceptance:** operator sees per-agent credential grants + last access via FUSE and `agentctl`;
 rotation policy configurable.
+
+---
+
+## Phase 11 — Skills subsystem (procedural knowledge, governed)
+
+The missing **procedural layer**: a skill is a packaged, portable *recipe* an agent loads on demand
+and executes *using its tools* — distinct from capabilities (permission), tools (actions), templates
+(identity), and memory (knowledge). AgentOS's edge is that skill execution is **capability-scoped,
+sandboxed, and flight-recorded** — a governed skills *host*, not a trust-by-default runtime. Full plan:
+**`docs/plans/skills-subsystem.md`**; build-session prompt: `docs/prompts/10-skills-subsystem.md`.
+
+**Layer:** Capability = *may I act* · Tool(MCP) = *what can I do* · Template = *who am I* · Memory =
+*what I know* · **Skill = *how do I do this task***. Skills sit above tools, orthogonal to templates
+(one agent, many skills).
+
+**⚠ Naming collision:** `AgentCard.skills` (`config.rs:450`) already exists but is free-form A2A
+advertising *tags*, NOT loadable procedures — leave it as-is. The new concept is `Capability::Skill` +
+a skills catalogue.
+
+**Locked decisions (2026-07-10):** (1) Anthropic Agent Skills `SKILL.md` format (interop over control,
+same reasoning as MCP-is-the-ABI); (2) deny-by-default access via `Capability::Skill { name }`,
+sub-agents get a *subset* of the parent's grants; (3) governed execution — skill scripts run only via
+`ShellExec` under the sandbox + flight recorder, never exceeding the loading agent's capability
+envelope; (4) synthesized skills are quarantined until operator-approved.
+
+- **skill.1** — Catalogue + discovery/load + `Capability::Skill` (substrate; instruction-only skills).
+  New `agentd/src/skill.rs` mirroring `template.rs`; `skill_list` (granted, name+desc only) +
+  `skill_load` (body, cap-gated); `SkillListed`/`SkillLoaded` events; 1–2 example skills.
+- **skill.2** — Sandboxed script execution + resources. Script-bearing skills require `ShellExec` and
+  run through the existing sandbox path (no new exec path); resources readable only via a skill-scoped
+  FS cap; large bodies page via `memory/context.rs`; THREAT_MODEL §. `/plan-eng-review` this one.
+- **skill.3** — Skill synthesis from experience (governed, weightless — no RL/weights). Extend
+  `distill_on_complete` (p5.6) to infer a candidate `SKILL.md` on a successful run (off by default),
+  **quarantined until operator-approved** via the approvals surface (p7.4). Ties to Track PERSONAL for
+  where approved skills live. `SkillSynthesized`/`Approved`/`Rejected` events.
+
+Sequencing: **skill.1 → skill.2 → skill.3**, one increment per branch, `main` shippable at each step.
+skill.1 alone is useful (a CoS triage recipe); skill.3 is the optional, most speculative tier — build
+it only after skill.1/2 prove out in the CoS. The UX cockpit *surfaces* skills (spawn-with-skills,
+loaded-skill in the activity view); it does not own them.
