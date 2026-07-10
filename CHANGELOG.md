@@ -3,6 +3,27 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cos-dogfood-2] - 2026-07-11 (v0.73.2)
+
+### Fixed — oauth_mcp: check_auth never refreshed from a stored refresh token
+
+- **Root cause**: at startup, `oauth_mcp.py` loads a refresh token (from
+  `google.json` or `OAUTH_REFRESH_TOKEN` env var) and sets
+  `_auth_state = "authorized"` as a lazy-fetch hint — but leaves `_access_token`
+  unset.  `handle_oauth_check_auth` had two ready-paths that were both unreachable
+  in this state: the fast path requires `_access_token` to be truthy, and the
+  env-refresh branch guards on `_auth_state != "authorized"`.  The function fell
+  through to `no_session`, triggering the interactive OAuth dance (which dead-ends
+  in Docker).
+- **Fix**: `handle_oauth_check_auth` now checks for any available refresh token
+  (`_cfg["OAUTH_REFRESH_TOKEN"]` or `_refresh_token`) regardless of `_auth_state`,
+  and calls `_ensure_fresh_token()` whenever there is no live access token.  Covers
+  both the startup lazy-fetch case and access-token expiry during a long session.
+- **Tests**: T30 (file-provided rt, `_auth_state="authorized"`, `_access_token=None`
+  → `check_auth` refreshes silently, returns `ready=true`) and T31 (token-file-stored
+  rt, `_cfg["OAUTH_REFRESH_TOKEN"]` empty → same outcome). Both fail without the fix.
+  Total self-tests: 29 → 31.
+
 ## [cos-dogfood] - 2026-07-10 (v0.73.1)
 
 ### Fixed — Mac+Docker CoS Gmail flow (live dogfood)

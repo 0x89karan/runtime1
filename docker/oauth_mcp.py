@@ -561,17 +561,22 @@ def handle_oauth_check_auth(_args: dict) -> tuple:
             ),
         })
 
-    # If already authorized, return ready
+    # Fast path: live, non-expired access token already in hand.
     with _token_lock:
-        if _auth_state == "authorized" and _access_token:
+        if (_auth_state == "authorized" and _access_token
+                and _token_expiry and time.monotonic() < _token_expiry - 30):
             return {"ready": True, "scopes": _token_scopes}, None
 
-    # If OAUTH_REFRESH_TOKEN env var is set, complete without dance
-    env_rt = _cfg.get("OAUTH_REFRESH_TOKEN", "")
-    if env_rt and _auth_state != "authorized":
+    # A refresh token is present (file-provided or env-provided) but there is no
+    # live access token yet — silently refresh now.  This handles the startup
+    # lazy-fetch case (startup sets _auth_state="authorized" but leaves
+    # _access_token=None) AND the access-token expiry case during a long session.
+    rt = _cfg.get("OAUTH_REFRESH_TOKEN", "") or _refresh_token
+    if rt:
         with _token_lock:
-            _refresh_token = env_rt
-            _auth_state    = "authorized"
+            if not _refresh_token:
+                _refresh_token = rt
+            _auth_state = "authorized"
         err = _ensure_fresh_token()
         if err:
             with _token_lock:
@@ -1350,8 +1355,69 @@ def _self_test():
     else:
         fail("29", f"result={result29} err={err29}")
 
+    # --- Test 30: startup lazy-fetch (file-provided refresh token) → check_auth returns ready ---
+    # Simulates: google.json loaded at startup → _cfg["OAUTH_REFRESH_TOKEN"] set,
+    # _auth_state="authorized", _access_token=None.  WITHOUT the fix, check_auth returns
+    # no_session because the env_rt branch guards on _auth_state != "authorized".
+    _reset_state()
+    _cfg["OAUTH_REFRESH_TOKEN"] = "file_rt_30"
+    _auth_state   = "authorized"   # set by startup lazy-fetch
+    _access_token = None           # NOT yet fetched (the bug)
+    _refresh_token = "file_rt_30"  # populated by startup
+
+    refresh_called_30: list = []
+
+    def _fake_urlopen_30(req, context=None, timeout=None):
+        refresh_called_30.append(req.get_full_url() if hasattr(req, "get_full_url") else str(req))
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"access_token": "fresh_at_30", "expires_in": 3600}).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen_30), \
+         patch("os.path.isfile", return_value=False):  # suppress token file write
+        result30, err30 = handle_oauth_check_auth({})
+
+    if (err30 is None and result30 is not None and result30.get("ready") is True
+            and len(refresh_called_30) == 1 and _access_token == "fresh_at_30"):
+        ok("30: startup lazy-fetch (file-provided rt) → check_auth refreshes silently, returns ready=true")
+    else:
+        fail("30", f"result={result30} err={err30} calls={refresh_called_30} token={_access_token}")
+
+    # --- Test 31: startup lazy-fetch (token file path) → check_auth returns ready ---
+    # Simulates: _load_token_file() at startup → _refresh_token set, _cfg["OAUTH_REFRESH_TOKEN"]
+    # empty, _auth_state="authorized", _access_token=None.  The refresh token came from the
+    # ~/.agentos-oauth/ token file, not from _cfg.  WITHOUT the fix, the env_rt branch skips
+    # because env_rt is empty, and the result is no_session.
+    _reset_state()
+    # _cfg["OAUTH_REFRESH_TOKEN"] stays "" (token file path — not env/secrets file)
+    _auth_state    = "authorized"   # set by startup
+    _access_token  = None
+    _refresh_token = "stored_rt_31"  # populated from token file by startup
+
+    refresh_called_31: list = []
+
+    def _fake_urlopen_31(req, context=None, timeout=None):
+        refresh_called_31.append(req.get_full_url() if hasattr(req, "get_full_url") else str(req))
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"access_token": "fresh_at_31", "expires_in": 3600}).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    with patch("urllib.request.urlopen", side_effect=_fake_urlopen_31), \
+         patch("os.path.isfile", return_value=False):
+        result31, err31 = handle_oauth_check_auth({})
+
+    if (err31 is None and result31 is not None and result31.get("ready") is True
+            and len(refresh_called_31) == 1 and _access_token == "fresh_at_31"):
+        ok("31: startup lazy-fetch (token-file-stored rt) → check_auth refreshes silently, returns ready=true")
+    else:
+        fail("31", f"result={result31} err={err31} calls={refresh_called_31} token={_access_token}")
+
     print(file=sys.stderr)
-    total = 29
+    total = 31
     if not failures:
         print(f"oauth_mcp.py: self-test PASSED ({total}/{total})", file=sys.stderr)
         sys.exit(0)
