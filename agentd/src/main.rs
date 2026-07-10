@@ -1302,6 +1302,18 @@ fn is_noop_deny_spawn(enf: &sandbox::EnforcementStatus, has_rules: bool) -> bool
         && has_rules
 }
 
+/// Format the diagnostic message emitted when Landlock ABI V4 is unavailable.
+/// Reports the actual detected ABI version rather than inferring the kernel version,
+/// because a kernel ≥ 6.7 may still lack V4 if compiled without full Landlock support.
+fn net_landlock_v4_unavailable_message(ports: &[u16]) -> String {
+    let abi = sandbox::landlock_abi_version();
+    format!(
+        "Net{{ports={ports:?}}} declared but Landlock ABI V4 unavailable (detected ABI: v{abi}); \
+         per-port enforcement skipped — server has unrestricted network access. \
+         ABI V4 (Linux ≥ 6.7, CONFIG_SECURITY_LANDLOCK=y) required for port-level isolation."
+    )
+}
+
 /// Convert an agent capability set into sandbox rules for an MCP server subprocess.
 ///
 /// Landlock FS rules map 1:1 from FsRead/FsWrite capabilities. DenySpawn is
@@ -1309,10 +1321,10 @@ fn is_noop_deny_spawn(enf: &sandbox::EnforcementStatus, has_rules: bool) -> bool
 /// whenever the Net capability is absent — enforcing network isolation at the
 /// Linux namespace level for servers that don't need outbound access.
 ///
-/// When `Net{ports}` is declared but the kernel does not support Landlock V4
-/// (< Linux 6.7), port-level enforcement is impossible. Best-effort ALLOW:
-/// skip IsolateNetwork so the server retains network access, preserving the
-/// operator's declared intent. Landlock FS degrades the same way.
+/// When `Net{ports}` is declared but the kernel does not support Landlock V4,
+/// port-level enforcement is impossible. Best-effort ALLOW: skip IsolateNetwork
+/// so the server retains network access, preserving the operator's declared intent.
+/// Landlock FS degrades the same way.
 fn caps_to_rules(caps: &[Capability]) -> Vec<SandboxRule> {
     let v4_available = sandbox::landlock_v4_available();
     caps_to_rules_inner(caps, v4_available)
@@ -1342,16 +1354,11 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
                     continue;
                 }
                 if !v4_available {
-                    // Landlock V4 unavailable (kernel < 6.7): per-port enforcement impossible.
+                    // Landlock V4 unavailable: per-port enforcement impossible.
                     // Best-effort ALLOW: do not push IsolateNetwork. The server retains
                     // unrestricted network access rather than getting deny-all, preserving
                     // the operator's declared intent. Landlock FS degrades the same way.
-                    tracing::warn!(
-                        "Net{{ports={:?}}} declared but Landlock ABI V4 unavailable (kernel < 6.7); \
-                         per-port enforcement skipped — server has unrestricted network access. \
-                         Upgrade to Linux ≥ 6.7 for port-level isolation.",
-                        ports
-                    );
+                    tracing::warn!("{}", net_landlock_v4_unavailable_message(ports));
                     continue;
                 }
                 // V4 available: emit per-port AllowNetConnect rules.
@@ -1574,7 +1581,7 @@ mod tests {
         let rules = caps_to_rules_inner(&[Capability::Net {
             hosts: vec!["api.anthropic.com".into()],
             ports: vec![443],
-        }], false); // v4_available = false (Docker Desktop, kernel < 6.7)
+        }], false); // v4_available = false (simulated; e.g. kernel with Landlock ABI < 4)
         assert!(
             !rules.iter().any(|r| matches!(r, SandboxRule::IsolateNetwork)),
             "Net{{ports}} on no-V4 kernel must degrade to allow, not deny-all: {:?}", rules
@@ -2079,6 +2086,60 @@ mod tests {
                 "CONVENTIONS.md missing event kind: `{kind}` — add a row to the taxonomy table"
             );
         }
+    }
+
+    // ── FIX 1: google_oauth sandbox FsRead grant ──────────────────────────────
+
+    #[test]
+    fn cos_config_google_oauth_grants_fs_read_secrets() {
+        // FAILS without FIX 1: google_oauth MCP server must declare FsRead for
+        // /run/secrets so the Landlock FS sandbox lets the sidecar read google.json.
+        // Checks BOTH config files so Docker and QEMU paths stay in sync.
+        fn assert_fs_read(raw: &str, label: &str) {
+            let cfg: agentd::config::Config =
+                toml::from_str(raw).unwrap_or_else(|e| panic!("{label} must parse: {e}"));
+            let server = cfg
+                .tools
+                .mcp_servers
+                .iter()
+                .find(|s| s.name == "google_oauth")
+                .unwrap_or_else(|| panic!("google_oauth server must exist in {label}"));
+            let caps = server.capabilities.as_deref().unwrap_or(&[]);
+            let has_fs_read = caps.iter().any(|c| {
+                matches!(c, Capability::FsRead { prefix } if prefix == "/run/secrets")
+            });
+            assert!(
+                has_fs_read,
+                "{label}: google_oauth must grant FsRead{{prefix=\"/run/secrets\"}} \
+                 so Landlock FS sandbox lets the sidecar read google.json"
+            );
+        }
+        assert_fs_read(include_str!("../cos.agents.toml"),       "agentd/cos.agents.toml");
+        assert_fs_read(
+            include_str!("../../distro/overlay/etc/agentd/cos.agents.toml"),
+            "distro/overlay/etc/agentd/cos.agents.toml",
+        );
+    }
+
+    // ── FIX 2: Landlock V4 unavailable message reports actual ABI ─────────────
+
+    #[test]
+    fn net_landlock_v4_unavailable_message_no_hardcoded_kernel_version() {
+        // FAILS without FIX 2: old message hardcoded "kernel < 6.7" which is
+        // misleading on kernels ≥ 6.7 compiled without full Landlock V4 support.
+        let msg = net_landlock_v4_unavailable_message(&[443]);
+        assert!(
+            !msg.contains("kernel < 6.7"),
+            "message must not claim 'kernel < 6.7' — report actual ABI version instead: {msg}"
+        );
+        assert!(
+            msg.contains("ABI"),
+            "message must mention 'ABI' to explain the real constraint: {msg}"
+        );
+        assert!(
+            msg.contains("detected ABI: v"),
+            "message must include the detected ABI version number: {msg}"
+        );
     }
 }
 

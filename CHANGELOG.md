@@ -3,6 +3,27 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [cos-dogfood] - 2026-07-10 (v0.73.1)
+
+### Fixed — Mac+Docker CoS Gmail flow (live dogfood)
+
+- **FsRead sandbox grant**: `google_oauth` MCP server in both `agentd/cos.agents.toml`
+  (Docker/dev) and `distro/overlay/etc/agentd/cos.agents.toml` (QEMU production) now
+  declares `FsRead { prefix = "/run/secrets" }`. On Docker Desktop's kernel 6.10
+  (LinuxKit), Landlock FS enforcement is active; without this grant the sidecar
+  silently cannot open `/run/secrets/google.json`. Guarded by
+  `cos_config_google_oauth_grants_fs_read_secrets` test covering both configs.
+- **Honest Landlock V4 message**: The `tracing::warn!` emitted when `Net{ports}`
+  is declared but Landlock ABI V4 is unavailable previously hardcoded "kernel < 6.7"
+  — factually wrong when a kernel ≥ 6.7 ships without `CONFIG_SECURITY_LANDLOCK=y`
+  (e.g. LinuxKit). Extracted `net_landlock_v4_unavailable_message()` helper +
+  `sandbox::landlock_abi_version()` public API. The message now reports the actual
+  detected ABI version. Guarded by `net_landlock_v4_unavailable_message_no_hardcoded_kernel_version` test.
+- **README redirect URI**: Removed incorrect "add `http://127.0.0.1:8585` to
+  Authorized redirect URIs" step. Desktop app OAuth clients allow all loopback
+  redirects automatically per RFC 8252 §7.3; Google Cloud Console has no redirect
+  URI field for that client type.
+
 ## [h8.2] - 2026-07-10 (v0.73.0)
 
 ### Added — `agentos:full` Docker image tier

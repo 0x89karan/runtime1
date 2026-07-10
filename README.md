@@ -125,8 +125,9 @@ mkdir -p ~/.agentos-secrets
 
 # 2. Get Google OAuth credentials
 #    console.cloud.google.com → APIs & Services → Credentials
-#    Create (or edit) an OAuth 2.0 Client ID (Desktop app type)
-#    Add http://127.0.0.1:8585 to Authorized redirect URIs
+#    Create (or edit) an OAuth 2.0 Client ID of type "Desktop app".
+#    No redirect URI to register — Desktop clients allow 127.0.0.1 loopback
+#    redirects automatically per RFC 8252 (agentctl uses http://127.0.0.1:8585).
 
 # 3. Provision credentials on the Mac host (runs the PKCE OAuth2 flow in a
 #    local browser tab, writes ~/.agentos-secrets/google.json)

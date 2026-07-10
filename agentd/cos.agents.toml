@@ -146,6 +146,9 @@ capabilities = [
     "www.googleapis.com",
     "gmail.googleapis.com",
   ], ports = [443] } },
+  # Allow reading /run/secrets/google.json (mounted from ~/.agentos-secrets/).
+  # Without this, Landlock FS sandbox blocks the sidecar from reading credentials.
+  { FsRead = { prefix = "/run/secrets" } },
 ]
 
 # ---------------------------------------------------------------------------

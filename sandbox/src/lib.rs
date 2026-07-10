@@ -162,6 +162,22 @@ impl CompiledSandbox {
     }
 }
 
+/// Returns the kernel's Landlock ABI version (1..N), or 0 if Landlock is unavailable.
+///
+/// Use this to report the actual ABI level in diagnostics rather than inferring
+/// the kernel version from the ABI number (a kernel ≥ 6.7 may still report ABI < 4
+/// if compiled without full Landlock support).
+pub fn landlock_abi_version() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        linux::query_landlock_abi_version() as u32
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
 /// Returns true if the running kernel supports Landlock ABI version 4 (Linux ≥ 6.7),
 /// which is required for TCP port enforcement via `AllowNetConnect`.
 ///
