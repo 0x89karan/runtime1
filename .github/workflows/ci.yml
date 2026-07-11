@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: ["**"]
+    tags: ["v*"]        # tag pushes reach all jobs (required for publish-docker on release)
   pull_request:
     branches: ["main"]
+  workflow_dispatch:    # manual publish from Actions UI (constrained to main in publish-docker)
 
 jobs:
   build-and-test:
@@ -115,7 +117,11 @@ jobs:
   build-aarch64:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    if: github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event_name == 'pull_request' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
 
@@ -184,7 +190,9 @@ jobs:
     needs: [build-and-test, build-aarch64, audit, build-macos]
     runs-on: ubuntu-latest
     timeout-minutes: 120  # arm64 QEMU build ~60-90 min on first push; GHA cache cuts subsequent runs to ~15 min
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     concurrency:
       group: publish-docker
       cancel-in-progress: false

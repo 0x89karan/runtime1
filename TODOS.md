@@ -160,6 +160,22 @@ promote to `docs/ROADMAP.md` (DX track) when picked up.
   artifact. Also: the `agent` compose service does not mount `~/.agentos-secrets` (only `cos`
   does) — add the mount (or document it) so the host-provisioned `google.json` reaches the agent.
 
+## dx.6 — Deferred items (v0.74.0)
+
+**P4 — Native ARM64 CI runners** (deferred from dx.6)
+- `build-aarch64` currently uses `cross` + QEMU emulation on `ubuntu-latest`. Native arm64 GHA
+  runners would cut the aarch64 test job from ~45 min to ~5 min and eliminate QEMU overhead.
+- Blocked by: private repo → paid GHA runner seats needed. Revisit if the repo goes public or
+  a self-hosted arm64 runner is available.
+
+**P3 — Cross-compiled arm64 Docker image** (deferred from dx.6)
+- `publish-docker` builds the arm64 Docker image via QEMU emulation (~60-90 min cold).
+  The `cross` toolchain (already used for musl static binaries) could cross-compile the Rust
+  binaries for arm64, reducing the Docker build to a COPY + Python layer (~5 min).
+- Investigate: `cross build --target aarch64-unknown-linux-musl` in the Docker builder stage,
+  then COPY the pre-built binary into the runtime image. Complexity: `ring` asm requires the
+  right linker; `Cross.toml` already pins the correct image.
+
 ## orch.1 — Interactive agent orchestrator (on-demand dispatch + conversational follow-up) [shipped — v0.66.0]
 
 > **Renamed from `h8.3`** (2026-07-05) to resolve a collision with ROADMAP's `h8.3` (multi-device

@@ -1,6 +1,9 @@
 services:
   cos:
-    build: .
+    image: ${AGENTOS_IMAGE:-agentos:dev}
+    build:
+      context: .
+      target: runtime-full
     # FUSE requires privileged mode (needed for agentctl watch + /agents filesystem)
     privileged: true
     volumes:
@@ -27,7 +30,10 @@ services:
       net.ipv4.tcp_keepalive_probes: 3
 
   agent:
-    build: .
+    image: ${AGENTOS_IMAGE:-agentos:dev}
+    build:
+      context: .
+      target: runtime-full
     # FUSE requires privileged mode (needed for /agents filesystem + agentctl watch)
     privileged: true
     volumes:

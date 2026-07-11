@@ -5,6 +5,69 @@ Both run the same Chief of Staff agent and speak the same `agentctl watch` surfa
 
 ---
 
+## Dev image — fast local loop (contributors)
+
+Skip the published image and build locally in ~15 min first run, ~2 min subsequent
+(cargo registry cache hit). **This is the inner-loop workflow for contributors
+iterating on agentd/agentctl.** Onboarding and first-run TTHW are unchanged.
+
+```bash
+# Build the full image (Python MCP + Rust binaries) — for the CoS dogfood path
+make dev-image          # → agentos:dev (native arm64 on Apple Silicon, no QEMU)
+
+# Build the Rust-only core image — faster, for agentd/agentctl-only changes
+make dev-image-core     # → agentos:dev-core
+# NOTE: the cos and agent compose services need the full image (Python MCP harness).
+# Use dev-image-core only for custom TOML setups that don't use standard MCP servers.
+
+# Run the CoS using your local image (no env var needed — agentos:dev is the default)
+docker compose up cos
+
+# Or run a named template against your local image
+docker compose run --rm agent
+```
+
+**If you have a pre-built published image and want to force it:**
+
+```bash
+AGENTOS_IMAGE=ghcr.io/0x89karan/runtime1:full docker compose up cos
+```
+
+**Tag glossary:**
+
+| Tag | Source | When to use |
+|-----|--------|-------------|
+| `agentos:dev` | `make dev-image` (local) | Daily inner loop on your machine |
+| `agentos:dev-core` | `make dev-image-core` (local) | Rust-only changes, no Python MCP |
+| `ghcr.io/…:full` | Published multi-arch (`workflow_dispatch` or `v*` tag) | Pull for production |
+| `ghcr.io/…:latest` | Same as `:full`, most recent publish | Convenience alias |
+
+**Notes:**
+- `docker compose pull` fails for local image names — use `make dev-image` instead.
+- `AGENTOS_IMAGE` must be unset or a non-empty string; `AGENTOS_IMAGE=` (empty) is an error.
+- If `AGENTOS_IMAGE` names an image that doesn't exist locally, Compose builds it from source.
+  Run `make dev-image` first to avoid a surprise 15-min build.
+- If a build gets stuck or produces stale layers, clear the BuildKit cache: `docker builder prune`.
+
+## Cutting a release image
+
+Published images are **not** built on every merge to `main`. To publish:
+
+```bash
+# Option A — manual dispatch (from the Actions UI, must be on main branch)
+# Go to: GitHub → Actions → CI → Run workflow → main
+
+# Option B — push a version tag
+git tag v0.74.0
+git push origin v0.74.0
+# The CI workflow builds linux/amd64 + linux/arm64 and pushes :full, :latest, :v0.74.0
+```
+
+The git tag version must match the `version` field in `agentd/Cargo.toml`.
+CI derives Docker tags from `cargo metadata` — a mismatch produces wrong Docker tags.
+
+---
+
 ## Path 1 — Mac + Docker
 
 > **Canonical source for the Mac + Docker quickstart.** The rendered guide
@@ -84,12 +147,7 @@ resumes.
 **Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed action-receipt
 chain with `agentctl verify ~/.agentos-data/evidence.jsonl`.
 
-<details><summary><strong>Build from source instead of the published image (dev)</strong></summary>
-
-`docker compose up -d cos` builds the image from your local checkout and runs the same CoS; monitor
-with `docker compose exec cos agentctl watch`. Use this when you're changing `agentd`/`agentctl` and
-want your local build rather than the released image.
-</details>
+For building from source and iterating locally, see **Dev image** at the top of this guide.
 
 ### Updating & clean re-test
 

@@ -84,8 +84,17 @@ tail -f flight.jsonl              # watch the flight log
 
 ## Docker quickstart
 
-Two image tiers are published to `ghcr.io/0x89karan/runtime1` on every push to
-`main` (multi-arch: `linux/amd64` + `linux/arm64`):
+**Contributors (fast inner loop):** build locally — native arm64 on Apple Silicon, no QEMU, ~2 min on second run.
+
+```bash
+make dev-image                                   # → agentos:dev
+docker compose up cos                            # uses agentos:dev by default
+```
+
+See `docs/DEPLOYMENT.md` for the full local dev loop and release publishing guide.
+
+**Published images** are pushed on `workflow_dispatch` or a `v*` tag push (not every merge).
+Two image tiers published to `ghcr.io/0x89karan/runtime1` (multi-arch: `linux/amd64` + `linux/arm64`):
 
 | Tier | Tag | Contents | When to use |
 |------|-----|----------|-------------|

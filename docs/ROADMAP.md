@@ -55,7 +55,16 @@ remaining work — one increment per branch, `main` shippable between, each thro
 1. ~~**cred.5** (v0.68.0) · **ma.4** (v0.67.0)~~ ✅ shipped — credential control plane visibility + isolation-tier honesty.
 2. ~~**dx.3** (v0.69.0) · **dx.4** (v0.71.0)~~ ✅ shipped — Linux QEMU production path + prebuilt images + device auth (`agentctl auth google --device`) + install.sh.
 3. ~~**h8.2** (v0.73.0)~~ ✅ shipped — `agentos:core` (Rust-only) + `agentos:full` (Python harness) image split; CI publishes both tiers with shared GHA layer cache.
-4. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
+4. ~~**dx.6** (v0.74.0)~~ ✅ shipped — `make dev-image` fast local loop; `publish-docker` gated to `workflow_dispatch`/`v*` tag; `AGENTOS_IMAGE` compose override; `.env.example`; DEPLOYMENT.md dev quickstart.
+5. **cheap wins** — Google OAuth app → Production (kills weekly 7-day Testing-mode token expiry; `MCP_SERVERS.md` fix); secret-redaction (`oauth_mcp.py:430`, `credential/mod.rs:341,371`; folds `cred.5-ar-01`). Ships independently.
+6. **cos-polish (rest)** — brief → file (`FsWrite` cap on orchestrator), KB findability (colon-segment reader, `kb_search` scope), inbox budget, orchestrate REPL race fix, `max_turns` guard.
+7. **memory-routing** — raw emails → h8.1 semantic L2; also fixes the ~820k token blowup.
+8. **cred.6** — CoS broker migration (config flip in `cos.agents.toml` + auth-retest gate; do not re-break v0.73.2 auth).
+9. **cred.7** — credential resilience (on top of broker mode).
+10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2 → ux.1 → ux.8 → ux.3.
+11. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
+
+Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
 
 **Deferred:** Track MESH (`mesh.1–6`, multi-instance) and ROADMAP `h8.3` (multi-device migration).
 **Planned:** Track PERSONAL (`personal.1+`, operator workflow brain via gbrain — after h8.1).

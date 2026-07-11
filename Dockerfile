@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ── Stage 1: build ───────────────────────────────────────────────────────────
 FROM rust:1-alpine AS builder
 
@@ -24,8 +25,12 @@ RUN mkdir -p agentd/src agentctl/src surfaces/src sandbox/src otel/src \
  # echo-mcp and sandbox-probe fixture binaries
  && mkdir -p agentd/tests/fixtures \
  && echo 'fn main(){}' > agentd/tests/fixtures/echo_mcp.rs \
- && echo 'fn main(){}' > agentd/tests/fixtures/sandbox_probe.rs \
- && cargo build --release 2>/dev/null || true
+ && echo 'fn main(){}' > agentd/tests/fixtures/sandbox_probe.rs
+# /usr/local/cargo/registry cache: speeds up local `make dev-image` builds by
+# persisting crate downloads across rebuilds. In CI, the GHA layer cache
+# (cache-from: type=gha) serves the equivalent purpose.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    cargo build --release 2>/dev/null || true
 
 # Now copy the real source and rebuild (only changed crates recompile)
 COPY agentd/src     agentd/src
@@ -36,7 +41,10 @@ COPY otel/src       otel/src
 COPY otel/tests     otel/tests
 COPY agentd/tests   agentd/tests
 
-RUN touch agentd/src/main.rs agentd/src/lib.rs agentctl/src/main.rs \
+# NOTE: do NOT cache /src/target here — cache mounts are not committed to image
+# layers, which would break the COPY --from=builder step in stage 2.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    touch agentd/src/main.rs agentd/src/lib.rs agentctl/src/main.rs \
           surfaces/src/lib.rs sandbox/src/lib.rs otel/src/main.rs \
  && cargo build --release --bin agentd --bin agentctl --bin agentos-otel
 

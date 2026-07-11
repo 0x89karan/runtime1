@@ -3,6 +3,19 @@
 
 RUST_IMAGE ?= rust:latest
 
+# Build the full Docker image locally — native arm64 on Apple Silicon, no QEMU.
+# Second run is fast (~2 min) when deps haven't changed (cargo registry cache hit).
+# After building: AGENTOS_IMAGE=agentos:dev docker compose up cos
+.PHONY: dev-image
+dev-image:
+	DOCKER_BUILDKIT=1 docker build --target runtime-full -t agentos:dev .
+
+# Build the Rust-only core image — faster, for agentd/agentctl-only changes.
+# Note: the cos and agent compose services need the full image (Python MCP harness).
+.PHONY: dev-image-core
+dev-image-core:
+	DOCKER_BUILDKIT=1 docker build --target runtime-core -t agentos:dev-core .
+
 # Run clippy on Linux inside Docker — required before pushing any
 # #[cfg(target_os = "linux")] code (fuser, libc, etc.).
 # Mirrors the CI working-directory: agentd step exactly.

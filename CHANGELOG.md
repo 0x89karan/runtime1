@@ -3,6 +3,28 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.76.0] - 2026-07-11
+
+### Added — fast local dev-image loop + on-demand multi-arch publish
+
+- **`make dev-image`** — builds the full Docker image (`runtime-full` target) locally and tags it
+  `agentos:dev`. Native arm64 on Apple Silicon (no QEMU). Second run ~2 min with the BuildKit cargo
+  registry cache warm.
+- **`make dev-image-core`** — builds the Rust-only core image (`runtime-core`) as `agentos:dev-core`
+  for faster agentd/agentctl-only iteration.
+- **`AGENTOS_IMAGE` compose override** — both `cos` and `agent` services now accept
+  `AGENTOS_IMAGE=agentos:dev docker compose up cos` to run against a pre-built local image.
+  Default is `agentos:dev` (matching `make dev-image` output); Compose builds from source if absent.
+- **`.env.example`** — copy to `.env` to persist `AGENTOS_IMAGE` without re-exporting every session.
+- **`publish-docker` gated to `workflow_dispatch` / `v*` tag** — a push to `main` no longer triggers
+  the 60-90 min QEMU arm64 Docker build. Publish by dispatching the workflow from the Actions UI or
+  pushing a version tag (`git tag v0.76.0 && git push origin v0.76.0`).
+- **BuildKit parser directive** (`# syntax=docker/dockerfile:1`) added to `Dockerfile`.
+- **`docs/DEPLOYMENT.md`** — new "Dev image" section (local loop, tag glossary, cutting a release);
+  stale `<details>` block replaced with a pointer to the new section.
+- **README.md** — contributor inner-loop one-liner added.
+- **TODOS.md** — deferred: native ARM64 CI runners (P4), cross-compiled arm64 Docker (P3).
+
 ## [v0.75.0] - 2026-07-11
 
 ### Fixed
