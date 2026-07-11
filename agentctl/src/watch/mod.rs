@@ -1,12 +1,14 @@
 use std::{
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::mpsc::{Receiver, SyncSender},
+    sync::Arc,
     time::Duration,
 };
 
 use anyhow::Context;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -16,6 +18,7 @@ pub mod app;
 pub mod approvals;
 pub mod inspector;
 pub mod memory;
+pub mod pump;
 pub mod reader;
 pub mod source;
 pub mod spawn;
@@ -24,6 +27,7 @@ pub mod views;
 
 use app::{App, MemoryPane, PendingSpawn, SpawnFocus, View};
 use approvals::ApprovalsMode;
+use pump::{spawn_producers, AppEvent};
 use source::{detect_source, DataSource};
 
 /// Outcome of `execute_pending_spawn`. Determines whether the TUI stays alive
@@ -82,7 +86,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
         run_plain(agents_dir, interval, log_path, data_source)
     } else {
-        run_tui(agents_dir, interval, log_path, data_source)
+        // Share the source across the render loop + producer threads (Option B).
+        let source: Arc<dyn DataSource> = Arc::from(data_source);
+        run_tui(agents_dir, interval, log_path, source)
     }
 }
 
@@ -105,191 +111,267 @@ fn run_plain(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>,
     }
 }
 
-fn run_tui(agents_dir: PathBuf, interval: Duration, log_path: Option<PathBuf>, source: Box<dyn DataSource>) -> anyhow::Result<()> {
-    let stdout = io::stdout();
+/// ux.0: outcome of one `step()` — mark the frame dirty, force a snapshot reconcile,
+/// or quit the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    Redraw,
+    /// Ask the snapshot producer to re-poll NOW (Invalidated → immediate reconcile; F3/C4).
+    Reconcile,
+    Quit,
+}
 
-    // CleanupGuard: restores terminal on both normal exit and panic.
-    struct CleanupGuard;
-    impl Drop for CleanupGuard {
-        fn drop(&mut self) {
+/// Max events drained from the channel per render tick before yielding to key poll +
+/// draw. Bounds per-tick work so a high-rate SSE burst can't starve input/render
+/// (anti-livelock). = CHANNEL_CAP, so a full channel still drains in one tick.
+const MAX_DRAIN_PER_TICK: usize = pump::CHANNEL_CAP;
+
+/// Terminal session guard (C2): owns raw mode + the alternate screen + a panic hook
+/// that restores the terminal. `Drop` restores everything (panic-safe), replacing the
+/// prior ad-hoc CleanupGuard + separate panic-hook dance in a single owner.
+struct TermGuard;
+impl TermGuard {
+    fn enter() -> anyhow::Result<Self> {
+        enable_raw_mode().context("enabling raw mode")?;
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
             let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            return Err(anyhow::Error::from(e)).context("entering alternate screen");
         }
+        // Chain a terminal-restoring hook ahead of the previous one so a panic still
+        // prints its message after the screen is restored. Gate the terminal restore on
+        // the MAIN (render) thread: a detached producer thread panicking must NOT touch
+        // raw-mode / the alt-screen while the render loop is still drawing (fix 5).
+        let main_id = std::thread::current().id();
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == main_id {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            }
+            prev(info);
+        }));
+        Ok(TermGuard)
     }
-
-    enable_raw_mode().context("enabling raw mode")?;
-    // Guard must be created immediately after enable_raw_mode succeeds so that
-    // any subsequent failure (including EnterAlternateScreen) triggers cleanup.
-    let _guard = CleanupGuard;
-    let mut stdout = stdout;
-    execute!(stdout, EnterAlternateScreen).context("entering alternate screen")?;
-
-    // Restore terminal on panic before the guard's Drop runs.
-    let orig_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
+}
+impl Drop for TermGuard {
+    fn drop(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        orig_hook(info);
-    }));
+        // Drop our hook (reinstalls the default) — matches the prior post-loop take_hook().
+        let _ = std::panic::take_hook();
+    }
+}
 
-    let backend  = CrosstermBackend::new(io::stdout());
+fn run_tui(
+    agents_dir: PathBuf,
+    interval: Duration,
+    log_path: Option<PathBuf>,
+    source: Arc<dyn DataSource>,
+) -> anyhow::Result<()> {
+    let guard = TermGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend).context("creating terminal")?;
-
-    let mut app  = App::new(agents_dir.clone());
+    let mut app = App::new(agents_dir.clone());
     app.log_path = log_path.clone();
-    let tick_ms  = interval.as_millis().max(100) as u64;
 
+    run_tui_loop(&mut term, &mut app, &source, interval)?;
+
+    // Restore the terminal before any pending exec replaces the process.
+    drop(guard);
+
+    // Handle a pending spawn after EACH loop exit — including one queued from a
+    // post-inject re-enter (fix 3: the re-enter's pending_exec was previously ignored,
+    // so a spawn from the injected view silently quit without launching).
+    let mut pending = app.spawn_view.pending_exec.take();
+    while let Some(p) = pending {
+        // Try /agents/control first; fall back to exec agentd.
+        match execute_pending_spawn(&agents_dir, p)? {
+            SpawnOutcome::FellBackToExec => {
+                // exec_agentd() replaced this process — unreachable on success.
+                break;
+            }
+            SpawnOutcome::InjectedViaControl { agent_id_hint } => {
+                // Re-enter to show the banner and let the operator watch the agent.
+                let guard2 = TermGuard::enter()?;
+                let backend2 = CrosstermBackend::new(io::stdout());
+                let mut term2 = Terminal::new(backend2).context("recreating terminal")?;
+                let mut app2 = App::new(agents_dir.clone());
+                app2.log_path = log_path.clone();
+                app2.spawn_banner =
+                    Some(format!("Agent '{}' injected via /agents/control", agent_id_hint));
+                run_tui_loop(&mut term2, &mut app2, &source, interval)?;
+                drop(guard2);
+                pending = app2.spawn_view.pending_exec.take();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The single event-pushed render loop (Option B). One bounded channel, two detached
+/// producer threads (snapshot + optional SSE), a 30 ms crossterm key poll, and a
+/// coalesced redraw. Replaces the two prior sync poll-render loops (F9). The render
+/// path never blocks on I/O: snapshots/approvals/SSE arrive from producer threads;
+/// keys are polled non-blocking (F5).
+fn run_tui_loop(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    source: &Arc<dyn DataSource>,
+    interval: Duration,
+) -> anyhow::Result<()> {
+    // Producers stop when `_producers`/`rx`/`wake_tx` drop at loop exit (detached; never joined — F7).
+    let (rx, wake_tx, _producers) = spawn_producers(Arc::clone(source), interval);
     loop {
-        // Refresh state on every frame.
-        let snap = source.load_snapshot();
-        app.apply_snapshot(snap);
-        let approvals = source.load_approvals();
-        app.update_approvals(approvals);
-
-        term.draw(|f| views::render(f, &app))?;
-
-        if event::poll(Duration::from_millis(tick_ms))? {
+        // Drain up to MAX_DRAIN_PER_TICK events, then always yield to key poll + draw
+        // so a high-rate SSE burst can't starve input/render (fix 2 anti-livelock).
+        if drain_events(&rx, app, source.as_ref(), &wake_tx, MAX_DRAIN_PER_TICK) {
+            return Ok(()); // a step returned Quit
+        }
+        // Poll for a key, capped at 30 ms so the loop stays responsive.
+        if event::poll(Duration::from_millis(30))? {
             match event::read()? {
                 Event::Key(key) => {
-                    let ctrl_c = key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL);
-                    if ctrl_c {
-                        break;
-                    }
-                    // Capture view BEFORE dispatch: q should quit only if we
-                    // were already on the Dashboard, not if we just navigated
-                    // back to it from AgentDetail/System/Topology/Memory.
-                    let was_dashboard = app.view == View::Dashboard;
-                    match app.view {
-                        View::Dashboard => handle_dashboard_key(key.code, &mut app),
-                        View::AgentDetail | View::System => {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => {
-                                    app.view = View::Dashboard;
-                                }
-                                _ => {}
-                            }
-                        }
-                        View::Topology => {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => {
-                                    app.view = View::Dashboard;
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    app.topology_scroll = app.topology_scroll.saturating_sub(1);
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    app.topology_scroll += 1;
-                                }
-                                _ => {}
-                            }
-                        }
-                        View::Memory      => handle_memory_key(key.code, &mut app),
-                        View::Spawn       => handle_spawn_key(key.code, &mut app),
-                        View::Inspector   => handle_inspector_key(key.code, &mut app),
-                        View::Approvals   => handle_approvals_key(key.code, &mut app, source.as_ref()),
-                        View::Credentials => {
-                            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                                app.view = View::Dashboard;
-                            }
-                        }
-                    }
-                    if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
-                        break;
-                    }
-                    // Pending exec: TUI loop exits; terminal is restored below.
-                    if app.spawn_view.pending_exec.is_some() {
-                        break;
+                    if apply_effects(step(app, AppEvent::Key(key), source.as_ref()), app, &wake_tx) {
+                        return Ok(());
                     }
                 }
-                Event::Resize(_, _) => { /* ratatui handles this */ }
+                Event::Resize(_, _) => app.dirty = true,
                 _ => {}
             }
         }
+        // Coalesced redraw: draw at most once per tick, only when something changed.
+        if app.dirty {
+            term.draw(|f| views::render(f, app))?;
+            app.dirty = false;
+        }
     }
+}
 
-    // Force terminal restore before any pending exec replaces the process.
-    drop(_guard);
-    let _ = std::panic::take_hook();
-
-    // Pending spawn: try /agents/control first; fall back to exec agentd.
-    if let Some(pending) = app.spawn_view.pending_exec.take() {
-        match execute_pending_spawn(&agents_dir, pending)? {
-            SpawnOutcome::FellBackToExec => {
-                // exec_agentd() replaced this process — unreachable on success.
+/// Apply a step's effects to `app`; returns `true` if the loop should quit.
+/// `Reconcile` pokes the snapshot producer to re-poll immediately (via `wake_tx`).
+fn apply_effects(effects: Vec<Effect>, app: &mut App, wake_tx: &SyncSender<()>) -> bool {
+    for eff in effects {
+        match eff {
+            Effect::Redraw => app.dirty = true,
+            Effect::Reconcile => {
+                let _ = wake_tx.try_send(()); // full → a wake is already pending
             }
-            SpawnOutcome::InjectedViaControl { agent_id_hint } => {
-                // Re-enter TUI to show the banner and let the operator watch the agent.
-                enable_raw_mode().context("re-enabling raw mode after inject")?;
-                let _guard2 = CleanupGuard;
-                execute!(io::stdout(), EnterAlternateScreen).context("re-entering alternate screen")?;
-                let backend2  = CrosstermBackend::new(io::stdout());
-                let mut term2 = Terminal::new(backend2).context("recreating terminal")?;
-                let mut app2  = App::new(agents_dir.clone());
-                app2.log_path = log_path;
-                app2.spawn_banner = Some(format!("Agent '{}' injected via /agents/control", agent_id_hint));
+            Effect::Quit => return true,
+        }
+    }
+    false
+}
 
-                loop {
-                    let snap = source.load_snapshot();
-                    app2.apply_snapshot(snap);
-                    term2.draw(|f| views::render(f, &app2))?;
-                    if event::poll(Duration::from_millis(tick_ms))? {
-                        match event::read()? {
-                            Event::Key(key) => {
-                                let ctrl_c = key.code == KeyCode::Char('c')
-                                    && key.modifiers.contains(KeyModifiers::CONTROL);
-                                if ctrl_c { break; }
-                                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
-                                    && app2.view == View::Dashboard
-                                {
-                                    break;
-                                }
-                                // Any key clears the banner.
-                                app2.spawn_banner = None;
-                                let was_dashboard = app2.view == View::Dashboard;
-                                match app2.view {
-                                    View::Dashboard => handle_dashboard_key(key.code, &mut app2),
-                                    View::AgentDetail | View::System => {
-                                        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                                            app2.view = View::Dashboard;
-                                        }
-                                    }
-                                    View::Topology => {
-                                        match key.code {
-                                            KeyCode::Char('q') | KeyCode::Esc => { app2.view = View::Dashboard; }
-                                            KeyCode::Up | KeyCode::Char('k') => {
-                                                app2.topology_scroll = app2.topology_scroll.saturating_sub(1);
-                                            }
-                                            KeyCode::Down | KeyCode::Char('j') => {
-                                                app2.topology_scroll += 1;
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                    View::Memory      => handle_memory_key(key.code, &mut app2),
-                                    View::Spawn       => handle_spawn_key(key.code, &mut app2),
-                                    View::Inspector   => handle_inspector_key(key.code, &mut app2),
-                                    View::Approvals   => handle_approvals_key(key.code, &mut app2, source.as_ref()),
-                                    View::Credentials => {
-                                        if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                                            app2.view = View::Dashboard;
-                                        }
-                                    }
-                                }
-                                if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
-                                    break;
-                                }
-                            }
-                            Event::Resize(_, _) => {}
-                            _ => {}
-                        }
-                    }
+/// Drain at most `max` events from `rx`, folding each via `step`. Returns `true` if a
+/// step returned Quit. Bounding the drain (vs. draining until empty) is the
+/// anti-livelock fix: the loop always falls through to key poll + draw within one tick.
+fn drain_events(
+    rx: &Receiver<AppEvent>,
+    app: &mut App,
+    source: &dyn DataSource,
+    wake_tx: &SyncSender<()>,
+    max: usize,
+) -> bool {
+    for _ in 0..max {
+        match rx.try_recv() {
+            Ok(ev) => {
+                if apply_effects(step(app, ev, source), app, wake_tx) {
+                    return true;
                 }
+            }
+            Err(_) => break, // channel empty (or disconnected) — yield to poll/draw
+        }
+    }
+    false
+}
+
+/// Fold one `AppEvent` into `App`, returning render/quit effects (F2). Pure and
+/// terminal-free except that the Approvals view calls `source.approve/deny` — which
+/// runs on the MAIN thread here, NOT inside a tokio runtime, so `reqwest::blocking`
+/// never panics (the reason Option B was chosen over `tokio::select!`).
+fn step(app: &mut App, ev: AppEvent, source: &dyn DataSource) -> Vec<Effect> {
+    match ev {
+        AppEvent::Snapshot(snap) => {
+            app.apply_snapshot(*snap);
+            vec![Effect::Redraw]
+        }
+        AppEvent::Approvals(items) => {
+            app.update_approvals(items);
+            vec![Effect::Redraw]
+        }
+        AppEvent::Flight(value) => {
+            app.push_event(value);
+            vec![Effect::Redraw]
+        }
+        AppEvent::Invalidated => {
+            // Stream gap: mark it AND force an immediate snapshot reconcile rather than
+            // waiting for the next interval tick (F3/C4 — snapshot is authoritative).
+            app.mark_gap();
+            vec![Effect::Redraw, Effect::Reconcile]
+        }
+        AppEvent::EventsDropped(n) => {
+            app.note_dropped(n);
+            vec![Effect::Redraw]
+        }
+        AppEvent::ProducerDied(_which) => {
+            // A producer thread panicked (fix 5): surface it as a gap so the feed
+            // reads as stalled instead of silently rendering the last state forever.
+            app.mark_gap();
+            vec![Effect::Redraw]
+        }
+        AppEvent::Key(key) => step_key(app, key, source),
+    }
+}
+
+/// Key dispatch, extracted verbatim from the old inline loop (behavior identical for
+/// the main path). Returns `Quit` for ctrl-c, `q` on the Dashboard, or when a pending
+/// exec was queued (the caller runs it after the loop). Note: the post-inject re-enter
+/// now shares this dispatch, so `Esc` on its Dashboard no longer exits (only `q` does),
+/// matching the main loop — a deliberate unification of the two formerly-divergent loops.
+fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect> {
+    let ctrl_c =
+        key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl_c {
+        return vec![Effect::Quit];
+    }
+    // Any key clears the post-inject banner (no-op in the main loop where it's None).
+    app.spawn_banner = None;
+    // Capture BEFORE dispatch: q quits only if we were already on the Dashboard,
+    // not if we just navigated back to it.
+    let was_dashboard = app.view == View::Dashboard;
+    match app.view {
+        View::Dashboard => handle_dashboard_key(key.code, app),
+        View::AgentDetail | View::System => {
+            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                app.view = View::Dashboard;
+            }
+        }
+        View::Topology => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => app.view = View::Dashboard,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.topology_scroll = app.topology_scroll.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => app.topology_scroll += 1,
+            _ => {}
+        },
+        View::Memory => handle_memory_key(key.code, app),
+        View::Spawn => handle_spawn_key(key.code, app),
+        View::Inspector => handle_inspector_key(key.code, app),
+        View::Approvals => handle_approvals_key(key.code, app, source),
+        View::Credentials => {
+            if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                app.view = View::Dashboard;
             }
         }
     }
-
-    Ok(())
+    let mut effects = vec![Effect::Redraw];
+    if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
+        effects.push(Effect::Quit);
+    }
+    if app.spawn_view.pending_exec.is_some() {
+        effects.push(Effect::Quit);
+    }
+    effects
 }
 
 fn handle_memory_key(code: KeyCode, app: &mut App) {
@@ -699,11 +781,15 @@ fn execute_pending_spawn(agents_dir: &Path, pending: PendingSpawn) -> anyhow::Re
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{handle_approvals_key, handle_dashboard_key, handle_memory_key, handle_spawn_key, App, View};
+    use super::{
+        drain_events, handle_approvals_key, handle_dashboard_key, handle_memory_key,
+        handle_spawn_key, step, step_key, App, Effect, View,
+    };
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
+    use crate::watch::pump::AppEvent;
     use crate::watch::reader::{AgentInfo, BudgetKind, PendingAction, Snapshot};
     use crate::watch::source::DataSource;
 
@@ -1327,5 +1413,131 @@ mod tests {
             "after 'don't ask again' must return to List mode");
         assert!(app.approvals_view.result_msg.is_some(),
             "result_msg must be set after don't-ask-again attempt");
+    }
+
+    // ── ux.0: step() / event pump ────────────────────────────────────────────
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn step_snapshot_applies_and_redraws() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        let effects = step(
+            &mut app,
+            AppEvent::Snapshot(Box::new(make_snapshot(&["a1", "a2"]))),
+            &TestSource,
+        );
+        assert_eq!(app.agents.len(), 2);
+        assert_eq!(effects, vec![Effect::Redraw]);
+    }
+
+    #[test]
+    fn step_key_ctrl_c_quits() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(step_key(&mut app, ev, &TestSource), vec![Effect::Quit]);
+    }
+
+    #[test]
+    fn step_key_q_on_dashboard_quits() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        assert_eq!(app.view, View::Dashboard);
+        assert!(step_key(&mut app, key('q'), &TestSource).contains(&Effect::Quit));
+    }
+
+    #[test]
+    fn step_key_q_off_dashboard_does_not_quit() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Memory;
+        let effects = step_key(&mut app, key('q'), &TestSource);
+        assert!(!effects.contains(&Effect::Quit));
+        assert_eq!(app.view, View::Dashboard, "memory 'q' navigates back, not quit");
+    }
+
+    #[test]
+    fn step_flight_pushes_to_ring() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        let effects = step(&mut app, AppEvent::Flight(serde_json::json!({"k": "v"})), &TestSource);
+        assert_eq!(app.events.len(), 1);
+        assert_eq!(effects, vec![Effect::Redraw]);
+    }
+
+    #[test]
+    fn step_invalidated_marks_gap() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        step(&mut app, AppEvent::Invalidated, &TestSource);
+        assert_eq!(app.event_gaps, 1);
+    }
+
+    #[test]
+    fn step_events_dropped_accumulates() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        step(&mut app, AppEvent::EventsDropped(5), &TestSource);
+        step(&mut app, AppEvent::EventsDropped(3), &TestSource);
+        assert_eq!(app.dropped_events, 8);
+    }
+
+    #[test]
+    fn event_ring_is_bounded() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        let cap = crate::watch::app::EVENT_RING_CAP;
+        for i in 0..(cap + 500) {
+            app.push_event(serde_json::json!({ "i": i }));
+        }
+        assert_eq!(app.events.len(), cap, "ring capped at EVENT_RING_CAP");
+        assert_eq!(app.events.front().unwrap()["i"], 500, "oldest 500 tail-dropped");
+    }
+
+    #[test]
+    fn snapshot_producer_emits_without_sse_for_fuse_like_source() {
+        // TestSource.event_stream_url() is None → snapshot-only producer (F4);
+        // proves the pushed loop gets state without an SSE feed.
+        use std::sync::Arc;
+        use std::time::Duration;
+        let src: Arc<dyn DataSource> = Arc::new(TestSource);
+        let (rx, _wake, _producers) =
+            crate::watch::pump::spawn_producers(src, Duration::from_millis(5));
+        let ev = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("snapshot producer should emit");
+        assert!(matches!(ev, AppEvent::Snapshot(_)));
+        // Dropping rx/_producers stops the detached producer (F7: never joined).
+    }
+
+    #[test]
+    fn step_invalidated_requests_reconcile() {
+        // fix 4: Invalidated must trigger an immediate snapshot reconcile, not just a gap.
+        let mut app = App::new(PathBuf::from("/agents"));
+        let effects = step(&mut app, AppEvent::Invalidated, &TestSource);
+        assert!(effects.contains(&Effect::Reconcile), "Invalidated must Reconcile");
+        assert_eq!(app.event_gaps, 1);
+    }
+
+    #[test]
+    fn step_producer_died_marks_gap() {
+        // fix 5: a producer-thread panic surfaces as a gap, not a silent frozen feed.
+        let mut app = App::new(PathBuf::from("/agents"));
+        step(&mut app, AppEvent::ProducerDied("snapshot"), &TestSource);
+        assert_eq!(app.event_gaps, 1);
+    }
+
+    #[test]
+    fn drain_events_caps_per_tick() {
+        // fix 2 (anti-livelock): a saturated channel drains at most `max` per call, then
+        // yields — the loop still reaches key poll + draw instead of spinning forever.
+        use std::sync::mpsc::sync_channel;
+        let (tx, rx) = sync_channel::<AppEvent>(64);
+        for i in 0..20 {
+            tx.try_send(AppEvent::Flight(serde_json::json!({ "i": i }))).unwrap();
+        }
+        let (wake_tx, _wake_rx) = sync_channel::<()>(4);
+        let mut app = App::new(PathBuf::from("/agents"));
+        let quit = drain_events(&rx, &mut app, &TestSource, &wake_tx, 4);
+        assert!(!quit, "no Quit from Flight events");
+        assert_eq!(app.events.len(), 4, "drained exactly the cap");
+        // 16 events remain in the channel for the next tick.
+        let remaining = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        assert_eq!(remaining, 16, "cap left the rest for the next tick");
     }
 }

@@ -1095,9 +1095,12 @@ host-loopback* — the Docker `cos` deployment binds management to `0.0.0.0` in-
 Backbone: one `tokio::select!` loop, three producers (keys + `/api/v1/events` SSE + ~30 ms render
 tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
 
-- **ux.0** — Async single-loop foundation + host-loopback reachability. No new feature; existing
-  views update live from SSE; `watch --url localhost:7999` works from the Mac host. `/plan-eng-review`
-  the refactor.
+- ~~**ux.0** — Async single-loop foundation~~ ✅ **shipped (v0.77.0)** — `agentctl watch` refactored to
+  a non-blocking event-pushed single loop (Option B: background threads + bounded `sync_channel`, no async).
+  Behavior-preserving; pure `step()`; SSE reconnect + reconciliation; livelock/panic guards; 408 tests.
+  **Host-loopback reachability split to ux.0b** (`docs/plans/ux.0b-host-loopback-reachability.md`) — it hit
+  the `management.rs` fail-closed loopback guard + unauthenticated-API Docker-bridge exposure (needs a
+  security decision).
 - **ux.2** — Observe (closes **cos-ux-01**): `last_activity`/`last_error`/`idle_secs` on the snapshot;
   agent-table `LAST-TOOL` + row-red-on-error + `idle→amber` stuck signal; live summary-first event
   stream (JSON on expand, filter chips, freeze, row-scopes-stream); AgentDetail timeline.

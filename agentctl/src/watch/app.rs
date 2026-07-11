@@ -439,7 +439,22 @@ pub struct App {
     /// Shown as a green banner on the Dashboard after a successful live injection
     /// via /agents/control; cleared on the next keypress.
     pub spawn_banner:    Option<String>,
+    /// ux.0: set when state changed and a redraw is due; the render loop draws
+    /// once per tick after draining all pending events (coalescing).
+    pub dirty:           bool,
+    /// ux.0: bounded ring of parsed SSE flight events (tail-drop). Not rendered in
+    /// ux.0 — infrastructure for the ux.2 live event stream. The SSE feed is lossy;
+    /// the snapshot poll is the authoritative view state.
+    pub events:          std::collections::VecDeque<serde_json::Value>,
+    /// Count of flight events dropped (channel overflow) since startup (C3).
+    pub dropped_events:  usize,
+    /// Count of stream gaps (reconnect / lag / parse-fail) seen (F3/C4).
+    pub event_gaps:      usize,
 }
+
+/// ux.0: cap on the in-memory event ring (tail-drop), mirroring MAX_DISPLAY_ENTRIES
+/// discipline elsewhere. Bounds memory regardless of SSE event rate.
+pub const EVENT_RING_CAP: usize = 2000;
 
 impl App {
     pub fn new(agents_dir: PathBuf) -> Self {
@@ -464,7 +479,31 @@ impl App {
             approvals_items: vec![],
             approvals_view:  ApprovalsViewState::default(),
             spawn_banner:    None,
+            dirty:           true,
+            events:          std::collections::VecDeque::new(),
+            dropped_events:  0,
+            event_gaps:      0,
         }
+    }
+
+    /// Append a flight event to the bounded ring, tail-dropping the oldest past
+    /// EVENT_RING_CAP so memory stays flat regardless of event rate (ux.0 F8).
+    pub fn push_event(&mut self, value: serde_json::Value) {
+        self.events.push_back(value);
+        while self.events.len() > EVENT_RING_CAP {
+            self.events.pop_front();
+        }
+    }
+
+    /// Record a stream gap (reconnect / lag / parse-fail). The snapshot poll is the
+    /// authoritative reconciliation source; the ring is not gapless (F3/C4).
+    pub fn mark_gap(&mut self) {
+        self.event_gaps = self.event_gaps.saturating_add(1);
+    }
+
+    /// Record `n` flight events dropped due to channel backpressure (C3).
+    pub fn note_dropped(&mut self, n: usize) {
+        self.dropped_events = self.dropped_events.saturating_add(n);
     }
 
     pub fn apply_snapshot(&mut self, snap: Snapshot) {

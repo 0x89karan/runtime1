@@ -3,6 +3,11 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.77.0] - 2026-07-12
+
+### Changed
+- **ux.0** (Track UX cockpit): refactor `agentctl watch` from a synchronous poll-render loop to a non-blocking, event-pushed single loop (Option B: background `std::thread` producers + a bounded `std::sync::mpsc` `sync_channel` + `crossterm` `poll(30ms)` + `try_recv`; no async runtime). Behavior-preserving across all TUI views + `--plain`; a pure `step()` state function; SSE producer with total-timeout reconnect + backoff-reset-on-healthy-close + `Invalidated`/snapshot reconciliation; bounded per-tick drain (livelock guard); `TermGuard` panic-hook gated to the main thread + `catch_unwind` producer sentinels. Foundation for ux.1/ux.2. Host-loopback reachability split to ux.0b. 408 tests (5 new); Codex + Claude adversarial review. `agentctl`-only.
+
 ## [v0.76.0] - 2026-07-11
 
 ### Added — fast local dev-image loop + on-demand multi-arch publish
