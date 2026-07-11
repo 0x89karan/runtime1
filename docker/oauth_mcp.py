@@ -51,7 +51,7 @@ _BROKER_TOKEN = os.environ.get("AGENTD_CREDENTIAL_TOKEN", "")
 # ---------------------------------------------------------------------------
 
 RESPONSE_CAP    = 4 * 1024 * 1024   # 4 MB cap on oauth_call_api response body
-ERROR_BODY_CAP  = 512               # bytes read from token endpoint error body
+ERROR_BODY_CAP  = 512               # bytes read from oauth_call_api HTTP error response body
 REQUEST_TIMEOUT = 20                 # seconds per sub-request (refresh + api call)
 CALLBACK_TIMEOUT_S = 600            # 10 minutes for the user to complete auth
 
@@ -375,14 +375,9 @@ def _exchange_code(code: str, redirect_uri: str, code_verifier: str) -> Optional
         with urllib.request.urlopen(req, context=ctx, timeout=REQUEST_TIMEOUT) as resp:
             payload = json.loads(resp.read(RESPONSE_CAP))
     except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read(ERROR_BODY_CAP).decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        return f"token exchange failed {e.code}: {body}"
+        return f"token exchange failed {e.code}"
     except Exception as exc:
-        return f"token exchange error: {exc}"
+        return f"token exchange error: {type(exc).__name__}"
 
     with _token_lock:
         _access_token  = payload.get("access_token")
@@ -422,14 +417,9 @@ def _do_refresh() -> Optional[str]:
         with urllib.request.urlopen(req, context=ctx, timeout=REQUEST_TIMEOUT) as resp:
             payload = json.loads(resp.read(RESPONSE_CAP))
     except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read(ERROR_BODY_CAP).decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        return f"refresh failed {e.code}: {body}"
+        return f"refresh failed {e.code}"
     except Exception as exc:
-        return f"refresh error: {exc}"
+        return f"refresh error: {type(exc).__name__}"
 
     _access_token = payload.get("access_token", _access_token)
     new_rt = payload.get("refresh_token")
@@ -1416,8 +1406,70 @@ def _self_test():
     else:
         fail("31", f"result={result31} err={err31} calls={refresh_called_31} token={_access_token}")
 
+    # --- Test 32: _do_refresh error does NOT include token-endpoint response body ---
+    # This test FAILS if the body read block is restored in _do_refresh().
+    # The body from a failed token endpoint can contain credential-shaped strings;
+    # only the HTTP status code is safe to include in error strings and logs.
+    _reset_state()
+    _auth_state = "authorized"; _refresh_token = "bad-rt"
+    _token_expiry = time.monotonic() - 1  # expired → forces refresh
+
+    sentinel = "access_token=SENTINELVALUE"
+    with patch("urllib.request.urlopen",
+               side_effect=urllib.error.HTTPError(
+                   None, 400, "Bad Request", {}, io.BytesIO(sentinel.encode()))):
+        err32 = _ensure_fresh_token()
+
+    if err32 and "400" in err32 and sentinel not in err32:
+        ok("32: _do_refresh body not included in error string (cred.5-ar-01)")
+    else:
+        fail("32", f"err={err32!r} (body sentinel must be absent, status must be present)")
+
+    # --- Test 33: _exchange_code error does NOT include token-endpoint response body ---
+    # Mirrors T32 for the initial auth-code exchange path. This test FAILS if the body
+    # read block is restored in _exchange_code().
+    _reset_state()
+    sentinel33 = "refresh_token=SENTINELVALUE33"
+    with patch("urllib.request.urlopen",
+               side_effect=urllib.error.HTTPError(
+                   None, 401, "Unauthorized", {}, io.BytesIO(sentinel33.encode()))):
+        err33 = _exchange_code("some-code", "http://127.0.0.1:9999/cb", "verifier")
+
+    if err33 and "401" in err33 and sentinel33 not in err33:
+        ok("33: _exchange_code body not included in error string (cred.5-ar-01)")
+    else:
+        fail("33", f"err={err33!r} (body sentinel must be absent, status must be present)")
+
+    # --- Test 34: _do_refresh generic Exception path does NOT include exc message ---
+    # Guards against `except Exception as exc: return f"refresh error: {exc}"` regression.
+    # {exc} could expose exc.args[0] if an Exception is raised with credential-shaped data.
+    _reset_state()
+    _auth_state = "authorized"; _refresh_token = "rt-for-t34"
+    _token_expiry = time.monotonic() - 1  # expired → forces refresh
+    sentinel34 = "client_secret=SENTINELVALUE34"
+    with patch("urllib.request.urlopen",
+               side_effect=Exception(sentinel34)):
+        err34 = _ensure_fresh_token()
+
+    if err34 and sentinel34 not in err34:
+        ok("34: _do_refresh generic Exception path not included in error string (cred.5-ar-01)")
+    else:
+        fail("34", f"err={err34!r} (exc message sentinel must be absent)")
+
+    # --- Test 35: _exchange_code generic Exception path does NOT include exc message ---
+    _reset_state()
+    sentinel35 = "client_secret=SENTINELVALUE35"
+    with patch("urllib.request.urlopen",
+               side_effect=Exception(sentinel35)):
+        err35 = _exchange_code("some-code", "http://127.0.0.1:9999/cb", "verifier")
+
+    if err35 and sentinel35 not in err35:
+        ok("35: _exchange_code generic Exception path not included in error string (cred.5-ar-01)")
+    else:
+        fail("35", f"err={err35!r} (exc message sentinel must be absent)")
+
     print(file=sys.stderr)
-    total = 31
+    total = 35
     if not failures:
         print(f"oauth_mcp.py: self-test PASSED ({total}/{total})", file=sys.stderr)
         sys.exit(0)

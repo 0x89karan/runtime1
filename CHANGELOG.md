@@ -3,6 +3,19 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.75.0] - 2026-07-11
+
+### Fixed
+
+- **secret-redaction** — OAuth token-refresh error bodies (HTTP non-2xx responses from
+  the token endpoint) are no longer included in error strings, flight-recorder events,
+  or `provider_last_error`. Only the HTTP status code is retained. Closes `cred.5-ar-01`.
+  (`docker/oauth_mcp.py` `_do_refresh` + `_exchange_code`, `agentd/src/credential/mod.rs`)
+- **Google OAuth Testing-mode trap** — `MCP_SERVERS.md` no longer steers operators into
+  Testing mode (7-day token expiry). Docs now guide operators to publish the OAuth app to
+  Production. Adds `invalid_grant` to the error reference table. (`docs/MCP_SERVERS.md`,
+  `docs/DEPLOYMENT.md`)
+
 ## [cos-dogfood-2] - 2026-07-11 (v0.73.2)
 
 ### Fixed — oauth_mcp: check_auth never refreshed from a stored refresh token

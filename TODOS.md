@@ -887,19 +887,18 @@ check applies only to agent-supplied target URLs, not to the broker URL itself. 
 - **Where to start:** `docker/oauth_mcp.py` → `_load_config()` broker short-circuit block, after
   populating `OAUTH_PROVIDER_NAME` and `ALLOWED_HOSTS`. Add `import ipaddress`.
 
-**cred.5-ar-01 (P3) — OAuth token-refresh error body included verbatim in provider_health.last_error**
+**✓ cred.5-ar-01 (closed in v0.75.0) — OAuth token-refresh error body stripped (runtime paths)**
 
-HTTP error responses from the token endpoint are stored in `provider_last_error` (up to 512 bytes,
-`mod.rs:342`) and surface in the FUSE `/agents/system/credentials` file and `GET /api/v1/credentials`.
-RFC 6749 §5.2 error responses never contain credential material, but a misconfigured provider could
-echo the request. Management API is loopback-only so blast radius is minimal; standard providers are
-safe. A future hardening pass could record only the HTTP status code and drop the body entirely.
+Token-endpoint HTTP response bodies are no longer included in runtime error strings, flight-recorder
+events, or `provider_last_error`. Only the HTTP status code is retained. Fixed in
+`docker/oauth_mcp.py` (`_do_refresh` + `_exchange_code`) and `agentd/src/credential/mod.rs`
+(`get_or_refresh`). Source-scan tests T32–T35 (Python) and `test_token_refresh_error_does_not_include_body`
+(Rust) guard against regression.
 
-- **Why:** tradeoff decided in cred.5 QA (2026-07-08): operator debugging value > paranoid body drop for
-  an operator-only, loopback-gated surface. Non-standard providers remain a theoretical risk.
-- **How to apply:** in `handle_credential_request()` at the `Err(format!(...body...))` site, strip the body
-  and store only the HTTP status code string. Adjust tests that assert on body content.
-- **Depends on:** cred.5 (credential surface).
+Note: `agentctl auth google` (`agentctl/src/auth/google.rs`) intentionally retains the body for
+`exchange_code()` — this is an interactive operator setup CLI, not the agent runtime. Google token
+endpoints return RFC 6749 error codes (e.g. `redirect_uri_mismatch`) but never echo credentials,
+so operator-facing diagnostic output is safe and useful for OAuth troubleshooting.
 
 **cred.4-ar-01 (P3) — Caps persistence is per-clean-exit only — in-flight counts lost on crash**
 

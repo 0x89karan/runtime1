@@ -555,6 +555,7 @@
         <li>Copy the <strong>Client ID</strong> and <strong>Client Secret</strong> — no redirect URI to register</li>
       </ol>
       <p>Desktop app clients allow <code>127.0.0.1</code> loopback redirects automatically per <a href="#">RFC 8252</a> — there is no redirect URI field in the Google Cloud Console for this client type. <code>agentctl auth google</code> uses port <code>8585</code> by default; pass <code>--port &lt;N&gt;</code> if that port is in use.</p>
+      <p>⚠️ <strong>Publish to Production before authorizing.</strong> On the <strong>OAuth consent screen</strong>, change <em>Publishing status</em> to <strong>Published</strong>. Testing-mode refresh tokens expire after 7 days. For <code>gmail.readonly</code> (a non-sensitive scope), unverified Production apps work fine — Google shows a warning screen but tokens stay valid indefinitely.</p>
     </div>
 
     <div class="step">

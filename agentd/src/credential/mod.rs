@@ -338,8 +338,7 @@ impl OAuthTokenCache {
                     .map_err(|e| format!("token refresh request failed: {e}"))?;
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
-                    let body = resp.text().await.unwrap_or_default();
-                    return Err(format!("token refresh HTTP {status}: {body:.512}"));
+                    return Err(format!("token refresh HTTP {status}"));
                 }
                 let tok_resp: TokenResponse = resp.json().await.map_err(|e| {
                     format!("token refresh response parse failed: {e}")
@@ -3032,5 +3031,23 @@ max_requests_per_agent = 100
         let json = serde_json::to_string(&snap).expect("CredentialSnapshot must serialize");
         assert!(json.contains("gateway_enabled"), "gateway_enabled field required");
         assert!(json.contains("HTTP 401"), "last_error must be present in JSON");
+    }
+
+    #[test]
+    fn test_token_refresh_error_does_not_include_body() {
+        // Source-scan guard: the token refresh error must never include the HTTP response body.
+        // Build the banned pattern from parts so this literal doesn't trigger itself.
+        let src = include_str!("mod.rs");
+        let banned = ["token refresh HTTP {status}", ": {body"].concat();
+        assert!(
+            !src.contains(&banned),
+            "token refresh error must not include the HTTP response body (cred.5-ar-01): \
+             only the status code should be logged"
+        );
+        // Positive guard: the HTTP status code placeholder must still be present in the format string.
+        assert!(
+            src.contains("token refresh HTTP {status}"),
+            "token refresh error must still include the HTTP status code (cred.5-ar-01 design intent)"
+        );
     }
 }

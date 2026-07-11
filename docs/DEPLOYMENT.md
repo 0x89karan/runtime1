@@ -29,6 +29,9 @@ sudo cp target/release/agentctl /usr/local/bin/agentctl   # optional: add to PAT
 #    NOTE: a Desktop-app client has NO "redirect URI" field — 127.0.0.1 loopback is
 #    allowed automatically (RFC 8252). agentctl uses port 8585; it must be free, or
 #    pass `agentctl auth google --port <N>`. (Nothing to register in the console.)
+#    ⚠️  Publish to Production (OAuth consent screen → Publish App) — Testing mode
+#    tokens expire after 7 days causing silent auth failures. gmail.readonly doesn't
+#    require Google verification; just accept the "unverified app" warning.
 
 # 3. Authorize Gmail (a browser opens; writes ~/.agentos-secrets/google.json)
 agentctl auth google \
@@ -179,6 +182,8 @@ Create `/home/agentos/.agentos-secrets/agentos.env` with **all** of the followin
 ANTHROPIC_API_KEY=sk-ant-...
 
 # Required: Google OAuth app (create at console.cloud.google.com)
+# ⚠️  Publish to Production (OAuth consent screen → Publish App) to avoid 7-day token expiry.
+# gmail.readonly doesn't require Google verification — accept the "unverified" warning.
 OAUTH_CLIENT_ID=<your-client-id>.apps.googleusercontent.com
 OAUTH_CLIENT_SECRET=<your-client-secret>
 

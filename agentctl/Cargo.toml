@@ -1,6 +1,6 @@
 [package]
 name = "agentctl"
-version = "0.73.2"
+version = "0.75.0"
 edition = "2021"
 
 [[bin]]

@@ -116,7 +116,11 @@ first example; other providers (Slack, GitHub, Notion) work by changing the env 
 1. Go to [console.cloud.google.com](https://console.cloud.google.com) and select or create a project.
 2. **APIs & Services → Library** → enable "Gmail API" and "Google Drive API".
 3. **APIs & Services → OAuth consent screen** → choose **External** → fill in App name and your email.
-   Add your email as a **Test user** if the app is in testing mode.
+   ⚠️  **Publish to Production — do not stay in Testing mode.** Testing-mode refresh tokens
+   expire after 7 days, causing silent auth failures. For non-sensitive scopes like
+   `gmail.readonly`, Google allows unverified Production apps: users see a "This app isn't
+   verified" warning screen but tokens stay valid indefinitely.
+   To publish: **OAuth consent screen → Publishing status → Publish App**.
 4. **APIs & Services → Credentials → Create Credentials → OAuth client ID**.
 5. Application type: **Desktop app** ← required for the localhost callback to work.
 6. Copy the **Client ID** and **Client Secret**.
@@ -195,6 +199,7 @@ the agent picks up the saved token — no browser flow required unless the token
 | `{"error": "auth_not_ready"}` | Agent called `oauth_call_api` before auth completed | Call `oauth_start_auth` first, complete browser flow, then `oauth_check_auth` |
 | `{"error": "host_not_allowed", "host": "..."}` | URL hostname not in `OAUTH_ALLOWED_HOSTS` | Add hostname to `OAUTH_ALLOWED_HOSTS` env var |
 | `{"error": "timeout"}` from `oauth_check_auth` | 10-minute browser flow window expired | Call `oauth_start_auth` again to get a fresh URL |
+| `refresh failed 400` | Refresh token expired or revoked — common causes: OAuth app in Testing mode (7-day limit), user revoked access, or Google account password change | Publish app to Production: **Google Cloud Console → APIs & Services → OAuth consent screen → Publish App**. If already in Production, have the user re-authorize via `oauth_start_auth`. |
 
 Self-test (no credentials required):
 ```bash
