@@ -1,5 +1,7 @@
 # 06 — cred.3.1 credential-manager hardening (build-session kickoff)
 
+> **✅ Shipped — cred.3.1 (v0.61.0, PR #85). Historical; kept for reference.**
+
 Paste the block below to start the build session. Full plan: `docs/plans/cred.3.1-hardening.md`.
 
 ---

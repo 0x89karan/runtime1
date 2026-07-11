@@ -1,7 +1,13 @@
 # 09 — Operator Cockpit (Track UX) — build-session kickoff
 
 Paste the block below. Full plan: `docs/plans/ux-cockpit.md`. Build the increments in order,
-one per branch; start with **ux.0**.
+one per branch.
+
+> **Entry point (2026-07-11):** the master build queue is `docs/prompts/12-build-queue-single-lane.md`.
+> **ux.0 is landed solo in that single-lane phase** (it churns the whole `agentctl/src/watch/` tree, so
+> it goes before parallelizing). **This cockpit lane resumes at `ux.9`** once ux.0 is merged, and folds
+> cos-polish #3 (memory pane, into ux.2) + #6 (orchestrate REPL, into ux.1). Ignore the "start with ux.0"
+> phrasing below when working the post-split lane — ux.0 is already done.
 
 > **North star (2026-07-11):** the cockpit is agentos's **default operator surface** — k9s/htop for
 > agents, booted alongside `agentd` (see `ux.9` cockpit-mode). The sequence below reflects that:

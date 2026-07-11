@@ -1,5 +1,7 @@
 # Prompt 5 — Operations runbook (Phase 4.6 / v0.16.0 + Phase 5/6 plans)
 
+> **✅ Shipped — produced `RUNBOOK.md` (kept current since; last refreshed v0.62.0). Historical; kept for reference.**
+
 **Run as:** a fresh Claude Code session inside the `agentos/` repo. Sonnet is
 fine — synthesis-heavy, judgment-light. Run **last**: this runbook documents
 the system as it stands today plus what's designed for Phases 5 and 6, so it

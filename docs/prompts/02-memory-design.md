@@ -1,5 +1,7 @@
 # Prompt 2 — Memory subsystem design (architectural)
 
+> **✅ Shipped — Phase 5 memory subsystem (implemented p5.1–p5.9, v0.18.0–v0.26.0). Historical; kept for reference.**
+
 **Run as:** a fresh Claude Code session inside the `agentos/` repo, on the
 strongest reasoning model available (Opus tier — this is the hardest design
 problem in the queue). Run **after** Prompt 1 (audit findings inform memory's

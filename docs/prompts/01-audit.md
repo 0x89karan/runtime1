@@ -1,5 +1,7 @@
 # Prompt 1 — State-of-the-union audit (Phase 4.6 / v0.16.0)
 
+> **✅ Shipped — Phase 4.6 (v0.16.0). Historical; kept for reference.**
+
 **Run as:** a fresh Claude Code session inside the `agentos/` repo, on the
 strongest reasoning model available (Opus tier — this is judgment-heavy).
 

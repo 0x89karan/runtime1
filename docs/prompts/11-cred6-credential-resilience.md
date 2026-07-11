@@ -1,5 +1,10 @@
 # 11 — cred.6 Credential resilience — build-session kickoff
 
+> **♻️ Superseded 2026-07-11 (not shipped).** The CEO review split this into **cred.6** (broker
+> migration) + **cred.7** (resilience). Use `docs/prompts/12-build-queue-single-lane.md` and the plans
+> `docs/plans/cred.6-broker-migration.md` / `docs/plans/cred.7-credential-resilience.md`. The plan path
+> referenced below (`docs/plans/cred.6-credential-resilience.md`) was renamed to `cred.7-…`. Kept for reference.
+
 Paste the block below. Full plan (read it first): `docs/plans/cred.6-credential-resilience.md`.
 Autoplan-hardened (4 voices) — build to the plan; the hardening items are the point, not extras.
 

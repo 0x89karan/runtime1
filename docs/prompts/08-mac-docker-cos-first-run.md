@@ -1,5 +1,7 @@
 # 08 — Mac + Docker CoS first-run fixes (build-session kickoff)
 
+> **✅ Shipped — dx.4b (v0.71.0, PR #96). Historical; kept for reference.**
+
 Paste the block below. Full plan: `docs/plans/mac-docker-cos-first-run.md`.
 
 ---

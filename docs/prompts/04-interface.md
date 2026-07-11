@@ -1,5 +1,7 @@
 # Prompt 4 — Interface design & agent catalogue (Phase 6)
 
+> **✅ Shipped — Phase 6 complete (p6.1–p6.8, v0.27.0–v0.34.0). Historical; kept for reference.**
+
 **Run as:** a fresh Claude Code session inside the `agentos/` repo. Opus or
 Sonnet both work — bounded surface area, but the TUI-vs-GUI call is a real
 judgment. Run **after** Prompts 1, 2, and 3.

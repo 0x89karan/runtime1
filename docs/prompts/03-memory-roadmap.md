@@ -1,5 +1,7 @@
 # Prompt 3 — Phase 5 roadmap (fully-fleshed implementation queue)
 
+> **✅ Shipped — Phase 5 complete (p5.1–p5.9, v0.18.0–v0.26.0). Historical; kept for reference.**
+
 **Run as:** a fresh Claude Code session inside the `agentos/` repo, on Opus
 tier (this is detailed engineering planning, not just prose). Run **after**
 Prompts 1 and 2 — this prompt consumes their outputs.
