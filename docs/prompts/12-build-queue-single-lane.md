@@ -9,10 +9,28 @@ was split by the CEO review into `cred.6` broker migration + `cred.7` resilience
 worktrees. ux.0 churns the whole `agentctl/src/watch/` tree, so landing it solo first avoids
 coordinating a big refactor across two sessions. See `docs/plans/ux-cockpit.md` "Sequencing".
 
+## Merge discipline (STANDING — every branch, every lane)
+
+Learned the hard way: cheap-wins (v0.75.0) merged ahead of dx.6 (v0.74.0) because each branch
+pre-baked its own version and they merged out of order, stranding dx.6 in a DIRTY PR and inverting
+the version. These two rules make that impossible — they apply to **every** branch, single-lane or
+parallel:
+
+- **RULE 1 — Serialize the *merge*, not the *build*.** Build branches in parallel if you like, but
+  only **one PR merges to `main` at a time**. **Always rebase onto current `main` immediately before
+  merging.** **Never merge a branch that is behind `main`.**
+- **RULE 2 — Assign the version bump + CHANGELOG entry at *merge* time**, based on current `main` —
+  **not** when you cut the branch. Pre-baked versions are what caused the 0.74/0.75 inversion.
+
+When two lanes touch the same file (notably `cos.agents.toml` — ux.0 edits `[management] bind_addr`,
+cos-polish #1 edits `FsWrite`, cred.6 edits `[credential_gateway]`): different keys, no logic clash;
+RULE 1 (rebase-before-merge) resolves it — whoever merges second rebases.
+
 ---
 
 ```
 Work the CoS cluster as ONE lane until the ux.0 refactor is merged, then split into two. Repo discipline: one increment per branch; /autoplan → build → /review → /qa → /ship; main shippable at each step; update docs/ROADMAP.md in the same PR; `make clippy-linux` before pushing Linux-gated code (agentctl/surfaces).
+MERGE DISCIPLINE (every branch): RULE 1 — only one PR merges to main at a time; ALWAYS rebase onto current main immediately before merging; NEVER merge a branch behind main. RULE 2 — assign the version bump + CHANGELOG entry at MERGE time (based on current main), not at branch-cut. (These prevent the out-of-order version inversion that stranded dx.6.)
 
 STEP 0 — Sync main (PR #103 merged as e35376d6; make sure your local main is current).
 - Commit or stash WIP, then: `git checkout main && git pull --ff-only origin main`.
