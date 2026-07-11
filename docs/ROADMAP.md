@@ -1109,15 +1109,25 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   converse/observe/spawn surface in a browser; still single-tenant, still loopback). ⚠ Browser ≠ FUSE
   boundary — needs an Origin/Host allowlist (DNS-rebinding guard) to land first.
 - **ux.7** — Run replay: reconstruct + scrub an agent's run from `flight.jsonl` + checkpoints.
+- **ux.8** — Live budget control (added 2026-07-11): a cockpit panel to view + set per-agent and global
+  token budgets over a new management-API budget endpoint. Fixes the live-run "500k too small" finding.
+  `/plan-eng-review` (live config writes).
+- **ux.9** — Cockpit mode (added 2026-07-11): a `cockpit` entrypoint that starts `agentd` **and** execs
+  `agentctl watch` in the foreground — boot straight into an always-on status/debug console. Reads FUSE
+  `/agents`; the flight recorder is the live log view. Basic version ships early; live with ux.0.
 
-Sequencing (CEO-locked 2026-07-10, observability-first; spec-review-corrected): core **ux.0 → ux.2 →
-ux.1 → ux.3** (NOT gated on connectors), then expansions **ux.6 (evidence, TUI) → ux.4 (push) → ux.5
-(web cockpit) → ux.7 (replay)**, then **skills (Phase 11) last**. One increment per branch across
-sessions, `main` shippable at each step. `cos-ux-01` is a silent-failure defect, so the observability
-floor (ux.0+ux.2) leads. **Connectors is a parallel track** (separate plan, not written) — the intended
-next value, but it must not block the cockpit path on undefined work; it slots in when ready. Skills
-compose tool calls, so they're worth most after connectors. Companion connectors: curated MCP servers
-via the credential broker (Calendar, GitHub, Linear, Slack, Notion) — integrate-don't-bundle.
+> **North star (2026-07-11):** the cockpit is **agentos's default operator surface** — an always-on
+> status/debug/control console (k9s/htop for agents), not an optional tool. ux.9 makes it the default;
+> ux.0/2/1/8 make it live, watchable, chattable, tunable.
+
+Sequencing (updated 2026-07-11 — cockpit-as-default): core **ux.0 → ux.9 (boot into TUI) → ux.2 (activity)
+→ ux.1 (chat — *bumped*) → ux.8 (budgets) → ux.3**, then expansions **ux.6 → ux.4 → ux.5 → ux.7**, then
+**skills (Phase 11) last**. One increment per branch, `main` shippable at each step. **Parallel, independent
+of the cockpit — do first (makes the CoS usable today):** `cos-polish` (`docs/plans/cos-polish.md` — the
+8 bugs from live testing: brief-not-written, KB-unfindable, orchestrate errors, undersized budgets) and
+`memory-routing` (`docs/plans/memory-routing.md` — raw emails → harness Layer 2, also fixes the token
+blowup). **Connectors** stays a parallel unwritten track (Calendar/GitHub/Linear/Slack/Notion via the
+credential broker); it must not block the cockpit path.
 
 ---
 
@@ -1286,6 +1296,28 @@ grants, last access, token expiry); rotation policy; alternate `CredentialStore`
 keychain / vault).
 **Acceptance:** operator sees per-agent credential grants + last access via FUSE and `agentctl`;
 rotation policy configurable.
+
+### cred.6 — Migrate the CoS to broker mode (close Phase 10 for the flagship)
+**Depends on:** cred.3–cred.5 (broker infra, all shipped) + cred.4b (broker-capable sidecars).
+**Why:** Phase 10's goal — "one credential model, tools hold no raw credential in memory-at-rest" —
+is **half-delivered**: the broker exists but the flagship CoS still runs the legacy file path
+(sidecar reads `/run/secrets/google.json` directly, `OAUTH_PROVIDER_NAME` + `FsRead /run/secrets`).
+This migrates it. Mostly **config** (add `[credential_gateway]` + a `Credential{Google}` grant to
+both `cos.agents.toml` files) + an **end-to-end auth retest gate** (do not re-break v0.73.2 auth).
+Do-first P0 (ships independently): **secret-redaction** of token-endpoint bodies (`oauth_mcp.py:430`,
+`credential/mod.rs:341,371`; folds cred.5-ar-01). Full plan: `docs/plans/cred.6-broker-migration.md`.
+**Acceptance:** the CoS authenticates + reads Gmail through the broker; the sidecar process holds no
+raw refresh token; auth retest passes; no token/secret in any log/event.
+
+### cred.7 — Credential resilience (refresh/failure recovery, on top of broker mode)
+**Depends on:** cred.6 (broker migration).
+**Goal:** terminal-failure detection + operator surfacing + resume-without-restart + multi-agent
+dedup, provider-agnostic in the gateway. Hardened by `/autoplan` (2026-07-10). Full plan:
+`docs/plans/cred.7-credential-resilience.md`. (Was cred.6 before the 2026-07-11 CEO review split the
+broker migration out as its own prerequisite increment.)
+**Acceptance:** a revoked/expired token → one classified attention approval + `CredentialAttentionRequired`
+event; operator fixes the credential on the host → gateway picks it up with no restart → `CredentialRecovered`;
+transient blips retry without false alarms; multi-agent → one approval not N.
 
 ---
 

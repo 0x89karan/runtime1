@@ -25,10 +25,10 @@ cargo build --release --bin agentctl
 sudo cp target/release/agentctl /usr/local/bin/agentctl   # optional: add to PATH
 
 # 2. Google OAuth — console.cloud.google.com → enable the Gmail API →
-#    Create Credentials → OAuth client ID → Desktop app.
-#    Authorized redirect URI: http://127.0.0.1:8585   (must be FREE; if not, use
-#    `agentctl auth google --port <N>` and register http://127.0.0.1:<N> instead).
-#    Copy the Client ID + Client Secret.
+#    Create Credentials → OAuth client ID → Desktop app → copy the Client ID + Secret.
+#    NOTE: a Desktop-app client has NO "redirect URI" field — 127.0.0.1 loopback is
+#    allowed automatically (RFC 8252). agentctl uses port 8585; it must be free, or
+#    pass `agentctl auth google --port <N>`. (Nothing to register in the console.)
 
 # 3. Authorize Gmail (a browser opens; writes ~/.agentos-secrets/google.json)
 agentctl auth google \
@@ -88,12 +88,38 @@ with `docker compose exec cos agentctl watch`. Use this when you're changing `ag
 want your local build rather than the released image.
 </details>
 
+### Updating & clean re-test
+
+The image is the code — a running container never updates itself, and a restart **resumes prior
+agents from the checkpoint** (by design; the CoS survives restarts). After pulling a fix, start fresh
+so a failed agent from an earlier run doesn't reload:
+
+```bash
+docker rm -f agentos-cos 2>/dev/null || true              # stop the old container (--rm cleans on exit)
+rm -f ~/.agentos-data/checkpoint.json 2>/dev/null || true # drop stale/failed agents (usually already gone)
+docker pull ghcr.io/0x89karan/runtime1:full             # get the newest build
+# then re-run step 6
+```
+
+- **Started with `docker compose`?** Stop with `docker compose down` (add `-v` only to also wipe the
+  named volumes — that's a data reset).
+- **Full reset** (only if a run *still* reloads stale state): `rm -rf ~/.agentos-data/*` regenerates
+  the memory store, flight log, and signing keys. Google credentials live in `~/.agentos-secrets` and
+  are **not** touched.
+- **Clean up old images:** `docker image ls ghcr.io/0x89karan/runtime1`, then `docker image prune`
+  or `docker rmi <id>`. Pin an exact tag (`:v0.73.2`) instead of `:full`/`:latest` for a reproducible
+  build.
+
 ### Troubleshooting
 
+- **Inbox agent stuck at "Not authenticated" / `no_session` (with a valid `google.json`):** your image
+  predates the **v0.73.2** Gmail-auth fix (older images never refresh the stored token). Re-pull
+  `agentos:full` (see *Updating & clean re-test* above) and restart.
 - **Container exits with "ANTHROPIC_API_KEY is not set":** the key wasn't in the shell that ran
   `docker run`. Re-`export` it here, or use the `agentos.env` approach above.
-- **Browser shows `ERR_CONNECTION_REFUSED` during auth:** redirect-URI mismatch — confirm
-  `http://127.0.0.1:8585` is registered in the Google OAuth app and that `8585` was free.
+- **Browser shows `ERR_CONNECTION_REFUSED` during auth:** port `8585` was already in use when
+  `agentctl auth google` started, so the loopback callback couldn't bind. Re-run with `--port
+  <free-port>` — Desktop clients accept any loopback port; there is nothing to register.
 - **No brief after a few minutes:** check the cron fired and Gmail was reached —
   `jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail`.
 - **Can't `docker exec` to watch:** the container must have been started with `--name agentos-cos`.

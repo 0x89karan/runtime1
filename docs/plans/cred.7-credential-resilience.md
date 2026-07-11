@@ -1,9 +1,18 @@
-# cred.6 — Credential resilience (general-purpose refresh/credential-failure recovery)
+# cred.7 — Credential resilience (general-purpose refresh/credential-failure recovery)
 
-**Increment:** cred.6 (Phase 10 — Credential manager). Supersedes the `auth-resilience` seed.
+**Increment:** cred.7 (Phase 10 — Credential manager). Supersedes the `auth-resilience` seed.
+**Renamed 2026-07-11:** was `cred.6`; the CEO review split the broker-mode migration out as its own
+prerequisite increment (**cred.6**, `docs/plans/cred.6-broker-migration.md`). This plan is the
+resilience framework that rides *on top of* broker mode.
 **Status:** Planned — hardened by `/autoplan` (2026-07-10, 4 independent voices: CEO/Eng/DX subagents + Codex). Not started.
-**Depends on:** cred.3+ broker (`agentd/src/credential/mod.rs`), dx.4 device flow (`agentctl auth google --device`), p7.4 approvals.
-**Not a dependency (already landed):** the FsRead sandbox cap that let the sidecar read `google.json` shipped as commit `4a0951a4` ("fix(cos): FsRead sandbox cap + honest Landlock message + README redirect URI"). The live "not authenticated" failure was a **stale image** — re-pull `agentos:full` built from `4a0951a4`.
+**Depends on:** **cred.6 (broker migration)** — the CoS must be broker-mode first; plus cred.3+ broker
+(`agentd/src/credential/mod.rs`), dx.4 device flow (`agentctl auth google --device`), p7.4 approvals.
+**Premise correction (2026-07-11):** an earlier draft attributed the live "not authenticated" failure
+to the FsRead sandbox cap (`4a0951a4`) / a stale image. That diagnosis was **wrong** — the FsRead cap
+was a no-op on Docker Desktop (Landlock absent), and the real cause was the `oauth_mcp.py` `check_auth`
+state-machine bug, fixed in **v0.73.2 (#102)**. Auth works today; this increment is not about that bug.
+**Secret-redaction moved out:** the token-endpoint-body redaction (§8 below) is pulled forward into
+**cred.6** as a do-first P0 (it is a live leak, ships independently of the resilience framework).
 
 ## Problem (corrected — the honest gap)
 
@@ -18,7 +27,9 @@ Note the seed overstated the failure as an automatic "loopback dead-end." There 
 - **D1 = host-driven recovery** (reuse dx.4's device flow). **D1b + D3 cut** — no in-container device flow, no container-writable token store. The RFC 8628 poller already exists and is hardened in `agentctl/src/auth/google_device.rs`, and in-container polling cannot fit under `MCP_TIMEOUT=30s`.
 - **Push (ux.4) cut** — it does not exist. MVP notification = a p7.4 approval + a durable flight event. (Add ux.4 as its own increment later if wanted.)
 - **Google Production-publishing prevention is REQUIRED**, not docs-optional — it removes the weekly 7-day Testing-mode expiry that is most of the failure volume.
-- **Precondition (part of cred.6): move the CoS to broker mode** — add `[credential_gateway]` + a `Credential{Google}` grant to `agentd/cos.agents.toml` + `distro/overlay/etc/agentd/cos.agents.toml`.
+- **Precondition = cred.6 (broker migration), now its own increment.** Moving the CoS to broker mode
+  (`[credential_gateway]` + a `Credential{Google}` grant in both `cos.agents.toml` files) is the
+  prerequisite; it is built and validated in cred.6 before this resilience work starts.
 
 ## The general framework (in the gateway)
 

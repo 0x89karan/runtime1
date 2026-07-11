@@ -283,26 +283,54 @@ exists (management SSE, signed Ed25519 receipts p7.5, checkpoints p3.2, flight r
   Acceptance: replaying a recorded run reproduces its step sequence; scrubbing is bounded (no OOM on
   a long run).
 
-## Sequencing (CEO-locked 2026-07-10 — observability-first, spec-review-corrected)
+## Added 2026-07-11 (live-dogfood + operator asks)
 
-**Core (observability-first):** `ux.0 → ux.2` (the silent-failure fix + debugging substrate), then
-the live cockpit `ux.1 → ux.3`. **This path is NOT gated on connectors.** Connectors is a **parallel
-track** (plan unwritten) that slots in whenever it's ready — the intended next *value* after the
-observability floor, but it must not block the cockpit on undefined work.
+- **ux.8 — Live budget control**. A cockpit panel to view and set token budgets — per-agent
+  `spent / budget` bars + an editable limit + a global default — over a new management-API budget
+  endpoint (read/set). Directly addresses the live-run finding where the inbox agent's 500 k budget
+  was exceeded (spent ~820 k). Reuses ux.2's budget bar. Acceptance: setting a live agent's budget
+  takes effect on its next turn; a `spent ≥ budget` agent shows the cap and is guarded, not silently
+  killed. `/plan-eng-review` (live config writes).
+- **ux.9 — Cockpit mode (the TUI as agentos's default surface)**. A `cockpit` entrypoint mode that
+  starts `agentd` **and** execs `agentctl watch` in the foreground of the same container — the operator
+  boots straight into an always-on status + debugging console (agents, activity, the flight-log
+  stream, and — once ux.1 lands — chat). The TUI reads the FUSE `/agents` surface (no port needed
+  in-container); the flight recorder *is* the live log view. Same shape as the existing `orchestrate`
+  entrypoint mode. A basic read-only version can ship early; it becomes live with ux.0 and interactive
+  with ux.1/ux.2/ux.8. Acceptance: `docker run -it … cockpit` boots agentd + the TUI as the foreground;
+  Ctrl-C shuts both down gracefully (checkpoint intact).
 
-**Expansions (cheap-high-impact first — a deliberate switch now that the observability floor is in):**
-`ux.6 (evidence, in the existing TUI cockpit) → ux.4 (push) → ux.5 (web cockpit) → ux.7 (replay)`.
-ux.6 and ux.4 are cheap and high-impact; ux.5 and ux.7 are heavier. ux.6 surfaces in `agentctl watch`
-(the TUI), so it precedes the web cockpit (ux.5). **ux.5 requires the Origin/Host allowlist to land
-first.**
+> **North star (2026-07-11):** Track UX's goal is the cockpit as **agentos's default operator
+> surface** — an always-on status/debug/control console (think `k9s`/`htop` for agents), not an
+> optional tool. ux.9 makes it the default; ux.0/2/1/8 make it live, watchable, chattable, and tunable.
 
-**Skills subsystem (Phase 11) lands last** — skills compose tool calls, so they're worth most after
-connectors exist.
+## Sequencing (updated 2026-07-11 — cockpit-as-default surface)
 
-One increment per branch, **across sessions (not one)**; `main` shippable at each step; `/autoplan` →
-build → `/review` → `/qa` → `/ship`. `/plan-eng-review` gates: **ux.0** (async-loop refactor must
-preserve behavior), **ux.4** (outbound push egress via the broker), **ux.5** (browser-reachable
-management API — DNS-rebinding).
+**Core (the always-on console you watch, chat with, and tune):**
+`ux.0` (async live loop + host reachability) → **`ux.9`** (boot into the TUI) → `ux.2` (per-agent
+activity/errors) → **`ux.1`** (chat — *bumped*: the marquee "talk to the orchestrator") → `ux.8`
+(budget control) → `ux.3` (custom spawn). This path is **not** gated on connectors (a parallel,
+unwritten track).
+
+**Expansions (cheap-high-impact first):** `ux.6 (evidence, in the TUI) → ux.4 (push) → ux.5 (web
+cockpit) → ux.7 (replay)`. ux.5 requires the Origin/Host allowlist first.
+
+**Parallel, independent of the cockpit (do the first one soon — it makes the CoS usable *today*):**
+- **cos-polish** (`docs/plans/cos-polish.md`) — the bugs surfaced in live testing (brief never
+  written to a file, KB unfindable, orchestrate REPL errors, undersized budgets, + the Google
+  Testing-mode 7-day expiry). Backend/config; no cockpit dependency.
+- **memory-routing** (`docs/plans/memory-routing.md`) — raw emails/data → harness Layer 2 (semantic
+  KB, h8.1); keeps the core light and *also* fixes the token blowup.
+- **Credential track** (`docs/plans/cred.6-broker-migration.md` → `docs/plans/cred.7-credential-resilience.md`)
+  — migrate the CoS to broker mode (closes Phase 10 for the flagship), then resilience on top. Sequenced
+  by the 2026-07-11 CEO review *after* cos-polish/memory-routing (user-value first). **Synergy:** ux.0 →
+  ux.2 (per-agent error visibility) is the surface cred.7 lights up — build the observe path first and a
+  credential failure is *visible* in the cockpit before cred.7 adds the attention approval + recovery.
+
+**Skills subsystem (Phase 11) lands last.** One increment per branch, `main` shippable at each step;
+`/autoplan` → build → `/review` → `/qa` → `/ship`. `/plan-eng-review` gates: **ux.0** (behavior-
+preserving refactor), **ux.4** (push egress), **ux.5** (browser-reachable API), **ux.8** (live budget
+writes).
 
 ## References
 

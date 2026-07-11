@@ -552,10 +552,9 @@
         <li><strong>APIs &amp; Services → Library</strong> → search <em>Gmail API</em> → Enable</li>
         <li><strong>APIs &amp; Services → Credentials → Create Credentials → OAuth client ID</strong></li>
         <li>Application type: <strong>Desktop app</strong> — name it anything</li>
-        <li>Under <em>Authorized redirect URIs</em>, add: <code>http://127.0.0.1:8585</code></li>
-        <li>Copy the <strong>Client ID</strong> and <strong>Client Secret</strong></li>
+        <li>Copy the <strong>Client ID</strong> and <strong>Client Secret</strong> — no redirect URI to register</li>
       </ol>
-      <p><code>8585</code> must be free when you run the auth flow (step 3). If it's already in use, run <code>agentctl auth google --port &lt;N&gt;</code> and register <code>http://127.0.0.1:&lt;N&gt;</code> as the redirect URI instead — a mismatch here is the usual cause of <code>ERR_CONNECTION_REFUSED</code> in the browser.</p>
+      <p>Desktop app clients allow <code>127.0.0.1</code> loopback redirects automatically per <a href="#">RFC 8252</a> — there is no redirect URI field in the Google Cloud Console for this client type. <code>agentctl auth google</code> uses port <code>8585</code> by default; pass <code>--port &lt;N&gt;</code> if that port is in use.</p>
     </div>
 
     <div class="step">
@@ -689,11 +688,81 @@
 
   </div><!-- /steps run -->
 
+  <!-- Keeping it updated -->
+  <div class="section-label">Updating &amp; older images</div>
+
+  <div class="note">
+    <div class="note-label">Stopping the CoS (run vs compose)</div>
+    <ul>
+      <li><strong>Started with <code>docker run … cos</code> (this guide):</strong> press <code>Ctrl+C</code> in its terminal — <code>--rm</code> stops <em>and</em> removes the container automatically. If one is left over (still running elsewhere, or holding the <code>agentos-cos</code> name), remove it with <code>docker rm -f agentos-cos</code>. You do <em>not</em> need <code>docker compose down</code> here.</li>
+      <li><strong>Started with <code>docker compose up</code> / <code>run</code> (the dev / build-from-source path):</strong> use <code>docker compose down</code> to stop and remove the compose containers + network.</li>
+      <li><strong>Not sure what's running?</strong> <code>docker ps -a --filter name=agentos</code> lists every AgentOS container; remove leftovers with <code>docker rm -f &lt;name&gt;</code>.</li>
+      <li><strong>Your data is safe.</strong> State (checkpoint, memory, briefs, flight log) lives in the host mounts <code>~/.agentos-data</code> and <code>~/.agentos-output</code> — removing a container never touches them, so the next run resumes. The only destructive command is <code>docker compose down <span class="k">-v</span></code>, which also deletes compose <em>named volumes</em> (state loss); plain <code>down</code> keeps them.</li>
+    </ul>
+  </div>
+
+  <div class="note">
+    <div class="note-label">After every release — re-pull</div>
+    <ul>
+      <li><strong>The image is the code.</strong> Fixes ship as new <code>agentos:full</code> / <code>:latest</code> builds; a running container never updates itself. After a release, re-pull to get the fix — e.g. the <code>v0.73.0 → v0.73.1</code> Gmail-auth fix. <strong>A stale local image is the #1 cause of "a fix landed but nothing changed."</strong></li>
+    </ul>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <div class="code-lang">bash</div>
+      </div>
+      <pre><code><span class="c"># 1. Pull the newest build (re-checks the registry by digest)</span>
+<span class="cmd">docker pull</span> ghcr.io/0x89karan/runtime1:full
+
+<span class="c"># 2. Remove the old container before re-running (--rm cleans it on exit,</span>
+<span class="c">#    but a still-running or leftover one holds the name)</span>
+<span class="cmd">docker rm</span> <span class="flag">-f</span> agentos-cos <span class="p">2&gt;/dev/null || true</span>
+
+<span class="c"># 3. Re-run step 6 with the fresh image</span></code></pre>
+    </div>
+  </div>
+
+  <div class="note">
+    <div class="note-label">Clean re-test after a fix (drop stale / failed agents)</div>
+    <ul>
+      <li><strong>A restart resumes prior agents from the checkpoint</strong> — by design (the CoS survives restarts and picks up its cron loop). But that includes any agent that <em>failed</em> in an earlier run, so after pulling a fix you want a fresh start rather than reloading a broken state. <code>docker rm</code> alone doesn't do this — the checkpoint lives on the host mount, not in the container.</li>
+    </ul>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-dots"><span></span><span></span><span></span></div>
+        <div class="code-lang">bash</div>
+      </div>
+      <pre><code><span class="c"># 1. Stop the old container</span>
+<span class="cmd">docker rm</span> <span class="flag">-f</span> agentos-cos <span class="p">2&gt;/dev/null || true</span>
+
+<span class="c"># 2. Drop the checkpoint so no stale/failed agents reload</span>
+<span class="cmd">rm -f</span> <span class="path">~/.agentos-data/checkpoint.json</span> <span class="p">2&gt;/dev/null || true</span>
+
+<span class="c"># 3. Pull the fixed image</span>
+<span class="cmd">docker pull</span> ghcr.io/0x89karan/runtime1:full
+
+<span class="c"># 4. Re-run step 6 — a fresh orchestrator starts, no carryover</span></code></pre>
+    </div>
+    <p><strong>Full reset</strong> (only if a run <em>still</em> reloads stale state): <code>rm -rf ~/.agentos-data/*</code> regenerates the memory store, flight log, and signing keys from scratch. Your Google credentials live in <code>~/.agentos-secrets</code> and are <strong>not</strong> touched.</p>
+  </div>
+
+  <div class="note">
+    <div class="note-label">Clean up stale images &amp; check versions</div>
+    <ul>
+      <li><strong>See what you have:</strong> <code>docker image ls ghcr.io/0x89karan/runtime1</code> and <code>docker ps -a --filter name=agentos</code>.</li>
+      <li><strong>Remove old images:</strong> <code>docker image prune</code> clears dangling layers; <code>docker rmi &lt;image-id&gt;</code> removes a specific old tag. Frees disk and stops you accidentally running yesterday's build.</li>
+      <li><strong>Confirm what a build is:</strong> <code>docker image inspect ghcr.io/0x89karan/runtime1:full --format '{{.Created}}'</code> shows its build date; the boot logs also print the agentos version.</li>
+      <li><strong>Building locally instead of pulling?</strong> <code>docker pull</code> already fetches the newest by digest, but a local <code>docker compose</code> build caches — force a clean one with <code>docker compose build --no-cache</code>.</li>
+      <li><strong>Pin a version for reproducibility:</strong> use an exact tag like <code>ghcr.io/0x89karan/runtime1:v0.73.1</code> instead of <code>:full</code>/<code>:latest</code> when you want an unchanging build.</li>
+    </ul>
+  </div>
+
   <div class="note">
     <div class="note-label">Troubleshooting</div>
     <ul>
+      <li><strong>Inbox agent stuck at "Not authenticated" / "no active session" (with a valid <code>google.json</code>):</strong> your image predates the <code>v0.73.2</code> Gmail-auth fix. Re-pull <code>agentos:full</code> (see <em>Updating &amp; older images</em> above) and restart — older images never refresh the stored token, so <code>oauth_check_auth</code> returns <code>no_session</code>.</li>
       <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker run</code>. Re-<code>export</code> it in this terminal, or use the <code>agentos.env</code> approach below.</li>
-      <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> the redirect URI doesn't match. Confirm <code>http://127.0.0.1:8585</code> is registered in the Google OAuth app and that <code>8585</code> was free.</li>
+      <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> port <code>8585</code> was already in use when <code>agentctl auth google</code> started. Re-run with <code>--port &lt;free-port&gt;</code> — Desktop app clients accept any loopback port automatically.</li>
       <li><strong>No brief after a few minutes:</strong> check the cron fired and Gmail was reached — <code>jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail</code>. An empty result means the trigger hasn't fired yet.</li>
       <li><strong>Can't <code>docker exec</code> to watch:</strong> the container must have been started with <code>--name agentos-cos</code> (step 6).</li>
     </ul>
@@ -714,7 +783,7 @@
   </div>
 
   <div style="margin-top:8px;font-family:'JetBrains Mono','SF Mono',Consolas,monospace;font-size:11px;color:var(--muted);text-align:center;letter-spacing:0.04em;">
-    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.73.0
+    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.73.2 (Gmail auth fixed)
   </div>
 
 </div>
