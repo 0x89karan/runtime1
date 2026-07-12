@@ -249,6 +249,68 @@ case "${1:-shell}" in
     fi
     ;;
 
+  cockpit)
+    # Zero-arg default (Dockerfile CMD). Cold-starts agentd with a minimal,
+    # agent-free config (docker/cockpit.toml — opening the cockpit shows the
+    # empty system state, it doesn't spend API tokens on demo work automatically)
+    # and attaches agentctl watch. FUSE is used opportunistically when the
+    # container is privileged; agentctl watch's detect_source() already prefers
+    # FUSE and falls back to the management API over HTTP on its own, so no
+    # --privileged requirement is enforced here — the readiness wait below
+    # accepts either surface coming up.
+    check_api_key
+    shift
+
+    if [ ! -t 1 ]; then
+      echo "ERROR: cockpit mode requires an interactive terminal (docker run -it ...)." >&2
+      echo "  For a one-shot, non-interactive agent run instead, use:" >&2
+      echo "    docker run ... run <config.toml>" >&2
+      exit 1
+    fi
+
+    export AGENTD_MANAGEMENT_ENABLED=true
+    export AGENTD_MANAGEMENT_PORT="${AGENTD_MANAGEMENT_PORT:-7999}"
+    _MGMT_URL="http://127.0.0.1:${AGENTD_MANAGEMENT_PORT}"
+
+    cd /workspace && agentd /etc/agentd/cockpit.toml &
+    AGENTD_PID=$!
+    # Late-bound (single-quoted) so $WATCH_PID — not yet set at trap-registration
+    # time — is re-read at signal-delivery time, once agentctl watch is running.
+    trap 'kill "$AGENTD_PID" "$WATCH_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null; exit 0' TERM INT
+
+    _ready=""
+    for _i in $(seq 1 30); do
+      kill -0 "$AGENTD_PID" 2>/dev/null || {
+        echo "ERROR: agentd exited unexpectedly during startup — see stderr above" >&2
+        exit 1
+      }
+      if [ -e /agents/system ] || curl -sf "${_MGMT_URL}/healthz" >/dev/null 2>&1; then
+        _ready=1
+        break
+      fi
+      sleep 0.5
+    done
+    if [ -z "$_ready" ]; then
+      echo "ERROR: agentd started but is not responding on either the FUSE surface or the management API after 15s — check agentd's stderr above" >&2
+      kill "$AGENTD_PID" 2>/dev/null || true
+      exit 1
+    fi
+
+    # Non-exec'd (preserves the trap above) and backgrounded only to capture its
+    # PID for cleanup; `wait` still blocks the script exactly like a foreground run.
+    set +e
+    agentctl watch "$@" &
+    WATCH_PID=$!
+    wait "$WATCH_PID"
+    rc=$?
+    set -e
+
+    kill "$WATCH_PID" 2>/dev/null || true
+    kill "$AGENTD_PID" 2>/dev/null || true
+    wait "$AGENTD_PID" 2>/dev/null || true
+    exit "$rc"
+    ;;
+
   *)
     exec "$@"
     ;;

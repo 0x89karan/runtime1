@@ -345,8 +345,10 @@ impl Config {
             (Some(_), false) => anyhow::bail!(
                 "cannot set both [agent] and [[agents]] in the same config; use one form"
             ),
+            (None, true) if self.scheduler.allow_empty_agents => Ok(vec![]),
             (None, true) => anyhow::bail!(
-                "no agents configured; set [agent] for a single agent or [[agents]] for multiple"
+                "no agents configured; set [agent] for a single agent or [[agents]] for multiple \
+                 (or set [scheduler] allow_empty_agents = true to start with zero agents)"
             ),
             (Some(a), true) => Ok(vec![a.clone()]),
             (None, false) => Ok(self.agents.clone()),
@@ -370,6 +372,12 @@ pub struct SchedulerConfig {
     /// 0 = SIGTERM/SIGINT only. Default 1 (every turn).
     #[serde(default = "default_checkpoint_interval_turns")]
     pub checkpoint_interval_turns: u32,
+    /// When `true`, `Config::agent_configs()` accepts a config with neither `[agent]`
+    /// nor `[[agents]]` set, returning an empty agent list instead of erroring.
+    /// Opt-in only — used by cockpit mode to cold-start `agentd` with no agents so
+    /// the management API and FUSE surface come up for an operator to spawn into.
+    #[serde(default)]
+    pub allow_empty_agents: bool,
 }
 
 fn default_max_spawn_depth() -> u32 {
@@ -387,6 +395,7 @@ impl Default for SchedulerConfig {
             max_concurrent_inferences: 0,
             max_spawn_depth:           default_max_spawn_depth(),
             checkpoint_interval_turns: default_checkpoint_interval_turns(),
+            allow_empty_agents:        false,
         }
     }
 }
@@ -907,6 +916,32 @@ model = "claude-sonnet-4-6"
         let cfg: Config = toml::from_str(raw).unwrap();
         let result = cfg.agent_configs();
         assert!(result.is_err(), "expected Err when neither [agent] nor [[agents]] is set");
+        assert!(result.unwrap_err().to_string().contains("no agents configured"));
+    }
+
+    #[test]
+    fn agent_configs_allows_empty_when_opted_in() {
+        let raw = r#"
+[scheduler]
+allow_empty_agents = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert!(cfgs.is_empty(), "expected an empty agent list, not an error");
+    }
+
+    #[test]
+    fn agent_configs_still_rejects_empty_by_default() {
+        let raw = r#"
+[scheduler]
+allow_empty_agents = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let result = cfg.agent_configs();
+        assert!(
+            result.is_err(),
+            "allow_empty_agents = false must still reject a zero-agent config"
+        );
         assert!(result.unwrap_err().to_string().contains("no agents configured"));
     }
 

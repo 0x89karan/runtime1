@@ -47,6 +47,25 @@ clippy-aarch64:
 	(cd agentd && cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings)
 	(cd agentctl && cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings)
 
+# Proves docker-compose.yml's cos/agent services are unaffected by the
+# Dockerfile's default CMD (ux.9 flipped it shell -> cockpit): both services
+# set an explicit `command:` that overrides the image CMD regardless of what
+# it is. This does not exercise the built image's actual CMD — it only
+# guards the compose YAML itself against someone later removing an explicit
+# command: line and unknowingly inheriting cockpit mode in cos/agent.
+.PHONY: compose-config-check
+compose-config-check:
+	@if docker compose config 2>/dev/null | sed -n '/^  cos:/,/^  agent:/p' | grep -A1 "command:" | grep -q "^\s*- cos$$"; then \
+	  echo "OK: cos service still sets command: cos"; \
+	else \
+	  echo "FAIL: cos service is missing its explicit command: cos"; exit 1; \
+	fi
+	@if docker compose config 2>/dev/null | sed -n '/^  agent:/,$$p' | grep -A1 "command:" | grep -q "^\s*- agent$$"; then \
+	  echo "OK: agent service still sets command: agent"; \
+	else \
+	  echo "FAIL: agent service is missing its explicit command: agent"; exit 1; \
+	fi
+
 # Run self-tests for the bundled standard MCP servers (no API key required).
 # Assumes python3 is on PATH.
 .PHONY: test-harness

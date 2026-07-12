@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # Pull:  docker pull ghcr.io/0x89karan/runtime1:core
 FROM alpine:3.20 AS runtime-core
 
-RUN apk add --no-cache fuse3 bash jq
+RUN apk add --no-cache fuse3 bash jq curl
 
 # Allow non-root users to mount FUSE filesystems
 RUN echo "user_allow_other" >> /etc/fuse.conf
@@ -66,6 +66,7 @@ COPY --from=builder /src/target/release/agentos-otel /usr/local/bin/agentos-otel
 # Base agent configs and full template catalogue
 COPY docker/agent.toml      /etc/agentd/agent.toml
 COPY docker/agents.toml     /etc/agentd/agents.toml
+COPY docker/cockpit.toml    /etc/agentd/cockpit.toml
 COPY agentd/cos.agents.toml /etc/agentd/cos.agents.toml
 COPY templates/             /etc/agentd/templates/
 
@@ -77,7 +78,7 @@ COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["shell"]
+CMD ["cockpit"]
 
 # ── Stage 2b: runtime-full — adds Python MCP harness ─────────────────────────
 # Extends core with all standard MCP servers (h7.1–h7.3, h8.1) and OAuth sidecar.
