@@ -116,6 +116,13 @@ proportionate follow-ons:
   --task "..."` boots straight into a running custom agent instead of the empty default state;
   (5) an exit summary on Ctrl-C (agents run, tokens spent, checkpoint path) instead of a bare
   terminal restore.
+- **ux.9-ar-10 (P4, found by `/document-release` during `/ship`) — CLAUDE.md's per-increment
+  status log has ~15 unlogged increments.** The running narrative log (`**xyz complete
+  (vX.Y.Z).**` entries) stopped at dx.3 (v0.69.0); dx.4, ma.1-4, cred.1-cred.4b, h8.1/h8.2,
+  orch.1/orch.2, cos-polish, dx.6, cheap-wins, and memory-routing all shipped and are documented
+  elsewhere (CHANGELOG.md, ROADMAP.md) but are missing from CLAUDE.md's log. This increment
+  (ux.9) added its own entry but did not backfill the gap — pre-existing debt, not introduced by
+  this branch. Worth a dedicated backfill pass.
 
 ## ux.0b — Open (deferred from ship-stage adversarial pass, 2026-07-12)
 
