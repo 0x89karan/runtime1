@@ -133,7 +133,13 @@ docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchest
 
 Once inside cockpit mode, press `[n]` in the TUI to spawn an agent from the template
 catalogue (`agentctl list-templates`) — the cockpit boots empty by design, spawning is
-a deliberate action, not an automatic one.
+a deliberate action, not an automatic one. **This currently only injects into the
+running cockpit when FUSE is mounted** (`--privileged`/`--cap-add SYS_ADMIN --device
+/dev/fuse`) — the unprivileged/HTTP-fallback path doesn't yet route spawn through the
+management API, so `[n]` there launches a separate one-shot agent process instead of
+injecting into the cockpit you're looking at (tracked as ux.9-ar-07 in TODOS.md). For
+a guaranteed single dedicated agent without `--privileged`, use `orchestrate` or
+`agent` mode instead.
 
 If the package is private, set it to Public once: GitHub repo → Packages →
 agentos → Package Settings → Change visibility → Public.

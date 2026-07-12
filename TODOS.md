@@ -1,53 +1,115 @@
 # TODOS
 
-## ux.9 — Open (deferred from build, 2026-07-12)
+## ux.9 — Open (deferred from build + /review adversarial pass, 2026-07-12)
 
-Cockpit mode (zero-agent `cockpit` entrypoint, now the Dockerfile default). Verified end-to-end
-in Docker (both the `--privileged` FUSE path and the unprivileged management-API fallback path;
-`docker stop` on both cleanly exits via the trap). Six follow-ups surfaced during the plan's
-review passes and manual verification, none blocking:
+Cockpit mode (zero-agent `cockpit` entrypoint, now the Dockerfile default). `/review` dispatched
+Testing/Maintainability/Security specialists + a Claude adversarial subagent + Codex adversarial
+review in parallel; Codex found one CRITICAL bug (checkpoint bleed-through) and the Claude
+subagent independently found one deterministic bug (terminal corruption on every SIGTERM) that
+directly contradicted this increment's own earlier "verified end-to-end, docker stop cleanly
+exits" claim — that claim had only exercised `--plain` mode (no raw mode, nothing to corrupt),
+never the real ratatui TUI. Both were confirmed by direct code read + a live Docker reproduction,
+fixed, and re-verified. Ten follow-ups total, two CRITICAL (fixed), rest are real but
+proportionate follow-ons:
 
+- **FIXED (CRITICAL, found by Codex) — stale `/workspace/checkpoint.json` silently resurrected
+  agents despite `cockpit.toml`'s zero-agent config.** `agentd/src/scheduler.rs:251-260`
+  unconditionally restores any checkpointed agent not present in the TOML's agent list — with
+  zero agents in the TOML, *every* checkpointed agent falls into that "remaining" bucket and gets
+  restored. `cockpit)` ran from `/workspace` (the operator's bind-mounted files directory, per
+  `print_banner`'s own "mount your files here"), so a `checkpoint.json` left there by a prior
+  `demo`/`run`/cockpit session on the same mount would silently resume and start spending tokens
+  again on the next `docker run`, contradicting the whole design intent ("opening the cockpit
+  shows the empty system state"). Fix: run from `/data` instead (matching `cos)`/`agent)`
+  modes' existing pattern, which solved this exact problem the same way — `agent)` mode's comment
+  literally says "no repo bind mount, no checkpoint bleed-through") + `rm -f
+  /data/checkpoint.json` before each launch (matching `agent)` mode's "each launch starts fresh"
+  rationale). Verified via a live Docker repro: planted a checkpoint with a `stale-agent` entry in
+  a mounted `/workspace`, confirmed cockpit booted with `agents: (none)` and `/workspace` was
+  untouched.
+- **FIXED (CRITICAL/deterministic, found by Claude adversarial subagent) — every `docker
+  stop`/SIGTERM against the real TUI (non-`--plain`) corrupted the operator's terminal.**
+  `agentctl watch`'s TUI installed no SIGTERM/SIGINT handler of its own — only a panic hook and a
+  `Drop` guard (`agentctl/src/watch/mod.rs`'s `TermGuard`). `cockpit)`'s trap sent a raw `kill(2)`
+  SIGTERM directly to the `agentctl watch` process; the OS default disposition for an uncaught
+  SIGTERM is immediate termination with no unwind, so neither the panic hook nor `Drop` ever ran,
+  leaving the terminal stuck in raw mode + the alternate screen (needing `reset`/`stty sane` to
+  recover). Fix, two parts: (1) `agentctl/src/watch/mod.rs` gained
+  `install_shutdown_signal_handlers()` — a minimal `libc::signal()`-based SIGTERM/SIGINT handler
+  that only sets an atomic flag (signal-safe), checked every ~30ms tick in `run_tui_loop`, letting
+  the loop return normally so `TermGuard::drop()` restores the terminal before exit; new test
+  `shutdown_signal_handler_sets_flag_on_sigterm_and_sigint`. (2) `docker/entrypoint.sh`'s trap now
+  `wait`s on `$WATCH_PID` (not just `$AGENTD_PID`) before `exit 0` — this script is the
+  container's PID 1, so without waiting, `exit 0` raced agentctl's ~30ms-later graceful shutdown
+  and usually won, tearing down the whole container before the terminal-restore write could land.
+  Verified via live `docker logs` byte-inspection: before the fix, `\x1b[?1049h` (enter alt
+  screen) appeared with no matching `\x1b[?1049l` (leave); after both fixes, both appear plus the
+  cursor-show sequence, and `docker stop` still completes in ~0.15-0.2s (no hang).
 - **ux.9-ar-01 (P3) — `orchestrate)` mode never calls `check_api_key`.** Every other mode
   (`shell`, `demo`, `cos`, `agent`, and the new `cockpit`) calls it explicitly; `orchestrate)`
   was missed. An unset `ANTHROPIC_API_KEY` under `orchestrate` currently surfaces as an opaque
   `agentd`/Anthropic API error instead of the same actionable message every other mode gives.
   `docker/entrypoint.sh`'s `orchestrate)` case.
 - **ux.9-ar-02 (P3) — `orchestrate)` mode's cold-start path doesn't guard `set -e` around the
-  client invocation.** `docker/entrypoint.sh:246` (`agentctl orchestrate --url ... "$@"`) is
-  unguarded; any nonzero, non-signal exit from it aborts the script immediately under `set -e`,
-  skipping the `kill`/`wait $AGENTD_PID` cleanup on the next two lines and leaking the
-  backgrounded `agentd` process. `cockpit)`'s new case fixes this for itself
+  client invocation.** `docker/entrypoint.sh` (`agentctl orchestrate --url ... "$@"` in
+  `orchestrate)`) is unguarded; any nonzero, non-signal exit from it aborts the script immediately
+  under `set -e`, skipping the `kill`/`wait $AGENTD_PID` cleanup on the next two lines and leaking
+  the backgrounded `agentd` process. `cockpit)`'s case fixes this for itself
   (`set +e; agentctl watch "$@"; rc=$?; set -e`) but the fix was not backported to `orchestrate)`.
-- **ux.9-ar-03 (P4) — `docker stop` racing a slow TUI redraw is a theoretical, not observed,
-  gap.** Manual verification (this increment) showed `docker stop` cleanly interrupts `wait
-  "$WATCH_PID"` and triggers the trap in both the FUSE and HTTP-fallback paths. The remaining
-  theoretical edge case: if `agentctl watch` is mid-redraw or spawns its own detached child when
-  the signal arrives, or the grace period elapses before terminal-restore cleanup finishes, the
-  container could be SIGKILLed with a corrupted terminal state. Not reproduced; logged as a
-  known limitation, not a confirmed bug.
 - **ux.9-ar-04 (P3) — Three near-duplicate readiness-wait loops in `docker/entrypoint.sh`.**
   `demo)` polls `mountpoint -q /agents`; `orchestrate)` polls `curl -sf .../healthz` via
-  `timeout 15 sh -c ...`; `cockpit)` (new) polls both `/agents/system` and `.../healthz` with an
-  added `kill -0` liveness check, hand-rolled as a `for` loop. Worth extracting a single shared
-  `wait_for_agentd_ready()` helper function someday — three copies is exactly the kind of DRY gap
-  that drifts (as `cockpit)`'s stricter liveness check demonstrates: the other two loops don't
-  have it).
-- **ux.9-ar-05 (P3) — No CI job builds the Docker image.** This increment's core behavior (the
-  `cockpit)` entrypoint case, the CMD flip, the `curl` dependency it exposed — see ux.9-ar-06)
-  was only verified via a local `docker build` + manual `docker run` smoke test, not CI. A
-  broken `Dockerfile`/`entrypoint.sh` would not be caught until someone notices manually. Worth a
-  CI job that at minimum runs `docker build --target runtime-core` and a smoke-test invocation.
+  `timeout 15 sh -c ...`; `cockpit)` polls both `/agents/system` and `.../healthz` with an added
+  `kill -0` liveness check, hand-rolled as a `for` loop. Worth extracting a single shared
+  `wait_for_agentd_ready()` helper someday — three copies is exactly the kind of DRY gap that
+  drifts (the other two loops lack `cockpit)`'s stricter liveness check).
+- **ux.9-ar-05 (P3) — No CI job builds the Docker image.** All of this increment's Docker-level
+  verification (the checkpoint-restore bug, the terminal-corruption bug, the `curl` gap below)
+  was found via local `docker build` + manual `docker run`, not CI — a broken
+  `Dockerfile`/`entrypoint.sh` would not be caught until someone notices manually. Worth a CI job
+  that at minimum runs `docker build --target runtime-core` and a smoke-test invocation. The new
+  `make compose-config-check` target (ux.9) is similarly not wired into CI yet — manual-only.
 - **ux.9-ar-06 (P2, found during build verification) — `curl` was never installed in the
   Docker image, silently breaking `orchestrate)` mode's cold-start healthz poll.** `Dockerfile`'s
   `runtime-core` stage ran `apk add --no-cache fuse3 bash jq` with no `curl`; `orchestrate)` has
   used `curl -sf .../healthz` since it shipped (v0.66.0). Discovered while manually verifying
   `cockpit)`'s own healthz-based readiness wait against a real built image — `curl: not found`.
-  **Fixed in this increment** (added `curl` to the `apk add` line) since `cockpit` is about to
-  become the zero-arg default and depends on the same pattern; `orchestrate)` gets the fix for
-  free from the same image layer.
+  **Fixed in this increment** (added `curl` to the `apk add` line); `orchestrate)` gets the fix
+  for free from the same image layer.
+- **ux.9-ar-07 (P2, found by Codex, /review) — the Spawn view's `[n]` action can't inject into
+  an unprivileged (HTTP-fallback) cockpit; it silently falls back to launching a second, separate
+  `agentd` process instead.** `execute_pending_spawn` (`agentctl/src/watch/mod.rs`) only checks
+  whether `/agents/control` (a FUSE path) exists; it never calls the `DataSource::spawn()`
+  abstraction, which already has a working HTTP implementation
+  (`HttpSource::spawn()` → `POST /api/v1/spawn`, `agentctl/src/watch/source.rs`). In HTTP-fallback
+  cockpit (no `--privileged`), `/agents/control` never exists, so every spawn attempt takes the
+  `FellBackToExec` branch: writes a temp TOML and `exec_agentd()`s a brand-new standalone agentd,
+  which then fights the *original* cockpit agentd for the FUSE mountpoint and port 7999 — likely
+  crashing immediately, dropping the operator out of the cockpit entirely, with the original
+  zero-agent daemon now orphaned in the background. README's `[n]` pointer was corrected in this
+  increment to document this limitation explicitly (with a `--privileged` or `orchestrate`/`agent`
+  workaround) rather than overclaiming. Real fix: thread the `DataSource` into
+  `execute_pending_spawn` and try `source.spawn()` before falling back to `exec`.
+- **ux.9-ar-08 (P3, found by Codex, /review) — the readiness check can pass slightly before
+  agentd's scheduler is actually processing commands.** `agentd/src/main.rs` mounts FUSE and
+  starts the management API before constructing the scheduler; `cockpit)`'s readiness wait treats
+  "`/agents/system` exists" or "`/healthz` returns 200" as ready. An HTTP spawn/inject/approve
+  request landing in this narrow gap could time out even though the command later succeeds.
+  Already partially mitigated by orch.2's existing 2s spawn-confirmation timeout tolerance
+  (`POST /api/v1/spawn`); not re-verified as an *observed* failure in this increment's manual
+  testing, but the code-level race is real.
+- **ux.9-ar-09 (P2, found by Claude adversarial subagent, /review) — no ongoing liveness
+  supervision after the initial readiness check, and no Dockerfile `HEALTHCHECK`.** If `agentd`
+  crashes or hangs mid-session (after boot succeeded), `agentctl watch` degrades to showing a
+  connection-error banner forever rather than exiting; nothing signals the failure to a container
+  orchestrator (`docker ps` shows "Up" indefinitely). This is the SAME gap as expansion candidate
+  (1) below ("crash-loop supervision") — that candidate was scoped out as a nice-to-have during
+  planning; this review pass reclassifies it as a confirmed, real gap (not just a "10x" idea),
+  though still not required for this increment's stated "boot two things together" acceptance
+  criteria. Raise its priority when scoping the next cockpit increment.
 - Five expansion candidates scoped out at CEO 0D (SELECTIVE EXPANSION, all auto-deferred —
-  none required for this increment's acceptance criteria): (1) crash-loop supervision — detect
-  `agentd` exiting unexpectedly post-boot and restart it with a visible "restarted Nx" banner;
+  none required for this increment's acceptance criteria; item (1) reclassified above as a
+  confirmed gap, not just a nice-to-have): (1) crash-loop supervision — detect `agentd` exiting
+  unexpectedly post-boot and restart it with a visible "restarted Nx" banner (see ux.9-ar-09);
   (2) a first-boot welcome/tour overlay distinguishing a cold start from attaching to an
   already-running `agentd`; (3) printing the exact `docker exec`/`agentctl watch --url` reattach
   command for a detached session; (4) a `--template` passthrough so `cockpit --template scout

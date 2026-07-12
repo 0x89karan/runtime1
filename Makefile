@@ -55,16 +55,13 @@ clippy-aarch64:
 # command: line and unknowingly inheriting cockpit mode in cos/agent.
 .PHONY: compose-config-check
 compose-config-check:
-	@if docker compose config 2>/dev/null | sed -n '/^  cos:/,/^  agent:/p' | grep -A1 "command:" | grep -q "^\s*- cos$$"; then \
-	  echo "OK: cos service still sets command: cos"; \
-	else \
-	  echo "FAIL: cos service is missing its explicit command: cos"; exit 1; \
-	fi
-	@if docker compose config 2>/dev/null | sed -n '/^  agent:/,$$p' | grep -A1 "command:" | grep -q "^\s*- agent$$"; then \
-	  echo "OK: agent service still sets command: agent"; \
-	else \
-	  echo "FAIL: agent service is missing its explicit command: agent"; exit 1; \
-	fi
+	@for svc in cos agent; do \
+	  if docker compose config 2>/dev/null | awk -v s="  $$svc:" '$$0==s{f=1; print; next} f && /^  [a-zA-Z]/{f=0} f{print}' | grep -A1 "command:" | grep -q "^[[:space:]]*- $$svc$$"; then \
+	    echo "OK: $$svc service still sets command: $$svc"; \
+	  else \
+	    echo "FAIL: $$svc service is missing its explicit command: $$svc"; exit 1; \
+	  fi; \
+	done
 
 # Run self-tests for the bundled standard MCP servers (no API key required).
 # Assumes python3 is on PATH.

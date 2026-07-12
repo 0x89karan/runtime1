@@ -337,9 +337,10 @@ pub struct CredentialGatewayConfig {
 }
 
 impl Config {
-    /// Returns 1+ AgentConfigs from either the `[agent]` or `[[agents]]` TOML form.
-    /// Errors if both are set (ambiguous), neither is set (nothing to run), or any
-    /// agent id is duplicated.
+    /// Returns AgentConfigs from either the `[agent]` or `[[agents]]` TOML form.
+    /// Errors if both are set (ambiguous), or neither is set unless
+    /// `[scheduler] allow_empty_agents = true` (in which case returns an empty
+    /// Vec). Also errors on any duplicate agent id.
     pub fn agent_configs(&self) -> anyhow::Result<Vec<AgentConfig>> {
         match (&self.agent, self.agents.is_empty()) {
             (Some(_), false) => anyhow::bail!(
@@ -943,6 +944,55 @@ allow_empty_agents = false
             "allow_empty_agents = false must still reject a zero-agent config"
         );
         assert!(result.unwrap_err().to_string().contains("no agents configured"));
+    }
+
+    // /review (ux.9, testing specialist): the (Some(_), false) match arm is matched
+    // before the (None, true) allow_empty_agents arm, so ambiguous configs are
+    // rejected regardless of the flag — but that safety was only implicit in arm
+    // ordering, unasserted by any test. Guards against a future refactor (e.g. into
+    // if/else) silently inverting the precedence.
+    #[test]
+    fn agent_configs_both_set_is_error_even_with_allow_empty_agents() {
+        let raw = r#"
+[scheduler]
+allow_empty_agents = true
+
+[agent]
+id = "solo"
+task = "task"
+
+[[agents]]
+id = "alpha"
+task = "task a"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let result = cfg.agent_configs();
+        assert!(
+            result.is_err(),
+            "allow_empty_agents=true must not bypass the both-set ambiguity check"
+        );
+        assert!(result.unwrap_err().to_string().contains("cannot set both"));
+    }
+
+    // /review (ux.9, testing specialist): docker/cockpit.toml is now what the
+    // Docker image's default CMD boots — a silent future schema drift (renamed
+    // field, a deny_unknown_fields added elsewhere) would break the new zero-arg
+    // default with nothing in CI to catch it before a manual `docker run`.
+    // Mirrors shipped_demo_agents_toml_parses_and_is_runnable's F-14/F-15 guard.
+    #[test]
+    fn shipped_cockpit_toml_parses_and_boots_empty() {
+        let raw = include_str!("../../docker/cockpit.toml");
+        let cfg: Config = toml::from_str(raw).expect("shipped docker/cockpit.toml must parse");
+        assert!(
+            cfg.scheduler.allow_empty_agents,
+            "cockpit.toml must opt into allow_empty_agents (it ships zero [[agents]])"
+        );
+        assert!(
+            cfg.management.enabled,
+            "cockpit.toml must enable the management API (the HTTP-fallback readiness path depends on it)"
+        );
+        let cfgs = cfg.agent_configs().expect("cockpit.toml must produce a valid (empty) agent list");
+        assert!(cfgs.is_empty(), "cockpit.toml must boot with zero agents by design");
     }
 
     #[test]

@@ -271,12 +271,47 @@ case "${1:-shell}" in
     export AGENTD_MANAGEMENT_ENABLED=true
     export AGENTD_MANAGEMENT_PORT="${AGENTD_MANAGEMENT_PORT:-7999}"
     _MGMT_URL="http://127.0.0.1:${AGENTD_MANAGEMENT_PORT}"
+    # agentctl's HTTP fallback (when FUSE is absent) is hard-coded to port 7999.
+    # Only override it with an explicit URL when the port was customized away
+    # from the default — doing this unconditionally would make agentctl always
+    # skip FUSE (an explicit --url/AGENTCTL_URL bypasses FUSE detection entirely),
+    # regressing the privileged-container path for the common (default-port) case.
+    if [ "$AGENTD_MANAGEMENT_PORT" != "7999" ]; then
+      export AGENTCTL_URL="${_MGMT_URL}"
+    fi
 
-    cd /workspace && agentd /etc/agentd/cockpit.toml &
+    # Register the trap BEFORE backgrounding agentd: if it were backgrounded first,
+    # a signal landing in that narrow gap would kill this untrapped script outright
+    # (bash does not forward signals to background jobs by default), orphaning
+    # agentd instead of giving it a chance at its own graceful SIGTERM checkpoint.
+    # Late-bound (single-quoted) so $AGENTD_PID/$WATCH_PID — not yet set here — are
+    # re-read at signal-delivery time, once each is actually assigned.
+    #
+    # CRITICAL: must `wait` on BOTH pids, not just $AGENTD_PID, before `exit 0`.
+    # This script is the container's PID 1 — the instant it exits, Docker tears
+    # down every other process in the container's PID namespace. agentctl watch's
+    # own graceful shutdown (its SIGTERM handler sets a flag; the render loop
+    # notices on its next ~30ms tick and restores the terminal: disables raw mode
+    # + leaves the alternate screen) needs a moment to actually run. Without
+    # waiting for it here first, `exit 0` races it and usually wins, so the
+    # container disappears before agentctl's terminal-restore write lands —
+    # leaving the operator's real terminal stuck in raw mode + the alternate
+    # screen (verified: reproducible without this `wait`, absent with it).
+    trap 'kill "$AGENTD_PID" "$WATCH_PID" 2>/dev/null; wait "$WATCH_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null; exit 0' TERM INT
+
+    # Run from /data, NOT /workspace: /workspace is a bind mount for the operator's
+    # own files ("mount your files here" in print_banner), and agentd writes its
+    # own runtime state (checkpoint.json, flight.jsonl) into its CWD. Running there
+    # would (a) contaminate the mounted directory and (b) silently restore agents
+    # from a stale checkpoint.json left by a prior demo/run/cockpit session on the
+    # same mount — resurrecting spawned agents and spending tokens despite
+    # cockpit.toml's zero-agent config. `cos)`/`agent)` modes already avoid this by
+    # using /data instead of /workspace; `rm -f checkpoint.json` matches `agent)`
+    # mode's same "each launch starts fresh" rationale.
+    mkdir -p /data
+    rm -f /data/checkpoint.json
+    cd /data && agentd /etc/agentd/cockpit.toml &
     AGENTD_PID=$!
-    # Late-bound (single-quoted) so $WATCH_PID — not yet set at trap-registration
-    # time — is re-read at signal-delivery time, once agentctl watch is running.
-    trap 'kill "$AGENTD_PID" "$WATCH_PID" 2>/dev/null; wait "$AGENTD_PID" 2>/dev/null; exit 0' TERM INT
 
     _ready=""
     for _i in $(seq 1 30); do
@@ -304,8 +339,12 @@ case "${1:-shell}" in
     wait "$WATCH_PID"
     rc=$?
     set -e
+    # Disarm the trap now: $WATCH_PID has already been wait-reaped (its PID number
+    # is free for kernel reuse), and a signal landing during the next few cleanup
+    # lines would otherwise re-fire the trap's `exit 0`, discarding a real nonzero
+    # `$rc` from agentctl watch and reporting success to Docker regardless.
+    trap - TERM INT
 
-    kill "$WATCH_PID" 2>/dev/null || true
     kill "$AGENTD_PID" 2>/dev/null || true
     wait "$AGENTD_PID" 2>/dev/null || true
     exit "$rc"
