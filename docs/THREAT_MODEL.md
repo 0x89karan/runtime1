@@ -663,6 +663,25 @@ ux.5** — that increment adds a *new*, browser-native consumer and so is the
 right place to add both a bearer token and an Origin/Host allowlist; it is
 not the point at which this CSRF exposure first appears.
 
+### §9.4 The management API is now on by default for the primary entrypoint (ux.9)
+
+`docker/cockpit.toml` sets `[management] enabled = true`, and the Dockerfile's
+`CMD` now boots that config unconditionally for a bare `docker run` with no
+arguments — the zero-arg default entrypoint, not just the opt-in `orchestrate`
+mode or the network-segmented `cos`/`agent` compose services from §9.2. The
+bind address and loopback guard are unchanged (`bind_addr = "127.0.0.1"` by
+default, per §9.1 — `docker/cockpit.toml` does not override it), so this is
+**not a new vulnerability class**, but the likelihood of an operator having
+the unauthenticated control plane live without realizing it is materially
+higher now that it is the default rather than something they opted into.
+`agentctl watch` (the cockpit's own client) runs inside the *same* container,
+connecting over loopback with no Docker NAT boundary to cross — the §9.2
+Docker-bridge-publish exposure only applies if an operator additionally
+publishes `7999` to the host (cockpit mode does not do this by default; no
+`docker-compose.yml` service exists for it). Flagged by the `/review`
+security specialist (2026-07-12); this section is the fix — a documentation
+gap, not a code change.
+
 ---
 
 ## 10. Summary table
