@@ -3,6 +3,41 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.82.0] - 2026-07-12
+
+### Added (ux.9 — Cockpit mode)
+- **`cockpit` entrypoint mode** (`docker/entrypoint.sh`): the new zero-arg default for
+  `docker run agentos:full` (no command). Cold-starts `agentd` with a minimal, agent-free
+  config (`docker/cockpit.toml`) and attaches `agentctl watch` — opening the cockpit shows
+  the empty system state, it doesn't spend API tokens on demo work automatically. FUSE is
+  used opportunistically when the container is `--privileged`; otherwise `agentctl watch`
+  transparently falls back to the management API over HTTP. Requires `-it` (fails fast with
+  an actionable message otherwise, instead of hanging).
+- **`[scheduler] allow_empty_agents`** (`agentd/src/config.rs`): opt-in config flag letting
+  `agentd` cold-start with zero agents (`Config::agent_configs()` returns an empty `Vec`
+  instead of erroring) — the mechanism `cockpit.toml` uses to boot empty.
+- **`make compose-config-check`**: guards that `docker-compose.yml`'s `cos`/`agent` services'
+  explicit `command:` lines keep overriding the image's default `CMD` regardless of what it is.
+
+### Changed
+- **BREAKING:** the Dockerfile's default `CMD` changed from `shell` to `cockpit` — a bare
+  `docker run agentos:full` (no command) now boots the cockpit TUI instead of a bash shell.
+  `docker compose up cos` / `docker compose run --rm agent` are unaffected (both set an
+  explicit `command:`). To get the old shell behavior back: `docker run -it agentos:full shell`.
+- **`agentctl watch` now installs a SIGTERM/SIGINT handler** (`agentctl/src/watch/mod.rs`):
+  fixes every `docker stop`/`kill` against the live TUI leaving the operator's terminal stuck
+  in raw mode + the alternate screen (previously relied only on a panic hook + `Drop`, neither
+  of which runs on an uncaught signal's default disposition).
+- `Dockerfile`'s `runtime-core` stage now installs `curl` — it was silently missing, which
+  also affected `orchestrate)` mode's pre-existing cold-start healthz poll (used since v0.66.0).
+
+### Fixed
+- **Checkpoint bleed-through**: `cockpit)` now runs `agentd` from `/data` instead of
+  `/workspace` (the operator's bind-mounted files directory) and removes any stale
+  `checkpoint.json` before each launch — matching `cos)`/`agent)`'s existing pattern. Running
+  from `/workspace` would silently restore agents from a prior `demo`/`run`/cockpit session's
+  checkpoint on the same mount, spending tokens despite the zero-agent config.
+
 ## [v0.81.0] - 2026-07-12
 
 ### Added (memory-routing)

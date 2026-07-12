@@ -1,0 +1,19 @@
+# Cockpit mode — zero-agent cold start for `docker run agentos:full` (no command).
+#
+# This is the config `docker/entrypoint.sh`'s `cockpit)` case boots `agentd` with. It
+# intentionally declares NO agents: opening the cockpit shows the (empty) system state,
+# it doesn't spend API tokens on demo work automatically. Spawning agents into a running
+# cockpit is `agentctl watch`'s Spawn view's job, not this config's.
+#
+# `allow_empty_agents = true` is required — `Config::agent_configs()` rejects a config
+# with neither [agent] nor [[agents]] unless this is set explicitly (agentd/src/config.rs).
+#
+# `agentctl watch` runs in the SAME container as this `agentd`, connecting over loopback —
+# there is no Docker NAT boundary to cross here (unlike cos.agents.toml's cross-container
+# case), so the management API's default bind_addr = "127.0.0.1" is correct as-is.
+
+[scheduler]
+allow_empty_agents = true
+
+[management]
+enabled = true

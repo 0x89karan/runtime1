@@ -395,6 +395,23 @@ TODOS.md; 1218 workspace tests.
 
 **dx.3 complete (v0.69.0).** Linux QEMU production path: `distro/buildroot.config` adds `BR2_PACKAGE_PYTHON3=y` + `BR2_PACKAGE_OPENSSL=y`; `distro/Makefile` refactors netdev out of shared `QEMU_FLAGS` into per-target lines, adds `RUN_NETDEV` with loopback `hostfwd:7999/8080` for `make run`, Python MCP overlay build step, `clean` fix; `distro/overlay/init` parses kernel cmdline `agentd.config=<path>` for config selection; `distro/overlay/etc/agentd/cos.agents.toml` (new) QEMU-mode CoS config with `bind_addr="0.0.0.0"` management, absolute MCP paths, `/run/memory` + `/run/output`; `agentd/cos.agents.toml` gains `[management] enabled=true`; `distro/agentos-cos.service` (new) systemd unit (`User=agentos`, loopback hostfwd, `ExecStartPre` mkdir, `-accel kvm`, 512 MB); `docs/DEPLOYMENT.md` (new) two-page operator guide with complete `agentos.env` template, SSH tunnel instructions, troubleshooting.
 
+**ux.9 complete (v0.82.0).** Cockpit mode — `docker/entrypoint.sh`'s new `cockpit)` case is now the
+Dockerfile's zero-arg `CMD` (was `shell`): cold-starts `agentd` from `/data` with a zero-agent config
+(`docker/cockpit.toml`, needs the new `[scheduler] allow_empty_agents` opt-in + a relaxed
+`Config::agent_configs()`) and attaches `agentctl watch` non-exec'd in the foreground; FUSE preferred
+under `--privileged`, else `agentctl watch`'s existing `detect_source` falls back to the management
+API over HTTP (`docker/cockpit.toml` sets `[management] enabled = true`). Two bugs found and fixed
+during `/review`: checkpoint bleed-through (was running from the bind-mounted `/workspace`, silently
+restoring a prior session's agents — now matches `cos)`/`agent)` and runs from `/data`, deleting any
+stale `checkpoint.json` first) and terminal corruption on `docker stop`/`kill` (`agentctl watch` gained
+its own SIGTERM/SIGINT handler, `agentctl/src/watch/mod.rs`, since a panic hook + `Drop` don't run on
+an uncaught signal's default disposition). `make compose-config-check` guards that `docker-compose.yml`'s
+`cos`/`agent` explicit `command:` lines keep overriding the image `CMD` regardless of what it is.
+`THREAT_MODEL.md` §9.4 documents that the management API is now on-by-default for the primary
+entrypoint (loopback-only per §9.1 — not a new vulnerability class, but higher likelihood of an
+operator not realizing it's live). Full plan: `docs/plans/ux.9-cockpit-mode.md`; 9 adversarial-review
+findings deferred to TODOS.md (`ux.9-ar-01`..`09`); next is ux.2 or the remaining cockpit track (ux.1/ux.3/ux.5/ux.8).
+
 ## How to work here
 
 - **Work the roadmap in order.** Each increment in `docs/ROADMAP.md` is a small,

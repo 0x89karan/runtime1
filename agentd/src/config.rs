@@ -337,16 +337,19 @@ pub struct CredentialGatewayConfig {
 }
 
 impl Config {
-    /// Returns 1+ AgentConfigs from either the `[agent]` or `[[agents]]` TOML form.
-    /// Errors if both are set (ambiguous), neither is set (nothing to run), or any
-    /// agent id is duplicated.
+    /// Returns AgentConfigs from either the `[agent]` or `[[agents]]` TOML form.
+    /// Errors if both are set (ambiguous), or neither is set unless
+    /// `[scheduler] allow_empty_agents = true` (in which case returns an empty
+    /// Vec). Also errors on any duplicate agent id.
     pub fn agent_configs(&self) -> anyhow::Result<Vec<AgentConfig>> {
         match (&self.agent, self.agents.is_empty()) {
             (Some(_), false) => anyhow::bail!(
                 "cannot set both [agent] and [[agents]] in the same config; use one form"
             ),
+            (None, true) if self.scheduler.allow_empty_agents => Ok(vec![]),
             (None, true) => anyhow::bail!(
-                "no agents configured; set [agent] for a single agent or [[agents]] for multiple"
+                "no agents configured; set [agent] for a single agent or [[agents]] for multiple \
+                 (or set [scheduler] allow_empty_agents = true to start with zero agents)"
             ),
             (Some(a), true) => Ok(vec![a.clone()]),
             (None, false) => Ok(self.agents.clone()),
@@ -370,6 +373,12 @@ pub struct SchedulerConfig {
     /// 0 = SIGTERM/SIGINT only. Default 1 (every turn).
     #[serde(default = "default_checkpoint_interval_turns")]
     pub checkpoint_interval_turns: u32,
+    /// When `true`, `Config::agent_configs()` accepts a config with neither `[agent]`
+    /// nor `[[agents]]` set, returning an empty agent list instead of erroring.
+    /// Opt-in only — used by cockpit mode to cold-start `agentd` with no agents so
+    /// the management API and FUSE surface come up for an operator to spawn into.
+    #[serde(default)]
+    pub allow_empty_agents: bool,
 }
 
 fn default_max_spawn_depth() -> u32 {
@@ -387,6 +396,7 @@ impl Default for SchedulerConfig {
             max_concurrent_inferences: 0,
             max_spawn_depth:           default_max_spawn_depth(),
             checkpoint_interval_turns: default_checkpoint_interval_turns(),
+            allow_empty_agents:        false,
         }
     }
 }
@@ -908,6 +918,81 @@ model = "claude-sonnet-4-6"
         let result = cfg.agent_configs();
         assert!(result.is_err(), "expected Err when neither [agent] nor [[agents]] is set");
         assert!(result.unwrap_err().to_string().contains("no agents configured"));
+    }
+
+    #[test]
+    fn agent_configs_allows_empty_when_opted_in() {
+        let raw = r#"
+[scheduler]
+allow_empty_agents = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let cfgs = cfg.agent_configs().unwrap();
+        assert!(cfgs.is_empty(), "expected an empty agent list, not an error");
+    }
+
+    #[test]
+    fn agent_configs_still_rejects_empty_by_default() {
+        let raw = r#"
+[scheduler]
+allow_empty_agents = false
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let result = cfg.agent_configs();
+        assert!(
+            result.is_err(),
+            "allow_empty_agents = false must still reject a zero-agent config"
+        );
+        assert!(result.unwrap_err().to_string().contains("no agents configured"));
+    }
+
+    // /review (ux.9, testing specialist): the (Some(_), false) match arm is matched
+    // before the (None, true) allow_empty_agents arm, so ambiguous configs are
+    // rejected regardless of the flag — but that safety was only implicit in arm
+    // ordering, unasserted by any test. Guards against a future refactor (e.g. into
+    // if/else) silently inverting the precedence.
+    #[test]
+    fn agent_configs_both_set_is_error_even_with_allow_empty_agents() {
+        let raw = r#"
+[scheduler]
+allow_empty_agents = true
+
+[agent]
+id = "solo"
+task = "task"
+
+[[agents]]
+id = "alpha"
+task = "task a"
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let result = cfg.agent_configs();
+        assert!(
+            result.is_err(),
+            "allow_empty_agents=true must not bypass the both-set ambiguity check"
+        );
+        assert!(result.unwrap_err().to_string().contains("cannot set both"));
+    }
+
+    // /review (ux.9, testing specialist): docker/cockpit.toml is now what the
+    // Docker image's default CMD boots — a silent future schema drift (renamed
+    // field, a deny_unknown_fields added elsewhere) would break the new zero-arg
+    // default with nothing in CI to catch it before a manual `docker run`.
+    // Mirrors shipped_demo_agents_toml_parses_and_is_runnable's F-14/F-15 guard.
+    #[test]
+    fn shipped_cockpit_toml_parses_and_boots_empty() {
+        let raw = include_str!("../../docker/cockpit.toml");
+        let cfg: Config = toml::from_str(raw).expect("shipped docker/cockpit.toml must parse");
+        assert!(
+            cfg.scheduler.allow_empty_agents,
+            "cockpit.toml must opt into allow_empty_agents (it ships zero [[agents]])"
+        );
+        assert!(
+            cfg.management.enabled,
+            "cockpit.toml must enable the management API (the HTTP-fallback readiness path depends on it)"
+        );
+        let cfgs = cfg.agent_configs().expect("cockpit.toml must produce a valid (empty) agent list");
+        assert!(cfgs.is_empty(), "cockpit.toml must boot with zero agents by design");
     }
 
     #[test]

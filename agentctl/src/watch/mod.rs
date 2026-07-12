@@ -126,6 +126,30 @@ enum Effect {
 /// (anti-livelock). = CHANNEL_CAP, so a full channel still drains in one tick.
 const MAX_DRAIN_PER_TICK: usize = pump::CHANNEL_CAP;
 
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+    // Signal-safe: an atomic store, no allocation, no locking.
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Installs a minimal SIGTERM/SIGINT handler that only sets an atomic flag.
+/// `run_tui_loop`'s 30ms key-poll tick checks it every iteration and returns
+/// normally, letting `TermGuard::drop()` restore the terminal before the process
+/// exits. Without this, an externally-delivered `kill(2)` (e.g. `docker stop`, or
+/// an entrypoint script forwarding SIGTERM) uses the default signal disposition —
+/// immediate termination with no unwind — so neither the panic hook nor `Drop`
+/// ever runs, leaving the operator's terminal stuck in raw mode + the alternate
+/// screen. Ctrl-C-as-a-key (crossterm `Event::Key` with `KeyCode::Char('c')` +
+/// `CONTROL`) is unaffected: raw mode already suppresses the tty driver's own
+/// SIGINT generation, so this handler only ever fires for out-of-band signals.
+fn install_shutdown_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_shutdown_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_shutdown_signal as *const () as libc::sighandler_t);
+    }
+}
+
 /// Terminal session guard (C2): owns raw mode + the alternate screen + a panic hook
 /// that restores the terminal. `Drop` restores everything (panic-safe), replacing the
 /// prior ad-hoc CleanupGuard + separate panic-hook dance in a single owner.
@@ -168,6 +192,7 @@ fn run_tui(
     log_path: Option<PathBuf>,
     source: Arc<dyn DataSource>,
 ) -> anyhow::Result<()> {
+    install_shutdown_signal_handlers();
     let guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend).context("creating terminal")?;
@@ -222,6 +247,12 @@ fn run_tui_loop(
     // Producers stop when `_producers`/`rx`/`wake_tx` drop at loop exit (detached; never joined — F7).
     let (rx, wake_tx, _producers) = spawn_producers(Arc::clone(source), interval);
     loop {
+        // Checked every tick (~30ms) so an out-of-band SIGTERM/SIGINT unwinds
+        // normally instead of hitting the default signal disposition — see
+        // install_shutdown_signal_handlers().
+        if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
         // Drain up to MAX_DRAIN_PER_TICK events, then always yield to key poll + draw
         // so a high-rate SSE burst can't starve input/render (fix 2 anti-livelock).
         if drain_events(&rx, app, source.as_ref(), &wake_tx, MAX_DRAIN_PER_TICK) {
@@ -801,6 +832,44 @@ mod tests {
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("mock: no control".into()) }
         fn deny(&self, _id: &str, _reason: Option<&str>) -> Result<(), String> { Err("mock: no control".into()) }
+    }
+
+    // ── shutdown signal handling (terminal-corruption fix) ──────────────────
+
+    // Both signals are asserted in ONE test (not two parallel tests) because they
+    // share the single process-wide SHUTDOWN_REQUESTED static — separate #[test]
+    // fns would race under cargo test's default parallel execution (one test's
+    // reset could clobber the flag between another's raise() and assert()).
+    #[test]
+    fn shutdown_signal_handler_sets_flag_on_sigterm_and_sigint() {
+        use super::{install_shutdown_signal_handlers, SHUTDOWN_REQUESTED};
+        use std::sync::atomic::Ordering;
+        install_shutdown_signal_handlers();
+
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        // SAFETY: raise() sends the signal to the current process; the handler
+        // only does an atomic store (signal-safe), so this cannot corrupt state.
+        unsafe { libc::raise(libc::SIGTERM) };
+        assert!(
+            SHUTDOWN_REQUESTED.load(Ordering::SeqCst),
+            "handler must set the flag synchronously before raise() returns (SIGTERM)"
+        );
+
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        unsafe { libc::raise(libc::SIGINT) };
+        assert!(
+            SHUTDOWN_REQUESTED.load(Ordering::SeqCst),
+            "handler must set the flag synchronously before raise() returns (SIGINT)"
+        );
+
+        SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+        // Restore the OS default so a later Ctrl-C during the same `cargo test`
+        // process (all tests share one binary/process) still aborts normally,
+        // instead of being silently absorbed by our handler for the rest of the run.
+        unsafe {
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
     }
 
     fn make_snapshot(ids: &[&str]) -> Snapshot {

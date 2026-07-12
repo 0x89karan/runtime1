@@ -108,13 +108,38 @@ docker pull ghcr.io/0x89karan/runtime1:full
 # Core tier (Rust runtime only)
 docker pull ghcr.io/0x89karan/runtime1:core
 
-# Chain-of-scouts research agent
+# Zero-arg default: cockpit mode (agentctl watch, no agents running yet — see below)
 export ANTHROPIC_API_KEY=sk-ant-...
+docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full
+
+# Chain-of-scouts research agent
 docker run --rm -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full cos
 
 # Interactive multi-turn orchestrator REPL (starts agentd + agentctl orchestrate)
 docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate
 ```
+
+### `docker/entrypoint.sh` modes
+
+| Mode | Invocation | What it does |
+|------|-----------|---------------|
+| **`cockpit`** (default — bare `docker run`, no command) | `docker run -it agentos:full` | Cold-starts `agentd` with zero agents + `agentctl watch` attached. Empty system state on boot — it doesn't spend API tokens automatically. FUSE is used when the container is `--privileged`; otherwise `agentctl watch` transparently falls back to the management API over HTTP. Requires `-it` (fails fast with an actionable message otherwise). |
+| `shell` | `docker run -it agentos:full shell` | Drops into a bash shell with `agentd`/`agentctl` on `PATH` — the old zero-arg default. Use this if you want manual control instead of the cockpit TUI. |
+| `run <config.toml>` | `docker run agentos:full run <config.toml>` | Runs one agent config to completion, non-interactively, then exits. |
+| `cos` | `docker run agentos:full cos` | Chain-of-scouts research agent (see below). |
+| `agent` | `TEMPLATE_NAME=scout AGENT_TASK="..." docker compose run --rm agent` | Lowers a template to a running agent. |
+| `orchestrate` | `docker run -it agentos:full orchestrate` | `agentctl orchestrate` REPL — spawn one agent and converse with it turn-by-turn. |
+| `demo` | `docker run -it agentos:full demo` | Starts the scout demo agent in the background, drops into a shell. |
+
+Once inside cockpit mode, press `[n]` in the TUI to spawn an agent from the template
+catalogue (`agentctl list-templates`) — the cockpit boots empty by design, spawning is
+a deliberate action, not an automatic one. **This currently only injects into the
+running cockpit when FUSE is mounted** (`--privileged`/`--cap-add SYS_ADMIN --device
+/dev/fuse`) — the unprivileged/HTTP-fallback path doesn't yet route spawn through the
+management API, so `[n]` there launches a separate one-shot agent process instead of
+injecting into the cockpit you're looking at (tracked as ux.9-ar-07 in TODOS.md). For
+a guaranteed single dedicated agent without `--privileged`, use `orchestrate` or
+`agent` mode instead.
 
 If the package is private, set it to Public once: GitHub repo → Packages →
 agentos → Package Settings → Change visibility → Public.
