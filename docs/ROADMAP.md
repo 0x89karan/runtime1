@@ -1136,9 +1136,14 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
 - **ux.8** — Live budget control (added 2026-07-11): a cockpit panel to view + set per-agent and global
   token budgets over a new management-API budget endpoint. Fixes the live-run "500k too small" finding.
   `/plan-eng-review` (live config writes).
-- **ux.9** — Cockpit mode (added 2026-07-11): a `cockpit` entrypoint that starts `agentd` **and** execs
-  `agentctl watch` in the foreground — boot straight into an always-on status/debug console. Reads FUSE
-  `/agents`; the flight recorder is the live log view. Basic version ships early; live with ux.0.
+- ~~**ux.9** — Cockpit mode~~ ✅ **shipped (v0.82.0)** — `docker/entrypoint.sh`'s `cockpit)` case:
+  the new zero-arg Docker default, cold-starts `agentd` with a zero-agent config
+  (`docker/cockpit.toml`) and attaches `agentctl watch` (non-exec'd, preserving signal handling).
+  FUSE preferred when `--privileged`; transparently falls back to the management API over HTTP
+  otherwise (`agentctl watch`'s existing `detect_source`). Two critical bugs found and fixed
+  during `/review`: checkpoint bleed-through from a stale `/workspace/checkpoint.json` (now runs
+  from `/data`, matching `cos)`/`agent)`), and terminal corruption on `docker stop` (agentctl
+  gained its own SIGTERM/SIGINT handler). Full plan: `docs/plans/ux.9-cockpit-mode.md`.
 
 > **North star (2026-07-11):** the cockpit is **agentos's default operator surface** — an always-on
 > status/debug/control console (k9s/htop for agents), not an optional tool. ux.9 makes it the default;

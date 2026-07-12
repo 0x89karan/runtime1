@@ -762,7 +762,7 @@ Synthesized from all three review phases. Each task derives from a specific find
         cockpit-only mention would be out of step with the rest of that file. `docs/DEPLOYMENT.md` is
         this repo's actual Docker-operations runbook and covers it.
       - Verify: manual doc review; README's Docker quickstart section shows the mode table.
-- [ ] **T7 (P2, human: ~15min / CC: ~5min)** — `CHANGELOG.md` — add a "BREAKING" migration note: the
+- [x] **T7 (P2, human: ~15min / CC: ~5min)** — `CHANGELOG.md` — add a "BREAKING" migration note: the
       bare `docker run agentos:full` (no command) default changed from `shell` to `cockpit`; scripts/CI
       relying on the old fast-exit shell behavior should append `shell` explicitly.
       - Surfaced by: DX Dual-voice (Codex finding — migration risk).
@@ -771,7 +771,7 @@ Synthesized from all three review phases. Each task derives from a specific find
         RULE 2) assigns the version bump + CHANGELOG entry at merge time against current `main`, not at
         branch-cut, to avoid the exact version-slot collision this repo hit on ux.0/cos-polish. The
         migration-note content is drafted and ready; only the version heading is pending.
-- [ ] **T8 (P3, human: ~15min / CC: ~5min)** — `docs/ROADMAP.md` — check off ux.9 on ship.
+- [x] **T8 (P3, human: ~15min / CC: ~5min)** — `docs/ROADMAP.md` — check off ux.9 on ship.
       - Files: `docs/ROADMAP.md`
       - **Deferred to `/ship`** for the same version-collision-avoidance reason as T7 (this repo's
         shipped-line convention embeds the version number, e.g. "shipped (v0.77.0)").
