@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 """
-semantic_kb_mcp — Layer-2 semantic KB MCP sidecar (h8.1).
+semantic_kb_mcp — Layer-2 semantic KB MCP sidecar (h8.1 / memory-routing).
 
 Exposes kb_put / kb_get / kb_search over HTTP/JSON-RPC (MCP spec 2024-11-05).
-Backed by Qdrant (vector store) + Voyage AI (embedding API).
+Backed by Qdrant (vector store) + OpenAI Embeddings API (text-embedding-3-small).
 
 Environment variables:
   QDRANT_URL            Qdrant base URL (default: http://qdrant:6333)
-  VOYAGE_API_KEY        Voyage AI key (required unless VOYAGE_MOCK_EMBEDDINGS=1)
-  VOYAGE_MODEL          Embedding model (default: voyage-3-lite)
-  VOYAGE_MOCK_EMBEDDINGS  Set to "1" to use zero vectors (testing, no key needed)
+  OPENAI_API_KEY        OpenAI key (required unless MOCK_EMBEDDINGS=1)
+  EMBED_MODEL           Embedding model (default: text-embedding-3-small, 1536 dims)
+  MOCK_EMBEDDINGS       Set to "1" to use zero vectors (testing, no key needed)
   PORT                  HTTP port to listen on (default: 8020)
+  SEMANTIC_MAX_AGE_DAYS Evict entries older than N days at startup (default: 30, 0=disabled)
+  SEMANTIC_MAX_ENTRIES  Evict oldest entries beyond this count per namespace (default: 10000, 0=disabled)
 
 Security:
-  - VOYAGE_API_KEY is never logged or returned to callers.
+  - OPENAI_API_KEY is never logged or returned to callers.
   - SSRF guard on QDRANT_URL: loopback, RFC-1918, and link-local are allowed
     (Docker-internal use case); external IPs are blocked at startup.
   - Key/segment input validation (no path separators, ≤128 chars).
   - kb_search results capped at 100 hits × 8 KB each.
 
-Self-test (no external services needed with VOYAGE_MOCK_EMBEDDINGS=1):
-  VOYAGE_MOCK_EMBEDDINGS=1 python3 semantic_kb_mcp.py --test
+Self-test (no external services needed with MOCK_EMBEDDINGS=1):
+  MOCK_EMBEDDINGS=1 python3 semantic_kb_mcp.py --test
 
 TOML example (docker-compose peer service):
   [[tools.mcp_servers]]
@@ -48,33 +50,37 @@ from uuid import uuid4, uuid5, NAMESPACE_OID
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-VOYAGE_API_URL   = "https://api.voyageai.com/v1/embeddings"
-VOYAGE_MODELS    = {
-    "voyage-3-lite": 512,
-    "voyage-3":      1024,
-    "voyage-code-3": 1024,
+OPENAI_API_URL   = "https://api.openai.com/v1/embeddings"
+# Known model → output dimension mapping. EMBED_DIM is derived at startup from EMBED_MODEL.
+# If EMBED_MODEL is set to an unlisted model, EMBED_DIM defaults to 1536 and a warning is
+# emitted — the collection will be created with the wrong size and every kb_put will fail
+# with a Qdrant 400 dimension-mismatch error.
+_EMBED_MODEL_DIMS: dict = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
 }
-DEFAULT_MODEL    = "voyage-3-lite"
 MAX_SEARCH_HITS  = 100
 HIT_CONTENT_CAP  = 8 * 1024          # 8 KB per hit
 KEY_MAX_CHARS    = 128
 QDRANT_TIMEOUT   = 10
-VOYAGE_TIMEOUT   = 30
-SERVER_VERSION   = "0.1.0"
+EMBED_TIMEOUT    = 30
+SERVER_VERSION   = "0.2.0"
 MAX_REQUEST_BODY    = 4 * 1024 * 1024   # 4 MB — matches MCP HTTP client cap in Rust
 MAX_QDRANT_RESPONSE = 4 * 1024 * 1024   # 4 MB — guard against oversized Qdrant responses
-MAX_VOYAGE_RESPONSE = 4 * 1024 * 1024   # 4 MB — guard against oversized Voyage AI responses
+MAX_EMBED_RESPONSE  = 4 * 1024 * 1024   # 4 MB — guard against oversized embedding responses
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 QDRANT_URL      = os.environ.get("QDRANT_URL", "http://qdrant:6333").rstrip("/")
-VOYAGE_KEY      = os.environ.get("VOYAGE_API_KEY", "")
-VOYAGE_MODEL    = os.environ.get("VOYAGE_MODEL", DEFAULT_MODEL)
-MOCK_EMBED      = os.environ.get("VOYAGE_MOCK_EMBEDDINGS", "0") == "1"
+OPENAI_KEY      = os.environ.get("OPENAI_API_KEY", "")
+EMBED_MODEL     = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
+EMBED_DIM       = _EMBED_MODEL_DIMS.get(EMBED_MODEL, 0)  # 0 = unknown model
+MOCK_EMBED      = os.environ.get("MOCK_EMBEDDINGS", "0") == "1"
 PORT            = int(os.environ.get("PORT", "8020"))
 SIDECAR_SECRET  = os.environ.get("SIDECAR_SECRET", "")  # optional inbound auth token
-
-VOYAGE_DIM = VOYAGE_MODELS.get(VOYAGE_MODEL, 512)
+SEMANTIC_MAX_AGE_DAYS = int(os.environ.get("SEMANTIC_MAX_AGE_DAYS", "30"))
+SEMANTIC_MAX_ENTRIES  = int(os.environ.get("SEMANTIC_MAX_ENTRIES", "10000"))
 
 # ── SSRF guard ────────────────────────────────────────────────────────────────
 
@@ -149,42 +155,42 @@ def _validate_segment(segment: str) -> None:
 def _embed(texts: list[str]) -> list[list[float]]:
     """Return embeddings for a list of texts. Uses mock zeros when MOCK_EMBED is set."""
     if MOCK_EMBED:
-        return [[0.0] * VOYAGE_DIM for _ in texts]
-    if not VOYAGE_KEY:
+        return [[0.0] * (EMBED_DIM or 1536) for _ in texts]
+    if not OPENAI_KEY:
         raise RuntimeError(
-            "VOYAGE_API_KEY is not set and VOYAGE_MOCK_EMBEDDINGS is not '1'. "
-            "Either export VOYAGE_API_KEY=<key> or set VOYAGE_MOCK_EMBEDDINGS=1 for testing."
+            "OPENAI_API_KEY is not set and MOCK_EMBEDDINGS is not '1'. "
+            "Either export OPENAI_API_KEY=<key> or set MOCK_EMBEDDINGS=1 for testing."
         )
     payload = json.dumps({
         "input": texts,
-        "model": VOYAGE_MODEL,
+        "model": EMBED_MODEL,
     }).encode()
     req = urllib.request.Request(
-        VOYAGE_API_URL,
+        OPENAI_API_URL,
         data=payload,
         headers={
-            "Authorization": f"Bearer {VOYAGE_KEY}",
+            "Authorization": f"Bearer {OPENAI_KEY}",
             "Content-Type": "application/json",
         },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=VOYAGE_TIMEOUT) as resp:
-            raw = resp.read(MAX_VOYAGE_RESPONSE + 1)
-            if len(raw) > MAX_VOYAGE_RESPONSE:
+        with urllib.request.urlopen(req, timeout=EMBED_TIMEOUT) as resp:
+            raw = resp.read(MAX_EMBED_RESPONSE + 1)
+            if len(raw) > MAX_EMBED_RESPONSE:
                 raise RuntimeError(
-                    f"Voyage AI response too large (> {MAX_VOYAGE_RESPONSE} bytes)"
+                    f"OpenAI Embeddings response too large (> {MAX_EMBED_RESPONSE} bytes)"
                 )
             body = json.loads(raw)
     except urllib.error.HTTPError as e:
-        body_bytes = e.read(MAX_VOYAGE_RESPONSE + 1)
-        if len(body_bytes) > MAX_VOYAGE_RESPONSE:
-            raise RuntimeError(f"Voyage AI API error {e.code}: error body too large") from e
+        body_bytes = e.read(MAX_EMBED_RESPONSE + 1)
+        if len(body_bytes) > MAX_EMBED_RESPONSE:
+            raise RuntimeError(f"OpenAI Embeddings API error {e.code}: error body too large") from e
         try:
             detail = json.loads(body_bytes).get("error", {}).get("message", body_bytes.decode("utf-8", errors="replace"))
         except Exception:
             detail = body_bytes.decode("utf-8", errors="replace")
-        raise RuntimeError(f"Voyage AI API error {e.code}: {detail}") from e
+        raise RuntimeError(f"OpenAI Embeddings API error {e.code}: {detail}") from e
     return [item["embedding"] for item in body["data"]]
 
 
@@ -234,7 +240,7 @@ def _ensure_collection(segment: str) -> None:
             method="PUT",
             body={
                 "vectors": {
-                    "size": VOYAGE_DIM,
+                    "size": EMBED_DIM,
                     "distance": "Cosine",
                 }
             },
@@ -253,6 +259,7 @@ def _point_id(key: str) -> str:
 # ── Tool handlers ─────────────────────────────────────────────────────────────
 
 def _handle_kb_put(args: dict) -> dict:
+    import time as _time
     segment  = args.get("segment", "default")
     key      = args.get("key", "")
     content  = args.get("content", "")
@@ -281,6 +288,7 @@ def _handle_kb_put(args: dict) -> dict:
                     "key":      key,
                     "content":  content,
                     "metadata": metadata,
+                    "ts":       _time.time(),
                 },
             }]
         },
@@ -355,6 +363,77 @@ def _handle_kb_search(args: dict) -> dict:
             "metadata": payload.get("metadata", {}),
         })
     return {"hits": hits, "segment": segment, "query": query}
+
+
+# ── Eviction ──────────────────────────────────────────────────────────────────
+
+def _evict_segment(segment: str) -> int:
+    """Remove entries older than SEMANTIC_MAX_AGE_DAYS from this segment's collection.
+    Returns the number of entries deleted.
+    Note: SEMANTIC_MAX_ENTRIES count-based eviction is not yet implemented (env var is a
+    no-op). TTL-only for now; add count-based pass here when needed."""
+    import time as _time
+    if SEMANTIC_MAX_AGE_DAYS <= 0:
+        return 0
+    cname = _collection_name(segment)
+    try:
+        _qdrant(f"/collections/{cname}")
+    except RuntimeError:
+        return 0  # collection doesn't exist yet
+
+    cutoff = _time.time() - SEMANTIC_MAX_AGE_DAYS * 86400
+    old_ids: list = []
+    offset = None
+    while True:
+        body: dict = {
+            "limit": 500,
+            "with_vector": False,
+            "with_payload": ["ts"],
+        }
+        if offset is not None:
+            body["offset"] = offset
+        result = _qdrant(f"/collections/{cname}/points/scroll", method="POST", body=body)
+        r = result.get("result", {})
+        for pt in r.get("points", []):
+            ts = pt.get("payload", {}).get("ts", None)
+            # ts is None for pre-memory-routing points (no ts field); treat as very old.
+            if ts is None or ts < cutoff:
+                old_ids.append(pt["id"])
+        next_offset = r.get("next_page_offset")
+        if not next_offset:
+            break
+        offset = next_offset
+
+    if old_ids:
+        _qdrant(
+            f"/collections/{cname}/points/delete",
+            method="POST",
+            body={"points": old_ids},
+        )
+    return len(old_ids)
+
+
+def _evict_all_collections() -> None:
+    """Run TTL eviction across all existing collections at startup."""
+    try:
+        result = _qdrant("/collections")
+        collections = [c["name"] for c in result.get("result", {}).get("collections", [])]
+    except RuntimeError:
+        return  # Qdrant not reachable yet — skip eviction
+    for cname in collections:
+        # Strip the "kb_" prefix to get the segment name
+        if not cname.startswith("kb_"):
+            continue
+        segment = cname[3:]
+        try:
+            deleted = _evict_segment(segment)
+            if deleted:
+                print(
+                    f"semantic_kb_mcp.py: evicted {deleted} old entries from {cname}",
+                    file=sys.stderr,
+                )
+        except RuntimeError as e:
+            print(f"semantic_kb_mcp.py: eviction warning for {cname}: {e}", file=sys.stderr)
 
 
 # ── MCP tool descriptors ──────────────────────────────────────────────────────
@@ -551,7 +630,7 @@ class McpHandler(BaseHTTPRequestHandler):
 class SelfTests(unittest.TestCase):
     def setUp(self):
         # All tests run with mock embeddings; Qdrant is also mocked via monkey-patching.
-        os.environ["VOYAGE_MOCK_EMBEDDINGS"] = "1"
+        os.environ["MOCK_EMBEDDINGS"] = "1"
         global MOCK_EMBED
         MOCK_EMBED = True  # re-read module-level for this process
         # Patch _qdrant so tests don't need a running Qdrant.
@@ -618,12 +697,12 @@ class SelfTests(unittest.TestCase):
         self.assertIsInstance(result["hits"], list)
         self.assertGreater(len(result["hits"]), 0, "search must return at least one hit")
 
-    # T3: VOYAGE_API_KEY absent + MOCK_EMBED off → graceful error
+    # T3: OPENAI_API_KEY absent + MOCK_EMBED off → graceful error
     def test_t3_missing_api_key_graceful_error(self):
         orig_mock = globals()["MOCK_EMBED"]
-        orig_key = globals()["VOYAGE_KEY"]
+        orig_key = globals()["OPENAI_KEY"]
         globals()["MOCK_EMBED"] = False
-        globals()["VOYAGE_KEY"] = ""
+        globals()["OPENAI_KEY"] = ""
         try:
             result = _dispatch("tools/call", {"name": "kb_put", "arguments": {
                 "segment": "x", "key": "k", "content": "c"
@@ -631,7 +710,7 @@ class SelfTests(unittest.TestCase):
             self.assertTrue(result["result"]["isError"], "missing API key must produce isError")
         finally:
             globals()["MOCK_EMBED"] = orig_mock
-            globals()["VOYAGE_KEY"] = orig_key
+            globals()["OPENAI_KEY"] = orig_key
 
     # T4: Qdrant unreachable → kb_put returns error, doesn't crash
     def test_t4_qdrant_unreachable(self):
@@ -658,12 +737,12 @@ class SelfTests(unittest.TestCase):
         result = _handle_kb_search({"segment": "test", "query": "", "limit": 10})
         self.assertEqual(result["hits"], [])
 
-    # T7: Voyage AI 429 → sidecar returns isError, stays up
+    # T7: embedding API error → sidecar returns isError, stays up
     def test_t7_embedding_error_is_error(self):
         orig_embed = globals()["_embed"]
 
         def _raise_embed(_texts):
-            raise RuntimeError("Voyage 429: rate limited")
+            raise RuntimeError("OpenAI 429: rate limited")
         globals()["_embed"] = _raise_embed
 
         try:
@@ -841,6 +920,63 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(result["error"]["code"], -32700)
             t.join(timeout=2)
 
+    # T19: eviction removes entries older than the cutoff
+    def test_t19_eviction_removes_old_entries(self):
+        import time as _time
+        # Store two points: one old (ts in the past), one recent.
+        old_id = _point_id("old-key")
+        new_id = _point_id("new-key")
+        cname = _collection_name("evict-test-seg")
+        # Prime the mock store with the two points.
+        self._store[cname] = {
+            old_id: {
+                "id": old_id,
+                "vector": [],
+                "payload": {"key": "old-key", "content": "old", "ts": 1.0},  # epoch = very old
+            },
+            new_id: {
+                "id": new_id,
+                "vector": [],
+                "payload": {"key": "new-key", "content": "new", "ts": _time.time()},
+            },
+        }
+        # Patch _qdrant to also handle delete + scroll + list.
+        deleted_ids: list = []
+        orig_qdrant = globals()["_qdrant"]
+
+        def _mock_with_evict(path, method="GET", body=None):
+            import re as _re
+            # /collections (list all)
+            if path == "/collections" and method == "GET":
+                return {"result": {"collections": [{"name": cname}]}}
+            # /collections/kb_evict-test-seg/points/scroll
+            if _re.match(r".*/points/scroll$", path) and method == "POST":
+                return {
+                    "result": {
+                        "points": list(self._store.get(cname, {}).values()),
+                        "next_page_offset": None,
+                    }
+                }
+            # delete
+            if _re.match(r".*/points/delete$", path) and method == "POST":
+                for pid in (body or {}).get("points", []):
+                    deleted_ids.append(pid)
+                    self._store.get(cname, {}).pop(pid, None)
+                return {"result": {"status": "ok"}}
+            return self._mock_qdrant(path, method, body)
+
+        globals()["_qdrant"] = _mock_with_evict
+        orig_age = globals()["SEMANTIC_MAX_AGE_DAYS"]
+        globals()["SEMANTIC_MAX_AGE_DAYS"] = 30
+        try:
+            deleted = _evict_segment("evict-test-seg")
+            self.assertEqual(deleted, 1, "eviction must remove exactly the old entry")
+            self.assertIn(old_id, deleted_ids, "old entry point_id must be in deleted list")
+            self.assertNotIn(new_id, deleted_ids, "new entry must not be evicted")
+        finally:
+            globals()["_qdrant"] = orig_qdrant
+            globals()["SEMANTIC_MAX_AGE_DAYS"] = orig_age
+
 
 def _run_self_tests():
     print("semantic_kb_mcp.py: running self-tests...", file=sys.stderr)
@@ -869,19 +1005,31 @@ if __name__ == "__main__":
         print(f"semantic_kb_mcp.py: FATAL — {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not VOYAGE_KEY and not MOCK_EMBED:
+    if not OPENAI_KEY and not MOCK_EMBED:
         print(
-            "semantic_kb_mcp.py: WARNING — VOYAGE_API_KEY is not set. "
-            "kb_put and kb_search will fail until VOYAGE_API_KEY is provided. "
-            "Set VOYAGE_MOCK_EMBEDDINGS=1 to use zero vectors for testing.",
+            "semantic_kb_mcp.py: WARNING — OPENAI_API_KEY is not set. "
+            "kb_put and kb_search will fail until OPENAI_API_KEY is provided. "
+            "Set MOCK_EMBEDDINGS=1 to use zero vectors for testing.",
+            file=sys.stderr,
+        )
+
+    if EMBED_DIM == 0 and not MOCK_EMBED:
+        print(
+            f"semantic_kb_mcp.py: WARNING — EMBED_MODEL='{EMBED_MODEL}' is not in the known "
+            f"model→dimension table {list(_EMBED_MODEL_DIMS)}. "
+            "Qdrant collection will be created with dim=0, causing dimension-mismatch errors on "
+            "every kb_put. Set EMBED_MODEL to a known model or update _EMBED_MODEL_DIMS.",
             file=sys.stderr,
         )
 
     print(
         f"semantic_kb_mcp.py: starting on port {PORT} "
-        f"(model={VOYAGE_MODEL}, dim={VOYAGE_DIM}, mock={MOCK_EMBED}, qdrant={QDRANT_URL})",
+        f"(model={EMBED_MODEL}, dim={EMBED_DIM}, mock={MOCK_EMBED}, qdrant={QDRANT_URL}, "
+        f"max_age_days={SEMANTIC_MAX_AGE_DAYS}, max_entries={SEMANTIC_MAX_ENTRIES})",
         file=sys.stderr,
     )
+
+    _evict_all_collections()
 
     server = ThreadingHTTPServer(("0.0.0.0", PORT), McpHandler)
     try:

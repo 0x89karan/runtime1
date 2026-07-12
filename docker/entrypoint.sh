@@ -127,6 +127,21 @@ case "${1:-shell}" in
       exit 1
     fi
 
+    # Semantic KB (memory-routing): email bodies are indexed via OpenAI text-embedding-3-small.
+    if [ -z "${OPENAI_API_KEY:-}" ]; then
+      echo ""
+      echo "  ERROR: OPENAI_API_KEY is not set."
+      echo ""
+      echo "  The CoS semantic KB requires an OpenAI API key for email embeddings."
+      echo "  Add it to your environment:"
+      echo "    export OPENAI_API_KEY=sk-..."
+      echo ""
+      echo "  Or pass it to docker compose:"
+      echo "    OPENAI_API_KEY=sk-... docker compose up cos"
+      echo ""
+      exit 1
+    fi
+
     mkdir -p /data /data/output
     # Patch the baked config: rewrite dev-mode relative paths to absolute paths.
     sed \

@@ -3,6 +3,36 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.81.0] - 2026-07-12
+
+### Added (memory-routing)
+- **L2 semantic KB for CoS email bodies** (`docker/semantic_kb_mcp.py`): routes `kb_put` /
+  `kb_get` / `kb_search` through the Qdrant-backed semantic sidecar using OpenAI
+  `text-embedding-3-small` (1536-dim) embeddings. Inbox agent stores raw email bodies keyed by
+  Gmail message ID; on subsequent runs `kb_get` returns the cached body, eliminating the ~820k
+  token/run cost of re-fetching all messages from Gmail.
+- **`mail:raw` KB segment** declared as `[[memory.segments]]` in `agentd/cos.agents.toml`
+  (`class = "scratch"`, last-writer-wins keyed by message ID); `tool_override = true` on the
+  `semantic-kb` MCP server block routes all `kb_*` calls to Qdrant when the sidecar is live.
+- **`OPENAI_API_KEY` preflight** in `docker/entrypoint.sh` (`cos` mode) — exits with an
+  actionable error if the key is absent; added to `docker-compose.yml` `cos` env block.
+- **`_EMBED_MODEL_DIMS` dict** in `semantic_kb_mcp.py` — maps known OpenAI embedding models
+  to their output dimensions; startup warning when `EMBED_MODEL` is unknown (prevents silent
+  Qdrant dimension-mismatch errors when using non-default models).
+- **Privacy note** in `docs/DEPLOYMENT.md` — discloses that email body plaintext (up to 8 KB
+  per message) is transmitted to OpenAI for vectorisation, with opt-out instructions.
+
+### Security
+- **`OPENAI_API_KEY` added to `PASSENV_BLOCKLIST`** (`agentd/src/tools/mcp.rs`): prevents the
+  OpenAI key from leaking to stdio MCP subprocesses that declare it in `passenv`.
+
+### Fixed
+- **Pre-migration eviction** (`semantic_kb_mcp.py`): points stored before the `ts` field was
+  added were silently skipped during TTL eviction. Now treated as maximally old and evicted.
+- **`semantic-kb-mcp` on dual Docker network** (`docker-compose.yml`): service is now on both
+  `cos-net` and `agent-net` so both the `cos` and `agent` Compose services can reach it after
+  the ux.0b network-segmentation change.
+
 ## [v0.80.0] - 2026-07-12
 
 ### Added
@@ -25,6 +55,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `docs/DEPLOYMENT.md` and `docs/RUNBOOK.md` updated to the new direct-host-URL workflow.
 - `docs/THREAT_MODEL.md` documents the management API's unauthenticated exposure, the accepted
   deployment-hygiene gaps, and defers per-session auth to the future web-cockpit increment (ux.5).
+
 
 ## [v0.79.0] - 2026-07-12
 

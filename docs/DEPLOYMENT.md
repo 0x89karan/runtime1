@@ -113,11 +113,13 @@ docker pull ghcr.io/0x89karan/runtime1:full
 
 # 6. Start the CoS — keep the `export` and `docker run` in the SAME terminal
 export ANTHROPIC_API_KEY=sk-ant-...
+export OPENAI_API_KEY=sk-...          # required for semantic KB (email body embeddings)
 docker run --rm -it \
   --name agentos-cos \
   --privileged \
   -p 127.0.0.1:7999:7999 \
   -e ANTHROPIC_API_KEY \
+  -e OPENAI_API_KEY \
   -e "TRIGGER_INTERVAL=every 2m" \
   -v ~/.agentos-secrets:/run/secrets:ro \
   -v ~/.agentos-output:/data/output \
@@ -147,6 +149,14 @@ resumes.
 
 **Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed action-receipt
 chain with `agentctl verify ~/.agentos-data/evidence.jsonl`.
+
+**Privacy note — email embeddings:** The CoS uses OpenAI's Embeddings API
+(`text-embedding-3-small`) to store email bodies as semantic vectors in Qdrant. Plain-text
+email body content (up to 8 KB per message) is transmitted to OpenAI for vectorisation.
+Review [OpenAI's data usage policies](https://openai.com/policies/api-data-usage-policies)
+before enabling the semantic KB on inboxes that contain sensitive content. To run without
+OpenAI (L1 BM25 only), comment out the `[tools.mcp_servers]` semantic-kb block in
+`cos.agents.toml` — the CoS will operate without email dedup and semantic search.
 
 For building from source and iterating locally, see **Dev image** at the top of this guide.
 

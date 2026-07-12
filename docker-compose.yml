@@ -33,6 +33,11 @@ services:
       # cos requires /run/secrets/google.json — there is no env-var fallback for this mode.
       # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
       - TRIGGER_INTERVAL=${TRIGGER_INTERVAL:-every 2m}
+      # OpenAI API key — required for semantic KB (email embeddings via text-embedding-3-small).
+      - OPENAI_API_KEY
+    depends_on:
+      semantic-kb-mcp:
+        condition: service_healthy
     command: cos
     stdin_open: true
     tty: true
@@ -98,9 +103,9 @@ services:
       # ── Web search (scout, librarian) ───────────────────────────────────────
       - BRAVE_SEARCH_API_KEY
       # ── Semantic KB (librarian-semantic) ────────────────────────────────────
-      # Required for semantic kb_put / kb_search (Voyage AI embeddings).
+      # Required for semantic kb_put / kb_search (OpenAI text-embedding-3-small).
       # librarian-semantic will start but embedding calls will fail without this.
-      - VOYAGE_API_KEY
+      - OPENAI_API_KEY
       # ── Debug ───────────────────────────────────────────────────────────────
       # DRY_RUN_ONLY=1: print rendered config and exit without running agentd
       - DRY_RUN_ONLY
@@ -118,18 +123,18 @@ services:
       net.ipv4.tcp_keepalive_intvl: 5
       net.ipv4.tcp_keepalive_probes: 3
 
-  # ── Semantic KB sidecar (h8.1) — started automatically with librarian-semantic ──
-  # Only needed when TEMPLATE_NAME=librarian-semantic (or another template with
-  # url = "http://semantic-kb-mcp:8020" in its [[tools.mcp_servers]]).
-  # Usage: docker compose --profile semantic up
+  # ── Semantic KB sidecar (h8.1 / memory-routing) ──────────────────────────────
+  # Always-on for the CoS: stores email bodies as OpenAI text-embedding-3-small vectors
+  # in Qdrant. OPENAI_API_KEY is required. Use --profile semantic to activate for the
+  # generic 'agent' service.
   qdrant:
     image: qdrant/qdrant:v1.13.6
-    profiles: [semantic]
+    # No profile — always-on for CoS (email body semantic index, memory-routing).
+    # On agent-net only: cos talks to qdrant via semantic-kb-mcp, not directly.
     networks: [agent-net]
     volumes:
       - qdrant-data:/qdrant/storage
-    # Qdrant is only reachable by services on agent-net — not exposed to the host,
-    # and not reachable from cos (separate network, ux.0b-ar-01).
+    # Qdrant is only reachable by services on agent-net — not exposed to the host.
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:6333/healthz"]
       interval: 10s
@@ -141,12 +146,15 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.semantic-kb-mcp
-    profiles: [semantic]
-    networks: [agent-net]
+    # No profile — always-on for CoS. On both networks so both cos and agent can reach it:
+    # cos (cos-net) → semantic-kb-mcp → qdrant (agent-net); agent (agent-net) → semantic-kb-mcp.
+    networks: [cos-net, agent-net]
     environment:
-      - VOYAGE_API_KEY
-      - VOYAGE_MODEL=${VOYAGE_MODEL:-voyage-3-lite}
+      - OPENAI_API_KEY
+      - EMBED_MODEL=${EMBED_MODEL:-text-embedding-3-small}
       - QDRANT_URL=http://qdrant:6333
+      - SEMANTIC_MAX_AGE_DAYS=${SEMANTIC_MAX_AGE_DAYS:-30}
+      - SEMANTIC_MAX_ENTRIES=${SEMANTIC_MAX_ENTRIES:-10000}
       # Optional inbound auth: set SIDECAR_SECRET to a shared token; the agent service
       # must pass the same value via headers_env = { X-Sidecar-Token = "SIDECAR_SECRET" }
       # in its [[tools.mcp_servers]] config. Leave unset to disable the check (Docker-network

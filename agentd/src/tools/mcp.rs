@@ -53,6 +53,8 @@ pub const PASSENV_BLOCKLIST: &[&str] = &[
     // GH_TOKEN is the name used by the GitHub CLI; GITHUB_TOKEN is the standard PAT name.
     "GITHUB_TOKEN",
     "GH_TOKEN",
+    // OpenAI — used by the semantic KB sidecar for embeddings; must not leak to MCP subprocesses.
+    "OPENAI_API_KEY",
 ];
 
 use super::{Tool, ToolContext};
