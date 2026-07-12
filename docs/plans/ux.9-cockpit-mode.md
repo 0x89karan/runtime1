@@ -710,7 +710,7 @@ existing anywhere in the document (DX review, Claude subagent finding); that's f
 
 Synthesized from all three review phases. Each task derives from a specific finding above.
 
-- [ ] **T1 (P1, human: ~1hr / CC: ~10min)** — `docker/entrypoint.sh` — add the new `cockpit)` case:
+- [x] **T1 (P1, human: ~1hr / CC: ~10min)** — `docker/entrypoint.sh` — add the new `cockpit)` case:
       `check_api_key`; `shift`; non-TTY check (`[ -t 1 ] || { echo ...; exit 1; }`); export
       `AGENTD_MANAGEMENT_ENABLED=true` + `AGENTD_MANAGEMENT_PORT`; background `agentd` with the new
       cockpit config; `trap` SIGTERM/SIGINT immediately; readiness wait polling `/agents/system` OR
@@ -723,7 +723,7 @@ Synthesized from all three review phases. Each task derives from a specific find
       - Verify: manual `docker run --privileged -it agentos:full` (FUSE path) and
         `docker run -it agentos:full` (HTTP fallback path) both boot the cockpit; `docker run --rm
         agentos:full` (no `-it`) exits immediately with the non-TTY message instead of hanging.
-- [ ] **T2 (P1, human: ~1-2hrs / CC: ~15min)** — `agentd/src/config.rs` — add
+- [x] **T2 (P1, human: ~1-2hrs / CC: ~15min)** — `agentd/src/config.rs` — add
       `[scheduler] allow_empty_agents` (or equivalent name), relax `Config::agent_configs()`'s
       `(None, true)` arm to return `Ok(vec![])` when the flag is set, else keep the existing bail.
       - Surfaced by: Eng Dual-voice (zero-agent config can't boot — critical, confirmed by direct code
@@ -731,18 +731,18 @@ Synthesized from all three review phases. Each task derives from a specific find
       - Files: `agentd/src/config.rs`
       - Verify: new unit tests `agent_configs_allows_empty_when_opted_in` +
         `agent_configs_still_rejects_empty_by_default`; `cargo test -p agentd`.
-- [ ] **T3 (P1, human: ~30min / CC: ~10min)** — `Dockerfile` — flip `CMD ["shell"]` → `CMD ["cockpit"]`
+- [x] **T3 (P1, human: ~30min / CC: ~10min)** — `Dockerfile` — flip `CMD ["shell"]` → `CMD ["cockpit"]`
       (line 80).
       - Surfaced by: CEO Premise Decision (USER CHALLENGE #1, resolved).
       - Files: `Dockerfile`
       - Verify: `docker build` succeeds; `docker inspect` shows the new default `Cmd`.
-- [ ] **T4 (P1, human: ~30min / CC: ~5min)** — new `docker/cockpit.toml` — minimal config: scheduler +
+- [x] **T4 (P1, human: ~30min / CC: ~5min)** — new `docker/cockpit.toml` — minimal config: scheduler +
       management block, `allow_empty_agents = true`, zero `[[agents]]` entries.
       - Surfaced by: CEO 0D (Decision #9, cold-start config).
       - Files: `docker/cockpit.toml` (new), `Dockerfile` (COPY it alongside `docker/agent.toml`/
         `docker/agents.toml`)
       - Verify: `agentd docker/cockpit.toml` parses and starts cleanly (with T2 landed).
-- [ ] **T5 (P2, human: ~30min / CC: ~5min)** — `docker compose config` assertion test proving the CMD
+- [x] **T5 (P2, human: ~30min / CC: ~5min)** — `docker compose config` assertion test proving the CMD
       flip doesn't affect `cos`/`agent`'s resolved command (Codex noted `docker compose config` proves
       the YAML merge, not the built image's `CMD` — frame the test/doc claim accordingly: it protects
       against someone removing the explicit `command:` lines, not against Docker's own guarantee).
@@ -751,23 +751,31 @@ Synthesized from all three review phases. Each task derives from a specific find
         implementation time; not a Rust test (no compose-parsing crate in this repo).
       - Verify: `docker compose config` output for `cos`/`agent` still shows `command: [cos]`/
         `command: [agent]` after the `Dockerfile` change.
-- [ ] **T6 (P2, human: ~1hr / CC: ~15min)** — Docs: `docs/DEPLOYMENT.md` / `docs/RUNBOOK.md` /
+- [x] **T6 (P2, human: ~1hr / CC: ~15min)** — Docs: `docs/DEPLOYMENT.md` / `docs/RUNBOOK.md` /
       `README.md` — document the new `cockpit` mode; add a one-line "press `[n]` to spawn your first
       agent" pointer to the existing Spawn view; add an explicit mode table (`cockpit`, `shell`, `cos`,
       `agent`, `orchestrate`) to README's Docker quickstart section (not just operator docs), including
       the `docker run -it agentos:full shell` escape hatch shown prominently, not just mentioned.
       - Surfaced by: DX Dual-voice (findings #1, #3, #4).
-      - Files: `docs/DEPLOYMENT.md`, `docs/RUNBOOK.md`, `README.md`
-      - Verify: manual doc review; README's Docker quickstart section shows all 5 modes.
+      - Files: `docs/DEPLOYMENT.md`, `README.md`. **`docs/RUNBOOK.md` deliberately skipped** — it
+        documents zero Docker `entrypoint.sh` modes today (not `cos`/`agent`/`orchestrate` either); a
+        cockpit-only mention would be out of step with the rest of that file. `docs/DEPLOYMENT.md` is
+        this repo's actual Docker-operations runbook and covers it.
+      - Verify: manual doc review; README's Docker quickstart section shows the mode table.
 - [ ] **T7 (P2, human: ~15min / CC: ~5min)** — `CHANGELOG.md` — add a "BREAKING" migration note: the
       bare `docker run agentos:full` (no command) default changed from `shell` to `cockpit`; scripts/CI
       relying on the old fast-exit shell behavior should append `shell` explicitly.
       - Surfaced by: DX Dual-voice (Codex finding — migration risk).
       - Files: `CHANGELOG.md`
-      - Verify: manual review.
+      - **Deferred to `/ship`**: this repo's merge-discipline rule (`docs/prompts/13-parallel-dev-rules.md`
+        RULE 2) assigns the version bump + CHANGELOG entry at merge time against current `main`, not at
+        branch-cut, to avoid the exact version-slot collision this repo hit on ux.0/cos-polish. The
+        migration-note content is drafted and ready; only the version heading is pending.
 - [ ] **T8 (P3, human: ~15min / CC: ~5min)** — `docs/ROADMAP.md` — check off ux.9 on ship.
       - Files: `docs/ROADMAP.md`
-- [ ] **T9 (P3, human: ~30min / CC: ~10min)** — `TODOS.md` — log: (a) `orchestrate)`'s pre-existing
+      - **Deferred to `/ship`** for the same version-collision-avoidance reason as T7 (this repo's
+        shipped-line convention embeds the version number, e.g. "shipped (v0.77.0)").
+- [x] **T9 (P3, human: ~30min / CC: ~10min)** — `TODOS.md` — log: (a) `orchestrate)`'s pre-existing
       missing-`check_api_key` gap, (b) `orchestrate)`'s pre-existing `set -e`-swallows-cleanup bug
       (same root cause as T1's fix, worth a cheap backport), (c) the `docker stop`-may-not-cleanly-stop-
       the-TUI-process shared limitation, (d) the 5 deferred expansion candidates from CEO 0D
