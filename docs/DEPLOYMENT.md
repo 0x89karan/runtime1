@@ -116,6 +116,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 docker run --rm -it \
   --name agentos-cos \
   --privileged \
+  -p 127.0.0.1:7999:7999 \
   -e ANTHROPIC_API_KEY \
   -e "TRIGGER_INTERVAL=every 2m" \
   -v ~/.agentos-secrets:/run/secrets:ro \
@@ -123,8 +124,8 @@ docker run --rm -it \
   -v ~/.agentos-data:/data \
   ghcr.io/0x89karan/runtime1:full cos
 
-# 7. Watch the agents (second terminal; needs the --name from step 6)
-docker exec -it agentos-cos agentctl watch
+# 7. Watch the agents (second terminal, directly from the Mac host — no docker exec needed)
+agentctl watch --url http://localhost:7999
 
 # 8. Read the brief (after the first cycle, ~2-3 min)
 cat ~/.agentos-output/brief-$(date +%Y-%m-%d).md

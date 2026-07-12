@@ -1101,6 +1101,18 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   **Host-loopback reachability split to ux.0b** (`docs/plans/ux.0b-host-loopback-reachability.md`) — it hit
   the `management.rs` fail-closed loopback guard + unauthenticated-API Docker-bridge exposure (needs a
   security decision).
+- ~~**ux.0b** — Host-loopback reachability~~ ✅ **shipped** — Option A (gated override):
+  `[management] allow_non_loopback` opt-in (default false) relaxes the fail-closed loopback guard;
+  `agentd/cos.agents.toml` + the QEMU overlay set `bind_addr = "0.0.0.0"` + `allow_non_loopback = true`
+  (also fixes the pre-existing QEMU management-API-refuses-to-start conflict); `docker-compose.yml`
+  publishes `127.0.0.1:7999:7999` (never bare `7999`), with `cos`/`agent` split onto separate Compose
+  networks (`cos-net`/`agent-net`) so `agent`'s untrusted/web-fetching templates can't reach `cos`'s
+  unauthenticated management API on the bridge (ux.0b-ar-01, fixed same PR after convergent ship-stage
+  adversarial review); `docs/DEPLOYMENT.md` + `docs/RUNBOOK.md` now use
+  `agentctl watch --url http://localhost:7999` directly from the Mac host, no `docker exec` workaround;
+  THREAT_MODEL.md §9 documents the unauthenticated-API exposure this accepts under the single-tenant
+  lock, deferring per-session auth to **ux.5** and the `allow_non_loopback` unscoped-bypass gap to
+  `ux.0b-ar-02` (TODOS.md).
 - **ux.2** — Observe (closes **cos-ux-01**): `last_activity`/`last_error`/`idle_secs` on the snapshot;
   agent-table `LAST-TOOL` + row-red-on-error + `idle→amber` stuck signal; live summary-first event
   stream (JSON on expand, filter chips, freeze, row-scopes-stream); AgentDetail timeline.

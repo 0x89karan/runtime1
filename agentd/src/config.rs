@@ -207,9 +207,16 @@ pub struct ManagementConfig {
     /// TCP port to bind (loopback only). Defaults to 7999.
     #[serde(default = "default_management_port")]
     pub port: u16,
-    /// Bind address. Must resolve to loopback; agentd refuses to start otherwise.
+    /// Bind address. Must resolve to loopback unless `allow_non_loopback` is set;
+    /// agentd refuses to start otherwise.
     #[serde(default = "default_management_bind_addr")]
     pub bind_addr: String,
+    /// Explicit deployment opt-in to bind a non-loopback address (e.g. `0.0.0.0`
+    /// so a container's `-p` mapping can reach it from the host). The management
+    /// API is unauthenticated; setting this exposes spawn/inject/approve/deny to
+    /// every peer that can reach the bound address. Defaults to false.
+    #[serde(default)]
+    pub allow_non_loopback: bool,
 }
 
 fn default_management_port() -> u16 {
@@ -222,9 +229,10 @@ fn default_management_bind_addr() -> String {
 impl Default for ManagementConfig {
     fn default() -> Self {
         Self {
-            enabled:   false,
-            port:      default_management_port(),
-            bind_addr: default_management_bind_addr(),
+            enabled:            false,
+            port:               default_management_port(),
+            bind_addr:          default_management_bind_addr(),
+            allow_non_loopback: false,
         }
     }
 }
@@ -696,6 +704,38 @@ impl McpServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_config_default_denies_non_loopback() {
+        let cfg = ManagementConfig::default();
+        assert_eq!(cfg.bind_addr, "127.0.0.1");
+        assert!(!cfg.allow_non_loopback);
+    }
+
+    #[test]
+    fn management_config_parses_allow_non_loopback_opt_in() {
+        let raw = r#"
+enabled = true
+bind_addr = "0.0.0.0"
+allow_non_loopback = true
+"#;
+        let cfg: ManagementConfig = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.bind_addr, "0.0.0.0");
+        assert!(cfg.allow_non_loopback);
+    }
+
+    #[test]
+    fn management_config_omitted_allow_non_loopback_defaults_false() {
+        // Distinct from `management_config_default_denies_non_loopback` (which
+        // tests `ManagementConfig::default()` directly): this exercises the
+        // `#[serde(default)]` attribute through a real `toml::from_str` parse,
+        // the actual code path a deployment's TOML file goes through.
+        let raw = r#"
+enabled = true
+"#;
+        let cfg: ManagementConfig = toml::from_str(raw).unwrap();
+        assert!(!cfg.allow_non_loopback);
+    }
 
     #[test]
     fn full_config_round_trips() {

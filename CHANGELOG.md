@@ -3,6 +3,29 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.80.0] - 2026-07-12
+
+### Added
+- **`[management] allow_non_loopback`** (Track UX cockpit, ux.0b): explicit deployment opt-in
+  (default `false`) that lets `agentd`'s management API bind a non-loopback address; the
+  fail-closed guard still refuses `0.0.0.0` for any config that doesn't set the flag.
+
+### Changed
+- **`agentctl watch --url http://localhost:7999` now works directly against the Docker `cos`
+  container from the Mac host** — no `docker exec`/`docker compose exec` workaround needed.
+  `agentd/cos.agents.toml` + the QEMU overlay config both opt in (`bind_addr = "0.0.0.0"` +
+  `allow_non_loopback = true`); `docker-compose.yml` publishes the port pinned to host loopback
+  (`127.0.0.1:7999:7999`, never bare `7999`). This also fixes a pre-existing bug where the QEMU
+  deployment's `0.0.0.0` bind silently failed the loopback guard and the management API never
+  started there at all.
+- **`docker-compose.yml` network segmentation**: `cos` and `agent` (+ its `semantic`-profile
+  sidecars) now run on separate Compose networks (`cos-net` / `agent-net`) instead of sharing
+  Compose's single default bridge, so `agent`'s untrusted/web-fetching template workloads can't
+  reach `cos`'s unauthenticated management API over the network.
+- `docs/DEPLOYMENT.md` and `docs/RUNBOOK.md` updated to the new direct-host-URL workflow.
+- `docs/THREAT_MODEL.md` documents the management API's unauthenticated exposure, the accepted
+  deployment-hygiene gaps, and defers per-session auth to the future web-cockpit increment (ux.5).
+
 ## [v0.79.0] - 2026-07-12
 
 ### Fixed — KB segment visibility at startup (cos-polish #3)

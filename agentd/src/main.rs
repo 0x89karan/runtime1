@@ -1092,6 +1092,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         match agentd::management::start(
             &cfg.management.bind_addr,
             cfg.management.port,
+            cfg.management.allow_non_loopback,
             Arc::clone(&snapshot),
             memory_store_for_management,
             broadcast_tx.clone(),
@@ -2118,6 +2119,86 @@ mod tests {
         assert_fs_read(
             include_str!("../../distro/overlay/etc/agentd/cos.agents.toml"),
             "distro/overlay/etc/agentd/cos.agents.toml",
+        );
+    }
+
+    // ── ux.0b: shipped cos configs must pair a non-loopback bind_addr with the
+    // explicit allow_non_loopback opt-in, or agentd's management::start guard
+    // refuses to bind — this is the pre-existing QEMU conflict ux.0b fixes. ──
+
+    #[test]
+    fn cos_configs_pair_non_loopback_bind_with_opt_in() {
+        fn assert_non_loopback_opted_in(raw: &str, label: &str) {
+            let cfg: agentd::config::Config =
+                toml::from_str(raw).unwrap_or_else(|e| panic!("{label} must parse: {e}"));
+            if cfg.management.bind_addr != "127.0.0.1" {
+                assert!(
+                    cfg.management.allow_non_loopback,
+                    "{label}: bind_addr={:?} is non-loopback but allow_non_loopback is false — \
+                     agentd's management::start guard will refuse to bind",
+                    cfg.management.bind_addr
+                );
+            }
+        }
+        assert_non_loopback_opted_in(include_str!("../cos.agents.toml"), "agentd/cos.agents.toml");
+        assert_non_loopback_opted_in(
+            include_str!("../../distro/overlay/etc/agentd/cos.agents.toml"),
+            "distro/overlay/etc/agentd/cos.agents.toml",
+        );
+    }
+
+    // ── ux.0b (adversarial-review follow-up): docker-compose.yml's management-
+    // port publish must stay pinned to host loopback. This has no YAML-parsing
+    // dependency (agentd stays a light runtime — see CLAUDE.md); a substring
+    // check is enough to catch the one-line regression that matters: reverting
+    // to a bare `7999:7999` publish, which LAN-exposes the unauthenticated
+    // management API. ──
+
+    #[test]
+    fn compose_management_port_is_loopback_pinned() {
+        // Scoped to the `cos:` service block specifically — a whole-file substring
+        // check (the original version of this test) passes as long as the safe
+        // string appears ANYWHERE in the file, even in a comment, even alongside
+        // an unsafe second port mapping added elsewhere in the same service.
+        // Adversarial review (ux.0b ship pass) confirmed both bypasses reproduce
+        // against the naive check; this version asserts there is exactly one
+        // `ports:` list item under `cos:`, and it is the loopback-pinned mapping.
+        let raw = include_str!("../../docker-compose.yml");
+        let lines: Vec<&str> = raw.lines().collect();
+        let cos_start = lines
+            .iter()
+            .position(|l| l.trim_end() == "  cos:")
+            .expect("docker-compose.yml must define a `cos:` service");
+        let cos_end = lines[cos_start + 1..]
+            .iter()
+            .position(|l| !l.trim().is_empty() && !l.starts_with("    "))
+            .map(|i| cos_start + 1 + i)
+            .unwrap_or(lines.len());
+        let cos_block = &lines[cos_start..cos_end];
+
+        let ports_line = cos_block
+            .iter()
+            .position(|l| l.trim() == "ports:")
+            .expect("cos service must declare a `ports:` mapping");
+        let port_items: Vec<&str> = cos_block[ports_line + 1..]
+            .iter()
+            .take_while(|l| l.trim_start().starts_with('-'))
+            .copied()
+            .collect();
+
+        assert_eq!(
+            port_items.len(),
+            1,
+            "cos service must publish exactly one port mapping (the loopback-pinned \
+             management API); found: {port_items:?}"
+        );
+        assert_eq!(
+            port_items[0].trim(),
+            "- \"127.0.0.1:7999:7999\"",
+            "cos service's only port mapping must be pinned to host loopback \
+             (127.0.0.1:7999:7999) — never bare, never 0.0.0.0, never a different host IP; \
+             got: {:?}",
+            port_items[0]
         );
     }
 

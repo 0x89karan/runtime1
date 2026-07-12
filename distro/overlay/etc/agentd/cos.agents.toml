@@ -20,12 +20,15 @@
 # See docs/DEPLOYMENT.md for the full setup guide.
 
 # ---------------------------------------------------------------------------
-# Management HTTP API — exposed at :7999 inside the VM, hostfwd'd to the host
+# Management HTTP API — exposed at :7999 inside the VM, hostfwd'd to the host.
+# allow_non_loopback is required (ux.0b): the guard refuses a non-loopback
+# bind_addr unless this is set explicitly — see THREAT_MODEL.md.
 # ---------------------------------------------------------------------------
 [management]
-enabled   = true
-port      = 7999
-bind_addr = "0.0.0.0"   # required: lets QEMU hostfwd reach the API from outside
+enabled            = true
+port               = 7999
+bind_addr          = "0.0.0.0"   # required: lets QEMU hostfwd reach the API from outside
+allow_non_loopback = true
 
 # ---------------------------------------------------------------------------
 # Shared model config

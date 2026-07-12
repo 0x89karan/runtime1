@@ -62,12 +62,22 @@ max_tokens = 8192
 streaming  = true
 
 # ---------------------------------------------------------------------------
-# Management HTTP API (dev mode — loopback only)
+# Management HTTP API — bound 0.0.0.0 so the compose `127.0.0.1:7999:7999`
+# port mapping can reach it from the Mac host (Docker `-p` cannot reach a
+# service bound to 127.0.0.1 *inside* the container). allow_non_loopback is
+# the explicit opt-in the guard requires for a non-loopback bind_addr; the
+# API is unauthenticated, so this is scoped to the Docker bridge network and
+# published to the host on loopback only — see THREAT_MODEL.md.
+#
+# ⚠ This config is baked into the Docker image and assumes the Docker NAT
+# boundary. If you run it directly on bare metal (`cargo run -- cos.agents.toml`,
+# no container), 0.0.0.0 binds to every interface on your machine, including
+# the LAN — there is no Docker port-publish step to re-scope it to loopback.
 # ---------------------------------------------------------------------------
 [management]
-enabled = true
-# bind_addr defaults to "127.0.0.1" — loopback only (safe for dev mode).
-# The QEMU overlay config uses "0.0.0.0" so hostfwd can reach the API from the host.
+enabled            = true
+bind_addr          = "0.0.0.0"
+allow_non_loopback = true
 
 # ---------------------------------------------------------------------------
 # Scheduler

@@ -1,3 +1,11 @@
+networks:
+  # cos and agent are segmented onto separate networks (ux.0b-ar-01 fix):
+  # cos's management API is unauthenticated, and agent runs arbitrary/
+  # web-fetching templates that would otherwise share Compose's single
+  # default bridge with cos and could reach cos:7999. See THREAT_MODEL.md §9.2.
+  cos-net: {}
+  agent-net: {}
+
 services:
   cos:
     image: ${AGENTOS_IMAGE:-agentos:dev}
@@ -6,6 +14,12 @@ services:
       target: runtime-full
     # FUSE requires privileged mode (needed for agentctl watch + /agents filesystem)
     privileged: true
+    networks: [cos-net]
+    # Management API (:7999, unauthenticated) — host loopback ONLY. Never
+    # publish bare `7999:7999`; that exposes spawn/inject/approve/deny to the
+    # LAN. See THREAT_MODEL.md for the Docker-bridge exposure this accepts.
+    ports:
+      - "127.0.0.1:7999:7999"
     volumes:
       # Named volume for all runtime state — no repo bind mount, no checkpoint bleed-through
       - cos-data:/data
@@ -36,6 +50,12 @@ services:
       target: runtime-full
     # FUSE requires privileged mode (needed for /agents filesystem + agentctl watch)
     privileged: true
+    networks: [agent-net]
+    # This service's templates (scout, librarian, ...) run untrusted/LLM-driven
+    # workloads — on a separate network from `cos` (ux.0b-ar-01) so they can't
+    # reach cos's unauthenticated management API. If you enable [management]
+    # here too, keep bind_addr=127.0.0.1 (the default) and never publish a
+    # port for it. See THREAT_MODEL.md §9.
     volumes:
       - agent-data:/data
       # Secrets provisioned by `agentctl auth google` on the Mac host (read-only)
@@ -105,9 +125,11 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.13.6
     profiles: [semantic]
+    networks: [agent-net]
     volumes:
       - qdrant-data:/qdrant/storage
-    # Qdrant is only reachable by services in this compose network — not exposed to the host.
+    # Qdrant is only reachable by services on agent-net — not exposed to the host,
+    # and not reachable from cos (separate network, ux.0b-ar-01).
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:6333/healthz"]
       interval: 10s
@@ -120,6 +142,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile.semantic-kb-mcp
     profiles: [semantic]
+    networks: [agent-net]
     environment:
       - VOYAGE_API_KEY
       - VOYAGE_MODEL=${VOYAGE_MODEL:-voyage-3-lite}

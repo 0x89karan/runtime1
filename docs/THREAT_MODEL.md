@@ -544,7 +544,128 @@ cred.3.2):
 
 ---
 
-## 9. Summary table
+## 9. Management HTTP API reachability (ux.0b)
+
+The management API (`agentd/src/management.rs`, `:7999` by default) exposes
+scheduler snapshot, memory, approvals, credentials, spawn, and inject over
+plain HTTP — **it is unauthenticated.** There is no bearer token, session
+cookie, or Origin/Host check: any peer that can open a TCP connection to the
+bound address can approve/deny pending actions, inject a turn into a running
+agent, or spawn a new one.
+
+### §9.1 Loopback-by-default guard
+
+`agentd` refuses to start the management API on a non-loopback address unless
+the deployment explicitly opts in:
+
+```
+ensure!(bound.ip().is_loopback() || cfg.allow_non_loopback, …)
+```
+
+The default config (`bind_addr = "127.0.0.1"`, `allow_non_loopback = false`)
+is unaffected by this increment — the guard still refuses `0.0.0.0` for any
+config that doesn't set the flag.
+
+**Gap:** `allow_non_loopback` is an unscoped bypass, not a Docker-bridge-only
+one — the guard is a plain `||`, so once the flag is true, the code itself
+does not distinguish a Docker bridge address from a real LAN or public NIC.
+The mitigation for that distinction lives entirely in operator judgment (only
+pair the flag with `bind_addr`s that are actually container-internal), not in
+the mechanism. Copying the exact `agentd/cos.agents.toml` pattern
+(`bind_addr = "0.0.0.0"`, `allow_non_loopback = true`) onto a bare-metal host
+or a cloud VM without Docker's NAT boundary exposes the full unauthenticated
+control plane (spawn/inject/approve/deny/credentials) to whatever network
+that interface actually reaches. Narrowing the guard (e.g. restricting the
+opt-in to RFC 1918/link-local ranges) was considered out of scope for this
+increment's Option A (gated override, smallest change); tracked as a
+follow-up in TODOS.md.
+
+### §9.2 The Docker-bridge exposure this increment accepts
+
+Docker's `-p`/`ports:` host-port mapping cannot reach a process bound to
+`127.0.0.1` *inside* the container — the mapping targets the container's
+network namespace, not its loopback interface. To make `agentctl watch --url
+http://localhost:7999` work from the Mac host against the `cos` container,
+`agentd/cos.agents.toml` and `distro/overlay/etc/agentd/cos.agents.toml` now
+set `bind_addr = "0.0.0.0"` + `allow_non_loopback = true` — an explicit,
+per-deployment opt-in, not a change to agentd's default.
+
+Binding `0.0.0.0` inside the container exposes the unauthenticated API to
+**every peer on the same Compose network** the container is attached to, not
+just the host loopback interface that `docker-compose.yml` publishes to
+(`127.0.0.1:7999:7999` — never bare `7999:7999`).
+
+**Finding (ux.0b ship-stage adversarial review) and fix, same PR:** an
+earlier draft of this section claimed the bridge "has no other services on
+it besides operator-controlled sidecars" — that was **false**.
+`docker-compose.yml` originally had no `networks:` stanza, so Compose put
+every service it defines — `cos`, `agent`, and (under the `semantic`
+profile) `qdrant`/`semantic-kb-mcp` — on the same default bridge network.
+`agent` is not an operator-controlled sidecar: it is the documented,
+ordinary way to run an arbitrary template (`docker compose run --rm agent`,
+`docs/DEPLOYMENT.md`), including templates with live `http_fetch`/`web_search`
+capabilities that process untrusted web content. A prompt-injected or
+otherwise misbehaving `agent` container could reach `cos:7999` on the bridge
+with no host-network exposure required at all — just the project's own two
+documented commands (`docker compose up cos` + `docker compose run --rm
+agent`) run together, an ordinary dogfooding pattern, not an
+attacker-controlled scenario. Three independent reviewers (Claude structured
++ adversarial, Codex adversarial, and an independent outside-voice pass) all
+converged on this being reachable via the default quickstart with no
+misconfiguration required, which raised it above the bar for "defer to a
+follow-up" — **`docker-compose.yml` now defines separate `cos-net` /
+`agent-net` networks**: `cos` is alone on `cos-net`; `agent`, `qdrant`, and
+`semantic-kb-mcp` share `agent-net`. `agent` can no longer reach `cos:7999`
+on the Compose bridge. Verified via `docker compose config` showing each
+service's resolved network membership.
+
+**Remaining gap:** an operator who attaches an untrusted or third-party
+container directly to `cos-net` still gives that container the same
+unauthenticated control (spawn, inject, approve, deny) — that is a
+deployment-hygiene requirement this fix does not (and cannot) enforce.
+`allow_non_loopback` also remains an unscoped bypass rather than one limited
+to Docker-internal ranges specifically — tracked as `ux.0b-ar-02` (P3) in
+TODOS.md, a design decision (IP-range scoping) deliberately left out of this
+increment's Option-A ("smallest change") scope.
+
+The QEMU deployment has always set `bind_addr = "0.0.0.0"` (so `hostfwd` can
+reach it) but — until this increment — the guard silently refused to start
+the management API there at all; `allow_non_loopback = true` in the overlay
+config fixes that pre-existing conflict rather than expanding QEMU's
+exposure (QEMU's hostfwd already scopes `:7999` to the host's loopback).
+
+### §9.3 Follow-up: per-session auth (deferred to ux.5)
+
+Auth (a per-session bearer token) is the only option that actually closes the
+Docker-bridge exposure in §9.2. It was considered and deferred (Option C in
+`docs/plans/ux.0b-host-loopback-reachability.md`) because the cockpit's only
+*first-party* consumer today is `agentctl` on a Mac/Linux host the operator
+controls.
+
+**Correction (found during adversarial review — this browser risk is already
+live, not a future one):** the moment `docker-compose.yml` publishes
+`127.0.0.1:7999:7999`, *any* webpage open in the operator's own browser on
+that host — not just a future ux.5 cockpit page — can already reach
+`http://localhost:7999` the same way any localhost dev server is reachable
+from browser JavaScript. The management API has no Host/Origin check and no
+CORS policy, and several routes (e.g. `POST /api/v1/spawn`) accept a JSON
+body; a request sent with `Content-Type: text/plain` is a CORS-simple
+request that the browser will send without a preflight, so the server-side
+handler executes even though the page can't read the response — a classic
+localhost CSRF pattern. This is a real, present-day gap this increment
+introduces (previously the port wasn't published to the host at all), not
+merely a future one. Ranked P1 for the ux.5 build (that increment must not
+ship a browser-facing cockpit without closing this), but not blocking ux.0b
+itself: the plan's Option-A decision explicitly accepted the "no auth yet"
+tradeoff for the `agentctl`-only consumer model, and adding auth now is a
+scope expansion the /plan-eng-review gate didn't approve. **Revisit at
+ux.5** — that increment adds a *new*, browser-native consumer and so is the
+right place to add both a bearer token and an Origin/Host allowlist; it is
+not the point at which this CSRF exposure first appears.
+
+---
+
+## 10. Summary table
 
 | Threat | Control | Gaps |
 |---|---|---|
@@ -566,3 +687,4 @@ cred.3.2):
 | Credential header injection (cred.3+) | See §8.5 | Allow-list enforced (v0.61.0+); x-goog-user-project blocked (billing injection) |
 | Universal-tier credential access | See §8.6 | Not implemented; deferred to cred.4/5 |
 | Egress content scan | See §8.7 | NOT IMPLEMENTED; no credential-shaped token scanning in tool output |
+| Management API unauthenticated access (ux.0b+) | See §9 | Loopback guard defaults on; `cos`/`agent` network-segmented (ux.0b-ar-01, fixed); `allow_non_loopback` opt-in still unscoped rather than Docker-bridge-limited (ux.0b-ar-02, open); no auth until ux.5 |

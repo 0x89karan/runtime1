@@ -1,5 +1,30 @@
 # TODOS
 
+## ux.0b — Open (deferred from ship-stage adversarial pass, 2026-07-12)
+
+Host-loopback reachability (Option A, gated `[management] allow_non_loopback`). The build-stage
+`/review` adversarial pass surfaced two gaps; the ship-stage adversarial pass (Claude + Codex +
+independent outside voice, all three convergent) recommended fixing the network-segmentation gap
+now rather than deferring it, since it's reachable via the project's own documented quickstart
+commands with no misconfiguration required — so it was fixed in this increment. One gap remains
+a genuine follow-up (a design decision beyond Option A's "smallest change" scope):
+
+- **ux.0b-ar-02 (P3) — `allow_non_loopback` is an unscoped bypass, not Docker-bridge-limited.**
+  `agentd/src/management.rs`'s guard is a plain `bound.ip().is_loopback() || allow_non_loopback` —
+  once true, nothing in code distinguishes a Docker-internal address from a real LAN/public NIC.
+  The exact `agentd/cos.agents.toml` pattern (`bind_addr = "0.0.0.0"`, `allow_non_loopback = true`)
+  would be unsafe if copy-pasted onto bare metal or a cloud VM without Docker's NAT boundary. Fix:
+  consider scoping the opt-in (e.g. restrict to RFC 1918/link-local ranges) or requiring a second,
+  more explicit acknowledgement. `agentd/src/management.rs:441`; THREAT_MODEL.md §9.1 documents
+  this as an accepted, unresolved gap.
+
+**~~ux.0b-ar-01 (P2) — `cos` and `agent` Compose services shared the same default bridge network.~~**
+**FIXED (same PR, ship-stage adversarial round):** `docker-compose.yml` now defines explicit
+`cos-net` / `agent-net` networks — `cos` is alone on `cos-net`; `agent`, `qdrant`, and
+`semantic-kb-mcp` share `agent-net`. `agent` (which runs arbitrary/untrusted templates with live
+`http_fetch`/`web_search`) can no longer reach `cos:7999`'s unauthenticated management API on the
+Compose bridge. Verified via `docker compose config` showing each service's resolved network.
+
 ## v0.60 whole-system audit (2026-07-06)
 
 Read-only audit: 7 parallel reviewers (Claude + Codex) across every crate + docs, main @ e2ec0e47.

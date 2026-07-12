@@ -696,9 +696,8 @@ TRIGGER_INTERVAL="every 2m"   # cos default; accepts cron expressions too
 # Start the CoS (runs continuously; Ctrl-C to stop)
 docker compose up cos
 
-# Watch in a second terminal:
-docker compose exec cos agentctl watch --url http://localhost:7999
-# or, from the host (if management API exposed):
+# Watch in a second terminal, directly from the host (ux.0b: docker-compose.yml
+# publishes the management API to 127.0.0.1:7999:7999 by default — no docker exec needed):
 agentctl watch --url http://localhost:7999
 ```
 
@@ -757,8 +756,10 @@ jq 'select(.kind=="REQUEST_APPROVAL" or .kind=="APPROVAL_GRANTED" or .kind=="APP
 # From inside the container:
 docker compose exec cos agentctl watch --agents-dir /agents
 
-# From the host via management API (p7.7+) — requires port forwarding in docker-compose.yml:
-#   ports: ["7999:7999"]   (under the 'cos' service; not enabled by default)
+# From the host via the management API (p7.7+; ux.0b made this the default) —
+# docker-compose.yml publishes it pinned to host loopback ONLY. Never change
+# this to bare `ports: ["7999:7999"]`; that exposes spawn/inject/approve/deny
+# (unauthenticated) to the LAN. See THREAT_MODEL.md §9.
 agentctl watch --url http://localhost:7999
 ```
 

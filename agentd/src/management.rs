@@ -419,10 +419,13 @@ fn parse_pagination(query: &str) -> (usize, usize) {
 /// # Errors
 /// Returns an error if:
 /// - Binding fails (port in use, permission denied).
-/// - The resolved address is not loopback (misconfiguration guard).
+/// - The resolved address is not loopback and `allow_non_loopback` is false
+///   (misconfiguration guard; the API is unauthenticated).
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     bind_addr: &str,
     port: u16,
+    allow_non_loopback: bool,
     snapshot: SharedSnapshot,
     memory_store: Option<Arc<dyn MemoryStore>>,
     broadcast_tx: broadcast::Sender<String>,
@@ -436,15 +439,25 @@ pub async fn start(
     let bound = listener.local_addr()?;
 
     anyhow::ensure!(
-        bound.ip().is_loopback(),
-        "management: refusing to bind on non-loopback address {bound} — API must be localhost-only"
+        bound.ip().is_loopback() || allow_non_loopback,
+        "management: refusing to bind on non-loopback address {bound} — API must be localhost-only \
+         (set [management] allow_non_loopback = true to opt in explicitly)"
     );
+
+    let non_loopback_opt_in = !bound.ip().is_loopback();
+    if non_loopback_opt_in {
+        tracing::warn!(
+            addr = %bound,
+            "management API bound to a non-loopback address via allow_non_loopback — \
+             the API is unauthenticated; see THREAT_MODEL.md §9"
+        );
+    }
 
     recorder.record(
         "management",
         None,
         EventKind::ManagementStarted,
-        json!({"addr": bound.to_string()}),
+        json!({"addr": bound.to_string(), "non_loopback_opt_in": non_loopback_opt_in}),
     );
 
     let state = Arc::new(ApiState {
@@ -643,10 +656,12 @@ mod tests {
         let recorder = Arc::new(
             crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap(),
         );
-        // 0.0.0.0:0 binds successfully but is not loopback — guard should fire.
+        // 0.0.0.0:0 binds successfully but is not loopback — guard should fire
+        // when allow_non_loopback is unset (the default).
         let result = start(
             "0.0.0.0",
             0,
+            false,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
             None,
             tx,
@@ -657,6 +672,122 @@ mod tests {
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("non-loopback"), "expected non-loopback error, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn loopback_guard_allows_non_loopback_with_opt_in() {
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap(),
+        );
+        // Same non-loopback bind, but allow_non_loopback=true is the explicit
+        // deployment opt-in — the guard must permit it.
+        let result = start(
+            "0.0.0.0",
+            0,
+            true,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+            tx,
+            recorder,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "expected bind to succeed with allow_non_loopback=true, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn management_started_event_flags_non_loopback_opt_in() {
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap(),
+        );
+        start(
+            "0.0.0.0",
+            0,
+            true,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+            tx,
+            recorder,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = logged
+            .lines()
+            .find_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                (v["kind"] == "management_started").then_some(v)
+            })
+            .expect("management_started event must be recorded");
+        assert_eq!(
+            event["data"]["non_loopback_opt_in"], true,
+            "management_started event must flag non_loopback_opt_in so operators \
+             have an audit signal when the unauthenticated API bypass is active"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_guard_allows_loopback_default() {
+        // Completes the guard's truth table (ux.0b coverage audit): the other two
+        // combinations bind on the default/most common path — loopback with the
+        // opt-in unset, and loopback with the opt-in set as a harmless no-op.
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap(),
+        );
+        let result = start(
+            "127.0.0.1",
+            0,
+            false,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+            tx,
+            recorder,
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "expected loopback bind to succeed by default, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn management_started_event_false_on_loopback_default() {
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap(),
+        );
+        start(
+            "127.0.0.1",
+            0,
+            false,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+            tx,
+            recorder,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let logged = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = logged
+            .lines()
+            .find_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).ok()?;
+                (v["kind"] == "management_started").then_some(v)
+            })
+            .expect("management_started event must be recorded");
+        assert_eq!(
+            event["data"]["non_loopback_opt_in"], false,
+            "management_started event must NOT flag non_loopback_opt_in on the default loopback path"
+        );
     }
 
     #[tokio::test]

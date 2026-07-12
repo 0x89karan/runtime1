@@ -116,7 +116,7 @@ Phase 0 kinds (canonical — do not rename):
 | `universal_agent_isolation_degraded` | `runsc` missing; fell back to unsandboxed exec (id, reason) (p7.6+) |
 | `scheduler_started` | agentd boot complete; emits `run_id` (UUID v4) used as the OTLP trace root + `config_hash` (obs.1+) |
 | `scheduler_stopped` | agentd graceful shutdown; emits `run_id` + `agent_count` (obs.1+) |
-| `management_started` | management HTTP API bound and ready (addr) (p7.7+) |
+| `management_started` | management HTTP API bound and ready (addr, non_loopback_opt_in: bool) (p7.7+; non_loopback_opt_in added ux.0b) |
 | `management_request` | management HTTP API received a request (method, path, status: u16) (p7.7+) |
 | `approval_http_approved` | operator approved a pending action via the HTTP management API (id, agent_id) (dx.2+) |
 | `approval_http_denied` | operator denied a pending action via the HTTP management API (id, agent_id, reason: Option<String>) (dx.2+) |
