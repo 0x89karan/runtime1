@@ -48,7 +48,7 @@ AGENTOS_IMAGE=ghcr.io/0x89karan/runtime1:full docker compose up cos
 - If `AGENTOS_IMAGE` names an image that doesn't exist locally, Compose builds it from source.
   Run `make dev-image` first to avoid a surprise 15-min build.
 - If a build gets stuck or produces stale layers, clear the BuildKit cache: `docker builder prune`.
-- **BREAKING (ux.9, v0.81.0+):** the image's zero-arg default changed from `shell` to `cockpit` —
+- **BREAKING (ux.9, v0.82.0+):** the image's zero-arg default changed from `shell` to `cockpit` —
   a bare `docker run agentos:dev` now cold-starts `agentd` with zero agents and attaches
   `agentctl watch`, instead of dropping into a bash shell. This does NOT affect
   `docker compose up cos` / `docker compose run --rm agent` — both set an explicit `command:`
