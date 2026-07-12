@@ -115,10 +115,31 @@ name  = "ops:entities"
 class = "scratch"
 # Named entities (people, open items, commitments) — last-writer-wins with version counter.
 
+[[memory.segments]]
+name  = "mail:raw"
+class = "scratch"
+# Raw email bodies indexed via L2 semantic KB (Qdrant + OpenAI embeddings).
+# Keyed by Gmail message ID; content is plain-text body (up to 8 KB per message).
+# Evicted after SEMANTIC_MAX_AGE_DAYS (default 30 days).
+
 # ---------------------------------------------------------------------------
 # Shared MCP servers — ALL servers must be declared here; children receive a
 # filtered view via their capabilities field.
 # ---------------------------------------------------------------------------
+
+# semantic-kb: Layer-2 semantic KB sidecar (h8.1 / memory-routing).
+# tool_override = true → ALL kb_put/kb_search/kb_get calls route to this sidecar (Qdrant +
+# OpenAI embeddings) instead of the native L1 BM25 core. Binary mode: sidecar-on = full L2.
+# Dev mode: comment out this block to fall back to L1 core (no Qdrant/OpenAI needed).
+# NOTE: L1 log-class append semantics are lost via tool_override. The L1 store ignores the
+# key for log-class segments (assigns monotonic hex seq). Qdrant uses the key as UUID5 input,
+# so a restart + same-day rerun will overwrite ops:briefs rather than append. Accepted tradeoff
+# of Option A (binary routing); low operational risk since orchestrator restarts are rare.
+[[tools.mcp_servers]]
+name               = "semantic-kb"
+url                = "http://semantic-kb-mcp:8020"
+allow_insecure_local = true
+tool_override      = true
 
 # cron_trigger: wakes the orchestrator on schedule
 [[tools.mcp_servers]]
@@ -183,7 +204,11 @@ capabilities = [
   { KbWrite = { segment = "ops:briefs"   } },
   { KbRead  = { segment = "ops:entities" } },
   { KbWrite = { segment = "ops:entities" } },
-  { Mcp    = { server = "cron_trigger", tools = [] } },
+  # mail:raw — raw email bodies stored in L2 semantic KB by the inbox agent.
+  { KbRead  = { segment = "mail:raw"     } },
+  { KbWrite = { segment = "mail:raw"     } },
+  { Mcp    = { server = "semantic-kb",   tools = [] } },
+  { Mcp    = { server = "cron_trigger",  tools = [] } },
   # google_oauth is needed so the spawned inbox child inherits access to OAuth tools.
   # Without this, filtered_specs omits google_oauth from the child's tool list.
   { Mcp    = { server = "google_oauth",  tools = [] } },
@@ -238,12 +263,20 @@ STEP 1 — Check Gmail authentication:
        The operator will click the URL, sign in, and approve.
     c. Call oauth_check_auth() again. If still not ready, wait 30s and retry.
 
-STEP 2 — Fetch recent emails:
+STEP 2 — Fetch and store recent emails (with dedup):
   Call oauth_call_api(method='GET',
     url='https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=newer_than:1d')
-  For each important message (up to 20), fetch its full content:
-    oauth_call_api(method='GET',
-      url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
+  For each message ID in the list:
+    a. Dedup check: kb_get(segment='mail:raw', key='{id}')
+       If content is present → skip the API fetch; use stored body for analysis.
+    b. If not cached: fetch full content:
+         oauth_call_api(method='GET',
+           url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
+       Store it: kb_put(segment='mail:raw', key='{id}',
+                         content=<plain-text body, truncate to 8 KB>)
+       If kb_put returns an error: truncate body to 4 KB and retry once.
+       If it still fails: skip storage, use the body in-memory for analysis only.
+  Analyze up to 20 messages (cached + new) ranked by importance for STEP 3.
 
 STEP 3 — Produce a structured OperatingBrief:
 IMPORTANT — keep the JSON compact (KB entry limit is 8 KB):
