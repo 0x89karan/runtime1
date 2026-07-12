@@ -82,7 +82,14 @@ blew their token budget. Ground truth via FUSE: the data **is** there —
 - Moving raw emails to the semantic KB (that's the `memory-routing` plan — related, but separate).
 
 ## Done
-On Mac+Docker: the CoS reads Gmail, writes a **readable markdown brief to `~/.agentos-output/brief-*.md`**,
-the KB is findable from the memory pane and from `kb_search`, the inbox run completes without
-`budget_exceeded`, and the interactive orchestrator answers cleanly (no swallowed answers, no 400s). Every
-fix has a test that fails without it.
+- **#1** (FsWrite capability): `{ FsWrite = { prefix = "./output" } }` added to orchestrator caps (v0.78.0).
+- **#5** (inbox token budget): raised to 1.5M; maxResults kept at 50 (v0.78.0, PR #108).
+- **#7** (orchestrator max_turns): raised 200 → 20,000; `checkpoint_interval_turns = 1` added (v0.78.0, PR #108).
+- **#2** (brief as JSON not markdown): STEP 6 now explicitly requires formatted markdown string in `write_file`; 4 new config tests guard this (v0.78.0, PR #108).
+- **#4** (wrong segment names): KB Segment Reference table added to orchestrator + curator task prompts; all `value=` → `content=` in `kb_put` calls fixed (v0.78.0, PR #108).
+
+- **#3** (memory pane colon-segment): `set_segment_class` now registers namespace in NAMESPACES table (count=0) so FUSE `/agents/kb/` lists configured segments before any data is written; 2 new tests (cos-polish #3, v0.79.0).
+
+**Remaining (COS lane):** #8 (verify if #5/#7 resolved the inference error; add bounded retry if not).
+**Cockpit lane:** #6 (orchestrate REPL race).
+**Docs/admin:** #9 (Google OAuth Production publishing).

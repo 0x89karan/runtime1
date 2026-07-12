@@ -3,6 +3,56 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.79.0] - 2026-07-12
+
+### Fixed — KB segment visibility at startup (cos-polish #3)
+
+- **`agentd/src/memory/store.rs`** — `set_segment_class` now also registers the
+  namespace in the `NAMESPACES` redb table (count=0) when the namespace is not already
+  present. Previously, configured KB segments (`ops:briefs`, `ops:entities`) were written
+  only to the `META` table; `list_namespaces()` (which reads `NAMESPACES`) returned empty
+  until a data write occurred, so FUSE `/agents/kb/` showed no segment directories at
+  startup and `agentctl watch [m]` rendered the "no KB data" banner even when segments
+  were configured. The `is_none()` guard is idempotent: existing namespaces with data
+  (count > 0 in `NAMESPACES`) are never overwritten. 2 new tests:
+  `set_segment_class_registers_namespace_before_write` and
+  `set_segment_class_does_not_reset_existing_namespace_count`. 1292 workspace tests pass.
+
+## [v0.78.0] - 2026-07-12
+
+### Fixed — CoS config calibration
+
+- **`agentd/cos.agents.toml`** — `kb_put` parameter name fixed: `value=` → `content=` in all 4
+  `kb_put` calls (orchestrator STEP 3b and curator STEPs 2–4). The schema enforces
+  `additionalProperties:false`; wrong parameter name caused every KB write to silently fail.
+- **`agentd/cos.agents.toml`** — KB Segment Reference table added to orchestrator and curator task
+  prompts; agents were using storage class names (`log`, `scratch`) as segment names instead of
+  the correct values (`ops:briefs`, `ops:entities`), so all KB reads and searches returned empty.
+- **`agentd/cos.agents.toml`** — KB log-class key semantics corrected: `ops:briefs` description
+  updated to "key arg ignored (runtime assigns hex seq)" — the runtime ignores the caller-supplied
+  key for log-class segments and assigns `format!("{seq:016x}")` internally.
+- **`agentd/cos.agents.toml`** — STEP 6 now explicitly requires a formatted markdown string for
+  `write_file content`; prevents agents from passing a JSON dump as the brief file content.
+- **`agentd/cos.agents.toml`** — inbox agent `token_budget` raised `500_000 → 1_500_000`; live
+  spend was ~820k tokens, causing mid-run budget exhaustion and truncated briefs.
+- **`agentd/cos.agents.toml`** — `global_token_budget = 10_000_000` (was 0/unlimited); provides a hard
+  daily spend ceiling across all 3 CoS agents (~3 full cycles at 1.5M inbox + 500k curator).
+- **`agentd/cos.agents.toml`** — corrected two inaccurate comments: child-ID collision comment (says
+  "terminated children remain in the scheduler's outcomes map" — they do not for awaited children);
+  and ops:briefs table entry (claimed "keyed by YYYY-MM-DD" — the log class ignores that key).
+- **`distro/overlay/etc/agentd/cos.agents.toml`** — synced all above fixes to the production QEMU
+  overlay; added clarifying comment that `global_token_budget = 0` is intentional for always-on
+  production (dev config uses 10_000_000 as a daily ceiling).
+- **`templates/orchestrator.template.toml`** — `max_turns = 200 → 20_000`; the old value killed a
+  cron-based orchestrator before it produced its first brief. Added `checkpoint_interval_turns = 1`.
+- **`agentd/src/config.rs`** — 4 new tests guard these invariants: `cos_agents_toml_parses_cleanly`
+  (both dev + overlay parse as valid `Config`), `cos_agents_toml_no_kb_put_value_param` (rejects
+  `value=` in any `kb_put` call), `cos_agents_toml_kb_segments_are_known` (all segment names in
+  prompts must appear in `[[memory.segments]]`), `cos_agents_toml_step6_requires_markdown_content`.
+- **`TODOS.md`** — logged pre-existing findings from adversarial review: spawn_agent budget schema max
+  (F1/P2), inbox least-privilege caps (F2/P2), curator max_turns=20 exhaustion (F5/P2), orchestrator
+  token_budget non-restartable (F6/P3), maxResults=50 context-window tradeoff (F7/note).
+
 ## [v0.77.0] - 2026-07-12
 
 ### Changed

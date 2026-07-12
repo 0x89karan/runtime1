@@ -1753,4 +1753,91 @@ allow_insecure_local = true
             "expected embedded-credentials error, got: {err}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // cos.agents.toml correctness guards
+    // These tests parse the real CoS config files and assert prompt hygiene
+    // invariants that are easy to regress without a compile-time check.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cos_agents_toml_parses_cleanly() {
+        let raw = include_str!("../cos.agents.toml");
+        let _cfg: Config = toml::from_str(raw)
+            .expect("cos.agents.toml must parse as a valid Config");
+        let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
+        let _overlay_cfg: Config = toml::from_str(overlay_raw)
+            .expect("distro overlay cos.agents.toml must parse as a valid Config");
+    }
+
+    #[test]
+    fn cos_agents_toml_no_kb_put_value_param() {
+        // kb_put requires `content`, not `value`; the wrong name is silently
+        // ignored by additionalProperties:false and the write never persists.
+        let dev_raw = include_str!("../cos.agents.toml");
+        let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
+        for (label, raw) in [("dev", dev_raw), ("overlay", overlay_raw)] {
+            let bad_lines: Vec<_> = raw
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains("kb_put") && l.contains("value="))
+                .collect();
+            assert!(
+                bad_lines.is_empty(),
+                "{} cos.agents.toml uses 'value=' in kb_put at lines {:?}; \
+                 the correct parameter name is 'content='",
+                label,
+                bad_lines.iter().map(|(n, _)| n + 1).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn cos_agents_toml_kb_segments_are_known() {
+        // Derive valid segment names from the parsed [[memory.segments]] config —
+        // no hardcoded list. Adding a new segment to [[memory.segments]] automatically
+        // allows it here; no Rust changes needed.
+        let dev_raw = include_str!("../cos.agents.toml");
+        let cfg: Config = toml::from_str(dev_raw).expect("must parse");
+        let known: Vec<&str> = cfg.memory.segments.iter().map(|s| s.name.as_str()).collect();
+
+        let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
+        for (label, raw) in [("dev", dev_raw), ("overlay", overlay_raw)] {
+            for (i, line) in raw.lines().enumerate() {
+                if !line.contains("kb_put") && !line.contains("kb_get") && !line.contains("kb_search") {
+                    continue;
+                }
+                // Extract the segment= value (single-quoted Python-style call notation).
+                if let Some(start) = line.find("segment='") {
+                    let rest = &line[start + 9..];
+                    if let Some(end) = rest.find('\'') {
+                        let seg = &rest[..end];
+                        assert!(
+                            known.contains(&seg),
+                            "{} line {}: unknown segment '{}'; \
+                             valid segments are {:?} — add it to [[memory.segments]] in cos.agents.toml",
+                            label,
+                            i + 1,
+                            seg,
+                            known
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cos_agents_toml_step6_requires_markdown_content() {
+        let dev_raw = include_str!("../cos.agents.toml");
+        let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
+        for (label, raw) in [("dev", dev_raw), ("overlay", overlay_raw)] {
+            assert!(
+                raw.contains("MUST be a formatted markdown string"),
+                "{} cos.agents.toml STEP 6 must contain an explicit instruction that \
+                 write_file content must be a formatted markdown string, not JSON",
+                label
+            );
+        }
+    }
 }

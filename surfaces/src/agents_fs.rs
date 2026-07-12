@@ -70,6 +70,7 @@ const INO_SYS_SANDBOX:  u64 = 13;
 const INO_SYS_PROVIDER: u64 = 14;
 /// Write-only control pseudofile: `echo '{"task":"..."}' > /agents/control`
 #[cfg(any(test, target_os = "linux"))]
+#[allow(dead_code)]
 pub(crate) const INO_CONTROL: u64 = 15;
 /// Read-only approvals pseudofile: JSON lines of pending approval requests.
 #[cfg(any(test, target_os = "linux"))]
@@ -167,6 +168,7 @@ struct AgentsFs {
     write_buffers:  HashMap<u64, Vec<u8>>,
     /// Monotonically increasing file-handle counter for open() calls on INO_CONTROL.
     /// Prevents two concurrent writers clobbering each other's buffer under fh=0.
+    #[allow(dead_code)]
     next_fh:        u64,
     /// agent_id → directory inode.
     /// INVARIANT: `dir_inodes` and `inode_to_id` are always consistent.
@@ -2710,7 +2712,7 @@ mod tests {
         // Any additional byte must be refused.
         let buf = &fs.write_buffers[&fh];
         assert!(buf.len() + 1 > 64 * 1024, "pre-condition");
-        drop(buf);
+        let _ = buf; // end borrow before re-borrowing below
         // Simulate what write() checks:
         let existing = fs.write_buffers.get(&fh).map(|b| b.len()).unwrap_or(0);
         let new_data = b"x";

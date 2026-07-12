@@ -18,7 +18,10 @@ model     = "claude-sonnet-5"
 streaming = true
 
 [agent]
-max_turns        = 200
+# max_turns is intentionally high — token_budget is the binding constraint for REPL sessions.
+# Input tokens accumulate with conversation history: expect 20-30 exchanges before 200k exhausts.
+# NOT suitable for always-on cron orchestrators — use cos.agents.toml (max_turns=200_000) instead.
+max_turns        = 20_000
 token_budget     = 200000
 priority         = 10
 checkpoint_interval_turns = 1

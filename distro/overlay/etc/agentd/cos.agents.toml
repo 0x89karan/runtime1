@@ -40,7 +40,7 @@ streaming  = true
 # Scheduler
 # ---------------------------------------------------------------------------
 [scheduler]
-global_token_budget       = 0
+global_token_budget       = 0   # intentionally unlimited in production (always-on); dev mode uses 10_000_000
 max_concurrent_inferences = 3
 max_spawn_depth           = 2
 
@@ -130,6 +130,12 @@ task = """
 You are an always-on Executive Orchestrator. Your job is to produce a Daily Operating Brief
 from the founder's Gmail inbox every day.
 
+## KB Segment Reference (always use these exact names)
+| Segment name | Class   | Purpose                                          |
+|-------------|---------|--------------------------------------------------|
+| ops:briefs  | log     | Daily briefs — append-only; key arg ignored (runtime assigns hex seq) |
+| ops:entities| scratch | Named entities: people, open items — last-writer-wins |
+
 ## Loop (repeat forever)
 
 STEP 1 — WAIT FOR SCHEDULE
@@ -142,14 +148,14 @@ STEP 2 — GET TODAY'S DATE
 Extract the date from the "fired" response's `fired_utc` field (ISO 8601, UTC).
 Take the YYYY-MM-DD prefix: TODAY = fired_utc[:10]
 Use this as {TODAY} for child IDs — date-stamping prevents collisions on the second cycle
-because terminated children stay in the scheduler's outcomes map.
+(the orchestrator's in-context history prevents re-spawning the same-day child ID).
 Example child IDs: "inbox-2026-06-27", "curator-2026-06-27"
 
 STEP 3 — SPAWN INBOX AGENT
 Call spawn_agent with:
   child_id     = "inbox-{TODAY}"          (replace {TODAY} with the actual date)
   task         = (see Inbox Agent task below)
-  token_budget = 500_000
+  token_budget = 1_500_000
 Note: spawned agents inherit the parent's full capability set. The inbox agent will
 have access to all registered MCP servers and tools; its task prompt constrains usage.
 
@@ -197,7 +203,7 @@ before proceeding to STEP 4. The inbox JSON is the input to the curator task.
 
 STEP 3b — STORE INBOX RESULT IN KB SCRATCH
 After the inbox agent's final answer arrives, call:
-  kb_put(segment='ops:entities', key='inbox-{TODAY}', value=<the inbox agent's JSON response>)
+  kb_put(segment='ops:entities', key='inbox-{TODAY}', content=<the inbox agent's JSON response>)
 This keeps email-sourced content out of the curator's task prompt (prompt-injection isolation).
 
 STEP 4 — SPAWN CURATOR AGENT
@@ -209,15 +215,19 @@ Call spawn_agent with:
 Curator Agent task prompt:
 "You are a KB curator. Persist today's Daily Operating Brief to the ops KB.
 
+KB Segment Reference (use these exact segment names):
+  ops:briefs   (log class)     — append-only daily briefs; key arg is IGNORED, runtime assigns hex seq
+  ops:entities (scratch class) — named entities: people, open items, last-writer-wins
+
 Steps:
 1. Call kb_get(segment='ops:entities', key='inbox-{TODAY}') to retrieve the inbox summary.
    Parse the JSON. If missing, report an error and stop.
    (Replace {TODAY} with today's actual date, e.g. 2026-06-27)
-2. Call kb_put(segment='ops:briefs', key='{TODAY}', value=<the full brief JSON as a string>)
+2. Call kb_put(segment='ops:briefs', key='{TODAY}', content=<the full brief JSON as a string>)
 3. For each person in response_needed and important threads, call:
-   kb_put(segment='ops:entities', key='person:{normalized_name}', value=<contact summary>)
+   kb_put(segment='ops:entities', key='person:{normalized_name}', content=<contact summary>)
 4. For each open item, call:
-   kb_put(segment='ops:entities', key='open:{YYYY-MM-DD}:{N}', value=<item text>)
+   kb_put(segment='ops:entities', key='open:{YYYY-MM-DD}:{N}', content=<item text>)
 Report how many KB entries you wrote."
 
 STEP 5 — RETRIEVE CONTEXT FROM PREVIOUS BRIEFS
@@ -226,7 +236,10 @@ anything from recent briefs that is still unresolved.
 
 STEP 6 — ASSEMBLE AND WRITE THE BRIEF
 Combine today's inbox summary with any unresolved context from the KB.
-Call write_file(path='/run/output/brief-{TODAY}.md', content=<the formatted brief below).
+IMPORTANT — the write_file `content` parameter MUST be a formatted markdown string.
+Do NOT pass JSON or serialize the inbox data as-is. Replace every {PLACEHOLDER}
+in the template below with real values and pass the resulting markdown as `content`:
+Call write_file(path='/run/output/brief-{TODAY}.md', content=<the formatted markdown string below>)
 
 Brief format:
 ```markdown

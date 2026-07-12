@@ -542,6 +542,80 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 
 ## cos.1 / Live Testing — Open
 
+**cos-polish-adv-F1 (P2) — spawn_agent token_budget has no schema maximum and no parent-budget clamp**
+- `spawn_agent` accepts any `token_budget` value without validation. An orchestrator prompt could
+  inadvertently (or via injection) spawn a child with a budget exceeding the parent's remaining
+  budget, allowing unbounded spend.
+- Fix: (a) add `"maximum": 5_000_000` to the `token_budget` field in the `spawn_agent` JSON schema
+  in `agentd/src/tools/native.rs` (see `SpawnAgentTool::input_schema`); (b) add a parent-budget
+  clamp in `dispatch_spawn` (`agentd/src/scheduler.rs`) that caps the child at
+  `parent.remaining_budget` — note: `dispatch_spawn` lives in `scheduler.rs`, NOT `native.rs`.
+- Found during cos-polish #5+#7 adversarial review (2026-07-11); pre-existing, not introduced by diff.
+
+**cos-polish-adv-F2 (P3) — orchestrator spawns inbox child with full parent capability set**
+- `spawn_agent` inherits the parent's full capability set by default. The inbox agent only needs
+  `Mcp{google_oauth}` but currently gets `KbRead/KbWrite`, `FsWrite`, `Spawn`, and `cron_trigger`
+  access too, violating least-privilege.
+- Fix: extend `spawn_agent` with an optional `capabilities` argument that lets the orchestrator
+  restrict the child's caps at spawn time; update cos.agents.toml to pass `capabilities = ["Mcp:google_oauth"]`.
+- Found during cos-polish #5+#7 adversarial review (2026-07-11); pre-existing, not introduced by diff.
+
+**cos-polish-adv-F3 (P3) — no global token budget ceiling for the full CoS run**
+- ~~`[scheduler] global_token_budget = 0` (unlimited). A runaway inbox agent with `token_budget =
+  1_500_000` could exhaust API credit if spawned in a tight loop (e.g. cron misfires).~~
+- **Resolved (v0.77.0):** `global_token_budget = 10_000_000` set in cos.agents.toml (allows ~3 full
+  CoS cycles at 1.5M inbox + 500k curator per cycle).
+
+**cos-polish-adv-F5 (P2) — spawned child agents receive max_turns=20 (default); curator hits MaxTurnsReached**
+- `dispatch_spawn` hardcodes `max_turns: crate::config::default_max_turns()` (= 20). The `spawn_agent`
+  schema and `SpawnConfig` have no `max_turns` field.
+- The curator agent requires: 1× kb_get, N× kb_put (brief + persons + open-items), 1× write_file, final
+  answer = ~25+ turns. Silently fails at turn 20, leaving a partial KB.
+- The 1.5M inbox token budget is overspecified for a 20-turn limit; actual spend is capped by turns.
+- Fix: add `max_turns: Option<u32>` to `SpawnConfig` + JSON schema in `native.rs` + `dispatch_spawn`
+  in `scheduler.rs`; update orchestrator task prompt to pass `max_turns = 100` for child agents.
+- Found during cos-polish #5+#7 adversarial review (2026-07-11); pre-existing in scheduler.
+
+**cos-polish-adv-F6 (P3) — tokens_spent lifetime-monotonic; orchestrator template non-restartable after 200k tokens**
+- `SchedulerCheckpoint` persists `tokens_spent`. The orchestrator template sets `token_budget = 200_000`.
+  After one session consuming 200k tokens, the next restore immediately hits BudgetExceeded and the
+  agent refuses to run without manual checkpoint deletion.
+- `checkpoint_interval_turns = 1` means even partial sessions accumulate toward the ceiling.
+- Fix paths: (a) reset `tokens_spent` on restore for interactive REPL agents, or (b) add a
+  `per_session_token_budget` field that resets each startup. Document workaround in template comment.
+- Found during cos-polish #5+#7 adversarial review (2026-07-11).
+
+**cos-polish-adv-F7 (note) — maxResults=50 with format=full may exceed 200k context on heavy email days**
+- Gmail `format=full` includes base64-encoded bodies + attachments. At ~50KB per message × 50 messages
+  = 2.5MB JSON ≈ 600k tokens — well above claude-sonnet-4-6's 200k context window.
+- When exceeded, the API returns a 400 (not a budget error); inbox agent fails silently with no brief.
+- Observed tradeoff: maxResults=20 would silently truncate the candidate pool (outside-voice finding);
+  maxResults=50 risks context-window failure on heavy days. A safer fix: switch to `format=metadata`
+  for the listing step and fetch `format=full` only for the top-N shortlisted messages.
+- Found during cos-polish #5+#7 adversarial review (2026-07-11); accepted tradeoff for now.
+
+**cos-polish-adv-F8 (P2) — `kb_list_segments` native tool missing**
+- Agents have no programmatic way to discover which KB segments exist; the current workaround is
+  embedding a segment reference table directly in the task prompt, which drifts when operators add
+  segments. The durable fix is a `kb_list_segments` native tool that returns the configured segment
+  names + classes at runtime, letting the agent query the source of truth instead of relying on a
+  static prompt.
+- Implementation: add `KbListSegments` to `agentd/src/tools/native.rs`; reads from `MemoryConfig.segments`
+  via `ToolContext.task_fp`; guarded by `KbRead` capability (any segment); no writes. Add `kb_list_segments`
+  to relevant templates + cos.agents.toml orchestrator + curator task prompts.
+- Promoted to P2 in autoplan (2026-07-12) from CEO + Eng dual-voice consensus; segment-name drift is
+  the root cause of cos-polish #4 recurring.
+
+**cos-polish-adv-F9 (P2) — no automated drift check between dev and distro overlay cos.agents.toml**
+- `agentd/cos.agents.toml` (dev) and `distro/overlay/etc/agentd/cos.agents.toml` (production) must
+  be kept in sync structurally (segment lists, capability grants, MCP server blocks). Currently the
+  Rust test suite catches `kb_put value=` errors and segment drift, but no check flags differing
+  capability sets, missing MCP server blocks, or diverging segment declarations between the two files.
+- Fix: add `make lint-cos` Makefile target that: (a) parses both files with `agentd/src/config.rs`
+  validation, (b) diffs `[[memory.segments]]` names + classes, (c) diffs `[[agents]]` capability
+  grants. Failure fails CI. Complements the Rust tests (which already check per-file correctness).
+- DX Review finding (2026-07-12): two-file maintenance is the deepest remaining DX friction for CoS operators.
+
 **cos-ux-01 — TUI lacks per-agent progress and error visibility**
 - During long-running agent turns (e.g. inbox agent fetching 20 Gmail messages), `agentctl watch`
   shows only `running` status and a growing context-size counter. There is no indication of

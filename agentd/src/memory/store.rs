@@ -709,6 +709,13 @@ impl MemoryStore for RedbStore {
             table
                 .insert(meta_key.as_str(), encoded)
                 .context("writing segment class")?;
+            // Register namespace in NAMESPACES so list_namespaces() surfaces it even
+            // before any entries are written (configured segments visible at startup).
+            // Only insert if absent — do not overwrite the count for an existing namespace.
+            let mut ns_tbl = txn.open_table(NAMESPACES).context("opening namespaces table")?;
+            if ns_tbl.get(namespace).context("checking namespace")?.is_none() {
+                ns_tbl.insert(namespace, 0u64).context("registering namespace")?;
+            }
         }
         txn.commit().context("committing segment class")?;
         Ok(())
@@ -1782,5 +1789,47 @@ mod tests {
         assert_eq!(evicted.len(), 1, "one entry must be evicted");
         assert!(store.list_namespaces().unwrap().contains(&"kb:partial".to_string()),
             "namespace must remain after partial eviction");
+    }
+
+    // ── set_segment_class registers namespace in NAMESPACES ───────────────────
+
+    #[test]
+    fn set_segment_class_registers_namespace_before_write() {
+        // cos-polish #3: configured segments (ops:briefs, ops:entities) must appear
+        // in list_namespaces() — and therefore in FUSE /agents/kb/ — immediately
+        // at startup, before any entries are written.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        // No data written yet — namespace must not appear.
+        assert!(store.list_namespaces().unwrap().is_empty(),
+            "precondition: no namespaces before set_segment_class");
+        // set_segment_class with a colon-containing name (matches real CoS config).
+        store.set_segment_class("ops:briefs", MutabilityClass::Log).unwrap();
+        store.set_segment_class("ops:entities", MutabilityClass::Scratch).unwrap();
+        let mut ns = store.list_namespaces().unwrap();
+        ns.sort();
+        assert_eq!(ns, vec!["ops:briefs", "ops:entities"],
+            "configured segments must appear in list_namespaces before any data is written");
+    }
+
+    #[test]
+    fn set_segment_class_does_not_reset_existing_namespace_count() {
+        // set_segment_class called on a namespace that already has entries must not
+        // overwrite the NAMESPACES counter with 0 (idempotent registration guard).
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        store.put("ops:briefs", "k1", "v1").unwrap();
+        store.put("ops:briefs", "k2", "v2").unwrap();
+        // Two entries — count = 2.
+        assert_eq!(store.namespace_count("ops:briefs").unwrap(), 2,
+            "precondition: two entries must be counted");
+        // Calling set_segment_class again must not reset count to 0.
+        store.set_segment_class("ops:briefs", MutabilityClass::Log).unwrap();
+        assert_eq!(store.namespace_count("ops:briefs").unwrap(), 2,
+            "set_segment_class must not overwrite existing namespace count");
+        // list_namespaces must still return the namespace.
+        let ns = store.list_namespaces().unwrap();
+        assert!(ns.contains(&"ops:briefs".to_string()),
+            "namespace must still appear after set_segment_class on existing namespace");
     }
 }
