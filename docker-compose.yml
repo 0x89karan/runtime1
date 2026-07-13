@@ -112,8 +112,8 @@ services:
     command: agent
     stdin_open: true
     tty: true
-    # When running --profile semantic, wait for semantic-kb-mcp to start before
-    # agentd attempts to connect. No-op when the semantic profile is inactive.
+    # Always-on: depends_on with required: false means agent starts even if
+    # semantic-kb-mcp is not running; kb_search/kb_put degrade gracefully without it.
     depends_on:
       semantic-kb-mcp:
         condition: service_started
@@ -125,8 +125,8 @@ services:
 
   # ── Semantic KB sidecar (h8.1 / memory-routing) ──────────────────────────────
   # Always-on for the CoS: stores email bodies as OpenAI text-embedding-3-small vectors
-  # in Qdrant. OPENAI_API_KEY is required. Use --profile semantic to activate for the
-  # generic 'agent' service.
+  # in Qdrant. OPENAI_API_KEY is required. Both qdrant and semantic-kb-mcp start
+  # unconditionally — there is no profile gate.
   qdrant:
     image: qdrant/qdrant:v1.13.6
     # No profile — always-on for CoS (email body semantic index, memory-routing).

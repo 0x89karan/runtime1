@@ -306,6 +306,11 @@ pub struct ProviderConfig {
     /// `None` (default) = unlimited. `0` = block all requests to this provider.
     #[serde(default)]
     pub max_requests_per_agent: Option<u64>,
+    /// Allowlist of query-parameter names forwarded to the upstream API.
+    /// Default (empty) = no params forwarded (preserves D3 injection prevention).
+    /// Only the listed param names are passed; all others are silently dropped.
+    #[serde(default)]
+    pub passthrough_query_params: Vec<String>,
 }
 
 /// Configuration for the in-process credential broker (cred.3+).

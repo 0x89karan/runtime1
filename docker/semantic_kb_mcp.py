@@ -52,9 +52,9 @@ from uuid import uuid4, uuid5, NAMESPACE_OID
 
 OPENAI_API_URL   = "https://api.openai.com/v1/embeddings"
 # Known model → output dimension mapping. EMBED_DIM is derived at startup from EMBED_MODEL.
-# If EMBED_MODEL is set to an unlisted model, EMBED_DIM defaults to 1536 and a warning is
-# emitted — the collection will be created with the wrong size and every kb_put will fail
-# with a Qdrant 400 dimension-mismatch error.
+# If EMBED_MODEL is set to an unlisted model, EMBED_DIM defaults to 0 and a warning is
+# emitted — the collection will be created with dim=0, causing a Qdrant 400
+# dimension-mismatch error on every kb_put. Set EMBED_MODEL to a known model or update this dict.
 _EMBED_MODEL_DIMS: dict = {
     "text-embedding-3-small": 1536,
     "text-embedding-3-large": 3072,

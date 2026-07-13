@@ -3,6 +3,35 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.83.0] - 2026-07-13
+
+### Changed (cred.6 — CoS broker migration)
+- **CoS migrated to credential broker mode** (`agentd/cos.agents.toml` +
+  `distro/overlay/etc/agentd/cos.agents.toml`): the `google_oauth` MCP sidecar now holds **no
+  raw refresh token in memory-at-rest**. `OAUTH_CLIENT_SECRET` and `OAUTH_REFRESH_TOKEN` are
+  removed from `google_oauth`'s `passenv`; the Rust credential gateway reads `google.json`
+  directly and issues access tokens. `FsRead /run/secrets` capability removed from `google_oauth`;
+  `Credential{Google}` grant added to the orchestrator so spawned inbox agents route through the
+  broker.
+- **`passthrough_query_params` allowlist** (`agentd/src/config.rs`,
+  `agentd/src/credential/mod.rs`): new `Vec<String>` field on `ProviderConfig` — per-param
+  allowlist for query string forwarding. Default empty = no params forwarded (preserves D3
+  injection prevention). CoS Google provider configured with `["maxResults", "q", "format",
+  "pageToken", "includeSpamTrash"]` so Gmail API calls work through the broker.
+- **`state_path = "/run/memory/oauth/google.json"`** in both CoS configs: OAuth access-token
+  cache written to the writable 9p memory mount (`/run/memory`) in both Docker and QEMU modes.
+
+### Fixed (review pass)
+- **T35b self-reference** (`agentd/src/credential/mod.rs`): guard string now constructed from
+  parts to check the filter idiom specifically, preventing the test from passing even if the
+  allowlist logic is removed from `handle_credential_request`.
+- **`passthrough_query_params` non-empty assertion** added to `cos_config_broker_mode_and_no_fs_read`
+  — catches accidental removal of Gmail query params from either cos config.
+- **Stale `--profile semantic` comments** removed from `docker-compose.yml`; updated to reflect
+  that qdrant and semantic-kb-mcp are always-on with no profile gate.
+- **`EMBED_DIM` comment** in `docker/semantic_kb_mcp.py` corrected: defaults to `0` (not `1536`)
+  for unknown models, with a startup warning.
+
 ## [v0.82.0] - 2026-07-12
 
 ### Added (ux.9 — Cockpit mode)

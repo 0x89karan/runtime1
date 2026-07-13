@@ -17,7 +17,29 @@
 #   OAUTH_PROVIDER_NAME, TRIGGER_CRON (e.g. "0 8 * * *")
 #   OAUTH_REFRESH_TOKEN (after first OAuth dance — skips browser on restart)
 #
+# BROKER MODE (cred.6): The credential broker is enabled. OAUTH_CLIENT_SECRET and
+# OAUTH_REFRESH_TOKEN are read by the Rust gateway (not the Python sidecar).
+# The google.json secrets file is read from /run/secrets/google.json.
+# Access token cache is written to /run/memory/oauth/google.json (writable 9p mount).
+#
 # See docs/DEPLOYMENT.md for the full setup guide.
+
+# ---------------------------------------------------------------------------
+# Credential broker (cred.6) — OAuth tokens stay in this Rust gateway.
+# The google_oauth MCP sidecar holds NO raw credential at rest.
+# ---------------------------------------------------------------------------
+[credential_gateway]
+enabled = true
+
+[credential_gateway.providers.google]
+auth_style    = "oauth-bearer"
+upstream_base = "https://gmail.googleapis.com"
+token_path    = "/run/secrets/google.json"
+# /run/memory is the writable 9p virtfs (memory0 → ~/.agentos-memory).
+# /run/state does NOT exist in the QEMU initramfs; /run/secrets is read-only.
+state_path    = "/run/memory/oauth/google.json"
+# Gmail query params forwarded to upstream (D3 allowlist — all others dropped).
+passthrough_query_params = ["maxResults", "q", "format", "pageToken", "includeSpamTrash"]
 
 # ---------------------------------------------------------------------------
 # Management HTTP API — exposed at :7999 inside the VM, hostfwd'd to the host.
@@ -86,15 +108,14 @@ name    = "google_oauth"
 command = "python3"
 args    = ["/usr/lib/agentos/docker/oauth_mcp.py"]
 passenv = [
-  "OAUTH_CLIENT_ID",
-  "OAUTH_CLIENT_SECRET",
-  "OAUTH_REFRESH_TOKEN",
+  "OAUTH_CLIENT_ID",      # needed for the OAuth auth-dance URL (first-run only)
   "OAUTH_AUTH_URL",
   "OAUTH_TOKEN_URL",
   "OAUTH_SCOPES",
-  "OAUTH_ALLOWED_HOSTS",
+  "OAUTH_ALLOWED_HOSTS",  # REQUIRED — SSRF guard blocks missing/wrong hosts
   "OAUTH_PROVIDER_NAME",
   "OAUTH_CALLBACK_PORT",
+  # OAUTH_CLIENT_SECRET + OAUTH_REFRESH_TOKEN intentionally omitted (broker mode).
 ]
 capabilities = [
   { Net = { hosts = [
@@ -103,7 +124,7 @@ capabilities = [
     "www.googleapis.com",
     "gmail.googleapis.com",
   ], ports = [443] } },
-  { FsRead = { prefix = "/run/secrets" } },
+  # FsRead /run/secrets intentionally absent — broker mode (cred.6).
 ]
 
 # ---------------------------------------------------------------------------
@@ -127,6 +148,7 @@ capabilities = [
   { Mcp    = { server = "cron_trigger", tools = [] } },
   { Mcp    = { server = "google_oauth",  tools = [] } },
   { FsWrite = { prefix = "/run/output" } },
+  { Credential = { provider = "Google" } },
 ]
 
 task = """

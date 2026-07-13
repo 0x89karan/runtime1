@@ -922,9 +922,27 @@ async fn handle_credential_request(
 
     // 6. Collect inbound body (bounded).
     let method = req.method().clone();
-    // Inbound query string is discarded — MCP servers must not inject URL params
-    // into the upstream request (D3). Credentials are attached by the broker at step 11.
-    let query = String::new();
+    // Build the forwarded query string from the allowlist (D3: reject by default,
+    // forward only params listed in passthrough_query_params).
+    let query = {
+        let raw = req.uri().query().unwrap_or("");
+        if raw.is_empty() || prov_cfg.passthrough_query_params.is_empty() {
+            String::new()
+        } else {
+            let allowed: Vec<_> = raw
+                .split('&')
+                .filter(|pair| {
+                    let key = pair.split('=').next().unwrap_or("");
+                    prov_cfg.passthrough_query_params.iter().any(|p| p == key)
+                })
+                .collect();
+            if allowed.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", allowed.join("&"))
+            }
+        }
+    };
     let (parts, body) = req.into_parts();
     let limited = http_body_util::Limited::new(body, MAX_INBOUND_REQUEST_BYTES);
     let body_bytes = match limited.collect().await {
@@ -1016,7 +1034,7 @@ async fn handle_credential_request(
     let upstream_base = prov_cfg.upstream_base.trim_end_matches('/');
     let safe_rest = normalize_path_segment(rest);
     let upstream_url = if safe_rest.is_empty() {
-        format!("{upstream_base}/{query}")
+        format!("{upstream_base}{query}")
     } else {
         format!("{upstream_base}/{safe_rest}{query}")
     };
@@ -1379,6 +1397,7 @@ mod tests {
             token_path:             Some("/run/secrets/google.json".to_string()),
             state_path:             Some("/data/state/oauth/google.json".to_string()),
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         }
     }
 
@@ -1392,6 +1411,7 @@ mod tests {
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         }
     }
 
@@ -1709,6 +1729,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         });
         let err = CredentialGateway::start(&cfg, recorder).await
             .err()
@@ -2154,6 +2175,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
             token_path:             Some(secrets_path.to_str().unwrap().to_string()),
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         };
         let recorder = Arc::new(
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
@@ -2411,27 +2433,69 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert_eq!(body["error"], "request_body_too_large");
     }
 
-    // ── T35b: Inbound query string is discarded (D3) ─────────────────────────────
+    // ── T35b: Query passthrough uses allowlist (D3 preserved) ────────────────────
     //
-    // This test FAILS if query passthrough is restored (query = req.uri().query()...).
+    // Only params listed in passthrough_query_params are forwarded. Unlisted params
+    // are silently dropped regardless of what the MCP server sends.
+    // This test FAILS if: (a) the allowlist filter is removed (unconditional passthrough),
+    // or (b) the entire query is always discarded (no forwarding even for listed params).
 
     #[test]
-    fn test_query_string_discarded_from_upstream() {
+    fn test_query_passthrough_allowlist_enforced() {
         let src = include_str!("mod.rs");
-        // Build the banned pattern from parts so the literal doesn't appear in this file
-        // (otherwise include_str! would find it in this very assertion and fail).
-        let banned = [".uri()", ".query()", ".map(|q| format!(\"?{q}\"))"].concat();
+        // Check that the allowlist filter loop exists in the production handler.
+        // Constructed from parts to avoid self-match (bare field name appears too broadly in mod.rs).
+        let filter_idiom = ["passthrough_query_params", ".iter().any(|p| p == key)"].concat();
         assert!(
-            !src.contains(&banned),
-            "query string must not be forwarded to upstream — old passthrough code found (D3 reverted?)"
+            src.contains(&filter_idiom),
+            "handle_credential_request must contain the passthrough_query_params allowlist filter \
+             loop (D3 preserved). If this fails, the allowlist was removed or renamed."
         );
-        // Build expected pattern from parts so the literal doesn't appear in this file.
-        let expected = ["let query", " = String::new()"].concat();
+        // Ensure the old full-discard pattern is gone (build from parts to avoid self-match).
+        let old_discard = ["Inbound query string", " is discarded"].concat();
         assert!(
-            src.contains(&expected),
-            "query must always be discarded with String::new() — inbound params must not \
-             reach the upstream URL"
+            !src.contains(&old_discard),
+            "Old D3 full-discard comment still present — update the comment to reflect allowlist semantics"
         );
+    }
+
+    // ── T35c: Allowlist filters correctly (listed in, unlisted out) ───────────────
+
+    #[test]
+    fn test_query_allowlist_filters_listed_params_only() {
+        // Simulate the allowlist logic from handle_credential_request.
+        fn apply_allowlist(raw: &str, allowed: &[&str]) -> String {
+            if raw.is_empty() || allowed.is_empty() {
+                return String::new();
+            }
+            let kept: Vec<_> = raw
+                .split('&')
+                .filter(|pair| {
+                    let key = pair.split('=').next().unwrap_or("");
+                    allowed.contains(&key)
+                })
+                .collect();
+            if kept.is_empty() { String::new() } else { format!("?{}", kept.join("&")) }
+        }
+
+        // Listed param is forwarded.
+        assert_eq!(apply_allowlist("maxResults=50", &["maxResults"]), "?maxResults=50");
+        // Multiple listed params forwarded.
+        assert_eq!(
+            apply_allowlist("maxResults=50&q=newer_than:1d", &["maxResults", "q"]),
+            "?maxResults=50&q=newer_than:1d"
+        );
+        // Unlisted param blocked.
+        assert_eq!(apply_allowlist("x-goog-user-project=evil", &["maxResults"]), "");
+        // Mix: listed kept, unlisted dropped.
+        assert_eq!(
+            apply_allowlist("maxResults=50&x-goog-user-project=evil", &["maxResults"]),
+            "?maxResults=50"
+        );
+        // Empty allowlist = nothing forwarded.
+        assert_eq!(apply_allowlist("maxResults=50", &[]), "");
+        // Empty query = nothing forwarded.
+        assert_eq!(apply_allowlist("", &["maxResults"]), "");
     }
 
     // ── G1: token_url with userinfo is rejected as malformed (ar-04c extract_host path) ──
@@ -2463,6 +2527,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
             token_path:             Some(secrets_path.to_str().unwrap().to_string()),
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         };
         let client = crate::loopback_proxy::build_loopback_client(
             crate::loopback_proxy::LoopbackClientConfig::credential(),
@@ -2615,6 +2680,7 @@ max_requests_per_agent = 100
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: None,   // <── no cap
+            passthrough_query_params: vec![],
         };
 
         let mut providers = std::collections::HashMap::new();
@@ -2693,6 +2759,7 @@ max_requests_per_agent = 100
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         };
         assert!(prov.header_value_prefix.is_none(),
             "header_value_prefix must be None for raw-token providers (T41)");
@@ -2723,6 +2790,7 @@ max_requests_per_agent = 100
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         });
         let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
         let recorder = Arc::new(
@@ -2756,6 +2824,7 @@ max_requests_per_agent = 100
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         });
         let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
         let recorder = Arc::new(
@@ -2783,6 +2852,7 @@ max_requests_per_agent = 100
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: None,
+            passthrough_query_params: vec![],
         });
         let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
         let recorder = Arc::new(
@@ -2902,6 +2972,7 @@ max_requests_per_agent = 100
             token_path:             None,
             state_path:             None,
             max_requests_per_agent: Some(1), // cap = 1: first request passes, second is 429
+            passthrough_query_params: vec![],
         });
         let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
         std::env::set_var("BRAVE_KEY_T47", "test-api-key-t47");

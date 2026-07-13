@@ -1157,6 +1157,22 @@ persisted when the agent cleanly deregisters — a crash mid-session loses the i
 - **Where to start:** `agentd/src/credential/mod.rs` — add a flush task in `CredentialGateway::start()`
   that holds a `Weak<GatewayState>` and aborts when the state is dropped.
 
+**cred.6-ar-01 (P3) — URL-encoded `%26` in query values passes allowlist for custom providers**
+
+The `passthrough_query_params` filter splits on literal `&` (not percent-decoded). A query value
+containing `%26` (URL-encoded `&`) passes the key-name allowlist check while encoding an extra
+parameter that the upstream server may decode. E.g. `?maxResults=50%26admin=1` — key `maxResults`
+passes; Gmail receives `maxResults=50&admin=1`. For Gmail this is inert. For custom `oauth-bearer`
+providers with non-Google upstreams, a compromised MCP sidecar could use this to inject params
+into the upstream request.
+
+- **Why:** allowlist filtering must operate on URL-decoded keys (after percent-decoding each pair).
+- **How to apply:** percent-decode each `pair` before splitting on `=` to extract the key, then
+  apply the allowlist against the decoded key. `percent_decode(pair.split('=').next())`. Also
+  validate that query values do not contain literal `&` after decode (or encode the value again).
+- **Confidence:** 6/10 (theoretical; inert for Gmail; relevant if custom providers are used).
+- **Where to start:** `agentd/src/credential/mod.rs:932` — the `filter(|pair| { ... })` closure.
+
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment
   (`next_log_seq` / `next_scratch_version`) commits in its own write transaction before
