@@ -539,6 +539,7 @@ mod tests {
         let mut snap = SchedulerSnapshot::default();
         snap.agents.push(AgentSnapshot {
             id: "a1".to_string(),
+            attention: vec![],
             status: AgentStatus::Running,
             turn: 2,
             context_tokens: 100,
@@ -570,6 +571,7 @@ mod tests {
         let mut snap = SchedulerSnapshot::default();
         snap.agents.push(AgentSnapshot {
             id: "a2".to_string(),
+            attention: vec![],
             status: AgentStatus::AwaitingChild("child-1".to_string()),
             turn: 1,
             context_tokens: 0,
@@ -795,6 +797,7 @@ mod tests {
         let mut snap = SchedulerSnapshot::default();
         snap.agents.push(AgentSnapshot {
             id: "done-agent".to_string(),
+            attention: vec![],
             status: AgentStatus::Done,
             turn: 5,
             context_tokens: 0,

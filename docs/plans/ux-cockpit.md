@@ -136,6 +136,13 @@ Mac host. **No user-visible new feature** beyond existing views now updating liv
 
 ## ux.2 — Observe: per-agent activity + live stream (closes cos-ux-01)
 
+**⚠ Reframed (2026-07-13, CEO review) and split.** This rough scope became the input to a full
+CEO/Design/Eng/DX review that reframed the increment around outcome/risk signals ("Attention")
+rather than raw activity detail, and split it into **ux.2a** (Approval/Budget/Degraded — shipped,
+`docs/plans/ux.2-attention-evidence.md`) and **ux.2b** (Idle/Error — not yet built, closes
+cos-ux-01 fully). The rough scope below is preserved as historical context for ux.2b's design,
+not an active spec for either increment. See `docs/ROADMAP.md`'s ux.2a/ux.2b entries for status.
+
 **Goal:** Answer "what is each agent doing right now / who needs attention" at a glance. Closes
 **cos-ux-01** (TODOS.md).
 

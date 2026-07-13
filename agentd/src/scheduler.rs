@@ -2047,9 +2047,102 @@ fn dispatch_send_message(
     enqueue_or_defer(effect, sender_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
 }
 
+/// Derive one agent's active attention signals (ux.2a) — Approval-pending, Budget-risk, and
+/// Degraded (credential/provider), in that priority order (see `AttentionReason`'s declaration
+/// order). Idle/Error are a follow-on increment ("ux.2b"): their prerequisite `AgentTask` fields
+/// don't exist yet — see `docs/plans/ux.2-attention-evidence.md`'s Eng Review rescope.
+///
+/// Reads `pending_approvals` directly (the scheduler's untruncated source), NOT the
+/// `.take(100)`-capped `pending_actions` snapshot vector built later in `update_snapshot` — an
+/// agent whose approval didn't make the cap must still get its Approval signal.
+/// Bundled inputs to `derive_attention` — matches this codebase's `ToolContext` precedent
+/// (p5.3) for multi-field call contexts, rather than a growing positional parameter list
+/// (Maintainability review finding; ux.2b will add more `AgentTask`-derived inputs here).
+struct AttentionInputs<'a> {
+    agent_id:             &'a str,
+    context_tokens:       u64,
+    token_budget:         u64,
+    credential_providers: &'a [String],
+    pending_approvals:    &'a HashMap<String, ParkedApproval>,
+    credential_snapshot:  Option<&'a surfaces::CredentialSnapshot>,
+}
+
+fn derive_attention(inputs: AttentionInputs) -> Vec<surfaces::AttentionSignal> {
+    let AttentionInputs {
+        agent_id, context_tokens, token_budget, credential_providers,
+        pending_approvals, credential_snapshot,
+    } = inputs;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut signals = Vec::new();
+
+    if let Some((approval_id, pa)) = pending_approvals.iter().find(|(_, pa)| pa.agent_id == agent_id) {
+        signals.push(surfaces::AttentionSignal {
+            reason:   surfaces::AttentionReason::ApprovalPending,
+            since:    now.saturating_sub(pa.created_at.elapsed().as_secs()),
+            evidence: Some(approval_id.clone()),
+        });
+    }
+
+    // Degraded fires on `!token_fresh` ALONE, not `AND last_error present` — a missing
+    // API-key env var sets `token_fresh: false` without ever populating `last_error` (no
+    // refresh attempt was ever made to fail), so requiring both would silently miss the
+    // single most common degraded case. No credential gateway configured at all (`None`) is
+    // a different state from "gateway configured but unreadable" — it means there's simply
+    // nothing to be degraded, not an unknown, so it produces no signal at all.
+    if let Some(snap) = credential_snapshot {
+        for provider in credential_providers {
+            match snap.provider_health.iter().find(|p| &p.name == provider) {
+                Some(health) if !health.token_fresh => {
+                    signals.push(surfaces::AttentionSignal {
+                        reason:   surfaces::AttentionReason::Degraded,
+                        since:    health.last_refresh_at.unwrap_or(now),
+                        evidence: Some(provider.clone()),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    // The agent's own credential grant references a provider the gateway's
+                    // config no longer/never lists — a real inconsistency (config drift, a
+                    // stale grant), not "nothing to evaluate." Distinct from an agent simply
+                    // not using any credentials at all (adversarial review finding, Codex).
+                    signals.push(surfaces::AttentionSignal {
+                        reason:   surfaces::AttentionReason::EvaluationUnavailable,
+                        since:    now,
+                        evidence: Some(format!("{provider} (not in gateway config)")),
+                    });
+                }
+            }
+        }
+    }
+
+    if crate::memory::context::assess(context_tokens, token_budget)
+        == crate::memory::context::MemoryPressure::Hard
+    {
+        let pct = if token_budget > 0 {
+            (context_tokens as f64 / token_budget as f64 * 100.0).round() as u64
+        } else {
+            0
+        };
+        signals.push(surfaces::AttentionSignal {
+            reason:   surfaces::AttentionReason::BudgetRisk,
+            since:    now,
+            evidence: Some(format!("{pct}%")),
+        });
+    }
+
+    signals
+}
+
 /// Write a snapshot of the current scheduler state into the shared snapshot.
 /// Uses `try_write` so a slow FUSE reader never blocks the scheduler.
 fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerState) {
+    // Computed once, reused both per-agent (attention derivation) and for the final
+    // `s.credential_snapshot` field below — avoids calling `gw.snapshot()` twice per cycle.
+    let credential_snapshot = state.cred_gw.as_ref().map(|gw| gw.snapshot());
+
     let agents: Vec<AgentSnapshot> = state
         .agents
         .iter()
@@ -2085,6 +2178,14 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     state.cred_gw.as_ref()
                         .map(|gw| gw.agent_grant_for(id))
                         .unwrap_or_default();
+                let attention = derive_attention(AttentionInputs {
+                    agent_id:             id,
+                    context_tokens:       task.context_tokens(),
+                    token_budget:         task.token_budget(),
+                    credential_providers: &cred_providers,
+                    pending_approvals:    &state.pending_approvals,
+                    credential_snapshot:  credential_snapshot.as_ref(),
+                });
                 AgentSnapshot {
                     id:             id.clone(),
                     status,
@@ -2117,6 +2218,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     credential_request_counts: cred_req,
                     credential_denied_counts:  cred_denied,
                     credential_last_access_at: cred_access,
+                    attention,
                 }
             }
         })
@@ -2149,6 +2251,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 credential_request_counts: HashMap::new(),
                 credential_denied_counts:  HashMap::new(),
                 credential_last_access_at: HashMap::new(),
+                attention:                 vec![],
             }
         })
         .collect();
@@ -2179,7 +2282,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         s.queue_depth         = state.deferred.len();
         s.pending_actions     = pending_actions;
         s.egress_addr         = state.egress_addr.map(|a| format!("http://{a}"));
-        s.credential_snapshot = state.cred_gw.as_ref().map(|gw| gw.snapshot());
+        s.credential_snapshot = credential_snapshot;
     }
 }
 
@@ -4646,5 +4749,242 @@ mod tests {
             log.contains("\"agent_not_waiting\""),
             "reason agent_not_waiting must appear in the event payload"
         );
+    }
+
+    // ── ux.2a: derive_attention ─────────────────────────────────────────────
+
+    /// Positional test wrapper around `derive_attention` (which takes a bundled
+    /// `AttentionInputs` in production code — this shorthand is purely test-ergonomics,
+    /// matching this file's existing small-helper convention, e.g. `parked_approval` below).
+    #[allow(clippy::too_many_arguments)]
+    fn da(
+        agent_id: &str,
+        context_tokens: u64,
+        token_budget: u64,
+        credential_providers: &[String],
+        pending_approvals: &HashMap<String, ParkedApproval>,
+        credential_snapshot: Option<&surfaces::CredentialSnapshot>,
+    ) -> Vec<surfaces::AttentionSignal> {
+        derive_attention(AttentionInputs {
+            agent_id, context_tokens, token_budget, credential_providers,
+            pending_approvals, credential_snapshot,
+        })
+    }
+
+    fn parked_approval(agent_id: &str) -> ParkedApproval {
+        ParkedApproval {
+            agent_id:   agent_id.to_string(),
+            call_id:    "call-1".to_string(),
+            action:     PendingActionRequest {
+                kind:       "write_file".to_string(),
+                risk:       "medium".to_string(),
+                summary:    "write a file".to_string(),
+                args:       serde_json::json!({}),
+                prev_state: None,
+                new_state:  None,
+            },
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    fn provider_health(name: &str, token_fresh: bool, last_error: Option<&str>) -> surfaces::ProviderHealth {
+        surfaces::ProviderHealth {
+            name: name.to_string(),
+            token_fresh,
+            last_refresh_at: Some(1_700_000_000),
+            expires_at: None,
+            last_error: last_error.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn derive_attention_clean_agent_has_no_signals() {
+        let signals = da("a1", 100, 50_000, &[], &HashMap::new(), None);
+        assert!(signals.is_empty(), "an agent with no active signal sources must be Clean");
+    }
+
+    #[test]
+    fn derive_attention_approval_pending_fires() {
+        let mut pending = HashMap::new();
+        pending.insert("act_1".to_string(), parked_approval("a1"));
+        let signals = da("a1", 100, 50_000, &[], &pending, None);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::ApprovalPending);
+        assert_eq!(signals[0].evidence.as_deref(), Some("act_1"));
+    }
+
+    #[test]
+    fn derive_attention_approval_ignores_other_agents() {
+        let mut pending = HashMap::new();
+        pending.insert("act_1".to_string(), parked_approval("someone-else"));
+        let signals = da("a1", 100, 50_000, &[], &pending, None);
+        assert!(signals.is_empty());
+    }
+
+    /// Guards against the Eng Dual Voices (Codex) finding: filtering the already-`.take(100)`-
+    /// capped `pending_actions` snapshot vector would silently drop signals for agents past the
+    /// 100th pending approval. `derive_attention` must read `pending_approvals` directly instead
+    /// — this test constructs >100 entries and asserts the 101st agent still gets a signal.
+    #[test]
+    fn derive_attention_approval_not_capped_at_one_hundred() {
+        let mut pending = HashMap::new();
+        for i in 0..150 {
+            pending.insert(format!("act_{i}"), parked_approval(&format!("filler-{i}")));
+        }
+        pending.insert("act_late".to_string(), parked_approval("agent-101"));
+        let signals = da("agent-101", 100, 50_000, &[], &pending, None);
+        assert_eq!(signals.len(), 1, "agent past a hypothetical 100-cap must still get its Approval signal");
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::ApprovalPending);
+    }
+
+    /// Guards against a HashMap-iteration-order footgun: if an agent ever had 2+ simultaneous
+    /// pending approvals (the scheduler's own invariant — parked agents can't re-step and
+    /// re-request — should prevent this today, but this test pins the behavior explicitly
+    /// rather than leaving it to chance if that invariant is ever weakened).
+    #[test]
+    fn derive_attention_multiple_approvals_same_agent_collapses_to_one_signal() {
+        let mut pending = HashMap::new();
+        pending.insert("act_a".to_string(), parked_approval("a1"));
+        pending.insert("act_b".to_string(), parked_approval("a1"));
+        let signals = da("a1", 100, 50_000, &[], &pending, None);
+        assert_eq!(signals.len(), 1, "must collapse to a single ApprovalPending signal per agent, never panic");
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::ApprovalPending);
+        assert!(
+            signals[0].evidence.as_deref() == Some("act_a") || signals[0].evidence.as_deref() == Some("act_b"),
+            "evidence must be one of the two approval IDs (HashMap iteration order is unspecified, not a bug)"
+        );
+    }
+
+    /// Distinct from "agent doesn't list the provider": here the agent DOES list a provider,
+    /// but that provider is absent from the gateway's own health snapshot entirely (e.g.
+    /// configured for the agent but never registered) — a different code branch than the
+    /// "provider listed and found" or "provider not listed at all" cases already covered above.
+    #[test]
+    fn derive_attention_degraded_provider_not_in_health_snapshot_is_evaluation_unavailable() {
+        // A provider absent from the gateway's health snapshot entirely (config drift, a
+        // stale grant) is a real inconsistency — must render EvaluationUnavailable, not
+        // silently Clean (adversarial review finding, Codex).
+        let snap = surfaces::CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["google".to_string()],
+            provider_health: vec![provider_health("google", false, None)],
+        };
+        let signals = da(
+            "a1", 100, 50_000, &["unregistered_provider".to_string()], &HashMap::new(), Some(&snap),
+        );
+        assert_eq!(signals.len(), 1, "must not panic, must not silently vanish");
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::EvaluationUnavailable);
+        assert_eq!(signals[0].evidence.as_deref(), Some("unregistered_provider (not in gateway config)"));
+    }
+
+    #[test]
+    fn derive_attention_budget_risk_fires_at_hard_threshold() {
+        // 92% of budget — past HARD_THRESHOLD (90%).
+        let signals = da("a1", 92_000, 100_000, &[], &HashMap::new(), None);
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::BudgetRisk);
+        assert_eq!(signals[0].evidence.as_deref(), Some("92%"));
+    }
+
+    #[test]
+    fn derive_attention_budget_below_threshold_is_clean() {
+        let signals = da("a1", 50_000, 100_000, &[], &HashMap::new(), None);
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn derive_attention_degraded_fires_on_stale_token_alone() {
+        let snap = surfaces::CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["google".to_string()],
+            provider_health: vec![provider_health("google", false, None)],
+        };
+        let signals = da(
+            "a1", 100, 50_000, &["google".to_string()], &HashMap::new(), Some(&snap),
+        );
+        assert_eq!(signals.len(), 1, "token_fresh:false with NO last_error must still fire Degraded");
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::Degraded);
+        assert_eq!(signals[0].evidence.as_deref(), Some("google"));
+    }
+
+    #[test]
+    fn derive_attention_degraded_does_not_fire_when_token_fresh() {
+        let snap = surfaces::CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["google".to_string()],
+            provider_health: vec![provider_health("google", true, None)],
+        };
+        let signals = da(
+            "a1", 100, 50_000, &["google".to_string()], &HashMap::new(), Some(&snap),
+        );
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn derive_attention_degraded_ignores_agents_not_using_the_provider() {
+        let snap = surfaces::CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["google".to_string()],
+            provider_health: vec![provider_health("google", false, None)],
+        };
+        // Agent doesn't list "google" among its own credential_providers.
+        let signals = da("a1", 100, 50_000, &[], &HashMap::new(), Some(&snap));
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn derive_attention_priority_approval_beats_degraded_for_row_ordering() {
+        let mut pending = HashMap::new();
+        pending.insert("act_1".to_string(), parked_approval("a1"));
+        let snap = surfaces::CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["google".to_string()],
+            provider_health: vec![provider_health("google", false, None)],
+        };
+        let mut signals = da(
+            "a1", 100, 50_000, &["google".to_string()], &pending, Some(&snap),
+        );
+        assert_eq!(signals.len(), 2, "both Approval and Degraded should be active simultaneously");
+        signals.sort_by(|a, b| a.reason.cmp(&b.reason));
+        assert_eq!(
+            signals[0].reason,
+            surfaces::AttentionReason::ApprovalPending,
+            "ApprovalPending must sort first by declaration-order priority, even though \
+             Degraded is more severe (Critical vs Info) — severity and routing priority are \
+             deliberately independent axes (Design Fix 1)"
+        );
+    }
+
+    #[test]
+    fn attention_signal_serializes_on_agent_snapshot() {
+        // Guards the manual-Serialize silent-drop trap: a new AgentSnapshot field with no
+        // matching serialize_field call compiles fine and silently vanishes from JSON.
+        let mut pending = HashMap::new();
+        pending.insert("act_1".to_string(), parked_approval("a1"));
+        let attention = da("a1", 100, 50_000, &[], &pending, None);
+        let snap = AgentSnapshot {
+            id: "a1".to_string(),
+            status: AgentStatus::Running,
+            turn: 0,
+            context_tokens: 100,
+            token_budget: 50_000,
+            task_preview: String::new(),
+            tools: vec![],
+            short_term_previews: vec![],
+            parent_id: None,
+            accessible_server_names: vec![],
+            capabilities_unrestricted: true,
+            tier: None,
+            pid: None,
+            credential_providers: vec![],
+            credential_request_counts: HashMap::new(),
+            credential_denied_counts: HashMap::new(),
+            credential_last_access_at: HashMap::new(),
+            attention,
+        };
+        let json = serde_json::to_value(&snap).expect("AgentSnapshot must serialize");
+        let arr = json["attention"].as_array().expect("attention field must be present and be an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["reason"], "approval_pending");
     }
 }

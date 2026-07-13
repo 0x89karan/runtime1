@@ -451,8 +451,30 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App) {
         KeyCode::Up | KeyCode::Char('k')   => app.select_prev(),
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
         KeyCode::Enter                     => {
-            if app.selected_agent().is_some() {
-                app.view = View::AgentDetail;
+            if let Some(agent) = app.selected_agent() {
+                // ux.2a: route by the highest-priority active signal (actionability, NOT
+                // severity — Design Fix 1: an ApprovalPending signal always wins Enter-routing
+                // even when a Degraded signal is more severe, since it's the one signal type
+                // an operator resolves directly). No active signal keeps the unchanged default.
+                // Reuses views::top_attention_signal — the Dashboard's stacked-reason-line
+                // picker — so routing and display can never disagree on which signal leads.
+                let top = views::top_attention_signal(&agent.attention);
+                match top.map(|s| &s.reason) {
+                    Some(reader::AttentionReason::ApprovalPending) => {
+                        app.view = View::Approvals;
+                        app.approvals_view.mode         = ApprovalsMode::List;
+                        app.approvals_view.selected_idx = 0;
+                        app.approvals_view.result_msg   = None;
+                    }
+                    Some(reader::AttentionReason::Degraded) => {
+                        app.view = View::Credentials;
+                    }
+                    _ => {
+                        // BudgetRisk, EvaluationUnavailable, or no signal at all — AgentDetail
+                        // is already agent-scoped, the safest and most informative default.
+                        app.view = View::AgentDetail;
+                    }
+                }
             }
         }
         KeyCode::Char('s') => app.view = View::System,
@@ -821,7 +843,7 @@ mod tests {
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
     use crate::watch::pump::AppEvent;
-    use crate::watch::reader::{AgentInfo, BudgetKind, PendingAction, Snapshot};
+    use crate::watch::reader::{self, AgentInfo, BudgetKind, PendingAction, Snapshot};
     use crate::watch::source::DataSource;
 
     struct TestSource;
@@ -888,6 +910,7 @@ mod tests {
                 tier:            "native".to_string(),
                 isolation:       String::new(),
                 pid:             0,
+                attention:       vec![],
             }).collect(),
             budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         }
@@ -937,6 +960,63 @@ mod tests {
         assert_eq!(app.view, View::Dashboard);
         handle_dashboard_key(KeyCode::Enter, &mut app);
         assert_eq!(app.view, View::AgentDetail);
+    }
+
+    // ── ux.2a: Enter-routing by actionability (Design Fix 1) ───────────────────
+
+    #[test]
+    fn dashboard_key_enter_routes_approval_pending_to_approvals() {
+        let mut app = app_with_agents(&["a"]);
+        app.agents[0].attention.push(reader::AttentionSignal {
+            reason: reader::AttentionReason::ApprovalPending,
+            since: 10,
+            evidence: Some("act_1".to_string()),
+        });
+        handle_dashboard_key(KeyCode::Enter, &mut app);
+        assert_eq!(app.view, View::Approvals);
+    }
+
+    #[test]
+    fn dashboard_key_enter_routes_degraded_to_credentials() {
+        let mut app = app_with_agents(&["a"]);
+        app.agents[0].attention.push(reader::AttentionSignal {
+            reason: reader::AttentionReason::Degraded,
+            since: 10,
+            evidence: Some("google".to_string()),
+        });
+        handle_dashboard_key(KeyCode::Enter, &mut app);
+        assert_eq!(app.view, View::Credentials);
+    }
+
+    #[test]
+    fn dashboard_key_enter_routes_budget_risk_to_agent_detail() {
+        let mut app = app_with_agents(&["a"]);
+        app.agents[0].attention.push(reader::AttentionSignal {
+            reason: reader::AttentionReason::BudgetRisk,
+            since: 10,
+            evidence: Some("92%".to_string()),
+        });
+        handle_dashboard_key(KeyCode::Enter, &mut app);
+        assert_eq!(app.view, View::AgentDetail);
+    }
+
+    #[test]
+    fn dashboard_key_enter_approval_wins_over_more_severe_degraded() {
+        // Design Fix 1: routing is actionability-driven, not severity-driven — ApprovalPending
+        // always wins Enter-routing even though Degraded (Critical) is more severe (Info).
+        let mut app = app_with_agents(&["a"]);
+        app.agents[0].attention.push(reader::AttentionSignal {
+            reason: reader::AttentionReason::Degraded,
+            since: 10,
+            evidence: Some("google".to_string()),
+        });
+        app.agents[0].attention.push(reader::AttentionSignal {
+            reason: reader::AttentionReason::ApprovalPending,
+            since: 10,
+            evidence: Some("act_1".to_string()),
+        });
+        handle_dashboard_key(KeyCode::Enter, &mut app);
+        assert_eq!(app.view, View::Approvals);
     }
 
     #[test]

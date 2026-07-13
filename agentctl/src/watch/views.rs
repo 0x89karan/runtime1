@@ -12,6 +12,7 @@ use super::memory::{
     filter_entries, filter_short_term, read_agent_memory, read_kb_segments, MAX_DISPLAY_ENTRIES,
     MAX_SEARCH_ENTRIES,
 };
+use super::reader;
 use super::topology::render_tree;
 
 /// Strip ASCII control characters (< 0x20, except tab) from a string before
@@ -63,24 +64,110 @@ fn status_style(status: &str) -> Style {
     }
 }
 
+/// `AttentionSignal.since` is an absolute Unix-epoch second (see `surfaces::AttentionSignal`'s
+/// doc comment), NOT a duration — every "{X}s ago" render site must subtract it from "now"
+/// first. (Adversarial review finding: every call site originally formatted `since` directly,
+/// producing a nonsensical multi-billion-second "ago" value on every real signal shown.)
+fn secs_ago(since: u64) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(since);
+    now.saturating_sub(since)
+}
+
+/// Three-way row classification shared by the TUI glyph, `--plain` marker, and the legend
+/// text — a single source of truth so the three can never drift apart (Maintainability
+/// review finding: the TUI and `--plain` paths previously reimplemented this independently
+/// with slightly different boolean logic).
+enum AttentionClass {
+    /// Evaluated, zero signals active.
+    Clean,
+    /// Every active signal is `EvaluationUnavailable` — a read/parse failure, never rendered
+    /// as Clean (Design Review Pass 2's CRITICAL finding).
+    Unavailable,
+    /// At least one real (non-`EvaluationUnavailable`) signal is active.
+    Active,
+}
+
+fn classify_attention(signals: &[reader::AttentionSignal]) -> AttentionClass {
+    if signals.is_empty() {
+        return AttentionClass::Clean;
+    }
+    if signals.iter().all(|s| s.reason == reader::AttentionReason::EvaluationUnavailable) {
+        return AttentionClass::Unavailable;
+    }
+    AttentionClass::Active
+}
+
+/// Named so the legend line (below) can never silently drift from what the glyph functions
+/// actually render — both read from these same three constants.
+const GLYPH_ACTIVE: &str = "⚠";
+const GLYPH_CLEAN: &str = "·";
+const GLYPH_UNAVAILABLE: &str = "?";
+
+/// ux.2a: single-glyph attention indicator for a row. Three states, never a blank cell —
+/// `Clean` and `EvaluationUnavailable` are visually distinct so a failed read is never
+/// mistaken for "nothing wrong" (Design Review Pass 2's CRITICAL finding).
+fn attention_glyph_and_style(signals: &[reader::AttentionSignal]) -> (&'static str, Style) {
+    match classify_attention(signals) {
+        AttentionClass::Clean       => (GLYPH_CLEAN, Style::default().fg(Color::DarkGray)),
+        AttentionClass::Unavailable => (GLYPH_UNAVAILABLE, Style::default().fg(Color::Yellow)),
+        AttentionClass::Active      => {
+            let color = if signals.iter().any(|s| s.reason.is_critical()) { Color::Red } else { Color::Yellow };
+            (GLYPH_ACTIVE, Style::default().fg(color))
+        }
+    }
+}
+
+/// Highest-priority active signal for the stacked reason line, by declaration order
+/// (`AttentionReason`'s `Ord` impl) — NOT severity. `ApprovalPending` always wins even when
+/// a `Degraded` signal is more severe, since an approval is the one signal type an operator
+/// resolves directly (Design Fix 1).
+pub(crate) fn top_attention_signal(signals: &[reader::AttentionSignal]) -> Option<&reader::AttentionSignal> {
+    signals.iter().min_by(|a, b| a.reason.cmp(&b.reason))
+}
+
+/// Fleet-wide attention counts, shared by the TUI and `--plain` summary lines so the two
+/// can never drift on what counts as "needs attention" vs. "unavailable" (Design Fix 3:
+/// `EvaluationUnavailable`-only agents count toward `unavailable`, not `needing`).
+fn attention_counts(agents: &[reader::AgentInfo]) -> (usize, usize) {
+    let needing = agents.iter().filter(|a| {
+        a.attention.iter().any(|s| s.reason != reader::AttentionReason::EvaluationUnavailable)
+    }).count();
+    let unavailable = agents.iter().filter(|a| {
+        a.attention.iter().any(|s| s.reason == reader::AttentionReason::EvaluationUnavailable)
+    }).count();
+    (needing, unavailable)
+}
+
 fn render_dashboard(f: &mut Frame, app: &App) {
     let area = f.area();
 
     // When a spawn banner is active, carve out an extra line below the header.
-    let (header_area, banner_area, content_area, footer_area) = if app.spawn_banner.is_some() {
+    let (header_area, summary_area, banner_area, content_area, footer_area) = if app.spawn_banner.is_some() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),  // header bar
+                Constraint::Length(1),  // ux.2a: attention summary line
                 Constraint::Length(1),  // spawn banner
                 Constraint::Min(1),     // main content
-                Constraint::Length(1),  // footer / key hints
+                Constraint::Length(2),  // footer: key hints + ux.2a legend
             ])
             .split(area);
-        (chunks[0], Some(chunks[1]), chunks[2], chunks[3])
+        (chunks[0], chunks[1], Some(chunks[2]), chunks[3], chunks[4])
     } else {
-        let (h, c, f2) = header_footer_layout(area);
-        (h, None, c, f2)
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),  // header bar
+                Constraint::Length(1),  // ux.2a: attention summary line
+                Constraint::Min(1),     // main content
+                Constraint::Length(2),  // footer: key hints + ux.2a legend
+            ])
+            .split(area);
+        (chunks[0], chunks[1], None, chunks[2], chunks[3])
     };
 
     // Header
@@ -92,6 +179,23 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         Paragraph::new(title).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         header_area,
     );
+
+    // ux.2a: attention summary line — always rendered, even at zero, so the layout never
+    // reflows and "nothing needs attention" is a stated fact, not an absence (Design Fix 3
+    // covers the fleet-wide-unavailable case; per-agent EvaluationUnavailable is excluded
+    // from the "needs attention" count here, matching Reference table 1's semantics).
+    let (needing, unavailable) = attention_counts(&app.agents);
+    let summary_text = match (needing, unavailable) {
+        (0, 0) => "0 need attention".to_string(),
+        (n, 0) => format!("{n} need attention"),
+        (n, m) => format!("{n} need attention · {m} unavailable"),
+    };
+    let summary_style = if needing > 0 {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    f.render_widget(Paragraph::new(summary_text).style(summary_style), summary_area);
 
     // Spawn banner (shown after live injection via /agents/control).
     if let (Some(msg), Some(banner_rect)) = (&app.spawn_banner, banner_area) {
@@ -107,6 +211,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     let header_row = Row::new(vec![
         Cell::from("Agent ID").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Status").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("ATTN").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Context").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Budget").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("Tools").style(Style::default().add_modifier(Modifier::BOLD)),
@@ -115,13 +220,32 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     let rows: Vec<Row> = app.agents.iter().enumerate().map(|(i, a)| {
         let is_sel = selected_idx == Some(i);
         let bg = if is_sel { Color::Blue } else { Color::Reset };
+        let (glyph, glyph_style) = attention_glyph_and_style(&a.attention);
+        // Stacked reason line, per the top-priority (most actionable) active signal — rendered
+        // as line 2 of the Agent ID cell (ratatui `Table` cells don't span columns; this is the
+        // widest column, `Constraint::Min(20)`, so the reason text has room to be readable).
+        let id_text: ratatui::text::Text = if let Some(sig) = top_attention_signal(&a.attention) {
+            let ago = secs_ago(sig.since);
+            let reason_line = match &sig.evidence {
+                Some(ev) => format!("  {} {} ({}) · {ago}s ago", glyph, sig.reason.label(), sanitize(ev)),
+                None     => format!("  {} {} · {ago}s ago", glyph, sig.reason.label()),
+            };
+            ratatui::text::Text::from(vec![
+                Line::from(a.id.clone()),
+                Line::from(Span::styled(reason_line, glyph_style)),
+            ])
+        } else {
+            ratatui::text::Text::from(a.id.clone())
+        };
+        let height = if top_attention_signal(&a.attention).is_some() { 2 } else { 1 };
         Row::new(vec![
-            Cell::from(a.id.clone()),
+            Cell::from(id_text),
             Cell::from(a.status.clone()).style(status_style(&a.status)),
+            Cell::from(glyph).style(glyph_style),
             Cell::from(format!("{}", a.context_tokens)),
             Cell::from(a.budget.display()),
             Cell::from(format!("{}", a.tools.len())),
-        ]).style(Style::default().bg(bg))
+        ]).style(Style::default().bg(bg)).height(height)
     }).collect();
 
     if app.agents.is_empty() {
@@ -139,6 +263,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
             [
                 Constraint::Min(20),     // Agent ID
                 Constraint::Length(20),  // Status
+                Constraint::Length(4),   // ATTN (ux.2a) — leads, right after Status
                 Constraint::Length(10),  // Context
                 Constraint::Length(12),  // Budget
                 Constraint::Length(6),   // Tools
@@ -149,11 +274,24 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         f.render_widget(table, content_area);
     }
 
-    // Footer
-    let hints = " ↑/↓ select  Enter detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  q quit ";
+    // Footer: key hints line + ux.2a legend line (a genuine 2-row layout change from the
+    // single-line footer this Dashboard had before — Design/DX Review both flagged that
+    // adding a legend without widening the footer wasn't actually free).
+    let footer_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(footer_area);
+    let hints = " ↑/↓ select  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector  q quit ";
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
-        footer_area,
+        footer_chunks[0],
+    );
+    let legend = format!(
+        "  Legend: {GLYPH_ACTIVE} needs attention   {GLYPH_CLEAN} checked, clear   {GLYPH_UNAVAILABLE} couldn't check"
+    );
+    f.render_widget(
+        Paragraph::new(legend).style(Style::default().fg(Color::DarkGray)),
+        footer_chunks[1],
     );
 }
 
@@ -205,7 +343,27 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
                 .join("  ")
         }
     };
-    let lines: Vec<Line> = vec![
+    // ux.2a: persistent attention strip — renders iff ≥1 signal is active, ALWAYS the top
+    // line(s) (before Status), one line per active signal, highest-priority first. Absent
+    // entirely for a clean agent, not rendered blank (same "silence is a real state" rule as
+    // the Dashboard).
+    let mut sorted_signals: Vec<&reader::AttentionSignal> = agent.attention.iter().collect();
+    sorted_signals.sort_by(|a, b| a.reason.cmp(&b.reason));
+    let attention_lines: Vec<Line> = sorted_signals.iter().map(|sig| {
+        let (glyph, style) = attention_glyph_and_style(std::slice::from_ref(sig));
+        let ago = secs_ago(sig.since);
+        let text = match &sig.evidence {
+            Some(ev) => format!("{} {} ({}) · {ago}s ago", glyph, sig.reason.label(), sanitize(ev)),
+            None     => format!("{} {} · {ago}s ago", glyph, sig.reason.label()),
+        };
+        Line::from(Span::styled(text, style))
+    }).collect();
+
+    let mut lines: Vec<Line> = attention_lines;
+    if !lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines.extend(vec![
         {
             let mut spans = vec![
                 Span::styled("  Status:   ", Style::default().add_modifier(Modifier::BOLD)),
@@ -257,7 +415,7 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
                 Line::from("")
             }
         },
-    ];
+    ]);
     f.render_widget(
         Paragraph::new(lines)
             .block(Block::default().borders(Borders::ALL).title(" detail ")),
@@ -1148,6 +1306,14 @@ pub fn render_plain(app: &App) -> String {
     if app.agents.is_empty() {
         out.push_str("agents: (none)\n");
     } else {
+        // ux.2a: attention summary — same "N need attention · M unavailable" semantics as the
+        // TUI's summary line, never silently omitting the caveat when M > 0.
+        let (needing, unavailable) = attention_counts(&app.agents);
+        out.push_str(&match (needing, unavailable) {
+            (0, 0) => "attention: 0 need attention\n".to_string(),
+            (n, 0) => format!("attention: {n} need attention\n"),
+            (n, m) => format!("attention: {n} need attention, {m} unavailable\n"),
+        });
         out.push_str(&format!("agents: {}\n", app.agents.len()));
         for a in &app.agents {
             let ctx_str = if a.tier == "universal" { "N/A".to_string() } else { a.context_tokens.to_string() };
@@ -1156,15 +1322,38 @@ pub fn render_plain(app: &App) -> String {
             } else {
                 String::new()
             };
+            let attn_marker = match classify_attention(&a.attention) {
+                AttentionClass::Clean       => "[OK]",
+                AttentionClass::Unavailable => "[?]",
+                AttentionClass::Active      => "[!]",
+            };
             out.push_str(&format!(
-                "  {} [{status}] ctx={ctx} budget={budget} tools={tools}{tier}\n",
+                "  {} {attn}[{status}] ctx={ctx} budget={budget} tools={tools}{tier}\n",
                 a.id,
+                attn   = attn_marker,
                 status = a.status,
                 ctx    = ctx_str,
                 budget = a.budget.display(),
                 tools  = a.tools.len(),
                 tier   = tier_str,
             ));
+            // Marker + reason text, not a bare marker — collapsing Approval/Budget/Degraded
+            // to an unlabeled "[!]" would make them indistinguishable in plain mode (DX Review
+            // finding).
+            let mut sorted: Vec<&reader::AttentionSignal> = a.attention.iter().collect();
+            sorted.sort_by(|x, y| x.reason.cmp(&y.reason));
+            for sig in sorted {
+                let marker = if sig.reason == reader::AttentionReason::EvaluationUnavailable { "[?]" } else { "[!]" };
+                let ago = secs_ago(sig.since);
+                match &sig.evidence {
+                    Some(ev) => out.push_str(&format!(
+                        "    {marker} {} ({}) · {ago}s ago\n", sig.reason.label(), sanitize(ev)
+                    )),
+                    None => out.push_str(&format!(
+                        "    {marker} {} · {ago}s ago\n", sig.reason.label()
+                    )),
+                }
+            }
         }
     }
     // Topology section
@@ -1297,6 +1486,7 @@ mod tests {
             tier:            "native".to_string(),
             isolation:       String::new(),
             pid:             0,
+            attention:       vec![],
         }
     }
 
@@ -1927,5 +2117,130 @@ mod tests {
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("stale/missing"), "stale token must show stale label");
         assert!(out.contains("last_error: token_expired"), "must show last_error");
+    }
+
+    // ── ux.2a: attention glyph / priority / --plain ────────────────────────────
+
+    /// `since` is an absolute Unix-epoch second, NOT a duration — constructed here as
+    /// "90 seconds ago" from real wall-clock time, matching what production code actually
+    /// produces (a tiny hand-picked constant like `since: 90` would silently mask the exact
+    /// "since is an epoch, not a duration" bug an adversarial review caught in this feature).
+    fn signal(reason: reader::AttentionReason, evidence: Option<&str>) -> reader::AttentionSignal {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        reader::AttentionSignal { reason, since: now - 90, evidence: evidence.map(str::to_string) }
+    }
+
+    #[test]
+    fn secs_ago_computes_elapsed_from_epoch_not_the_epoch_itself() {
+        // Regression test for the adversarial-review CRITICAL finding: `since` is an absolute
+        // Unix-epoch second; rendering it directly as "{since}s ago" produces a nonsensical
+        // multi-billion-second value. `secs_ago` must subtract from "now" first.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let ago = secs_ago(now - 42);
+        assert!(ago < 1_000_000, "secs_ago({}) returned {ago} — looks like a raw epoch, not an elapsed duration", now - 42);
+        assert!((40..=45).contains(&ago), "expected ~42s elapsed, got {ago}s (tolerance for test execution time)");
+    }
+
+    fn make_agent_with_attention(id: &str, attention: Vec<reader::AttentionSignal>) -> AgentInfo {
+        let mut a = make_agent(id, "running", 100, vec![]);
+        a.attention = attention;
+        a
+    }
+
+    #[test]
+    fn attention_glyph_clean_is_dim_dot() {
+        let (glyph, style) = attention_glyph_and_style(&[]);
+        assert_eq!(glyph, "·");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn attention_glyph_evaluation_unavailable_only_is_question_mark() {
+        let sigs = vec![signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway"))];
+        let (glyph, style) = attention_glyph_and_style(&sigs);
+        assert_eq!(glyph, "?");
+        assert_eq!(style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn attention_glyph_real_signal_is_warning_not_question_mark() {
+        // A real signal must never be visually indistinguishable from "couldn't check" —
+        // that ambiguity was the Design Review's CRITICAL finding.
+        let sigs = vec![signal(reader::AttentionReason::ApprovalPending, None)];
+        let (glyph, _) = attention_glyph_and_style(&sigs);
+        assert_eq!(glyph, "⚠");
+    }
+
+    #[test]
+    fn attention_glyph_mixed_real_and_unavailable_is_warning_not_question_mark() {
+        // A real signal alongside an EvaluationUnavailable one (e.g. approval pending AND the
+        // credential-health read failed) must still lead with the real, actionable signal —
+        // the "all EvaluationUnavailable" branch must not fire when a real signal is present.
+        let sigs = vec![
+            signal(reader::AttentionReason::ApprovalPending, Some("act_1")),
+            signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway")),
+        ];
+        let (glyph, _) = attention_glyph_and_style(&sigs);
+        assert_eq!(glyph, "⚠", "a real signal must not be masked by a co-occurring EvaluationUnavailable");
+    }
+
+    #[test]
+    fn attention_glyph_degraded_is_red_others_are_yellow() {
+        let (_, degraded_style) = attention_glyph_and_style(&[signal(reader::AttentionReason::Degraded, None)]);
+        assert_eq!(degraded_style.fg, Some(Color::Red));
+        let (_, approval_style) = attention_glyph_and_style(&[signal(reader::AttentionReason::ApprovalPending, None)]);
+        assert_eq!(approval_style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn top_attention_signal_approval_beats_degraded() {
+        let sigs = vec![
+            signal(reader::AttentionReason::Degraded, Some("google")),
+            signal(reader::AttentionReason::ApprovalPending, Some("act_1")),
+        ];
+        let top = top_attention_signal(&sigs).expect("must have a top signal");
+        assert_eq!(top.reason, reader::AttentionReason::ApprovalPending);
+    }
+
+    #[test]
+    fn render_plain_clean_agent_shows_ok_marker() {
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention("scout-1", vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("[OK]"));
+        assert!(out.contains("attention: 0 need attention"));
+    }
+
+    #[test]
+    fn render_plain_flagged_agent_shows_marker_and_reason_text() {
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention(
+                "scout-1",
+                vec![signal(reader::AttentionReason::ApprovalPending, Some("act_1"))],
+            )],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("[!]"));
+        assert!(out.contains("approval pending (act_1)"), "reason text must render, not a bare marker");
+        assert!(out.contains("attention: 1 need attention"));
+    }
+
+    #[test]
+    fn render_plain_evaluation_unavailable_shows_distinct_marker_and_is_not_counted_as_needing() {
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention(
+                "scout-1",
+                vec![signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway"))],
+            )],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("[?]"));
+        assert!(out.contains("attention: 0 need attention"), "eval-unavailable alone is not 'needs attention'");
     }
 }
