@@ -2101,9 +2101,20 @@ fn derive_attention(inputs: AttentionInputs) -> Vec<surfaces::AttentionSignal> {
         for provider in credential_providers {
             match snap.provider_health.iter().find(|p| &p.name == provider) {
                 Some(health) if !health.token_fresh || health.attention_reason.is_some() => {
+                    // ApiKey-style providers whose env var was NEVER set (the single most
+                    // common Degraded case) never populate attention_since (cred.7's health
+                    // machine is OAuth-only) or last_refresh_at (only ever written on the
+                    // OAuth success path) — both stay None forever. Falling back to `now` here
+                    // would recompute "just broke" on every tick for a credential that has
+                    // been missing since the deployment was first stood up. `since: 0` is a
+                    // sentinel meaning "no real onset ever tracked" (a real Unix-epoch second
+                    // is never exactly 0 in practice) — agentctl's age_display renders it as
+                    // "active" instead of a fake elapsed time, same as BudgetRisk/
+                    // EvaluationUnavailable (adversarial review finding, Claude + Codex both
+                    // independently caught this).
                     signals.push(surfaces::AttentionSignal {
                         reason:   surfaces::AttentionReason::Degraded,
-                        since:    health.attention_since.or(health.last_refresh_at).unwrap_or(now),
+                        since:    health.attention_since.or(health.last_refresh_at).unwrap_or(0),
                         evidence: Some(provider.clone()),
                     });
                 }
@@ -4924,6 +4935,31 @@ mod tests {
         assert_eq!(signals.len(), 1, "token_fresh:false with NO last_error must still fire Degraded");
         assert_eq!(signals[0].reason, surfaces::AttentionReason::Degraded);
         assert_eq!(signals[0].evidence.as_deref(), Some("google"));
+    }
+
+    /// Ship-review finding (Claude + Codex adversarial, independently confirmed): ApiKey-style
+    /// providers whose env var was never set (the single most common Degraded case) never get
+    /// attention_since (cred.7's health machine is OAuth-only) or last_refresh_at (only ever
+    /// written on the OAuth success path) populated — both stay None forever. `since` must be
+    /// the `0` sentinel in this case, not `now` (which would recompute "just broke" every tick).
+    #[test]
+    fn derive_attention_degraded_since_is_zero_sentinel_when_never_tracked() {
+        let mut health = provider_health("brave_search", false, None);
+        health.last_refresh_at = None;
+        let snap = surfaces::CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["brave_search".to_string()],
+            provider_health: vec![health],
+        };
+        let signals = da(
+            "a1", 100, 50_000, &["brave_search".to_string()], &HashMap::new(), Some(&snap),
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::Degraded);
+        assert_eq!(
+            signals[0].since, 0,
+            "must use the 0 sentinel (never-tracked), not fall back to `now`, when no real onset exists"
+        );
     }
 
     #[test]

@@ -924,6 +924,21 @@ impl fuser::Filesystem for AgentsFs {
                         let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
                         reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
                     }
+                    // Ship-review finding (Codex structured review): this arm was missing for
+                    // both "credentials" (cred.5, pre-existing) and "attention" (ux.2a) — both
+                    // files were listed by readdir but returned ENOENT on open-by-path over a
+                    // real FUSE mount, since lookup() name resolution never had a match arm for
+                    // them. readdir and lookup() must stay in sync for every per-agent file.
+                    "credentials" => {
+                        let ino = dir_ino + OFF_CREDENTIALS;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    "attention" => {
+                        let ino = dir_ino + OFF_ATTENTION;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
                     "memory" if self.memory.is_some() => {
                         let ino = dir_ino + OFF_MEMORY_DIR;
                         reply.entry(&TTL, &make_file_attr(ino, 0, fuser::FileType::Directory), 0);

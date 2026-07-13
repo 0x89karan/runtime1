@@ -80,13 +80,18 @@ fn secs_ago(since: u64) -> u64 {
 /// every poll — their `since` is stamped "now" every time, not a tracked onset (ship-review
 /// Red Team finding). Rendering that as "0s ago" implies a duration these signal types can't
 /// actually measure, and would silently mislead an operator into thinking a long-standing
-/// budget or config-drift issue just started. `ApprovalPending`/`Degraded` DO have a real
-/// onset (`created_at`/`last_refresh_at`/`attention_since`) and keep showing true elapsed time.
+/// budget or config-drift issue just started. `ApprovalPending` always has a real onset
+/// (`created_at`). `Degraded` usually has one too (`last_refresh_at`/`attention_since`), EXCEPT
+/// for ApiKey-style providers whose env var was never set — that path never populates either
+/// field, so `derive_attention` sends `since: 0` as a sentinel (a real Unix-epoch second is
+/// never exactly 0) meaning "no onset was ever tracked" (adversarial review finding, Claude +
+/// Codex both independently caught this for the missing-API-key case).
 fn age_display(sig: &reader::AttentionSignal) -> String {
     match sig.reason {
         reader::AttentionReason::BudgetRisk | reader::AttentionReason::EvaluationUnavailable => {
             "active".to_string()
         }
+        reader::AttentionReason::Degraded if sig.since == 0 => "active".to_string(),
         reader::AttentionReason::ApprovalPending | reader::AttentionReason::Degraded => {
             format!("{}s ago", secs_ago(sig.since))
         }
@@ -1345,7 +1350,12 @@ pub fn render_plain(app: &App) -> String {
                 AttentionClass::Active      => "[!]",
             };
             out.push_str(&format!(
-                "  {} {attn}[{status}] ctx={ctx} budget={budget} tools={tools}{tier}\n",
+                // Ship-review finding (Codex adversarial): the attention marker and status
+                // bracket must stay as two separate tokens ("[OK] [failed]"), not concatenated
+                // ("[OK][failed]") — anything parsing --plain output positionally (this mode is
+                // explicitly for CI/non-TTY consumption) would otherwise see the second token
+                // silently change shape.
+                "  {} {attn} [{status}] ctx={ctx} budget={budget} tools={tools}{tier}\n",
                 a.id,
                 attn   = attn_marker,
                 status = a.status,
@@ -2232,6 +2242,21 @@ mod tests {
         assert!(out.contains("attention: 0 need attention"));
     }
 
+    /// Ship-review finding (Codex adversarial): the attention marker and status bracket must
+    /// be two separate tokens, not concatenated — --plain is explicitly for CI/non-TTY
+    /// consumption, and a positional-field parser would see the status token silently change
+    /// shape from "[status]" to "[OK][status]".
+    #[test]
+    fn render_plain_attn_marker_and_status_bracket_have_a_space_between_them() {
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention("scout-1", vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("[OK] ["), "attn marker and status bracket must be space-separated, not concatenated: {out}");
+        assert!(!out.contains("[OK]["), "must never concatenate the two tokens: {out}");
+    }
+
     #[test]
     fn render_plain_flagged_agent_shows_marker_and_reason_text() {
         let snap = Snapshot {
@@ -2353,5 +2378,28 @@ mod tests {
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("s ago"), "ApprovalPending must still show real elapsed time, not 'active': {out}");
         assert!(!out.contains("· active"), "ApprovalPending must not show 'active': {out}");
+    }
+
+    /// Ship-review finding (Claude + Codex adversarial): Degraded's `since: 0` sentinel (an
+    /// ApiKey provider that was never configured, so no real onset was ever tracked) must
+    /// render "active", not "0s ago" — indistinguishable from a credential that broke this
+    /// exact instant, which is the misleading-freshness bug this session already fixed once
+    /// for BudgetRisk/EvaluationUnavailable.
+    #[test]
+    fn render_plain_degraded_zero_since_sentinel_shows_active() {
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention(
+                "scout-1",
+                vec![reader::AttentionSignal {
+                    reason: reader::AttentionReason::Degraded,
+                    since: 0,
+                    evidence: Some("brave_search".to_string()),
+                }],
+            )],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("degraded (brave_search) · active"), "since:0 sentinel must show 'active': {out}");
+        assert!(!out.contains("0s ago"), "must never render the misleading '0s ago' for a never-tracked onset: {out}");
     }
 }

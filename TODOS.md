@@ -843,6 +843,19 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   distinct egress-budget concept (`ProxyRegistry`'s ephemeral-key budget) that isn't represented
   in `AgentSnapshot` at all today. Building a real universal-tier attention signal needs new
   instrumentation reading `ProxyRegistry` state — genuine scope expansion, not a bug fix.
+- **`Vec<AttentionSignal>` deserialization is all-or-nothing** (P2, /ship adversarial finding,
+  Codex): both `agentctl::watch::source::agent_info_from_json` and (indirectly, via the same
+  `serde_json` mechanics) the FUSE path deserialize the whole `attention` array as one unit —
+  if a single element has a `reason` value the running `agentctl` doesn't recognize (e.g. a
+  future `idle`/`error` variant from ux.2b, once it exists), the ENTIRE array fails to parse,
+  and the current fallback replaces ALL signals for that agent with one
+  `EvaluationUnavailable`, silently hiding any co-occurring `ApprovalPending`/`Degraded`/
+  `BudgetRisk` signal that was in the same array. Not exploitable today (only one
+  `AttentionReason` variant set exists in the wild), but **must be fixed before ux.2b adds new
+  variants** — change to per-element parsing that preserves every recognized signal and reports
+  only the unrecognized element(s) separately (e.g. `#[serde(other)]` catch-all variant, or a
+  manual per-element `Result` fold instead of `serde_json::from_value::<Vec<_>>` on the whole
+  array).
 
 ## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
 
