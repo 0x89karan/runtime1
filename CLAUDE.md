@@ -411,6 +411,14 @@ an uncaught signal's default disposition). `make compose-config-check` guards th
 entrypoint (loopback-only per §9.1 — not a new vulnerability class, but higher likelihood of an
 operator not realizing it's live). Full plan: `docs/plans/ux.9-cockpit-mode.md`; 9 adversarial-review
 findings deferred to TODOS.md (`ux.9-ar-01`..`09`); next is ux.2 or the remaining cockpit track (ux.1/ux.3/ux.5/ux.8).
+**cred.6 complete (v0.83.0).** CoS broker migration — `google_oauth` MCP sidecar holds no raw refresh
+token in memory-at-rest; `OAUTH_CLIENT_SECRET` + `OAUTH_REFRESH_TOKEN` removed from passenv; `FsRead
+/run/secrets` removed from `google_oauth` capabilities; `Credential{Google}` grant added to orchestrator;
+`passthrough_query_params` allowlist field on `ProviderConfig` (default empty = D3 full-discard, CoS
+configured with Gmail params); `state_path = "/run/memory/oauth/google.json"` in both Docker and QEMU
+configs; `allow_non_loopback = true` explicit opt-in on `ManagementConfig` for 0.0.0.0 bind in Docker
+compose mode; 1307 workspace tests. Manual gate (Step 4 of plan): live Gmail auth dance required after
+deploy. `cred.6-ar-01` (P3 — URL-encoded `%26` in allowlist values, inert for Gmail) filed in TODOS.md.
 
 ## How to work here
 

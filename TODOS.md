@@ -149,6 +149,17 @@ a genuine follow-up (a design decision beyond Option A's "smallest change" scope
 `http_fetch`/`web_search`) can no longer reach `cos:7999`'s unauthenticated management API on the
 Compose bridge. Verified via `docker compose config` showing each service's resolved network.
 
+## cos-dev — Open items
+
+- **cos-dev-01 (P3) — `write_file` silently fails in dev mode if `./output/` doesn't exist.**
+  `FsWrite { prefix = "./output" }` is granted and the orchestrator task calls
+  `write_file(path='./output/brief-{TODAY}.md', ...)`, but the native `write_file` tool does not
+  create missing parent directories. Result: the brief lands in `ops:briefs` KB only with no
+  filesystem copy; the orchestrator reports a capability-denied error that looks like a permission
+  problem rather than a missing directory. Fix (either): pre-create `agentd/output/` with a
+  `.gitkeep` so it exists when `cargo run` is invoked from the repo root, OR have `write_file`
+  call `fs::create_dir_all` on the parent before writing. `agentd/src/tools/native.rs`.
+
 ## v0.60 whole-system audit (2026-07-06)
 
 Read-only audit: 7 parallel reviewers (Claude + Codex) across every crate + docs, main @ e2ec0e47.
@@ -1201,6 +1212,22 @@ persisted when the agent cleanly deregisters — a crash mid-session loses the i
 - **Depends on:** cred.4 (caps infrastructure).
 - **Where to start:** `agentd/src/credential/mod.rs` — add a flush task in `CredentialGateway::start()`
   that holds a `Weak<GatewayState>` and aborts when the state is dropped.
+
+**cred.6-ar-01 (P3) — URL-encoded `%26` in query values passes allowlist for custom providers**
+
+The `passthrough_query_params` filter splits on literal `&` (not percent-decoded). A query value
+containing `%26` (URL-encoded `&`) passes the key-name allowlist check while encoding an extra
+parameter that the upstream server may decode. E.g. `?maxResults=50%26admin=1` — key `maxResults`
+passes; Gmail receives `maxResults=50&admin=1`. For Gmail this is inert. For custom `oauth-bearer`
+providers with non-Google upstreams, a compromised MCP sidecar could use this to inject params
+into the upstream request.
+
+- **Why:** allowlist filtering must operate on URL-decoded keys (after percent-decoding each pair).
+- **How to apply:** percent-decode each `pair` before splitting on `=` to extract the key, then
+  apply the allowlist against the decoded key. `percent_decode(pair.split('=').next())`. Also
+  validate that query values do not contain literal `&` after decode (or encode the value again).
+- **Confidence:** 6/10 (theoretical; inert for Gmail; relevant if custom providers are used).
+- **Where to start:** `agentd/src/credential/mod.rs:932` — the `filter(|pair| { ... })` closure.
 
 **p5.4-ar-01 (P3) — Version/seq counter can be bumped without a corresponding entry**
 - `tools/native.rs:KbPut::invoke`: for both Log and Scratch, the counter increment

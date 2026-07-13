@@ -29,6 +29,12 @@
 #   # After first run (skip the browser dance):
 #   export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
 #
+# BROKER MODE (cred.6):
+#   The credential broker is enabled. The google_oauth sidecar holds NO raw refresh token
+#   at rest — the token is kept in the Rust gateway (credential/mod.rs) and injected
+#   per-request. The sidecar receives only an ephemeral broker token valid for this spawn.
+#   The FsRead /run/secrets grant is removed from google_oauth's capabilities.
+#
 # LAUNCH:
 #   cargo run -- agentd/cos.agents.toml
 #
@@ -60,6 +66,23 @@ provider   = "anthropic"
 model      = "claude-sonnet-4-6"
 max_tokens = 8192
 streaming  = true
+
+# ---------------------------------------------------------------------------
+# Credential broker (cred.6) — OAuth tokens stay in this Rust gateway.
+# The google_oauth MCP sidecar calls the broker instead of reading secrets.
+# ---------------------------------------------------------------------------
+[credential_gateway]
+enabled = true
+
+[credential_gateway.providers.google]
+auth_style    = "oauth-bearer"
+upstream_base = "https://gmail.googleapis.com"
+token_path    = "/run/secrets/google.json"
+# Writable 9p memory mount (Docker: ~/.agentos-secrets → /run/secrets;
+# QEMU: 9p memory0 → /run/memory; /run/state does NOT exist in the initramfs).
+state_path    = "/run/memory/oauth/google.json"
+# Gmail query params forwarded to upstream (D3 allowlist — all others dropped).
+passthrough_query_params = ["maxResults", "q", "format", "pageToken", "includeSpamTrash"]
 
 # ---------------------------------------------------------------------------
 # Management HTTP API — bound 0.0.0.0 so the compose `127.0.0.1:7999:7999`
@@ -151,8 +174,10 @@ args    = ["../docker/cron_mcp.py"]
 passenv = ["TRIGGER_CRON", "TRIGGER_INTERVAL", "TRIGGER_MAX_WAIT_S"]
 # No capabilities → deny-all spawn + network isolation (cron needs neither).
 
-# google_oauth: OAuth2+PKCE sidecar — the Gmail token NEVER leaves this process.
-# The inbox agent calls oauth_call_api; the raw token stays in the sidecar.
+# google_oauth: OAuth2+PKCE sidecar — broker mode (cred.6).
+# The sidecar holds NO raw credential at rest. It receives an ephemeral broker
+# token from the runtime and calls the credential gateway, which injects the
+# OAuth Bearer token per request. FsRead /run/secrets is intentionally absent.
 [[tools.mcp_servers]]
 name    = "google_oauth"
 command = "python3"
@@ -160,15 +185,15 @@ command = "python3"
 # Distro/QEMU mode:                   /usr/lib/agentos/docker/oauth_mcp.py
 args    = ["../docker/oauth_mcp.py"]
 passenv = [
-  "OAUTH_CLIENT_ID",
-  "OAUTH_CLIENT_SECRET",
-  "OAUTH_REFRESH_TOKEN",      # optional: skip browser dance after first auth
+  "OAUTH_CLIENT_ID",      # needed for the OAuth auth-dance URL (first-run only)
   "OAUTH_AUTH_URL",
   "OAUTH_TOKEN_URL",
   "OAUTH_SCOPES",
-  "OAUTH_ALLOWED_HOSTS",      # REQUIRED — SSRF guard blocks missing/wrong hosts
+  "OAUTH_ALLOWED_HOSTS",  # REQUIRED — SSRF guard blocks missing/wrong hosts
   "OAUTH_PROVIDER_NAME",
-  "OAUTH_CALLBACK_PORT",      # REQUIRED in Docker — fixes callback port binding
+  "OAUTH_CALLBACK_PORT",  # REQUIRED in Docker — fixes callback port binding
+  # OAUTH_CLIENT_SECRET + OAUTH_REFRESH_TOKEN are intentionally omitted.
+  # The broker gateway holds these; the sidecar receives only the ephemeral token.
 ]
 capabilities = [
   { Net = { hosts = [
@@ -177,9 +202,8 @@ capabilities = [
     "www.googleapis.com",
     "gmail.googleapis.com",
   ], ports = [443] } },
-  # Allow reading /run/secrets/google.json (mounted from ~/.agentos-secrets/).
-  # Without this, Landlock FS sandbox blocks the sidecar from reading credentials.
-  { FsRead = { prefix = "/run/secrets" } },
+  # FsRead /run/secrets intentionally absent — broker mode means the sidecar
+  # never reads the credential file; the Rust gateway owns that boundary.
 ]
 
 # ---------------------------------------------------------------------------
@@ -213,6 +237,9 @@ capabilities = [
   # Without this, filtered_specs omits google_oauth from the child's tool list.
   { Mcp    = { server = "google_oauth",  tools = [] } },
   { FsWrite = { prefix = "./output" } },
+  # Credential broker access — spawned children inherit this grant, which lets
+  # the inbox agent's google_oauth calls route through the broker gateway.
+  { Credential = { provider = "Google" } },
   # request_approval is a native tool with no required capability; always available.
 ]
 

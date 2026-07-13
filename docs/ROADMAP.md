@@ -59,7 +59,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 5. **cheap wins** — Google OAuth app → Production (kills weekly 7-day Testing-mode token expiry; `MCP_SERVERS.md` fix); secret-redaction (`oauth_mcp.py:430`, `credential/mod.rs:341,371`; folds `cred.5-ar-01`). Ships independently.
 6. **cos-polish (rest)** — brief → file (`FsWrite` cap on orchestrator), KB findability (colon-segment reader, `kb_search` scope), inbox budget, orchestrate REPL race fix, `max_turns` guard.
 7. ~~**memory-routing** (v0.81.0)~~ ✅ shipped — raw emails → h8.1 semantic L2 (OpenAI text-embedding-3-small); CoS email dedup via `kb_get`; fixes ~820k token/run blowup.
-8. **cred.6** — CoS broker migration (config flip in `cos.agents.toml` + auth-retest gate; do not re-break v0.73.2 auth).
+8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. **cred.7** — credential resilience (on top of broker mode).
 10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 → ux.8 → ux.3 → ux.2b (idle/error).
 11. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.

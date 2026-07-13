@@ -2089,16 +2089,20 @@ mod tests {
         }
     }
 
-    // ── FIX 1: google_oauth sandbox FsRead grant ──────────────────────────────
+    // ── cred.6: broker mode — google_oauth must NOT have FsRead /run/secrets ──
+    //
+    // In broker mode the Rust credential gateway reads the token file; the sidecar
+    // holds no raw credential. FsRead /run/secrets must be absent from google_oauth's
+    // capabilities, and the orchestrator must carry Credential{Google} so spawned
+    // children can route through the broker.
+    // Checks BOTH config files so Docker and QEMU paths stay in sync.
 
     #[test]
-    fn cos_config_google_oauth_grants_fs_read_secrets() {
-        // FAILS without FIX 1: google_oauth MCP server must declare FsRead for
-        // /run/secrets so the Landlock FS sandbox lets the sidecar read google.json.
-        // Checks BOTH config files so Docker and QEMU paths stay in sync.
-        fn assert_fs_read(raw: &str, label: &str) {
+    fn cos_config_broker_mode_and_no_fs_read() {
+        fn assert_broker_mode(raw: &str, label: &str) {
             let cfg: agentd::config::Config =
                 toml::from_str(raw).unwrap_or_else(|e| panic!("{label} must parse: {e}"));
+            // 1. google_oauth must NOT have FsRead /run/secrets (broker reads it instead).
             let server = cfg
                 .tools
                 .mcp_servers
@@ -2110,13 +2114,42 @@ mod tests {
                 matches!(c, Capability::FsRead { prefix } if prefix == "/run/secrets")
             });
             assert!(
-                has_fs_read,
-                "{label}: google_oauth must grant FsRead{{prefix=\"/run/secrets\"}} \
-                 so Landlock FS sandbox lets the sidecar read google.json"
+                !has_fs_read,
+                "{label}: google_oauth must NOT have FsRead{{prefix=\"/run/secrets\"}} \
+                 in broker mode — the sidecar holds no raw credential (cred.6)"
+            );
+            // 2. Orchestrator must have Credential{Google} so children inherit broker access.
+            let agent_caps = cfg
+                .agent_configs()
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|a| a.capabilities.unwrap_or_default())
+                .collect::<Vec<_>>();
+            let has_credential_google = agent_caps.iter().any(|c| {
+                matches!(c, Capability::Credential { provider }
+                    if matches!(provider, agentd::capability::CredentialProvider::Google))
+            });
+            assert!(
+                has_credential_google,
+                "{label}: orchestrator capabilities must include Credential{{provider=Google}} \
+                 so spawned inbox agents can call through the broker gateway (cred.6)"
+            );
+            // 3. google provider must have non-empty passthrough_query_params so Gmail
+            //    query params (maxResults, q, format, pageToken) reach the upstream API.
+            //    An empty list silently drops all query params, causing Gmail to return
+            //    unfiltered results without a diagnostically clear error.
+            let gw_providers = &cfg.credential_gateway.providers;
+            let google_prov = gw_providers
+                .get("google")
+                .unwrap_or_else(|| panic!("{label}: credential_gateway must have a 'google' provider"));
+            assert!(
+                !google_prov.passthrough_query_params.is_empty(),
+                "{label}: credential_gateway.providers.google must have non-empty \
+                 passthrough_query_params so Gmail query params reach the upstream API (cred.6)"
             );
         }
-        assert_fs_read(include_str!("../cos.agents.toml"),       "agentd/cos.agents.toml");
-        assert_fs_read(
+        assert_broker_mode(include_str!("../cos.agents.toml"),       "agentd/cos.agents.toml");
+        assert_broker_mode(
             include_str!("../../distro/overlay/etc/agentd/cos.agents.toml"),
             "distro/overlay/etc/agentd/cos.agents.toml",
         );
