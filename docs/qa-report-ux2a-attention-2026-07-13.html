@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QA Report — ux.2a Attention (2026-07-13)</title>
+<style>
+  :root {
+    --bg: #0B0F17;
+    --surface: #131923;
+    --border: #1E2B3F;
+    --text: #C8D8EE;
+    --muted: #5C7396;
+    --accent: #3CB882;
+    --warn: #F0A030;
+    --code-bg: #070B11;
+    --code-text: #A8C4E0;
+    --tag-bg: rgba(60,184,130,0.15);
+    --tag-text: #3CB882;
+    --link: #7EB8F0;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #F0F4FA;
+      --surface: #FFFFFF;
+      --border: #D4DEF0;
+      --text: #0F1D2E;
+      --muted: #5C7080;
+      --accent: #1F8A5C;
+      --warn: #C07A10;
+      --code-bg: #0F1D2E;
+      --code-text: #A8C4E0;
+      --tag-bg: rgba(31,138,92,0.12);
+      --tag-text: #1F8A5C;
+      --link: #1A6AC0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    max-width: 840px;
+    margin: 0 auto;
+    padding: 2.5rem 1.5rem 5rem;
+  }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  h2 {
+    font-size: 1.15rem;
+    margin-top: 2.2rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--border);
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin-bottom: 1.5rem;
+  }
+  .meta code { color: var(--muted); }
+  .badge {
+    display: inline-block;
+    background: var(--tag-bg);
+    color: var(--tag-text);
+    font-size: 0.75rem;
+    font-weight: 600;
+    padding: 0.15rem 0.6rem;
+    border-radius: 999px;
+    margin-right: 0.4rem;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 1.1rem 1.3rem;
+    margin: 1rem 0;
+  }
+  code, pre {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.88em;
+  }
+  code {
+    background: var(--code-bg);
+    color: var(--code-text);
+    padding: 0.1em 0.4em;
+    border-radius: 4px;
+  }
+  pre {
+    background: var(--code-bg);
+    color: var(--code-text);
+    padding: 1rem 1.1rem;
+    border-radius: 8px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  pre code { background: none; padding: 0; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin-bottom: 0.35rem; }
+  a { color: var(--link); }
+  .limitation {
+    border-left: 3px solid var(--warn);
+    padding: 0.6rem 1rem;
+    background: rgba(240,160,48,0.08);
+    border-radius: 0 6px 6px 0;
+  }
+  .result-line {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.85em;
+    color: var(--muted);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 0.75rem 0;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.92rem;
+  }
+  th { color: var(--muted); font-weight: 600; }
+  .verdict {
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--accent);
+  }
+</style>
+</head>
+<body>
+
+<h1>QA Report — ux.2a Attention</h1>
+<div class="meta">
+  <span class="badge">SHIP-READY</span>
+  Date: 2026-07-13 &middot; Branch: <code>ux.2a-attention</code> &middot; Commit: <code>3233ef83</code>
+</div>
+
+<div class="card">
+  <strong>Stack:</strong> Rust — <code>agentd</code> (headless agent runtime) + <code>agentctl</code>
+  (terminal UI / CLI). No web app, no URL, no browser — standard browser-based <code>/qa</code>
+  doesn't apply here. Testing was adapted to this stack: the full test suite as a regression
+  baseline, plus a real live <code>agentd</code> process and the real compiled <code>agentctl</code>
+  binary exercised end-to-end.
+</div>
+
+<h2>Approach</h2>
+<ol>
+  <li><code>cargo test --workspace</code> as the regression baseline.</li>
+  <li>A real, live <code>agentd</code> process (zero-agent <code>docker/cockpit.toml</code> config)
+      serving the real management HTTP API on <code>127.0.0.1:7999</code>.</li>
+  <li>The real, compiled <code>agentctl</code> binary &mdash; both <code>--plain</code> mode and the
+      interactive ratatui TUI &mdash; run against that live server, capturing actual output and
+      checking for panics or crashes.</li>
+</ol>
+<p>
+  This exercises the full pipeline (<code>agentd</code> computes <code>attention</code> &rarr;
+  serializes &rarr; real HTTP &rarr; real <code>agentctl</code> binary via <code>reqwest</code>
+  &rarr; parses &rarr; renders) end-to-end &mdash; the seams between layers that unit tests,
+  which test each layer in isolation, don't cover.
+</p>
+
+<h2>Baseline</h2>
+<p class="result-line">cargo test --workspace: 1338 tests total, 0 failed, 0 new since the /review pass.</p>
+
+<h2>Live smoke test</h2>
+<table>
+  <tr><th>Check</th><th>Result</th></tr>
+  <tr><td><code>agentd</code> startup + <code>/healthz</code></td><td>Clean start, <code>{"ok":true}</code></td></tr>
+  <tr><td><code>/api/v1/snapshot</code> serves <code>attention</code> field</td><td>Confirmed via <code>curl</code>, real JSON</td></tr>
+  <tr><td><code>agentctl watch --plain --url ...</code></td><td>Multiple poll cycles, no crash, correct summary line + marker rendering</td></tr>
+  <tr><td><code>agentctl watch --url ...</code> (interactive TUI)</td><td>Launched, entered alt-screen, rendered frames, exited cleanly on SIGTERM</td></tr>
+  <tr><td><code>agentd</code> log across the session</td><td>No panics, no errors</td></tr>
+</table>
+
+<pre><code>attention: 0 need attention
+agents: 1
+  slow-agent [OK][failed] ctx=0 budget=100000 tools=0
+topology:
+  topology: slow-agent parent=none status=failed
+credentials: gateway not configured</code></pre>
+<p class="result-line">Real captured output from the live <code>--plain</code> run &mdash; the new summary
+line and <code>[OK]</code> marker rendering correctly against a real server response, not a unit-test fixture.</p>
+
+<div class="limitation">
+  <strong>Limitation, stated plainly:</strong> no <code>ANTHROPIC_API_KEY</code> was available in this
+  environment, so no real agent could be driven through actual tool calls. The live test only exercised
+  the <strong>Clean</strong> (empty <code>attention</code>) case end-to-end &mdash; the Approval-pending,
+  Budget-risk, and Degraded signal paths were <strong>not</strong> verified live, only via the unit test
+  suite (23 tests directly exercising <code>derive_attention</code>'s three signal paths, added during
+  <code>/review</code>). This is a real, honest gap, not a claim of full coverage.
+</div>
+
+<h2>Findings</h2>
+<p><strong>Zero new bugs found.</strong> The two critical bugs in this feature &mdash; the
+<code>since</code>/"ago" epoch-vs-duration rendering bug, and <code>EvaluationUnavailable</code>
+never actually firing &mdash; were already found and fixed during the <code>/review</code> pass,
+before this QA pass started, both by dual-voice adversarial review (Claude subagent + Codex,
+independently converging on the same finding). This QA pass's live smoke test found nothing
+additional: no crashes, no panics, no malformed output, no regressions against the pre-existing
+1338-test baseline.</p>
+
+<h2>Health Assessment</h2>
+<p>No web-app health-score rubric applies (no console, no links, no visual/UX categories in the
+browser sense). Equivalent for this stack: build clean, clippy clean, full test suite green, live
+process smoke test clean across both TUI modes and both render paths.</p>
+
+<h2>Summary</h2>
+<p class="verdict">Ship-ready.</p>
+<p>QA found 0 new issues. The feature's two real bugs were caught and fixed in the prior
+<code>/review</code> pass. Live smoke-testing (server + both TUI modes, real binary, real HTTP)
+found no additional issues, with one explicitly stated limitation: the Approval/Budget/Degraded
+signal paths were verified via unit tests only, not live, due to no <code>ANTHROPIC_API_KEY</code>
+in this environment.</p>
+<p>If you want live verification of the 3 real signal paths before relying on this in production,
+that needs a session with a real <code>ANTHROPIC_API_KEY</code> and a credential provider with a
+genuinely missing/expired key (for Degraded), or a low-token-budget agent driven through several
+real turns (for Budget-risk).</p>
+
+</body>
+</html>

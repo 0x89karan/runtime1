@@ -66,6 +66,46 @@ pub struct AgentSandbox {
     pub servers: Vec<ServerEnforcement>,
 }
 
+/// Why an attention signal fired — mirrors `surfaces::AttentionReason` (ux.2a). Declaration
+/// order matches the server's routing-priority order: `ApprovalPending` wins ties, then
+/// `Degraded`, then `BudgetRisk`, then `EvaluationUnavailable` (lowest).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionReason {
+    ApprovalPending,
+    Degraded,
+    BudgetRisk,
+    EvaluationUnavailable,
+}
+
+impl AttentionReason {
+    /// Row-color severity — independent of routing priority (Design Fix 1): `Degraded` is
+    /// more severe than `ApprovalPending` but does not win routing, since an approval is more
+    /// actionable than most other signals even when less severe.
+    pub fn is_critical(&self) -> bool {
+        matches!(self, AttentionReason::Degraded)
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            AttentionReason::ApprovalPending       => "approval pending",
+            AttentionReason::Degraded              => "degraded",
+            AttentionReason::BudgetRisk             => "budget risk",
+            AttentionReason::EvaluationUnavailable => "evaluation unavailable",
+        }
+    }
+}
+
+/// One active attention signal, parsed from /agents/<id>/attention (ux.2a).
+#[derive(Deserialize, Debug, Clone)]
+pub struct AttentionSignal {
+    pub reason:   AttentionReason,
+    #[serde(default)]
+    pub since:    u64,
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
 /// Parsed content of /agents/system/provider
 #[derive(Deserialize, Debug, Clone, Default)]
 pub struct SysProvider {
@@ -130,6 +170,9 @@ pub struct AgentInfo {
     pub isolation:        String,
     /// PID of the child process for universal-tier agents; 0 for native.
     pub pid:              u32,
+    /// Active attention signals (ux.2a). Empty means "evaluated, clean" — see
+    /// `AttentionReason::EvaluationUnavailable` for the "couldn't tell" case.
+    pub attention:        Vec<AttentionSignal>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -150,6 +193,28 @@ impl BudgetKind {
 
 fn read_trimmed(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+/// Outcome of a read that needs to distinguish "file genuinely doesn't exist" from "a real
+/// read error occurred" — used only where that distinction matters (currently
+/// `read_agent_attention`). `read_trimmed` above collapses both to `None`, which is fine for
+/// every other call site (they already treat "no content" as "use a fallback default"), but
+/// wrong for a signal that must never silently render as "evaluated, clean" on account of a
+/// transient FUSE hiccup or a permission bounce (ship-review finding, Claude adversarial
+/// subagent: only `NotFound` should mean "genuinely missing"; every other `io::ErrorKind` is a
+/// real failure and must produce `EvaluationUnavailable`, same as an unparseable file).
+enum ReadOutcome {
+    Missing,
+    Content(String),
+    Error,
+}
+
+fn read_trimmed_checked(path: &Path) -> ReadOutcome {
+    match fs::read_to_string(path) {
+        Ok(s) => ReadOutcome::Content(s.trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Missing,
+        Err(_) => ReadOutcome::Error,
+    }
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
@@ -204,6 +269,7 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
     let pid = read_trimmed(&dir.join("pid"))
         .and_then(|s| if s == "(none)" { None } else { s.parse::<u32>().ok() })
         .unwrap_or(0);
+    let attention = read_agent_attention(agents_dir, id);
     AgentInfo {
         id: id.to_string(),
         status,
@@ -218,12 +284,45 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
         tier,
         isolation,
         pid,
+        attention,
     }
 }
 
 /// Read /agents/<id>/sandbox
 pub fn read_agent_sandbox(agents_dir: &Path, id: &str) -> Option<AgentSandbox> {
     read_json(&agents_dir.join(id).join("sandbox"))
+}
+
+/// Read /agents/<id>/attention (ux.2a). **Distinguishes "file missing" (no attention data
+/// yet — an older agentd, or a brand-new agent — genuinely Clean) from "a real read/parse
+/// failure"** (file present but unparseable, OR an io error other than NotFound — a transient
+/// FUSE hiccup, a permission bounce). The latter must render as `EvaluationUnavailable`, never
+/// silently collapse to Clean (Design Review's CRITICAL finding: a failed read must never be
+/// mistaken for "nothing wrong" — an adversarial review found the original
+/// `read_json(...).unwrap_or_default()` form collapsed BOTH cases to empty/Clean, defeating
+/// that guarantee entirely; a follow-up adversarial pass found `read_trimmed`'s blanket
+/// `Result::ok()` still collapsed non-NotFound io errors the same way — fixed here).
+pub fn read_agent_attention(agents_dir: &Path, id: &str) -> Vec<AttentionSignal> {
+    let evaluation_unavailable = || AttentionSignal {
+        reason:   AttentionReason::EvaluationUnavailable,
+        since:    now_unix(),
+        evidence: Some("attention_file".to_string()),
+    };
+    match read_trimmed_checked(&agents_dir.join(id).join("attention")) {
+        ReadOutcome::Missing => vec![],
+        ReadOutcome::Error   => vec![evaluation_unavailable()],
+        ReadOutcome::Content(content) => match serde_json::from_str::<Vec<AttentionSignal>>(&content) {
+            Ok(signals) => signals,
+            Err(_) => vec![evaluation_unavailable()],
+        },
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Scan flight.jsonl and count `egress_brokered` and `egress_denied` events per
@@ -508,6 +607,59 @@ mod tests {
         let result = read_agent_sandbox(tmp.path(), "a");
         assert!(result.is_some());
         assert!(result.unwrap().servers.is_empty());
+    }
+
+    #[test]
+    fn read_agent_attention_returns_empty_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        let result = read_agent_attention(tmp.path(), "a");
+        assert!(result.is_empty(), "missing attention file must default to empty (clean), not panic");
+    }
+
+    #[test]
+    fn read_agent_attention_parses_signal() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[
+            ("attention", r#"[{"reason":"approval_pending","since":10,"evidence":"act_1"}]"#),
+        ]);
+        let result = read_agent_attention(tmp.path(), "a");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].reason, AttentionReason::ApprovalPending);
+        assert_eq!(result[0].evidence.as_deref(), Some("act_1"));
+    }
+
+    #[test]
+    fn read_agent_attention_malformed_json_becomes_evaluation_unavailable_not_clean() {
+        // A present-but-unparseable file is a real failure, not "nothing wrong" — must never
+        // silently collapse to Clean (Design Review CRITICAL finding; adversarial review
+        // caught this exact collapse in the original implementation).
+        let tmp = tempfile::tempdir().unwrap();
+        write_agent_files(tmp.path(), "a", &[("attention", "not json")]);
+        let result = read_agent_attention(tmp.path(), "a");
+        assert_eq!(result.len(), 1, "malformed attention file must not panic, but also must not silently vanish");
+        assert_eq!(result[0].reason, AttentionReason::EvaluationUnavailable);
+    }
+
+    /// Ship-review finding (Claude adversarial subagent): `read_trimmed`'s blanket `Result::ok()`
+    /// collapsed EVERY io error (not just NotFound) to None → Clean, silently repeating the
+    /// same "failed read looks like nothing wrong" bug the malformed-JSON case above already
+    /// fixed. This test forces a real non-NotFound io error (NotADirectory, portable across
+    /// platforms) by making the "attention" path component a file instead of a directory.
+    #[test]
+    fn read_agent_attention_non_not_found_io_error_becomes_evaluation_unavailable_not_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("a")).unwrap();
+        // "attention" is a FILE here, not a directory — so joining it with a further path
+        // component and reading fails with NotADirectory, not NotFound.
+        std::fs::write(tmp.path().join("a").join("attention"), b"irrelevant").unwrap();
+        let bogus_dir = tmp.path().join("a").join("attention").join("nested");
+        let result = read_agent_attention(&bogus_dir, "x");
+        assert_eq!(
+            result.len(), 1,
+            "a real (non-NotFound) io error must render EvaluationUnavailable, not silently vanish to Clean"
+        );
+        assert_eq!(result[0].reason, AttentionReason::EvaluationUnavailable);
     }
 
     #[test]

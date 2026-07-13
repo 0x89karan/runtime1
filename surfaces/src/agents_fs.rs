@@ -56,6 +56,9 @@ pub(crate) const OFF_PID:           u64 = 12;
 /// /agents/<id>/credentials — per-agent credential grant JSON (cred.5).
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const OFF_CREDENTIALS:   u64 = 13;
+/// /agents/<id>/attention — active attention signals JSON (ux.2a).
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const OFF_ATTENTION:     u64 = 14;
 
 /// System directory and file inodes (not in inode_to_id; handled explicitly).
 #[cfg(any(test, target_os = "linux"))]
@@ -98,6 +101,8 @@ const _: () = assert!(OFF_TIER    < DIR_STEP - 1, "OFF_TIER must be < DIR_STEP -
 const _: () = assert!(OFF_PID     < DIR_STEP - 1, "OFF_PID must be < DIR_STEP - 1");
 #[cfg(any(test, target_os = "linux"))]
 const _: () = assert!(OFF_CREDENTIALS < DIR_STEP - 1, "OFF_CREDENTIALS must be < DIR_STEP - 1");
+#[cfg(any(test, target_os = "linux"))]
+const _: () = assert!(OFF_ATTENTION < DIR_STEP - 1, "OFF_ATTENTION must be < DIR_STEP - 1");
 
 /// Last 64 KB of flight.jsonl to scan for per-agent events.
 #[cfg(any(test, target_os = "linux"))]
@@ -271,11 +276,11 @@ impl AgentsFs {
         let ino = self.next_dir_inode;
         self.next_dir_inode += DIR_STEP;
         self.dir_inodes.insert(agent_id.to_string(), ino);
-        // Register all 14 fixed inodes so inode_to_id lookups work.
+        // Register all 15 fixed inodes so inode_to_id lookups work.
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
             OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
-            OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS,
+            OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS, OFF_ATTENTION,
         ] {
             self.inode_to_id.insert(ino + offset, agent_id.to_string());
         }
@@ -462,6 +467,11 @@ impl AgentsFs {
                      \"denied_counts\":{den_counts},\"last_access_at\":{last_access}}}\n"
                 ).into_bytes()
             }
+            OFF_ATTENTION => {
+                // ux.2a: active attention signals as a JSON array (empty array = clean).
+                let json = serde_json::to_string(&agent.attention).unwrap_or_else(|_| "[]".to_string());
+                format!("{json}\n").into_bytes()
+            }
             // OFF_MEMORY_DIR and OFF_LONG_TERM_DIR are directories — not served here.
             _ => return None,
         };
@@ -596,11 +606,11 @@ impl AgentsFs {
     /// into a `Vec<String>` before calling this (Rust borrow checker requires it).
     fn prune_dead_agent(&mut self, agent_id: &str) {
         if let Some(base) = self.dir_inodes.remove(agent_id) {
-            // Remove all 14 fixed per-agent inodes (dir + offsets 1–13).
+            // Remove all 15 fixed per-agent inodes (dir + offsets 1–14).
             for offset in [
                 0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
                 OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
-                OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS,
+                OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS, OFF_ATTENTION,
             ] {
                 self.inode_to_id.remove(&(base + offset));
             }
@@ -702,6 +712,7 @@ fn file_name_for_offset(offset: u64) -> Option<&'static str> {
         OFF_TIER          => Some("tier"),
         OFF_PID           => Some("pid"),
         OFF_CREDENTIALS   => Some("credentials"),
+        OFF_ATTENTION     => Some("attention"),
         _ => None,
     }
 }
@@ -910,6 +921,21 @@ impl fuser::Filesystem for AgentsFs {
                     }
                     "pid" => {
                         let ino = dir_ino + OFF_PID;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    // Ship-review finding (Codex structured review): this arm was missing for
+                    // both "credentials" (cred.5, pre-existing) and "attention" (ux.2a) — both
+                    // files were listed by readdir but returned ENOENT on open-by-path over a
+                    // real FUSE mount, since lookup() name resolution never had a match arm for
+                    // them. readdir and lookup() must stay in sync for every per-agent file.
+                    "credentials" => {
+                        let ino = dir_ino + OFF_CREDENTIALS;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    "attention" => {
+                        let ino = dir_ino + OFF_ATTENTION;
                         let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
                         reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
                     }
@@ -1186,6 +1212,7 @@ impl fuser::Filesystem for AgentsFs {
                     (dir_ino + OFF_TIER,        fuser::FileType::RegularFile, "tier".to_string()),
                     (dir_ino + OFF_PID,         fuser::FileType::RegularFile, "pid".to_string()),
                     (dir_ino + OFF_CREDENTIALS, fuser::FileType::RegularFile, "credentials".to_string()),
+                    (dir_ino + OFF_ATTENTION,   fuser::FileType::RegularFile, "attention".to_string()),
                 ];
                 if self.memory.is_some() {
                     v.push((dir_ino + OFF_MEMORY_DIR, fuser::FileType::Directory, "memory".to_string()));
@@ -1453,6 +1480,7 @@ mod tests {
             credential_request_counts: std::collections::HashMap::new(),
             credential_denied_counts:  std::collections::HashMap::new(),
             credential_last_access_at: std::collections::HashMap::new(),
+            attention:                 vec![],
         }
     }
 

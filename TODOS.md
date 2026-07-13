@@ -777,18 +777,85 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 - DX Review finding (2026-07-12): two-file maintenance is the deepest remaining DX friction for CoS operators.
 
 **cos-ux-01 — TUI lacks per-agent progress and error visibility**
-- During long-running agent turns (e.g. inbox agent fetching 20 Gmail messages), `agentctl watch`
-  shows only `running` status and a growing context-size counter. There is no indication of
-  what tool the agent last called, what it returned, or whether errors occurred.
-- Needed: a live activity pane (or per-agent detail view) showing:
-  - Last tool call + result summary (tool name, truncated args/result, timestamp)
-  - Last error, if any (`is_error` tool result or `capability_denied` event)
-  - Turn count and last-inference timestamp so the operator can distinguish "busy" from "hung"
-- Implementation path: tail `/data/flight.jsonl` per-agent (the Inspector view at `[i]` already
-  does this globally); expose a filtered single-agent stream in the AgentDetail view; add a
-  `last_tool` field to `AgentSnapshot` so the Dashboard table can show it without opening Detail.
-- Precedent: `View::Inspector` (`[i]`) already tails the full log with filter/search — extend
-  it with an agent-scoped filter that auto-selects when entering from the Dashboard row.
+- **Partially addressed by ux.2a (2026-07-13, "Attention"):** the Dashboard now shows an `ATTN`
+  column + summary line surfacing Approval-pending, Budget-risk, and Degraded (credential/
+  provider) signals per agent, plus a persistent attention strip in `AgentDetail`. **NOT
+  closed** — the specific incident that motivated this item (an agent hangs mid-tool-call,
+  not erroring, not over budget, not degraded) is the Idle signal, deferred to a follow-on
+  increment, **ux.2b**, which reuses the design already fully specified in the superseded
+  `docs/plans/ux.2-observe.md` (new `AgentTask` fields for `idle_secs`/`error_count`/
+  `last_error_at`, the `CallTools`-dispatch-site fix for in-flight visibility) — re-verify
+  that design against current `main` before implementing, don't assume it's still accurate.
+- Original text (for context, superseded by the above): during long-running agent turns
+  (e.g. inbox agent fetching 20 Gmail messages), `agentctl watch` showed only `running` status
+  and a growing context-size counter, with no indication of what tool the agent last called,
+  what it returned, or whether errors occurred — the "busy vs. hung" ambiguity ux.2b must close.
+
+## ux.2a — Open (deferred from build, 2026-07-13)
+
+- **ux.2b (P1): Idle + Error attention signals.** Reuses the superseded `docs/plans/
+  ux.2-observe.md` plan's already-fully-reviewed design (new `AgentTask` fields, the
+  `CallTools`-dispatch-site fix, batch-aggregation semantics) — re-verify against current
+  `main` before implementing, not assumed accurate. Closes `cos-ux-01` fully once landed.
+- **`filter_agent_id` on `ApprovalsViewState`** (P1, upgraded from P2 — /ship Red Team
+  re-assessment, 2026-07-13): Enter-routing for an Approval-pending signal currently lands on
+  the unscoped global Approvals list at `selected_idx: 0`, not the specific approval that
+  triggered the signal. In a multi-agent deployment with 2+ pending approvals, pressing Enter
+  on Agent A's flagged Dashboard row can land the operator on Agent B's approval request
+  instead — a real risk, not just a UX papercut, since this UI exists to gate risky actions
+  (shell_exec, write_file) behind human approval and an operator who trusts the routing could
+  approve/deny the wrong agent's action. Fix: search `app.approvals_items` for the entry whose
+  `id` matches the signal's `evidence` (the approval_id) or whose `agent_id` matches the
+  selected agent, set `selected_idx` to that index (fall back to 0 with a visible warning if
+  not found). Add a regression test with 2+ agents having simultaneous pending approvals.
+  Similarly, `View::System`/`View::Credentials` need an analogous "jump to and highlight this
+  agent's section" for Degraded-signal routing.
+- **Sandbox-degradation (p6.8) as an attention signal** (P3): deferred, not built — whether
+  `SandboxSummary` (largely static, startup-time) is a meaningful *runtime* attention trigger
+  needs its own Eng verification before adding it to either ux.2a or ux.2b.
+- **Generalized "Attention contract v1"** (P3): a richer shared domain model (severity
+  taxonomy, escalation/suppression policy, operator SLA) was proposed during CEO review and
+  deferred as premature — revisit when ux.4 (proactive push) exists to validate the design
+  against a real second consumer.
+- **Trace/span view in `AgentDetail`** (P3, user-requested, sequenced after ux.7): reuse
+  `otel/src/span_builder.rs`'s hierarchy-computation logic (trace/span/parent-id construction
+  from `flight.jsonl`), NOT the `agentos-otel` crate itself (pulls in the full `opentelemetry`/
+  `tonic` gRPC stack — unjustified dependency for a TUI client). Extract the pure hierarchy
+  logic into a small shared crate both `otel` and `agentctl` can depend on.
+- `docs/ROADMAP.md`/`docs/plans/ux-cockpit.md`: rename "ux.2" references to "Attention" (not
+  "Attention & Evidence" — collides with ux.6's Evidence view) and split into ux.2a/ux.2b.
+- **Unused `surfaces::AttentionReason::severity()`/`label()`** (P3, /review finding): defined
+  and exported but never called — `agentctl` independently reimplements the same concept via
+  its own mirrored `is_critical()`/`label()` in `reader.rs` (the established mirror-type
+  pattern this codebase already uses for every other snapshot field). Kept as forward-looking
+  API rather than removed; revisit if it stays unused after ux.2b lands, or wire `agentctl` to
+  consume it directly instead of maintaining a parallel copy.
+- **No cross-crate wire-compat test for `surfaces::AttentionSignal` ↔ `agentctl::reader::
+  AttentionSignal`** (P3, /review finding): a future rename or serde-casing change to one side
+  would compile clean on both but silently break parsing at runtime. This is a pre-existing gap
+  across ALL of this codebase's mirror-type pairs (`AgentSandbox`/`ServerEnforcement`,
+  `CredentialSnapshot`/`SysCredentials`, etc.), not new to ux.2a — fixing it properly means
+  adding round-trip tests for every mirrored pair, out of this increment's scope.
+- **Universal-tier agents never get attention signals** (P3, /review finding, Codex): hardcoded
+  to `attention: vec![]` in `update_snapshot`'s universal-agent branch. Not a regression (their
+  `context_tokens`/`credential_providers` were already hardcoded to 0/empty before ux.2a, so a
+  budget/degraded signal couldn't have fired anyway) — but universal-tier agents have their own
+  distinct egress-budget concept (`ProxyRegistry`'s ephemeral-key budget) that isn't represented
+  in `AgentSnapshot` at all today. Building a real universal-tier attention signal needs new
+  instrumentation reading `ProxyRegistry` state — genuine scope expansion, not a bug fix.
+- **`Vec<AttentionSignal>` deserialization is all-or-nothing** (P2, /ship adversarial finding,
+  Codex): both `agentctl::watch::source::agent_info_from_json` and (indirectly, via the same
+  `serde_json` mechanics) the FUSE path deserialize the whole `attention` array as one unit —
+  if a single element has a `reason` value the running `agentctl` doesn't recognize (e.g. a
+  future `idle`/`error` variant from ux.2b, once it exists), the ENTIRE array fails to parse,
+  and the current fallback replaces ALL signals for that agent with one
+  `EvaluationUnavailable`, silently hiding any co-occurring `ApprovalPending`/`Degraded`/
+  `BudgetRisk` signal that was in the same array. Not exploitable today (only one
+  `AttentionReason` variant set exists in the wild), but **must be fixed before ux.2b adds new
+  variants** — change to per-element parsing that preserves every recognized signal and reports
+  only the unrecognized element(s) separately (e.g. `#[serde(other)]` catch-all variant, or a
+  manual per-element `Result` fold instead of `serde_json::from_value::<Vec<_>>` on the whole
+  array).
 
 ## Phase 5 — Open (deferred from p5.1–p5.5 adversarial reviews)
 

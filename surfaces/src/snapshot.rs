@@ -156,6 +156,77 @@ pub struct SchedulerSnapshot {
     pub credential_snapshot: Option<CredentialSnapshot>,
 }
 
+/// Why an agent's `attention` signal fired — see `docs/plans/ux.2-attention-evidence.md`.
+///
+/// Declaration order is also tie-break/routing-priority order (highest first): a row with
+/// both `ApprovalPending` and `Degraded` active always resolves ties toward `ApprovalPending`.
+/// `Error` and `Idle` are deferred to a follow-on increment ("ux.2b") — their prerequisite
+/// fields don't exist on `AgentTask` yet; adding them later is additive (new enum variants),
+/// not a redesign of this one.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionReason {
+    ApprovalPending,
+    Degraded,
+    BudgetRisk,
+    /// A signal source itself couldn't be read this cycle (e.g. the credential gateway
+    /// snapshot was unavailable) — never silently rendered as "clean," always its own signal.
+    EvaluationUnavailable,
+}
+
+/// Row-color severity — a SEPARATE axis from routing priority (`AttentionReason`'s declaration
+/// order). E.g. `Degraded` is `Critical` (red) but does not win routing over `ApprovalPending`
+/// (`Info`/cyan), which is more actionable even though less severe. Computed from `reason`
+/// rather than stored, so severity can never drift out of sync with the reason it describes.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+impl AttentionReason {
+    pub fn severity(&self) -> AttentionSeverity {
+        match self {
+            AttentionReason::ApprovalPending       => AttentionSeverity::Info,
+            AttentionReason::Degraded              => AttentionSeverity::Critical,
+            AttentionReason::BudgetRisk             => AttentionSeverity::Warning,
+            AttentionReason::EvaluationUnavailable => AttentionSeverity::Warning,
+        }
+    }
+
+    /// Short, human-readable label for the stacked reason line (the `{reason}` in
+    /// `⚠ {reason} · {since} ago`). `evidence` supplies the specific detail (approval ID,
+    /// provider name); this supplies the fixed part of the sentence.
+    pub fn label(&self) -> &'static str {
+        match self {
+            AttentionReason::ApprovalPending       => "approval pending",
+            AttentionReason::Degraded              => "degraded",
+            AttentionReason::BudgetRisk             => "budget risk",
+            AttentionReason::EvaluationUnavailable => "evaluation unavailable",
+        }
+    }
+}
+
+/// One active attention signal for an agent. An agent's `attention: Vec<AttentionSignal>` is
+/// empty for "clean" (evaluated, nothing active) and non-empty for "needs attention" — the
+/// distinction between "clean" and "couldn't evaluate" is carried by `EvaluationUnavailable`
+/// being present, never by absence alone (see `docs/plans/ux.2-attention-evidence.md`'s Design
+/// Review, Pass 2 — collapsing "clean" and "unavailable" into the same empty state was a
+/// CRITICAL finding in that review and must not regress).
+#[derive(Clone, Debug, Serialize)]
+pub struct AttentionSignal {
+    pub reason:   AttentionReason,
+    /// Unix seconds when this signal is believed to have started (approximate for
+    /// signals derived from a monotonic `Instant`; exact for signals with a real
+    /// wall-clock source like `ProviderHealth.last_refresh_at`).
+    pub since:    u64,
+    /// Short pointer to more context: an approval ID, a provider name, a budget
+    /// percentage — whatever disambiguates *which* instance of this reason fired.
+    pub evidence: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct AgentSnapshot {
     pub id:            String,
@@ -192,10 +263,19 @@ pub struct AgentSnapshot {
     pub credential_denied_counts:  HashMap<String, u64>,
     /// Unix secs of last successful credential request per provider.
     pub credential_last_access_at: HashMap<String, u64>,
+    /// Active attention signals (ux.2a) — empty means "evaluated, clean," NOT "not evaluated."
+    /// See `AttentionReason::EvaluationUnavailable` for the "couldn't tell" case.
+    pub attention: Vec<AttentionSignal>,
 }
 
 /// Manual Serialize: emits `status` as the flat string from `as_str()` (matching the FUSE
 /// text format) plus an optional `status_detail` field for tuple variants.
+///
+/// ⚠ Adding a field to `AgentSnapshot`? You MUST add a matching `serialize_field` call below
+/// AND bump `field_count` — this impl is hand-written, not derived, so a forgotten field
+/// silently vanishes from both FUSE and management-API JSON with no compile error (this bit
+/// ux.2's own design phase once already; there is a regression test for this in
+/// `agentd/src/scheduler.rs`'s `attention_signal_serializes_on_agent_snapshot` — do not remove it).
 impl Serialize for AgentSnapshot {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -203,7 +283,7 @@ impl Serialize for AgentSnapshot {
             AgentStatus::AwaitingChild(s) | AgentStatus::AwaitingApproval(s) => Some(s.as_str()),
             _ => None,
         };
-        let field_count = 17 + usize::from(detail.is_some());
+        let field_count = 18 + usize::from(detail.is_some());
         let mut s = ser.serialize_struct("AgentSnapshot", field_count)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("status", self.status.as_str())?;
@@ -225,6 +305,7 @@ impl Serialize for AgentSnapshot {
         s.serialize_field("credential_request_counts", &self.credential_request_counts)?;
         s.serialize_field("credential_denied_counts", &self.credential_denied_counts)?;
         s.serialize_field("credential_last_access_at", &self.credential_last_access_at)?;
+        s.serialize_field("attention", &self.attention)?;
         s.end()
     }
 }

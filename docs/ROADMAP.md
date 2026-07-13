@@ -61,7 +61,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 7. ~~**memory-routing** (v0.81.0)~~ ✅ shipped — raw emails → h8.1 semantic L2 (OpenAI text-embedding-3-small); CoS email dedup via `kb_get`; fixes ~820k token/run blowup.
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. **cred.7** — credential resilience (on top of broker mode).
-10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2 → ux.1 → ux.8 → ux.3.
+10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 → ux.8 → ux.3 → ux.2b (idle/error).
 11. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
@@ -1113,9 +1113,19 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   THREAT_MODEL.md §9 documents the unauthenticated-API exposure this accepts under the single-tenant
   lock, deferring per-session auth to **ux.5** and the `allow_non_loopback` unscoped-bypass gap to
   `ux.0b-ar-02` (TODOS.md).
-- **ux.2** — Observe (closes **cos-ux-01**): `last_activity`/`last_error`/`idle_secs` on the snapshot;
-  agent-table `LAST-TOOL` + row-red-on-error + `idle→amber` stuck signal; live summary-first event
-  stream (JSON on expand, filter chips, freeze, row-scopes-stream); AgentDetail timeline.
+- ~~**ux.2** — Observe~~ **reframed (2026-07-13, CEO review) → ux.2a "Attention"** ✅ **shipped**:
+  Dashboard `ATTN` column + summary line surfacing Approval-pending/Budget-risk/Degraded
+  (credential/provider) signals, actionability-driven Enter-routing (Approvals/Credentials/
+  AgentDetail), persistent `AgentDetail` attention strip, `--plain` markers + reason text. Reuses
+  existing scheduler/credential state — zero/near-zero new instrumentation. **Partially
+  addresses cos-ux-01, does NOT close it** — see **ux.2b** below. Full plan (superseded
+  "Observe" plan preserved for reference): `docs/plans/ux.2-observe.md` →
+  `docs/plans/ux.2-attention-evidence.md`.
+- **ux.2b** — Idle + Error attention signals (closes **cos-ux-01** fully): reuses the
+  superseded "Observe" plan's already-designed `last_activity`/`last_error`/`idle_secs`
+  mechanism (new `AgentTask` fields, `CallTools`-dispatch-site fix) — re-verify against
+  current `main` before implementing. Wires into ux.2a's existing `AttentionSignal`/routing
+  mechanism as two additional enum variants, no redesign needed.
 - **ux.1** — Converse: fold `orchestrate.rs` into the cockpit as the chat rail (`[c]`); streaming
   green; retarget any agent via the selected row; `follow`/`▼ N new`; inline errors, never hang.
 - **ux.3** — Spawn custom on the fly (closes **p7.3-ar-02**): repoint the Spawn view from
@@ -1149,8 +1159,9 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
 > status/debug/control console (k9s/htop for agents), not an optional tool. ux.9 makes it the default;
 > ux.0/2/1/8 make it live, watchable, chattable, tunable.
 
-Sequencing (updated 2026-07-11 — cockpit-as-default): core **ux.0 → ux.9 (boot into TUI) → ux.2 (activity)
-→ ux.1 (chat — *bumped*) → ux.8 (budgets) → ux.3**, then expansions **ux.6 → ux.4 → ux.5 → ux.7**, then
+Sequencing (updated 2026-07-13 — ux.2 reframed + split): core **ux.0 → ux.9 (boot into TUI) →
+ux.2a (attention, ✅ shipped) → ux.1 (chat — *bumped*) → ux.8 (budgets) → ux.3**, then expansions
+**ux.6 → ux.4 → ux.5 → ux.7 → ux.2b (idle/error, closes cos-ux-01 fully)**, then
 **skills (Phase 11) last**. One increment per branch, `main` shippable at each step. **Parallel, independent
 of the cockpit — do first (makes the CoS usable today):** `cos-polish` (`docs/plans/cos-polish.md` — the
 8 bugs from live testing: brief-not-written, KB-unfindable, orchestrate errors, undersized budgets) and

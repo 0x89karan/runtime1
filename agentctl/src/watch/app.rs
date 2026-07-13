@@ -656,6 +656,7 @@ mod tests {
             tier:            "native".to_string(),
             isolation:       String::new(),
             pid:             0,
+            attention:       vec![],
         }
     }
 

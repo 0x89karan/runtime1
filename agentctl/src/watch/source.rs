@@ -6,8 +6,9 @@
 use serde_json::Value;
 
 use super::reader::{
-    self, AgentInfo, AgentSandbox, BudgetKind, PendingAction, ProvHealthInfo, ServerEnforcement,
-    Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue, SysSandbox,
+    self, AgentInfo, AgentSandbox, AttentionSignal, BudgetKind, PendingAction, ProvHealthInfo,
+    ServerEnforcement, Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue,
+    SysSandbox,
 };
 
 /// Spawn request sent to the management API (orch.1+).
@@ -292,6 +293,24 @@ fn agent_info_from_json(v: &Value) -> AgentInfo {
 
     let sandbox = agent_sandbox_from_json(v);
 
+    // Distinguishes "key absent" (older agentd, genuinely Clean) from "key present but
+    // unparseable" (a real failure, must render EvaluationUnavailable — never silently
+    // collapse both to Clean; same fix as reader::read_agent_attention's FUSE path).
+    let attention: Vec<AttentionSignal> = match v.get("attention") {
+        None => vec![],
+        Some(val) => match serde_json::from_value::<Vec<AttentionSignal>>(val.clone()) {
+            Ok(signals) => signals,
+            Err(_) => vec![AttentionSignal {
+                reason:   reader::AttentionReason::EvaluationUnavailable,
+                since:    std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                evidence: Some("attention_field".to_string()),
+            }],
+        },
+    };
+
     AgentInfo {
         id,
         status,
@@ -306,6 +325,7 @@ fn agent_info_from_json(v: &Value) -> AgentInfo {
         tier,
         isolation,
         pid,
+        attention,
     }
 }
 
@@ -509,6 +529,33 @@ mod tests {
         assert_eq!(info.tools, vec!["read_file"]);
         assert_eq!(info.tier, "native");
         assert!(info.status_detail.is_none());
+        assert!(info.attention.is_empty(), "no 'attention' key at all must default to Clean, not fail");
+    }
+
+    #[test]
+    fn agent_info_from_json_parses_attention_signals() {
+        let v = serde_json::json!({
+            "id": "agent-1", "status": "running", "token_budget": 50000_u64,
+            "attention": [{"reason": "approval_pending", "since": 10, "evidence": "act_1"}],
+        });
+        let info = agent_info_from_json(&v);
+        assert_eq!(info.attention.len(), 1);
+        assert_eq!(info.attention[0].reason, reader::AttentionReason::ApprovalPending);
+        assert_eq!(info.attention[0].evidence.as_deref(), Some("act_1"));
+    }
+
+    #[test]
+    fn agent_info_from_json_malformed_attention_becomes_evaluation_unavailable() {
+        // A present-but-unparseable "attention" value is a real failure, not "nothing wrong" —
+        // must render EvaluationUnavailable, never silently collapse to Clean (matches the
+        // FUSE-path fix in reader::read_agent_attention).
+        let v = serde_json::json!({
+            "id": "agent-1", "status": "running", "token_budget": 50000_u64,
+            "attention": "not an array",
+        });
+        let info = agent_info_from_json(&v);
+        assert_eq!(info.attention.len(), 1);
+        assert_eq!(info.attention[0].reason, reader::AttentionReason::EvaluationUnavailable);
     }
 
     #[test]
