@@ -55,6 +55,25 @@
   creation" instead of the actual collision reason — on top of the dispatch-freeze TODO
   above, a real if low-severity papercut for a fleet with non-orchestrated agents.
   Depends on: none.
+- **`agentctl orchestrate`'s CLI still truncates replies at 512 chars** (P1, found by
+  `/ship`'s Step 8 plan-completion audit): the plan (`docs/plans/ux.1-converse.md` Pass 5)
+  explicitly decided to fix this as a byproduct of the streaming-delta work, by having
+  `orchestrate.rs`'s `drain_until_turn_complete` consume `InferenceStreamDelta` events for
+  display instead of relying on the server-capped `orchestrator_turn_complete.answer`
+  field. What actually shipped (T10) only adds a cheap early-continue on delta events —
+  they're skipped, not accumulated — so the CLI REPL still shows the same 512-char-capped
+  reply for any operator running against a non-colocated `agentd` as before this branch.
+  CHANGELOG.md/CLAUDE.md briefly claimed this was fixed; corrected in the same commit that
+  files this TODO. Depends on: none.
+- **`agentctl orchestrate`'s CLI never adopted `converse.rs`'s shared `dispatch()`/
+  `on_flight_event()` helpers** (P2, found by `/ship`'s Step 8 plan-completion audit): T3
+  in the plan called for `orchestrate.rs` to be refactored onto the new shared helper (a
+  "net LOC decrease" per the plan's architecture section) instead of keeping its own
+  parallel spawn/inject + 4-event field-path logic. `converse.rs` was built as the shared
+  module and is used by the Dashboard rail, but `orchestrate.rs` was never ported onto it
+  — the two now have duplicated, independently-maintained copies of the same
+  spawn-or-resume and field-path-lookup logic, with only the `DEFAULT_MAX_TURNS` constant
+  actually shared. Depends on: none.
 
 ## ux.9 — Open (deferred from build + /review adversarial pass, 2026-07-12)
 

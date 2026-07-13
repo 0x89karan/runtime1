@@ -469,8 +469,11 @@ internally (mirrors `handle_spawn_key`'s exact shape — zero call-site changes 
 tests); `r` retargets to the selected row. `[c]` stays bound to Credentials — the rough scope's original
 `[c]`-for-chat proposal collided with the already-shipped Credentials hotkey (cred.5, v0.68.0), caught
 during Design review alongside a corrected minimum-rail-width floor (95→115 cols, arithmetic from the
-table's real column constraints). `agentctl orchestrate`'s CLI shares the same helpers; unchanged
-block-then-print behavior (does not gain live streaming) but now sees un-truncated replies as a byproduct.
+table's real column constraints). `agentctl orchestrate`'s CLI does NOT share converse.rs's helpers (kept
+its own duplicated spawn/inject + field-path logic) and does NOT consume the delta stream — it still
+block-then-prints the server-capped 512-char `answer`, unchanged from before this branch. The plan called
+for both; `/ship`'s Step 8 plan-completion audit caught that neither landed and that this note (and
+CHANGELOG.md) had claimed otherwise — corrected here, follow-up filed as TODOs.
 docs/INTERFACE.md §3 annotated as superseded-by-shipped-implementation. `/review`'s adversarial pass
 (Codex + Claude subagent) then found and fixed 10 more real bugs post-implementation, including one
 critical panic (byte-index truncation at the 64KB cap could slice mid-UTF8-character and crash the

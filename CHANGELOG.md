@@ -33,11 +33,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   idiom); **`r`** retargets the rail to the selected table row's agent. `[c]` stays bound
   to Credentials — the rough scope's original `[c]`-for-chat proposal collided with the
   already-shipped Credentials hotkey (cred.5, v0.68.0), caught during Design review.
-- `agentctl orchestrate`'s CLI shares the same `converse.rs` helpers; its
-  `orchestrator_turn_complete`-driven block-then-print behavior is unchanged (does not
-  gain live token streaming in this increment) but now sees un-truncated replies as a
-  byproduct of the same fix (the 512-char `answer` cap only ever mattered because there
-  was no other way to see the full text remotely).
+- `agentctl orchestrate`'s CLI gains a cheap early-continue on `inference_stream_delta`
+  events in `drain_until_turn_complete` (T10) so it skips wasted work per chunk, but it
+  still does NOT consume the delta stream for display and does NOT call `converse.rs`'s
+  `dispatch()`/`on_flight_event()` — it kept its own duplicated spawn/inject logic and
+  still block-then-prints the server-capped 512-char `orchestrator_turn_complete.answer`
+  field, exactly as before this branch. The plan originally called for both (see
+  `docs/plans/ux.1-converse.md`'s Pass 5), but neither landed in the diff — caught by
+  `/ship`'s Step 8 plan-completion audit, which found this changelog entry had claimed
+  otherwise. Filed as TODOs rather than fixed under ship-time pressure; see `TODOS.md`'s
+  ux.1 section.
 - `docs/INTERFACE.md` §3 annotated as superseded-by-shipped-implementation (stale
   number-key/tab-bar keymap sketch, predates Phase 6).
 - **`/autoplan` review found and fixed two critical issues before implementation**: (1)
