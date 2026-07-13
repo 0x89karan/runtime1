@@ -430,6 +430,23 @@ for backwards compat with v1–v4 checkpoints); early checkpoint peek in `main.r
 start; `write_secrets_file_ext()` preserves custom `token_url` across re-auth; `sync_all()` durability on OAuth
 state writes; `agentctl auth google --device` re-auth without `--force` when credentials read from existing file;
 1327 workspace tests (+20).
+**ux.2a complete (v0.85.0).** Attention — outcome/risk signals on the cockpit Dashboard: `AttentionReason`
+enum (`ApprovalPending | Degraded | BudgetRisk | EvaluationUnavailable`, declaration order doubles as
+tie-break/routing priority) + `AttentionSignal { reason, since, evidence }` struct (`surfaces/src/snapshot.rs`),
+added to `AgentSnapshot` and served over both FUSE (`/agents/<id>/attention`, new `OFF_ATTENTION` offset) and
+the management HTTP API (reused `Serialize` impl); `derive_attention()` (`agentd/src/scheduler.rs`) computes
+all three signals from already-existing scheduler/credential state — no new instrumentation, no new flight
+events. Dashboard gains an `ATTN` column, an always-visible "N need attention · M unavailable" summary line,
+a stacked reason line per flagged agent, a persistent `AgentDetail` attention strip, and `--plain` markers;
+actionability-driven Enter-key routing (`ApprovalPending` → Approvals, `Degraded` → Credentials, else →
+AgentDetail) is a deliberately separate axis from severity-driven row color. Reframe of the original
+"Observe" plan (`docs/plans/ux.2-observe.md`, preserved for reference) toward outcome/risk signals per CEO
+dual-voice review — full review in `docs/plans/ux.2-attention-evidence.md`. Does **not** close `cos-ux-01`:
+Idle/Error signals need new `AgentTask` fields that don't exist yet, deferred to **ux.2b**. Three rounds of
+ship-review found and fixed 2 CRITICAL bugs (`since` rendered as raw epoch instead of elapsed time;
+`EvaluationUnavailable` was dead code, never constructed, so a failed FUSE/HTTP read silently degraded to
+"clean") plus a FUSE `lookup()` gap (no match arm for `"attention"`, mirroring a pre-existing `"credentials"`
+gap fixed in the same pass) and a `--plain` output concatenation bug; 1377 workspace tests (+50).
 
 ## How to work here
 
