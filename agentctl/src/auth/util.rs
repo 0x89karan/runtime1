@@ -18,11 +18,32 @@ pub fn write_secrets_file(
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<()> {
-    let json = serde_json::json!({
-        "client_id":     client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-    });
+    write_secrets_file_ext(path, client_id, client_secret, refresh_token, None)
+}
+
+/// Like `write_secrets_file` but optionally includes a `token_url` field.
+/// Used by the device-auth re-auth path (cred.7) to preserve custom token_url values.
+pub fn write_secrets_file_ext(
+    path: &Path,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+    token_url: Option<&str>,
+) -> Result<()> {
+    let json = if let Some(url) = token_url {
+        serde_json::json!({
+            "client_id":     client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "token_url":     url,
+        })
+    } else {
+        serde_json::json!({
+            "client_id":     client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+        })
+    };
     let content = serde_json::to_string_pretty(&json).unwrap();
 
     let dir = path.parent().context("Invalid secrets file path")?;

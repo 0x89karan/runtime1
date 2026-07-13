@@ -1337,7 +1337,7 @@ keychain / vault).
 **Acceptance:** operator sees per-agent credential grants + last access via FUSE and `agentctl`;
 rotation policy configurable.
 
-### cred.6 — Migrate the CoS to broker mode (close Phase 10 for the flagship)
+### ✓ cred.6 — Migrate the CoS to broker mode (close Phase 10 for the flagship) [v0.83.0]
 **Depends on:** cred.3–cred.5 (broker infra, all shipped) + cred.4b (broker-capable sidecars).
 **Why:** Phase 10's goal — "one credential model, tools hold no raw credential in memory-at-rest" —
 is **half-delivered**: the broker exists but the flagship CoS still runs the legacy file path
@@ -1349,7 +1349,7 @@ Do-first P0 (ships independently): **secret-redaction** of token-endpoint bodies
 **Acceptance:** the CoS authenticates + reads Gmail through the broker; the sidecar process holds no
 raw refresh token; auth retest passes; no token/secret in any log/event.
 
-### cred.7 — Credential resilience (refresh/failure recovery, on top of broker mode)
+### ✓ cred.7 — Credential resilience (refresh/failure recovery, on top of broker mode) [v0.84.0]
 **Depends on:** cred.6 (broker migration).
 **Goal:** terminal-failure detection + operator surfacing + resume-without-restart + multi-agent
 dedup, provider-agnostic in the gateway. Hardened by `/autoplan` (2026-07-10). Full plan:

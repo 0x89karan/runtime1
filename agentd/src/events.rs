@@ -170,6 +170,12 @@ pub enum EventKind {
     /// Device-level isolation capabilities probed at startup.
     /// data: { tier, arch, runsc: path|null, landlock: bool, seccomp: bool }
     IsolationProbed,
+    /// Provider entered AttentionRequired state (first time after a clean run).
+    /// data: { provider, recovery_kind: "reauth"|"config_fix"|"secret_replace", reason }
+    CredentialAttentionRequired,
+    /// Provider recovered from AttentionRequired (operator reset or successful refresh).
+    /// data: { provider, source: "reset_attention"|"proactive_refresh"|"foreground_request" }
+    CredentialRecovered,
     Error,
 }
 
@@ -260,6 +266,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::OrchestratorTurnComplete), "orchestrator_turn_complete");
         assert_eq!(kind_str(EventKind::OrchestratorExited), "orchestrator_exited");
         assert_eq!(kind_str(EventKind::IsolationProbed), "isolation_probed");
+        assert_eq!(kind_str(EventKind::CredentialAttentionRequired), "credential_attention_required");
+        assert_eq!(kind_str(EventKind::CredentialRecovered), "credential_recovered");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

@@ -2369,7 +2369,10 @@ async fn poll_universal_agents(
 /// Terminal agents are excluded — they've already delivered their results.
 /// The deferred queue is intentionally omitted: those agents remain in `state.agents`
 /// in NeedInfer state, so step() re-derives their InferenceRequest on restore.
-fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
+fn build_scheduler_checkpoint(
+    state: &SchedulerState,
+    cred_gw: Option<&Arc<crate::credential::CredentialGateway>>,
+) -> SchedulerCheckpoint {
     // Include waiting orchestrated agents (terminal=true) in addition to active agents.
     // Their terminal flag is preserved so the seed loop skips them on restore.
     let agents: Vec<crate::checkpoint::AgentCheckpoint> = state
@@ -2402,6 +2405,11 @@ fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
         })
         .collect();
 
+    // cred.7: persist per-provider AttentionRequired health states.
+    let credential_health = cred_gw
+        .map(|gw| gw.provider_health_checkpoints())
+        .unwrap_or_default();
+
     SchedulerCheckpoint {
         format_version:      crate::checkpoint::FORMAT_VERSION,
         agents,
@@ -2415,6 +2423,7 @@ fn build_scheduler_checkpoint(state: &SchedulerState) -> SchedulerCheckpoint {
         approval_seq:        state.approval_seq,
         waiting_agents:      state.waiting.iter().cloned().collect(),
         orchestrated_agents: state.orchestrated.iter().cloned().collect(),
+        credential_health,
     }
 }
 
@@ -2425,7 +2434,7 @@ async fn checkpoint_all(
     state: &SchedulerState,
     recorder: &FlightRecorder,
 ) {
-    let cp = build_scheduler_checkpoint(state);
+    let cp = build_scheduler_checkpoint(state, state.cred_gw.as_ref());
     if let Err(e) = store.save(&cp).await {
         tracing::warn!("checkpoint save failed (best-effort): {e:#}");
         return;
@@ -3682,6 +3691,7 @@ mod tests {
             approval_seq:        0,
             waiting_agents:      vec![],
             orchestrated_agents: vec![],
+            credential_health:   HashMap::new(),
         }
     }
 
@@ -3785,6 +3795,7 @@ mod tests {
             approval_seq:        0,
             waiting_agents:      vec![],
             orchestrated_agents: vec![],
+            credential_health:   HashMap::new(),
         };
         let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
         let (rec, _tmp) = recorder();
@@ -4502,7 +4513,7 @@ mod tests {
         let mut state = minimal_state("native");
         state.universal_agents.insert(cfg.id.clone(), ua);
 
-        let cp = build_scheduler_checkpoint(&state);
+        let cp = build_scheduler_checkpoint(&state, None);
         assert!(
             !cp.agents.iter().any(|a| a.agent_id == "univ_ck"),
             "universal agent must NOT appear in checkpoint"
@@ -4643,7 +4654,7 @@ mod tests {
         state.orchestrated.insert("orch".to_string());
         // Terminal flag would normally be set by AgentTask completing — test that
         // filter includes waiting agents regardless of terminal status.
-        let cp = build_scheduler_checkpoint(&state);
+        let cp = build_scheduler_checkpoint(&state, None);
         assert!(
             cp.waiting_agents.contains(&"orch".to_string()),
             "waiting_agents must be included in checkpoint"
