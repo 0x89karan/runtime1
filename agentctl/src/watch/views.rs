@@ -76,6 +76,23 @@ fn secs_ago(since: u64) -> u64 {
     now.saturating_sub(since)
 }
 
+/// `BudgetRisk` and `EvaluationUnavailable` are recomputed fresh on every scheduler tick /
+/// every poll — their `since` is stamped "now" every time, not a tracked onset (ship-review
+/// Red Team finding). Rendering that as "0s ago" implies a duration these signal types can't
+/// actually measure, and would silently mislead an operator into thinking a long-standing
+/// budget or config-drift issue just started. `ApprovalPending`/`Degraded` DO have a real
+/// onset (`created_at`/`last_refresh_at`/`attention_since`) and keep showing true elapsed time.
+fn age_display(sig: &reader::AttentionSignal) -> String {
+    match sig.reason {
+        reader::AttentionReason::BudgetRisk | reader::AttentionReason::EvaluationUnavailable => {
+            "active".to_string()
+        }
+        reader::AttentionReason::ApprovalPending | reader::AttentionReason::Degraded => {
+            format!("{}s ago", secs_ago(sig.since))
+        }
+    }
+}
+
 /// Three-way row classification shared by the TUI glyph, `--plain` marker, and the legend
 /// text — a single source of truth so the three can never drift apart (Maintainability
 /// review finding: the TUI and `--plain` paths previously reimplemented this independently
@@ -225,10 +242,10 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         // as line 2 of the Agent ID cell (ratatui `Table` cells don't span columns; this is the
         // widest column, `Constraint::Min(20)`, so the reason text has room to be readable).
         let id_text: ratatui::text::Text = if let Some(sig) = top_attention_signal(&a.attention) {
-            let ago = secs_ago(sig.since);
+            let age = age_display(sig);
             let reason_line = match &sig.evidence {
-                Some(ev) => format!("  {} {} ({}) · {ago}s ago", glyph, sig.reason.label(), sanitize(ev)),
-                None     => format!("  {} {} · {ago}s ago", glyph, sig.reason.label()),
+                Some(ev) => format!("  {} {} ({}) · {age}", glyph, sig.reason.label(), sanitize(ev)),
+                None     => format!("  {} {} · {age}", glyph, sig.reason.label()),
             };
             ratatui::text::Text::from(vec![
                 Line::from(a.id.clone()),
@@ -351,10 +368,10 @@ fn render_agent_detail(f: &mut Frame, app: &App) {
     sorted_signals.sort_by(|a, b| a.reason.cmp(&b.reason));
     let attention_lines: Vec<Line> = sorted_signals.iter().map(|sig| {
         let (glyph, style) = attention_glyph_and_style(std::slice::from_ref(sig));
-        let ago = secs_ago(sig.since);
+        let age = age_display(sig);
         let text = match &sig.evidence {
-            Some(ev) => format!("{} {} ({}) · {ago}s ago", glyph, sig.reason.label(), sanitize(ev)),
-            None     => format!("{} {} · {ago}s ago", glyph, sig.reason.label()),
+            Some(ev) => format!("{} {} ({}) · {age}", glyph, sig.reason.label(), sanitize(ev)),
+            None     => format!("{} {} · {age}", glyph, sig.reason.label()),
         };
         Line::from(Span::styled(text, style))
     }).collect();
@@ -1344,13 +1361,13 @@ pub fn render_plain(app: &App) -> String {
             sorted.sort_by(|x, y| x.reason.cmp(&y.reason));
             for sig in sorted {
                 let marker = if sig.reason == reader::AttentionReason::EvaluationUnavailable { "[?]" } else { "[!]" };
-                let ago = secs_ago(sig.since);
+                let age = age_display(sig);
                 match &sig.evidence {
                     Some(ev) => out.push_str(&format!(
-                        "    {marker} {} ({}) · {ago}s ago\n", sig.reason.label(), sanitize(ev)
+                        "    {marker} {} ({}) · {age}\n", sig.reason.label(), sanitize(ev)
                     )),
                     None => out.push_str(&format!(
-                        "    {marker} {} · {ago}s ago\n", sig.reason.label()
+                        "    {marker} {} · {age}\n", sig.reason.label()
                     )),
                 }
             }
@@ -2296,5 +2313,45 @@ mod tests {
             out.contains("evaluation unavailable (credential_gateway)"),
             "EvaluationUnavailable label text must render verbatim: {out}"
         );
+    }
+
+    /// Ship-review Red Team finding: `derive_attention` recomputes `since: now` on every
+    /// scheduler tick for BudgetRisk and config-drift EvaluationUnavailable — there is no
+    /// tracked onset, so displaying "0s ago" would misrepresent a potentially long-standing
+    /// issue as having "just started." These two must show "active" instead; ApprovalPending
+    /// and Degraded DO have a real onset and must keep showing true elapsed time.
+    #[test]
+    fn render_plain_budget_and_unavailable_show_active_not_elapsed_time() {
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention(
+                "scout-1",
+                vec![
+                    signal(reader::AttentionReason::BudgetRisk, Some("92%")),
+                    signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway")),
+                ],
+            )],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("budget risk (92%) · active"), "BudgetRisk must show 'active', not a fake elapsed time: {out}");
+        assert!(
+            out.contains("evaluation unavailable (credential_gateway) · active"),
+            "EvaluationUnavailable must show 'active', not a fake elapsed time: {out}"
+        );
+        assert!(!out.contains("0s ago"), "must never render a misleading '0s ago' for these signal types: {out}");
+    }
+
+    #[test]
+    fn render_plain_approval_and_degraded_still_show_real_elapsed_time() {
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention(
+                "scout-1",
+                vec![signal(reader::AttentionReason::ApprovalPending, Some("act_1"))],
+            )],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("s ago"), "ApprovalPending must still show real elapsed time, not 'active': {out}");
+        assert!(!out.contains("· active"), "ApprovalPending must not show 'active': {out}");
     }
 }

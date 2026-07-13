@@ -797,10 +797,19 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   ux.2-observe.md` plan's already-fully-reviewed design (new `AgentTask` fields, the
   `CallTools`-dispatch-site fix, batch-aggregation semantics) — re-verify against current
   `main` before implementing, not assumed accurate. Closes `cos-ux-01` fully once landed.
-- **`filter_agent_id` on `ApprovalsViewState`** (P2): Enter-routing for an Approval-pending
-  signal currently lands on the unscoped global Approvals list, not pre-filtered to the
-  flagged agent. Similarly, `View::System`/`View::Credentials` need an analogous "jump to and
-  highlight this agent's section" for Degraded-signal routing.
+- **`filter_agent_id` on `ApprovalsViewState`** (P1, upgraded from P2 — /ship Red Team
+  re-assessment, 2026-07-13): Enter-routing for an Approval-pending signal currently lands on
+  the unscoped global Approvals list at `selected_idx: 0`, not the specific approval that
+  triggered the signal. In a multi-agent deployment with 2+ pending approvals, pressing Enter
+  on Agent A's flagged Dashboard row can land the operator on Agent B's approval request
+  instead — a real risk, not just a UX papercut, since this UI exists to gate risky actions
+  (shell_exec, write_file) behind human approval and an operator who trusts the routing could
+  approve/deny the wrong agent's action. Fix: search `app.approvals_items` for the entry whose
+  `id` matches the signal's `evidence` (the approval_id) or whose `agent_id` matches the
+  selected agent, set `selected_idx` to that index (fall back to 0 with a visible warning if
+  not found). Add a regression test with 2+ agents having simultaneous pending approvals.
+  Similarly, `View::System`/`View::Credentials` need an analogous "jump to and highlight this
+  agent's section" for Degraded-signal routing.
 - **Sandbox-degradation (p6.8) as an attention signal** (P3): deferred, not built — whether
   `SandboxSummary` (largely static, startup-time) is a meaningful *runtime* attention trigger
   needs its own Eng verification before adding it to either ux.2a or ux.2b.

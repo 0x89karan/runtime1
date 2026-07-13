@@ -2086,19 +2086,24 @@ fn derive_attention(inputs: AttentionInputs) -> Vec<surfaces::AttentionSignal> {
         });
     }
 
-    // Degraded fires on `!token_fresh` ALONE, not `AND last_error present` — a missing
-    // API-key env var sets `token_fresh: false` without ever populating `last_error` (no
-    // refresh attempt was ever made to fail), so requiring both would silently miss the
-    // single most common degraded case. No credential gateway configured at all (`None`) is
-    // a different state from "gateway configured but unreadable" — it means there's simply
-    // nothing to be degraded, not an unknown, so it produces no signal at all.
+    // Degraded fires on `!token_fresh` OR `attention_reason.is_some()` — not `AND
+    // last_error present`. A missing API-key env var sets `token_fresh: false` without ever
+    // populating `last_error` (no refresh attempt was ever made to fail), so requiring both
+    // would silently miss the single most common degraded case. Separately, cred.7's health
+    // state machine (`ProviderHealthState::AttentionRequired`) can flag a provider needing
+    // attention (e.g. persistent 401s) while `token_fresh` stays `true` for ApiKey-style
+    // providers, whose freshness is derived purely from "is the env var set" — independent
+    // of whether the key actually works. Checking `attention_reason` too closes that gap
+    // (ship-review Testing specialist finding). No credential gateway configured at all
+    // (`None`) is a different state from "gateway configured but unreadable" — it means
+    // there's simply nothing to be degraded, not an unknown, so it produces no signal at all.
     if let Some(snap) = credential_snapshot {
         for provider in credential_providers {
             match snap.provider_health.iter().find(|p| &p.name == provider) {
-                Some(health) if !health.token_fresh => {
+                Some(health) if !health.token_fresh || health.attention_reason.is_some() => {
                     signals.push(surfaces::AttentionSignal {
                         reason:   surfaces::AttentionReason::Degraded,
-                        since:    health.last_refresh_at.unwrap_or(now),
+                        since:    health.attention_since.or(health.last_refresh_at).unwrap_or(now),
                         evidence: Some(provider.clone()),
                     });
                 }
@@ -4932,6 +4937,33 @@ mod tests {
             "a1", 100, 50_000, &["google".to_string()], &HashMap::new(), Some(&snap),
         );
         assert!(signals.is_empty());
+    }
+
+    /// Ship-review Testing specialist finding: cred.7's health state machine can flag a
+    /// provider `AttentionRequired` (e.g. persistent 401s) while `token_fresh` stays `true`
+    /// for ApiKey-style providers, whose freshness is derived purely from "is the env var
+    /// set" (agentd/src/credential/mod.rs) — independent of whether the key actually works.
+    /// Degraded must fire on `attention_reason.is_some()` too, not `!token_fresh` alone.
+    #[test]
+    fn derive_attention_degraded_fires_when_attention_required_even_if_token_fresh() {
+        let mut health = provider_health("brave_search", true, None);
+        health.attention_reason = Some("persistent_401".to_string());
+        health.recovery_kind    = Some("config_fix".to_string());
+        health.attention_since  = Some(1_700_000_000);
+        let snap = surfaces::CredentialSnapshot {
+            gateway_enabled: true,
+            configured_providers: vec!["brave_search".to_string()],
+            provider_health: vec![health],
+        };
+        let signals = da(
+            "a1", 100, 50_000, &["brave_search".to_string()], &HashMap::new(), Some(&snap),
+        );
+        assert_eq!(
+            signals.len(), 1,
+            "AttentionRequired must fire Degraded even when token_fresh is true for ApiKey providers"
+        );
+        assert_eq!(signals[0].reason, surfaces::AttentionReason::Degraded);
+        assert_eq!(signals[0].since, 1_700_000_000, "must prefer attention_since as the real onset over now");
     }
 
     #[test]
