@@ -2851,6 +2851,9 @@ mod tests {
                         last_refresh_at: Some(1720000000),
                         expires_at:      Some(1720003600),
                         last_error:      None,
+                        attention_reason: None,
+                        attention_since:  None,
+                        recovery_kind:   None,
                     }
                 ],
             }),

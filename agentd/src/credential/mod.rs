@@ -16,6 +16,7 @@
 //! Budget enforcement: per-agent per-provider request-count cap (cred.4).
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -28,6 +29,86 @@ type LastAccess      = Arc<std::sync::RwLock<HashMap<(String, String), u64>>>;
 type ProviderExpiry  = Arc<std::sync::RwLock<HashMap<String, u64>>>;
 type ProviderRefresh = Arc<std::sync::RwLock<HashMap<String, u64>>>;
 type ProviderError   = Arc<std::sync::RwLock<HashMap<String, Option<String>>>>;
+// cred.7: provider health state machine shared across GatewayState + CredentialGateway
+type ProviderStates  = Arc<std::sync::RwLock<HashMap<String, ProviderHealthState>>>;
+// cred.7: OAuth caches wrapped in Arc so CredentialGateway::reset_attention() can clear tokens
+type CachesMap = Arc<tokio::sync::RwLock<HashMap<String, Arc<OAuthTokenCache>>>>;
+
+// ── cred.7 failure classification ─────────────────────────────────────────────
+
+/// What the operator must do to recover a failed credential provider.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecoveryKind {
+    /// Re-run `agentctl auth google --device` (refresh token revoked or invalid_grant).
+    Reauth,
+    /// Fix the provider configuration (bad token_url, SSRF-blocked host, etc.).
+    ConfigFix,
+    /// Replace the secrets file at `token_path` (file missing or unparseable).
+    SecretReplace,
+}
+
+impl RecoveryKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reauth        => "reauth",
+            Self::ConfigFix     => "config_fix",
+            Self::SecretReplace => "secret_replace",
+        }
+    }
+}
+
+/// 3-way classification of a credential failure.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FailureClass {
+    /// Transient network/timeout error — retry on next request.
+    Retryable,
+    /// Permanent until operator takes action.
+    AttentionRequired { recovery_kind: RecoveryKind },
+}
+
+/// Error returned by `OAuthTokenCache::get_or_refresh`.
+#[derive(Debug, Clone)]
+pub struct CredentialError {
+    pub class:   FailureClass,
+    pub message: String,
+}
+
+impl CredentialError {
+    fn retryable(msg: impl Into<String>) -> Self {
+        Self { class: FailureClass::Retryable, message: msg.into() }
+    }
+    fn attention(rk: RecoveryKind, msg: impl Into<String>) -> Self {
+        Self { class: FailureClass::AttentionRequired { recovery_kind: rk }, message: msg.into() }
+    }
+}
+
+impl fmt::Display for CredentialError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+// ── cred.7 provider health state machine ──────────────────────────────────────
+
+/// State of a credential provider from the health-state-machine perspective.
+/// Stored in `GatewayState::provider_states` (and shared into `CredentialGateway`).
+#[derive(Debug, Clone)]
+pub enum ProviderHealthState {
+    Healthy,
+    /// Permanent failure until the operator takes the specified action.
+    AttentionRequired {
+        recovery_kind: RecoveryKind,
+        reason:        String,
+        /// Unix secs when this state was first entered.
+        since:         u64,
+    },
+}
+
+impl ProviderHealthState {
+    fn is_attention_required(&self) -> bool {
+        matches!(self, Self::AttentionRequired { .. })
+    }
+}
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -53,8 +134,10 @@ use surfaces;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Seconds before a cached access token expires where we proactively refresh.
+/// Seconds before a cached access token expires where we consider it "stale".
 const TOKEN_EXPIRY_BUFFER_SECS: u64 = 60;
+/// Proactive refresh lead time: background task refreshes when `expires_at - now < this`.
+const PROACTIVE_REFRESH_LEAD_SECS: u64 = 300; // 5 min
 /// Maximum response body from an upstream provider (4 MB).
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum inbound request body from an MCP server (4 MB).
@@ -238,16 +321,20 @@ impl OAuthTokenCache {
 
     /// Return a valid access token, refreshing if needed.
     ///
+    /// Returns `CredentialError` with a 3-way `FailureClass`:
+    /// - `Retryable`: transient (network, timeout, 5xx) — retry on next request.
+    /// - `AttentionRequired { RecoveryKind }`: permanent until operator acts.
+    ///
     /// If the refresh token rotation write fails (QEMU 9p atomicity issue), emits
     /// `CredentialRefreshFailed` with `token_written: false` but still returns the
-    /// access token for this request — preventing silent unrecoverable failure.
+    /// access token — preventing silent unrecoverable failure.
     async fn get_or_refresh(
         &self,
         provider:  &str,
         cfg:       &ProviderConfig,
         recorder:  &Arc<FlightRecorder>,
         client:    &reqwest::Client,
-    ) -> Result<String, String> {
+    ) -> Result<String, CredentialError> {
         let mut inner = self.state.lock().await;
 
         let now = SystemTime::now()
@@ -266,32 +353,47 @@ impl OAuthTokenCache {
         // ar-05: the entire slow path (file read + DNS + HTTP POST) is wrapped in a
         // timeout. If it fires, `inner` is released (no more mutex hold) and the
         // caller receives a 503 rather than stalling until the next retry.
-        let slow_path_result: Result<String, String> = tokio::time::timeout(
+        let slow_path_result: Result<String, CredentialError> = tokio::time::timeout(
             Duration::from_secs(OAUTH_REFRESH_TIMEOUT_SECS),
             async {
                 let token_path = cfg.token_path.as_deref().unwrap_or("");
                 if token_path.is_empty() {
-                    return Err(format!("provider '{}' has no token_path configured", provider));
+                    return Err(CredentialError::attention(
+                        RecoveryKind::ConfigFix,
+                        format!("provider '{}' has no token_path configured", provider),
+                    ));
                 }
                 let secrets_bytes = tokio::fs::read(token_path).await.map_err(|e| {
-                    format!("cannot read secrets file '{}': {e}", token_path)
+                    CredentialError::attention(
+                        RecoveryKind::SecretReplace,
+                        format!("cannot read secrets file '{}': {e}", token_path),
+                    )
                 })?;
                 let secrets: OAuthSecretsFile = serde_json::from_slice(&secrets_bytes)
-                    .map_err(|e| format!("cannot parse secrets file '{}': {e}", token_path))?;
+                    .map_err(|e| CredentialError::attention(
+                        RecoveryKind::SecretReplace,
+                        format!("cannot parse secrets file '{}': {e}", token_path),
+                    ))?;
                 if !secrets.token_url.starts_with("https://") {
-                    return Err(format!(
-                        "provider '{}' token_url must use https://, got '{}'",
-                        provider,
-                        &secrets.token_url[..secrets.token_url.len().min(64)],
+                    return Err(CredentialError::attention(
+                        RecoveryKind::ConfigFix,
+                        format!(
+                            "provider '{}' token_url must use https://, got '{}'",
+                            provider,
+                            &secrets.token_url[..secrets.token_url.len().min(64)],
+                        ),
                     ));
                 }
 
                 // ar-04c: SSRF check on token_url.
                 let token_host = extract_host(&secrets.token_url).map_err(|_| {
-                    format!(
-                        "provider '{}' token_url '{}' is malformed",
-                        provider,
-                        &secrets.token_url[..secrets.token_url.len().min(64)],
+                    CredentialError::attention(
+                        RecoveryKind::ConfigFix,
+                        format!(
+                            "provider '{}' token_url '{}' is malformed",
+                            provider,
+                            &secrets.token_url[..secrets.token_url.len().min(64)],
+                        ),
                     )
                 })?;
                 match tokio::net::lookup_host(format!("{token_host}:443")).await {
@@ -304,12 +406,15 @@ impl OAuthTokenCache {
                         } else {
                             for sa in addrs {
                                 if is_ssrf_blocked(sa.ip()) {
-                                    return Err(format!(
-                                        "provider '{}' token_url '{}' resolves to SSRF-blocked \
-                                         address {} — refusing token refresh (ar-04c)",
-                                        provider,
-                                        &secrets.token_url[..secrets.token_url.len().min(64)],
-                                        sa.ip(),
+                                    return Err(CredentialError::attention(
+                                        RecoveryKind::ConfigFix,
+                                        format!(
+                                            "provider '{}' token_url '{}' resolves to SSRF-blocked \
+                                             address {} — refusing token refresh (ar-04c)",
+                                            provider,
+                                            &secrets.token_url[..secrets.token_url.len().min(64)],
+                                            sa.ip(),
+                                        ),
                                     ));
                                 }
                             }
@@ -335,13 +440,29 @@ impl OAuthTokenCache {
                     .form(&params)
                     .send()
                     .await
-                    .map_err(|e| format!("token refresh request failed: {e}"))?;
+                    .map_err(|e| CredentialError::retryable(
+                        format!("token refresh request failed: {e}"),
+                    ))?;
                 if !resp.status().is_success() {
                     let status = resp.status().as_u16();
-                    return Err(format!("token refresh HTTP {status}"));
+                    // Inspect body for OAuth error codes to distinguish Reauth from transient.
+                    let body_bytes = resp.bytes().await.unwrap_or_default();
+                    let oauth_error = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                        .ok()
+                        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_string));
+                    return match oauth_error.as_deref() {
+                        Some("invalid_grant") | Some("invalid_client") | Some("token_expired") => {
+                            Err(CredentialError::attention(
+                                RecoveryKind::Reauth,
+                                format!("token refresh HTTP {status}: {} — re-run agentctl auth",
+                                    oauth_error.unwrap_or_default()),
+                            ))
+                        }
+                        _ => Err(CredentialError::retryable(format!("token refresh HTTP {status}"))),
+                    };
                 }
                 let tok_resp: TokenResponse = resp.json().await.map_err(|e| {
-                    format!("token refresh response parse failed: {e}")
+                    CredentialError::retryable(format!("token refresh response parse failed: {e}"))
                 })?;
 
                 let new_access = tok_resp.access_token;
@@ -389,10 +510,10 @@ impl OAuthTokenCache {
                 Ok(new_access)
             }
         ).await.unwrap_or_else(|_elapsed| {
-            Err(format!(
+            Err(CredentialError::retryable(format!(
                 "provider '{}' token refresh timed out after {}s (ar-05)",
                 provider, OAUTH_REFRESH_TIMEOUT_SECS,
-            ))
+            )))
         });
 
         slow_path_result
@@ -438,6 +559,8 @@ async fn write_state_atomic(path: &str, data: &[u8]) -> Result<()> {
         .with_context(|| format!("open tmp state file '{}'", tmp))?;
     f.write_all(data).await.with_context(|| format!("write tmp state file '{}'", tmp))?;
     f.flush().await.with_context(|| format!("flush tmp state file '{}'", tmp))?;
+    // Durability: sync data to disk before rename so the atomic swap is crash-safe.
+    f.sync_all().await.with_context(|| format!("sync_all tmp state file '{}'", tmp))?;
     drop(f);
     tokio::fs::rename(&tmp, path).await
         .with_context(|| format!("rename '{}' → '{}'", tmp, path))?;
@@ -552,7 +675,8 @@ fn remove_agent_caps(db: &Arc<Database>, agent_id: &str) {
 struct GatewayState {
     config:     CredentialGatewayConfig,
     registry:   Arc<CredentialRegistry>,
-    caches:     tokio::sync::RwLock<HashMap<String, Arc<OAuthTokenCache>>>,
+    /// Arc-wrapped so CredentialGateway::reset_attention() can clear cached tokens.
+    caches:     CachesMap,
     /// reqwest client built with per-provider `.resolve()` overrides (ar-04 IP pinning).
     client:     reqwest::Client,
     recorder:   Arc<FlightRecorder>,
@@ -575,13 +699,22 @@ struct GatewayState {
     provider_last_refresh: ProviderRefresh,
     /// Per-provider last OAuth refresh error string; None when healthy.
     provider_last_error:   ProviderError,
+    // ── cred.7 health state machine ──────────────────────────────────────────
+    /// Per-provider health state; shared with CredentialGateway for snapshot/reset.
+    provider_states: ProviderStates,
 }
 
 impl GatewayState {
     /// Build GatewayState: validate provider configs, resolve + SSRF-check upstream
     /// hostnames, pin resolved IPs into the reqwest client to block DNS rebinding (ar-04),
     /// and eagerly load persisted OAuth state.
-    async fn new(config: CredentialGatewayConfig, recorder: Arc<FlightRecorder>) -> Result<Self> {
+    ///
+    /// `credential_health` restores AttentionRequired states from the last checkpoint.
+    async fn new(
+        config:            CredentialGatewayConfig,
+        recorder:          Arc<FlightRecorder>,
+        credential_health: HashMap<String, crate::checkpoint::ProviderHealthCheckpoint>,
+    ) -> Result<Self> {
         let lp_cfg = crate::loopback_proxy::LoopbackClientConfig::credential();
         // Use base_builder() to prevent settings drift from build_loopback_client() (ar-10).
         let mut builder = crate::loopback_proxy::base_builder(&lp_cfg);
@@ -700,7 +833,7 @@ impl GatewayState {
         Ok(Self {
             config,
             registry:              Arc::new(CredentialRegistry::new()),
-            caches:                tokio::sync::RwLock::new(caches),
+            caches:                Arc::new(tokio::sync::RwLock::new(caches)),
             client,
             recorder,
             pinned_ips,
@@ -712,6 +845,28 @@ impl GatewayState {
             provider_expiry:       Arc::new(std::sync::RwLock::new(init_expiry)),
             provider_last_refresh: Arc::new(std::sync::RwLock::new(init_refresh)),
             provider_last_error:   Arc::new(std::sync::RwLock::new(HashMap::new())),
+            // cred.7: restore AttentionRequired states from checkpoint
+            provider_states: {
+                let mut m: HashMap<String, ProviderHealthState> = HashMap::new();
+                for (name, cp) in &credential_health {
+                    let rk = match cp.recovery_kind.as_str() {
+                        "reauth"         => RecoveryKind::Reauth,
+                        "config_fix"     => RecoveryKind::ConfigFix,
+                        "secret_replace" => RecoveryKind::SecretReplace,
+                        other => {
+                            tracing::warn!(provider = %name, kind = %other,
+                                "credential: unknown recovery_kind in checkpoint — treating as ConfigFix");
+                            RecoveryKind::ConfigFix
+                        }
+                    };
+                    m.insert(name.clone(), ProviderHealthState::AttentionRequired {
+                        recovery_kind: rk,
+                        reason:        cp.reason.clone(),
+                        since:         cp.since,
+                    });
+                }
+                Arc::new(std::sync::RwLock::new(m))
+            },
         })
     }
 
@@ -977,13 +1132,69 @@ async fn handle_credential_request(
                     if let Ok(mut pe) = state.provider_last_error.write() {
                         pe.insert(provider.clone(), None);
                     }
+                    // cred.7: clear AttentionRequired state on successful refresh.
+                    let was_attention = if let Ok(mut states) = state.provider_states.write() {
+                        if states.get(&provider).map(|s| s.is_attention_required()).unwrap_or(false) {
+                            states.insert(provider.clone(), ProviderHealthState::Healthy);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if was_attention {
+                        state.recorder.record(
+                            "credential_gateway",
+                            None,
+                            EventKind::CredentialRecovered,
+                            json!({ "provider": &provider, "source": "foreground_request" }),
+                        );
+                    }
                     tok
                 }
                 Err(e) => {
                     tracing::warn!(provider = %provider, error = %e, "credential refresh failed");
-                    // cred.5: record last error
+                    // cred.5: record last error string.
                     if let Ok(mut pe) = state.provider_last_error.write() {
-                        pe.insert(provider.clone(), Some(e.clone()));
+                        pe.insert(provider.clone(), Some(e.to_string()));
+                    }
+                    // cred.7: on AttentionRequired, update health state and emit event (once).
+                    if let FailureClass::AttentionRequired { ref recovery_kind } = e.class {
+                        let now_s = SystemTime::now()
+                            .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                        let rk   = recovery_kind.clone();
+                        let msg  = e.message.clone();
+                        let prov = provider.clone();
+                        let became_attention = if let Ok(mut states) = state.provider_states.write() {
+                            let entry = states
+                                .entry(prov.clone())
+                                .or_insert(ProviderHealthState::Healthy);
+                            if !entry.is_attention_required() {
+                                *entry = ProviderHealthState::AttentionRequired {
+                                    recovery_kind: rk.clone(),
+                                    reason:        msg.clone(),
+                                    since:         now_s,
+                                };
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if became_attention {
+                            state.recorder.record(
+                                "credential_gateway",
+                                None,
+                                EventKind::CredentialAttentionRequired,
+                                json!({
+                                    "provider":      &prov,
+                                    "recovery_kind": rk.as_str(),
+                                    "reason":        &msg,
+                                }),
+                            );
+                        }
                     }
                     return Ok(json_response(
                         503,
@@ -1164,6 +1375,140 @@ async fn handle_credential_request(
         .expect("credential response builder must not fail"))
 }
 
+// ── cred.7: proactive refresh background task ─────────────────────────────────
+
+/// Background task: wakes up `PROACTIVE_REFRESH_LEAD_SECS` before a cached OAuth
+/// token expires and refreshes it proactively so foreground requests never stall.
+///
+/// If a foreground request is concurrently refreshing, `try_peek_expiry()` returns
+/// `None` (try_lock miss) and the loop sleeps `SLEEP_WHEN_NO_TOKEN_SECS` before
+/// re-checking. The foreground request will update expiry, so no token is missed.
+async fn proactive_refresh_loop(state: Arc<GatewayState>, provider: String) {
+    const SLEEP_WHEN_NO_TOKEN_SECS: u64 = 300;
+    const SLEEP_AFTER_REFRESH_SECS: u64 = 60;
+
+    loop {
+        // Peek at expiry without locking the full cache (best-effort).
+        let expires_at = {
+            let map = state.caches.read().await;
+            map.get(&provider).and_then(|c| c.try_peek_expiry())
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let sleep_secs = match expires_at {
+            None => {
+                // No token cached yet — check again later.
+                SLEEP_WHEN_NO_TOKEN_SECS
+            }
+            Some(exp) if exp > now + PROACTIVE_REFRESH_LEAD_SECS => {
+                // Token is fresh — sleep until the lead window opens.
+                (exp - now - PROACTIVE_REFRESH_LEAD_SECS).max(10)
+            }
+            Some(_) => {
+                // Token is within the lead window or expired — refresh now.
+                if let Some(prov_cfg) = state.config.providers.get(&provider) {
+                    let cache = state.get_cache(&provider).await;
+                    match cache.get_or_refresh(
+                        &provider,
+                        prov_cfg,
+                        &state.recorder,
+                        &state.client,
+                    ).await {
+                        Ok(_) => {
+                            // cred.7: clear AttentionRequired on proactive success.
+                            let was_attention = if let Ok(mut states) = state.provider_states.write() {
+                                if states.get(&provider).map(|s| s.is_attention_required()).unwrap_or(false) {
+                                    states.insert(provider.clone(), ProviderHealthState::Healthy);
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            if was_attention {
+                                state.recorder.record(
+                                    "credential_gateway",
+                                    None,
+                                    EventKind::CredentialRecovered,
+                                    json!({ "provider": &provider, "source": "proactive_refresh" }),
+                                );
+                            }
+                            // cred.5: update expiry + refresh maps.
+                            if let Some(exp2) = cache.try_peek_expiry() {
+                                if let Ok(mut pe) = state.provider_expiry.write() {
+                                    pe.insert(provider.clone(), exp2);
+                                }
+                                let now_s = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                if let Ok(mut pr) = state.provider_last_refresh.write() {
+                                    pr.insert(provider.clone(), now_s);
+                                }
+                            }
+                            if let Ok(mut pe) = state.provider_last_error.write() {
+                                pe.insert(provider.clone(), None);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = %provider,
+                                error    = %e,
+                                "credential: proactive refresh failed",
+                            );
+                            if let Ok(mut pe) = state.provider_last_error.write() {
+                                pe.insert(provider.clone(), Some(e.to_string()));
+                            }
+                            // cred.7: on AttentionRequired, update state and emit event.
+                            if let FailureClass::AttentionRequired { ref recovery_kind } = e.class {
+                                let now_s = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                let rk  = recovery_kind.clone();
+                                let msg = e.message.clone();
+                                let became = if let Ok(mut states) = state.provider_states.write() {
+                                    let entry = states
+                                        .entry(provider.clone())
+                                        .or_insert(ProviderHealthState::Healthy);
+                                    if !entry.is_attention_required() {
+                                        *entry = ProviderHealthState::AttentionRequired {
+                                            recovery_kind: rk.clone(),
+                                            reason:        msg.clone(),
+                                            since:         now_s,
+                                        };
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                };
+                                if became {
+                                    state.recorder.record(
+                                        "credential_gateway",
+                                        None,
+                                        EventKind::CredentialAttentionRequired,
+                                        json!({
+                                            "provider":      &provider,
+                                            "recovery_kind": rk.as_str(),
+                                            "reason":        &msg,
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                SLEEP_AFTER_REFRESH_SECS
+            }
+        };
+
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+    }
+}
+
 // ── CredentialGateway ──────────────────────────────────────────────────────────
 
 /// In-process credential broker.
@@ -1190,6 +1535,12 @@ pub struct CredentialGateway {
     provider_last_refresh: ProviderRefresh,
     /// Shared with GatewayState — per-provider last OAuth error; None = healthy.
     provider_last_error:   ProviderError,
+    // ── cred.7 resilience ────────────────────────────────────────────────────
+    /// Shared with GatewayState — per-provider health state machine.
+    provider_states: ProviderStates,
+    /// Shared with GatewayState — OAuth token caches; needed by reset_attention().
+    caches:          CachesMap,
+    recorder:        Arc<FlightRecorder>,
 }
 
 impl CredentialGateway {
@@ -1198,11 +1549,17 @@ impl CredentialGateway {
     /// Provider validation (HTTPS scheme, DNS SSRF check, IP pinning) is performed
     /// inside `GatewayState::new()` so the check and the pinned client are always
     /// constructed together (ar-04).
+    ///
+    /// `credential_health` restores per-provider `AttentionRequired` states from the
+    /// last scheduler checkpoint (cred.7). Pass `Default::default()` on cold start.
     pub async fn start(
-        cfg:      &CredentialGatewayConfig,
-        recorder: Arc<FlightRecorder>,
+        cfg:               &CredentialGatewayConfig,
+        recorder:          Arc<FlightRecorder>,
+        credential_health: HashMap<String, crate::checkpoint::ProviderHealthCheckpoint>,
     ) -> Result<(Arc<Self>, std::net::SocketAddr)> {
-        let state = Arc::new(GatewayState::new(cfg.clone(), recorder).await?);
+        let state = Arc::new(
+            GatewayState::new(cfg.clone(), Arc::clone(&recorder), credential_health).await?
+        );
         let registry              = Arc::clone(&state.registry);
         // counters is already Arc<RwLock<...>> on GatewayState — clone the Arc to share.
         let counters              = Arc::clone(&state.counters);
@@ -1215,10 +1572,22 @@ impl CredentialGateway {
         let provider_expiry       = Arc::clone(&state.provider_expiry);
         let provider_last_refresh = Arc::clone(&state.provider_last_refresh);
         let provider_last_error   = Arc::clone(&state.provider_last_error);
+        // cred.7: share provider_states and caches for reset_attention() + snapshot()
+        let provider_states       = Arc::clone(&state.provider_states);
+        let caches                = Arc::clone(&state.caches);
 
         let listener = TcpListener::bind("127.0.0.1:0").await
             .context("credential gateway: bind loopback listener")?;
         let bound = listener.local_addr().context("credential gateway: local_addr")?;
+
+        // cred.7: spawn a proactive refresh background task per OAuth provider.
+        for (name, prov) in &state.config.providers {
+            if prov.auth_style == crate::config::AuthStyle::OauthBearer {
+                let state_clone = Arc::clone(&state);
+                let name_clone  = name.clone();
+                tokio::spawn(proactive_refresh_loop(state_clone, name_clone));
+            }
+        }
 
         tokio::spawn(async move {
             loop {
@@ -1256,6 +1625,9 @@ impl CredentialGateway {
             provider_expiry,
             provider_last_refresh,
             provider_last_error,
+            provider_states,
+            caches,
+            recorder,
         }), bound))
     }
 
@@ -1302,6 +1674,9 @@ impl CredentialGateway {
             .unwrap_or_else(|p| p.into_inner());
         let error_map   = self.provider_last_error.read()
             .unwrap_or_else(|p| p.into_inner());
+        // cred.7: read health states for attention fields.
+        let states_map  = self.provider_states.read()
+            .unwrap_or_else(|p| p.into_inner());
 
         let mut provider_health = Vec::new();
         for name in &self.configured_providers {
@@ -1323,12 +1698,24 @@ impl CredentialGateway {
                 }
             };
 
+            // cred.7: extract attention fields from the health state machine.
+            let (attention_reason, recovery_kind, attention_since) =
+                match states_map.get(name) {
+                    Some(ProviderHealthState::AttentionRequired { reason, recovery_kind, since }) => {
+                        (Some(reason.clone()), Some(recovery_kind.as_str().to_string()), Some(*since))
+                    }
+                    _ => (None, None, None),
+                };
+
             provider_health.push(ProviderHealth {
-                name:            name.clone(),
+                name:             name.clone(),
                 token_fresh,
-                last_refresh_at: refresh_map.get(name).copied(),
+                last_refresh_at:  refresh_map.get(name).copied(),
                 expires_at,
-                last_error:      error_map.get(name).and_then(|e| e.clone()),
+                last_error:       error_map.get(name).and_then(|e| e.clone()),
+                attention_reason,
+                recovery_kind,
+                attention_since,
             });
         }
 
@@ -1337,6 +1724,61 @@ impl CredentialGateway {
             configured_providers: self.configured_providers.clone(),
             provider_health,
         }
+    }
+
+    /// Clear `AttentionRequired` for `provider` and invalidate its cached token
+    /// so the next request forces a fresh refresh attempt.
+    ///
+    /// Called by the management API `POST /api/v1/credentials/<provider>/reset-attention`.
+    /// Returns `false` if the provider is unknown (not configured).
+    pub async fn reset_attention(&self, provider: &str) -> bool {
+        // Check the provider is configured.
+        if !self.configured_providers.iter().any(|p| p == provider) {
+            return false;
+        }
+        // Clear health state.
+        if let Ok(mut states) = self.provider_states.write() {
+            states.insert(provider.to_string(), ProviderHealthState::Healthy);
+        }
+        // Invalidate cached token so the next request triggers a real refresh.
+        {
+            let map = self.caches.read().await;
+            if let Some(cache) = map.get(provider) {
+                let mut inner = cache.state.lock().await;
+                inner.token = None;
+                inner.expires_at = 0;
+            }
+        }
+        // Clear the last-error field too.
+        if let Ok(mut pe) = self.provider_last_error.write() {
+            pe.insert(provider.to_string(), None);
+        }
+        self.recorder.record(
+            "credential_gateway",
+            None,
+            EventKind::CredentialRecovered,
+            json!({ "provider": provider, "source": "reset_attention" }),
+        );
+        true
+    }
+
+    /// Collect `ProviderHealthCheckpoint` entries for all providers currently in
+    /// `AttentionRequired` state. Called by the scheduler when writing a checkpoint.
+    pub fn provider_health_checkpoints(
+        &self,
+    ) -> HashMap<String, crate::checkpoint::ProviderHealthCheckpoint> {
+        let states = self.provider_states.read().unwrap_or_else(|p| p.into_inner());
+        states.iter().filter_map(|(name, state)| {
+            if let ProviderHealthState::AttentionRequired { recovery_kind, reason, since } = state {
+                Some((name.clone(), crate::checkpoint::ProviderHealthCheckpoint {
+                    recovery_kind: recovery_kind.as_str().to_string(),
+                    reason:        reason.clone(),
+                    since:         *since,
+                }))
+            } else {
+                None
+            }
+        }).collect()
     }
 
     /// Return per-agent credential usage for `AgentSnapshot` (cred.5).
@@ -1731,7 +2173,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
             max_requests_per_agent: None,
             passthrough_query_params: vec![],
         });
-        let err = CredentialGateway::start(&cfg, recorder).await
+        let err = CredentialGateway::start(&cfg, recorder, HashMap::new()).await
             .err()
             .expect("gateway must reject http:// upstream_base");
         assert!(err.to_string().contains("https://"), "error must mention https://");
@@ -1746,7 +2188,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("flight.jsonl")).expect("recorder"),
         );
         let cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await
             .expect("gateway must start");
         assert!(addr.port() > 0, "gateway must bind on non-zero port");
         gw.register_token("tok".to_string(), "agent-x".to_string(), vec!["google".to_string()]).await;
@@ -1957,7 +2399,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         );
         // Empty providers map — no SSRF check runs at startup, gateway binds cleanly.
         let cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await
             .expect("gateway must start");
 
         // Register a token with NO providers (the ar-07 case).
@@ -2032,7 +2474,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
 
         // Gateway start: DNS lookup for api.search.brave.com warns but does not fail
         // when unreachable (air-gapped), so this test is CI-safe.
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await
             .expect("gateway must start");
 
         let token = "test-api-key-header-missing-t25";
@@ -2079,7 +2521,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
         cfg.providers.insert("loopback-test".to_string(), private_prov);
 
-        let result = GatewayState::new(cfg, recorder).await;
+        let result = GatewayState::new(cfg, recorder, HashMap::new()).await;
         assert!(result.is_err(),
             "GatewayState::new() must reject loopback upstream_base — ar-04 SSRF check \
              not in GatewayState::new()? (was only in CredentialGateway::start())");
@@ -2094,7 +2536,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         let recorder2 = Arc::new(
             crate::flight_recorder::FlightRecorder::new(&dir2.path().join("fl.jsonl")).unwrap(),
         );
-        let ok_state = GatewayState::new(empty_cfg, recorder2).await.unwrap();
+        let ok_state = GatewayState::new(empty_cfg, recorder2, HashMap::new()).await.unwrap();
         // Field access proves the struct has pinned_ips (compile-time).
         let _ = &ok_state.pinned_ips;
     }
@@ -2120,7 +2562,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
         cfg.providers.insert("public-ip-test".to_string(), prov);
 
-        let state = GatewayState::new(cfg, recorder).await
+        let state = GatewayState::new(cfg, recorder, HashMap::new()).await
             .expect("public IP upstream must not be rejected");
         assert_eq!(state.pinned_ips.len(), 1,
             "pinned_ips must have 1 entry for the resolved IP (IP pinning not executing?)");
@@ -2191,7 +2633,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert!(result.is_err(), "token_url pointing to loopback must be blocked (ar-04c)");
         let err = result.unwrap_err();
         assert!(
-            err.contains("SSRF-blocked") || err.contains("127.0.0.1"),
+            err.message.contains("SSRF-blocked") || err.message.contains("127.0.0.1"),
             "error must name the SSRF block, got: {err}"
         );
     }
@@ -2282,7 +2724,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         cfg.providers.insert("google".to_string(), provider_cfg_oauth());
         cfg.providers.insert("brave-search".to_string(), provider_cfg_api_key_header());
 
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await
             .expect("gateway must start");
 
         // Token for agent-a scoped to google only.
@@ -2321,7 +2763,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         cfg.providers.insert("google".to_string(), provider_cfg_oauth());
 
         // DNS for googleapis.com may warn in air-gapped CI but start() does not fail.
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await
             .expect("gateway must start (DNS warn is OK in air-gapped CI)");
 
         let token = "test-oauth-t32";
@@ -2351,7 +2793,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
         );
         let cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await
             .expect("gateway must start with no providers");
 
         let token = "test-deregister-lifecycle-t33";
@@ -2413,7 +2855,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
         cfg.providers.insert("google".to_string(), provider_cfg_api_key_header());
 
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await.unwrap();
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await.unwrap();
         let token = "test-inbound-413-t35";
         gw.register_token(token.to_string(), "agent-t35".to_string(), vec!["google".to_string()]).await;
 
@@ -2537,7 +2979,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert!(result.is_err(),
             "token_url with userinfo must be rejected as malformed (ar-04c extract_host path)");
         let err = result.err().unwrap();
-        assert!(err.contains("malformed"),
+        assert!(err.message.contains("malformed"),
             "error must mention 'malformed', got: {err}");
     }
 
@@ -2577,7 +3019,7 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
         cfg.providers.insert("userinfo-test".to_string(), prov);
 
-        let result = GatewayState::new(cfg, recorder).await;
+        let result = GatewayState::new(cfg, recorder, HashMap::new()).await;
         assert!(result.is_err(),
             "upstream_base with userinfo must be rejected — extract_host() guard not in new()? (G3)");
         let err = result.err().unwrap().to_string();
@@ -2694,7 +3136,7 @@ max_requests_per_agent = 100
         let recorder = Arc::new(
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
         );
-        let state = Arc::new(GatewayState::new(cfg, recorder).await.unwrap());
+        let state = Arc::new(GatewayState::new(cfg, recorder, HashMap::new()).await.unwrap());
         // counters must remain empty — no cap means no counter entry.
         let counters = state.counters.read().await;
         assert!(counters.is_empty(), "no counter should be created when cap is None");
@@ -2796,7 +3238,7 @@ max_requests_per_agent = 100
         let recorder = Arc::new(
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
         );
-        let result = GatewayState::new(cfg, recorder).await;
+        let result = GatewayState::new(cfg, recorder, HashMap::new()).await;
         assert!(result.is_err(), "CRLF in header_value_prefix must be rejected at startup (T42)");
         let err = result.err().unwrap().to_string();
         assert!(
@@ -2830,7 +3272,7 @@ max_requests_per_agent = 100
         let recorder = Arc::new(
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
         );
-        let result = GatewayState::new(cfg, recorder).await;
+        let result = GatewayState::new(cfg, recorder, HashMap::new()).await;
         assert!(result.is_err(),
             "TAB (0x09) in header_value_prefix must be rejected — control char guard too narrow? (T42b)");
     }
@@ -2858,7 +3300,7 @@ max_requests_per_agent = 100
         let recorder = Arc::new(
             crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
         );
-        let result = GatewayState::new(cfg, recorder).await;
+        let result = GatewayState::new(cfg, recorder, HashMap::new()).await;
         assert!(result.is_err(),
             "CRLF in header_name must be rejected at startup (T42c — header_name validation missing?)");
         let err = result.err().unwrap().to_string();
@@ -2977,7 +3419,7 @@ max_requests_per_agent = 100
         let cfg = CredentialGatewayConfig { enabled: true, providers, caps_db_path: None };
         std::env::set_var("BRAVE_KEY_T47", "test-api-key-t47");
 
-        let (gw, addr) = CredentialGateway::start(&cfg, recorder).await.unwrap();
+        let (gw, addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await.unwrap();
         let token = "tok-t47-spend-cap";
         gw.register_token(token.to_string(), "agent-t47".to_string(), vec!["brave".to_string()]).await;
 
@@ -3097,6 +3539,9 @@ max_requests_per_agent = 100
                 last_refresh_at: None,
                 expires_at: None,
                 last_error: Some("HTTP 401".to_string()),
+                attention_reason: None,
+                attention_since: None,
+                recovery_kind: None,
             }],
         };
         let json = serde_json::to_string(&snap).expect("CredentialSnapshot must serialize");
@@ -3120,5 +3565,256 @@ max_requests_per_agent = 100
             src.contains("token refresh HTTP {status}"),
             "token refresh error must still include the HTTP status code (cred.5-ar-01 design intent)"
         );
+    }
+
+    // ── cred.7: FailureClass / RecoveryKind / ProviderHealthState / reset_attention ──
+
+    #[test]
+    fn recovery_kind_as_str_values() {
+        assert_eq!(RecoveryKind::Reauth.as_str(), "reauth");
+        assert_eq!(RecoveryKind::ConfigFix.as_str(), "config_fix");
+        assert_eq!(RecoveryKind::SecretReplace.as_str(), "secret_replace");
+    }
+
+    #[test]
+    fn failure_class_retryable_is_not_attention() {
+        let e = CredentialError::retryable("timeout");
+        assert_eq!(e.class, FailureClass::Retryable);
+        assert_eq!(e.to_string(), "timeout");
+    }
+
+    #[test]
+    fn failure_class_attention_required_carries_recovery_kind() {
+        let e = CredentialError::attention(RecoveryKind::Reauth, "invalid_grant");
+        assert!(
+            matches!(e.class, FailureClass::AttentionRequired { recovery_kind: RecoveryKind::Reauth }),
+            "AttentionRequired must carry Reauth"
+        );
+    }
+
+    #[test]
+    fn failure_class_config_fix_variant() {
+        let e = CredentialError::attention(RecoveryKind::ConfigFix, "bad token_url");
+        assert!(
+            matches!(e.class, FailureClass::AttentionRequired { recovery_kind: RecoveryKind::ConfigFix }),
+        );
+    }
+
+    #[test]
+    fn failure_class_secret_replace_variant() {
+        let e = CredentialError::attention(RecoveryKind::SecretReplace, "missing secrets file");
+        assert!(
+            matches!(e.class, FailureClass::AttentionRequired { recovery_kind: RecoveryKind::SecretReplace }),
+        );
+    }
+
+    #[test]
+    fn provider_health_state_healthy_is_not_attention() {
+        let s = ProviderHealthState::Healthy;
+        assert!(!s.is_attention_required());
+    }
+
+    #[test]
+    fn provider_health_state_attention_required_is_attention() {
+        let s = ProviderHealthState::AttentionRequired {
+            recovery_kind: RecoveryKind::Reauth,
+            reason:        "test".to_string(),
+            since:         12345,
+        };
+        assert!(s.is_attention_required());
+    }
+
+    #[test]
+    fn provider_health_checkpoints_empty_when_all_healthy() {
+        let states: ProviderStates = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        states.write().unwrap().insert("google".to_string(), ProviderHealthState::Healthy);
+
+        let gw_states = Arc::clone(&states);
+        let checkpoints: HashMap<String, crate::checkpoint::ProviderHealthCheckpoint> =
+            gw_states.read().unwrap().iter().filter_map(|(name, state)| {
+                if let ProviderHealthState::AttentionRequired { recovery_kind, reason, since } = state {
+                    Some((name.clone(), crate::checkpoint::ProviderHealthCheckpoint {
+                        recovery_kind: recovery_kind.as_str().to_string(),
+                        reason: reason.clone(),
+                        since: *since,
+                    }))
+                } else {
+                    None
+                }
+            }).collect();
+        assert!(checkpoints.is_empty(), "healthy states must not produce checkpoint entries");
+    }
+
+    #[test]
+    fn provider_health_checkpoints_captures_attention_required() {
+        let states: ProviderStates = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        states.write().unwrap().insert("google".to_string(), ProviderHealthState::AttentionRequired {
+            recovery_kind: RecoveryKind::Reauth,
+            reason:        "invalid_grant".to_string(),
+            since:         9999,
+        });
+
+        let checkpoints: HashMap<String, crate::checkpoint::ProviderHealthCheckpoint> =
+            states.read().unwrap().iter().filter_map(|(name, state)| {
+                if let ProviderHealthState::AttentionRequired { recovery_kind, reason, since } = state {
+                    Some((name.clone(), crate::checkpoint::ProviderHealthCheckpoint {
+                        recovery_kind: recovery_kind.as_str().to_string(),
+                        reason: reason.clone(),
+                        since: *since,
+                    }))
+                } else {
+                    None
+                }
+            }).collect();
+        assert_eq!(checkpoints.len(), 1);
+        let cp = checkpoints.get("google").unwrap();
+        assert_eq!(cp.recovery_kind, "reauth");
+        assert_eq!(cp.reason, "invalid_grant");
+        assert_eq!(cp.since, 9999);
+    }
+
+    #[tokio::test]
+    async fn reset_attention_returns_false_for_unknown_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        let (gw, _addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await.unwrap();
+        // "nonexistent" is not a configured provider — must return false.
+        let result = gw.reset_attention("nonexistent").await;
+        assert!(!result, "reset_attention must return false for unknown provider");
+    }
+
+    #[tokio::test]
+    async fn reset_attention_returns_true_for_configured_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("google".to_string(), provider_cfg_api_key_header());
+        let (gw, _addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await.unwrap();
+        let result = gw.reset_attention("google").await;
+        assert!(result, "reset_attention must return true for a configured provider");
+    }
+
+    #[tokio::test]
+    async fn reset_attention_clears_health_state_to_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("google".to_string(), provider_cfg_api_key_header());
+        let (gw, _addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await.unwrap();
+        // Manually set health state to AttentionRequired.
+        if let Ok(mut states) = gw.provider_states.write() {
+            states.insert("google".to_string(), ProviderHealthState::AttentionRequired {
+                recovery_kind: RecoveryKind::Reauth,
+                reason:        "test".to_string(),
+                since:         1234,
+            });
+        }
+        // reset_attention should clear it back to Healthy.
+        let result = gw.reset_attention("google").await;
+        assert!(result);
+        let states_arc = Arc::clone(&gw.provider_states);
+        let is_healthy = {
+            let states = states_arc.read().unwrap();
+            !states.get("google").map(|s| s.is_attention_required()).unwrap_or(true)
+        };
+        assert!(is_healthy, "state must be Healthy after reset_attention");
+    }
+
+    #[tokio::test]
+    async fn provider_health_checkpoints_empty_after_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let recorder = Arc::new(
+            crate::flight_recorder::FlightRecorder::new(&dir.path().join("fl.jsonl")).unwrap(),
+        );
+        let mut cfg = CredentialGatewayConfig { enabled: true, ..Default::default() };
+        cfg.providers.insert("google".to_string(), provider_cfg_api_key_header());
+        let (gw, _addr) = CredentialGateway::start(&cfg, recorder, HashMap::new()).await.unwrap();
+        // Set to AttentionRequired.
+        if let Ok(mut states) = gw.provider_states.write() {
+            states.insert("google".to_string(), ProviderHealthState::AttentionRequired {
+                recovery_kind: RecoveryKind::Reauth,
+                reason:        "test".to_string(),
+                since:         9999,
+            });
+        }
+        assert_eq!(gw.provider_health_checkpoints().len(), 1, "should have 1 entry before reset");
+        gw.reset_attention("google").await;
+        assert_eq!(gw.provider_health_checkpoints().len(), 0, "should have 0 entries after reset");
+    }
+
+    #[test]
+    fn credential_health_checkpoint_round_trip() {
+        // SchedulerCheckpoint with credential_health round-trips through JSON.
+        let mut health = HashMap::new();
+        health.insert("google".to_string(), crate::checkpoint::ProviderHealthCheckpoint {
+            recovery_kind: "reauth".to_string(),
+            reason:        "invalid_grant".to_string(),
+            since:         1_720_000_000,
+        });
+        let cp = crate::checkpoint::SchedulerCheckpoint {
+            format_version:      crate::checkpoint::FORMAT_VERSION,
+            agents:              vec![],
+            awaiting:            vec![],
+            mailboxes:           HashMap::new(),
+            tokens_spent:        0,
+            child_seq:           0,
+            spawn_depths:        HashMap::new(),
+            parent_map:          HashMap::new(),
+            pending_approvals:   vec![],
+            approval_seq:        0,
+            waiting_agents:      vec![],
+            orchestrated_agents: vec![],
+            credential_health:   health,
+        };
+        let json = serde_json::to_string(&cp).expect("serialize must succeed");
+        let back: crate::checkpoint::SchedulerCheckpoint =
+            serde_json::from_str(&json).expect("deserialize must succeed");
+        let entry = back.credential_health.get("google").unwrap();
+        assert_eq!(entry.recovery_kind, "reauth");
+        assert_eq!(entry.since, 1_720_000_000);
+    }
+
+    #[test]
+    fn credential_health_checkpoint_defaults_empty_on_old_format() {
+        // SchedulerCheckpoints without credential_health field must deserialize with
+        // credential_health = {} (the #[serde(default)] annotation).
+        let json = r#"{
+            "format_version": 4,
+            "agents": [],
+            "awaiting": [],
+            "mailboxes": {},
+            "tokens_spent": 0,
+            "child_seq": 0,
+            "spawn_depths": {},
+            "parent_map": {},
+            "pending_approvals": [],
+            "approval_seq": 0,
+            "waiting_agents": [],
+            "orchestrated_agents": []
+        }"#;
+        let cp: crate::checkpoint::SchedulerCheckpoint =
+            serde_json::from_str(json).expect("must parse without credential_health field");
+        assert!(cp.credential_health.is_empty(), "#[serde(default)] must produce empty map");
+    }
+
+    #[test]
+    fn proactive_refresh_lead_secs_constant_is_defined_and_positive() {
+        // Compile-time invariant: constant must be >= 60 s.
+        const { assert!(PROACTIVE_REFRESH_LEAD_SECS >= 60) }
+        let _ = PROACTIVE_REFRESH_LEAD_SECS; // ensure the symbol is reachable
+    }
+
+    #[test]
+    fn credential_attention_required_and_recovered_events_exist() {
+        // EventKind variants for cred.7 must exist (compile-time check exercised at runtime).
+        let _ = EventKind::CredentialAttentionRequired;
+        let _ = EventKind::CredentialRecovered;
     }
 }

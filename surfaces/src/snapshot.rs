@@ -98,6 +98,16 @@ pub struct ProviderHealth {
     pub expires_at:      Option<u64>,
     /// Last refresh-error string; cleared on the next successful refresh. `None` when healthy.
     pub last_error:      Option<String>,
+    // ── cred.7 resilience fields ──────────────────────────────────────────────
+    /// Human-readable reason the provider entered AttentionRequired; None when healthy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_reason: Option<String>,
+    /// Recovery action the operator should take: "reauth" | "config_fix" | "secret_replace".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_kind:    Option<String>,
+    /// Unix secs when the provider first entered AttentionRequired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attention_since:  Option<u64>,
 }
 
 /// A pending operator approval, projected from the scheduler into the snapshot.

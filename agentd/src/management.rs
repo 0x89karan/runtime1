@@ -14,6 +14,7 @@
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
 //!   GET  /api/v1/credentials                     → 200 CredentialSnapshot JSON (cred.5)
+//!   POST /api/v1/credentials/:provider/reset-attention → 200 | 404 (cred.7)
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -41,12 +42,14 @@ const MAX_MEMORY_LIMIT: usize = 100;
 
 /// Shared state threaded into every request handler.
 struct ApiState {
-    snapshot:      SharedSnapshot,
-    memory_store:  Option<Arc<dyn MemoryStore>>,
-    broadcast_tx:  broadcast::Sender<String>,
-    recorder:      Arc<FlightRecorder>,
+    snapshot:           SharedSnapshot,
+    memory_store:       Option<Arc<dyn MemoryStore>>,
+    broadcast_tx:       broadcast::Sender<String>,
+    recorder:           Arc<FlightRecorder>,
     /// Sender half of the scheduler control channel. None when not wired (non-Linux or test).
-    control_tx:    Option<mpsc::Sender<ControlCommand>>,
+    control_tx:         Option<mpsc::Sender<ControlCommand>>,
+    /// Credential gateway for reset-attention endpoint (cred.7). None when disabled.
+    credential_gateway: Option<Arc<crate::credential::CredentialGateway>>,
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -394,6 +397,28 @@ async fn route(
             }
         }
 
+        (Method::POST, path)
+            if path.starts_with("/api/v1/credentials/")
+                && path.ends_with("/reset-attention") =>
+        {
+            let provider = path
+                .strip_prefix("/api/v1/credentials/")
+                .and_then(|s| s.strip_suffix("/reset-attention"))
+                .unwrap_or("")
+                .trim();
+            if provider.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "provider must not be empty");
+            }
+            let Some(gw) = &state.credential_gateway else {
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "credential gateway not configured");
+            };
+            if gw.reset_attention(provider).await {
+                json_response(StatusCode::OK, json!({"reset": provider}))
+            } else {
+                error_response(StatusCode::NOT_FOUND, "provider not found or not configured")
+            }
+        }
+
         _ => error_response(StatusCode::NOT_FOUND, "not found"),
     }
 }
@@ -431,6 +456,7 @@ pub async fn start(
     broadcast_tx: broadcast::Sender<String>,
     recorder: Arc<FlightRecorder>,
     control_tx: Option<mpsc::Sender<ControlCommand>>,
+    credential_gateway: Option<Arc<crate::credential::CredentialGateway>>,
 ) -> anyhow::Result<SocketAddr> {
     let addr = format!("{bind_addr}:{port}");
     let listener = TcpListener::bind(&addr)
@@ -466,6 +492,7 @@ pub async fn start(
         broadcast_tx,
         recorder,
         control_tx,
+        credential_gateway,
     });
 
     tracing::info!("management API listening on {bound}");
@@ -521,6 +548,7 @@ mod tests {
             broadcast_tx: tx,
             recorder,
             control_tx,
+            credential_gateway: None,
         })
     }
 
@@ -667,6 +695,7 @@ mod tests {
             tx,
             recorder,
             None,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -692,6 +721,7 @@ mod tests {
             tx,
             recorder,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "expected bind to succeed with allow_non_loopback=true, got: {result:?}");
@@ -712,6 +742,7 @@ mod tests {
             None,
             tx,
             recorder,
+            None,
             None,
         )
         .await
@@ -751,6 +782,7 @@ mod tests {
             tx,
             recorder,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "expected loopback bind to succeed by default, got: {result:?}");
@@ -771,6 +803,7 @@ mod tests {
             None,
             tx,
             recorder,
+            None,
             None,
         )
         .await
@@ -963,6 +996,9 @@ mod tests {
                     last_refresh_at: Some(1_700_000_000),
                     expires_at: Some(1_700_003_600),
                     last_error: None,
+                    attention_reason: None,
+                    attention_since: None,
+                    recovery_kind: None,
                 }],
             }),
             ..Default::default()
@@ -976,5 +1012,57 @@ mod tests {
         assert_eq!(v["configured_providers"][0], "google");
         assert_eq!(v["provider_health"][0]["token_fresh"], true);
         assert_eq!(v["provider_health"][0]["last_error"], serde_json::Value::Null);
+    }
+
+    // ── cred.7: reset-attention route ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn reset_attention_returns_503_when_no_gateway() {
+        // No credential_gateway in state → must return 503.
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/credentials/google/reset-attention", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE,
+            "POST /api/v1/credentials/<p>/reset-attention must return 503 when gateway is not configured");
+    }
+
+    #[tokio::test]
+    async fn reset_attention_empty_provider_returns_400() {
+        // Path /api/v1/credentials//reset-attention has empty provider segment → must return 400.
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/credentials//reset-attention", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "POST /api/v1/credentials//reset-attention must return 400 for empty provider");
+    }
+
+    #[tokio::test]
+    async fn credentials_provider_health_attention_fields_serialized() {
+        // A ProviderHealth with attention fields set must include them in JSON.
+        use surfaces::{CredentialSnapshot, ProviderHealth};
+        let snap = SchedulerSnapshot {
+            credential_snapshot: Some(CredentialSnapshot {
+                gateway_enabled: true,
+                configured_providers: vec!["google".to_string()],
+                provider_health: vec![ProviderHealth {
+                    name: "google".to_string(),
+                    token_fresh: false,
+                    last_refresh_at: None,
+                    expires_at: None,
+                    last_error: Some("invalid_grant".to_string()),
+                    attention_reason: Some("Token was revoked".to_string()),
+                    attention_since: Some(1_720_000_000),
+                    recovery_kind: Some("reauth".to_string()),
+                }],
+            }),
+            ..Default::default()
+        };
+        let state = make_state(snap);
+        let resp = route(state, Method::GET, "/api/v1/credentials", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = collect_body(resp).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["provider_health"][0]["attention_reason"], "Token was revoked",
+            "attention_reason must be serialized in JSON");
+        assert_eq!(v["provider_health"][0]["recovery_kind"], "reauth",
+            "recovery_kind must be serialized in JSON");
     }
 }

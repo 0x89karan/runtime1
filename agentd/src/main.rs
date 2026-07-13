@@ -379,6 +379,17 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // Start the credential gateway BEFORE spawning any MCP server so we can
     // inject AGENTD_CREDENTIAL_GATEWAY_URL + AGENTD_CREDENTIAL_TOKEN into each
     // subprocess environment at spawn time.
+
+    // cred.7: peek at the checkpoint file early (before the full restore at line ~1115)
+    // to extract per-provider health states so the gateway can restore AttentionRequired.
+    // The file is not removed here; the full restore below handles that.
+    let early_credential_health: std::collections::HashMap<String, agentd::checkpoint::ProviderHealthCheckpoint> = {
+        let store = CheckpointStore::new(std::path::Path::new("."));
+        store.load().ok().flatten()
+            .map(|cp| cp.credential_health)
+            .unwrap_or_default()
+    };
+
     let (maybe_cred_gw, cred_gw_url): (Option<Arc<CredentialGateway>>, Option<String>) =
         if cfg.credential_gateway.enabled {
             // cred.4: derive caps_db_path from memory store dir so cap counters survive
@@ -424,7 +435,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                     }
                 }
             }
-            match CredentialGateway::start(&cred_gw_cfg, Arc::clone(&recorder)).await {
+            match CredentialGateway::start(&cred_gw_cfg, Arc::clone(&recorder), early_credential_health).await {
                 Ok((gw, addr)) => {
                     tracing::info!(addr = %addr, "credential gateway started");
                     (Some(gw), Some(format!("http://{addr}")))
@@ -1098,6 +1109,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             broadcast_tx.clone(),
             Arc::clone(&recorder),
             mgmt_control_tx,
+            maybe_cred_gw.clone(),
         ).await {
             Ok(bound) => {
                 tracing::info!(addr = %bound, "management API started");

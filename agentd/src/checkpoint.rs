@@ -15,6 +15,19 @@ use crate::{
 
 pub const FORMAT_VERSION: u32 = 4;
 
+/// Serializable per-provider health state for checkpoint persistence.
+///
+/// `TransientRetry` is NOT checkpointed — it is transient by definition and
+/// resets on restart. `ProviderHealthState::Healthy` maps to `None` in the map.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHealthCheckpoint {
+    /// "reauth" | "config_fix" | "secret_replace"
+    pub recovery_kind: String,
+    pub reason:        String,
+    /// Unix secs when the provider first entered AttentionRequired.
+    pub since:         u64,
+}
+
 /// Create `path` with mode 0600 on Unix, then write `data`.
 ///
 /// On non-Unix (Windows) falls back to `tokio::fs::write` (different ACL model).
@@ -128,6 +141,11 @@ pub struct SchedulerCheckpoint {
     /// On restore these IDs are re-inserted into `state.orchestrated`. Absent in v1–v3 → empty.
     #[serde(default)]
     pub orchestrated_agents: Vec<String>,
+    /// Per-provider credential health state (cred.7).
+    /// Only AttentionRequired entries are stored; absent entries are Healthy.
+    /// Absent in v1–v4 → empty.
+    #[serde(default)]
+    pub credential_health: HashMap<String, ProviderHealthCheckpoint>,
 }
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
@@ -276,6 +294,7 @@ mod tests {
             approval_seq:       0,
             waiting_agents:     vec![],
             orchestrated_agents: vec![],
+            credential_health:  HashMap::new(),
         }
     }
 

@@ -419,6 +419,17 @@ configured with Gmail params); `state_path = "/run/memory/oauth/google.json"` in
 configs; `allow_non_loopback = true` explicit opt-in on `ManagementConfig` for 0.0.0.0 bind in Docker
 compose mode; 1307 workspace tests. Manual gate (Step 4 of plan): live Gmail auth dance required after
 deploy. `cred.6-ar-01` (P3 — URL-encoded `%26` in allowlist values, inert for Gmail) filed in TODOS.md.
+**cred.7 complete (v0.84.0).** Credential resilience — 3-way failure classifier (`FailureClass`/`RecoveryKind`);
+per-provider `ProviderHealthState` machine (`Healthy`/`AttentionRequired { recovery_kind, reason, since }`);
+`CredentialError` struct replacing plain `String` in `get_or_refresh()` return type; `CredentialAttentionRequired`
++ `CredentialRecovered` flight events; proactive OAuth refresh background task per provider (`PROACTIVE_REFRESH_LEAD_SECS=300`);
+`POST /api/v1/credentials/<provider>/reset-attention` management API (503 when disabled, 404 for unknown provider);
+`ProviderHealth` gains `attention_reason`/`recovery_kind`/`attention_since` fields (skip_serializing_if None);
+`ProviderHealthCheckpoint` serde type + `credential_health` field on `SchedulerCheckpoint` (`#[serde(default)]`
+for backwards compat with v1–v4 checkpoints); early checkpoint peek in `main.rs` to restore health before gateway
+start; `write_secrets_file_ext()` preserves custom `token_url` across re-auth; `sync_all()` durability on OAuth
+state writes; `agentctl auth google --device` re-auth without `--force` when credentials read from existing file;
+1327 workspace tests (+20).
 
 ## How to work here
 

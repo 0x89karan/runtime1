@@ -19,15 +19,40 @@ pub fn run(
     client_secret_arg: Option<String>,
     force: bool,
 ) -> Result<()> {
-    // Resolve client_id: CLI/env arg → compile-time embed → error.
-    let client_id = client_id_arg
-        .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("OAUTH_CLIENT_ID").map(str::to_owned))
+    let secrets_file = super::util::secrets_file_path()?;
+
+    // Resolve client_id / client_secret:
+    // 1. CLI/env arg  2. compile-time embed  3. existing secrets file (cred.7 re-auth path).
+    // When credentials come from the existing file we skip the --force guard (the operator
+    // is re-authenticating with the same app credentials, not replacing them).
+    let creds_from_args = client_id_arg.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        || client_secret_arg.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+        || option_env!("OAUTH_CLIENT_ID").is_some()
+        || option_env!("OAUTH_CLIENT_SECRET").is_some();
+
+    let id_from_env  = client_id_arg.filter(|s| !s.is_empty())
+        .or_else(|| option_env!("OAUTH_CLIENT_ID").map(str::to_owned));
+    let sec_from_env = client_secret_arg.filter(|s| !s.is_empty())
+        .or_else(|| option_env!("OAUTH_CLIENT_SECRET").map(str::to_owned));
+
+    // Try reading existing secrets file to fill missing credentials and preserve token_url.
+    let existing_json: Option<serde_json::Value> = if secrets_file.exists() {
+        std::fs::read(&secrets_file).ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    } else {
+        None
+    };
+
+    let client_id = id_from_env
+        .or_else(|| existing_json.as_ref().and_then(|v| v["client_id"].as_str().map(str::to_owned)))
         .unwrap_or_default();
-    let client_secret = client_secret_arg
-        .filter(|s| !s.is_empty())
-        .or_else(|| option_env!("OAUTH_CLIENT_SECRET").map(str::to_owned))
+    let client_secret = sec_from_env
+        .or_else(|| existing_json.as_ref().and_then(|v| v["client_secret"].as_str().map(str::to_owned)))
         .unwrap_or_default();
+
+    // Preserve token_url from existing file so operator customisations survive re-auth.
+    let existing_token_url: Option<String> = existing_json.as_ref()
+        .and_then(|v| v["token_url"].as_str().map(str::to_owned));
 
     if client_id.is_empty() {
         bail!(
@@ -53,8 +78,10 @@ pub fn run(
         );
     }
 
-    let secrets_file = super::util::secrets_file_path()?;
-    if secrets_file.exists() && !force {
+    // --force is required only when the operator is supplying new/different credentials.
+    // Re-authenticating with credentials read from the existing file (cred.7 reset path)
+    // does not need --force — we're updating the refresh token, not the app credentials.
+    if secrets_file.exists() && creds_from_args && !force {
         bail!(
             "{} already exists.\n\
              \n\
@@ -193,11 +220,12 @@ pub fn run(
             bail!("Google returned an empty refresh_token.");
         }
 
-        super::util::write_secrets_file(
+        super::util::write_secrets_file_ext(
             &secrets_file,
             &client_id,
             &client_secret,
             &refresh_token,
+            existing_token_url.as_deref(),
         )?;
 
         println!();

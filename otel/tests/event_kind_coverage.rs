@@ -90,6 +90,8 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::OrchestratorTurnComplete => false,
         EventKind::OrchestratorExited => false,
         EventKind::IsolationProbed => false,
+        EventKind::CredentialAttentionRequired => false,
+        EventKind::CredentialRecovered => false,
         EventKind::Error => false,
     }
 }

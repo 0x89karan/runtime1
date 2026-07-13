@@ -3,6 +3,42 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.84.0] - 2026-07-13
+
+### Added (cred.7 — credential resilience)
+- **3-way failure classifier** (`agentd/src/credential/mod.rs`): `RecoveryKind` enum
+  (`Reauth | ConfigFix | SecretReplace`) + `FailureClass` enum (`Retryable |
+  AttentionRequired { recovery_kind }`). `CredentialError` struct replaces bare `String` as
+  the `get_or_refresh()` error type — OAuth error body inspection maps `invalid_grant` /
+  `invalid_client` / `token_expired` → `Reauth`; other HTTP errors → `Retryable`.
+- **Per-provider health state machine**: `ProviderHealthState` enum (`Healthy |
+  AttentionRequired { recovery_kind, reason, since }`) stored on `GatewayState`. Health
+  transitions on every `handle_credential_request()` — success → Healthy, attention error →
+  AttentionRequired. Exposed in `CredentialGateway::snapshot()` via 3 new `ProviderHealth`
+  fields (`attention_reason`, `recovery_kind`, `attention_since` — all `skip_serializing_if =
+  "Option::is_none"`).
+- **Proactive OAuth refresh background task**: one `tokio::spawn` per OAuth provider in
+  `CredentialGateway::start()` running `proactive_refresh_loop()`. Wakes 5 min before expiry
+  (`PROACTIVE_REFRESH_LEAD_SECS = 300`), calls `get_or_refresh()` to renew the token before
+  the agent needs it. On contention (`try_peek_expiry()` returns `None`), sleeps 5 min and
+  retries.
+- **`POST /api/v1/credentials/<provider>/reset-attention`** management API endpoint: clears
+  health state to Healthy, invalidates cached token, clears last error, emits
+  `CredentialRecovered` flight event. Returns `{"reset": "<provider>"}` on success, 404 on
+  unknown provider, 503 when no credential gateway is configured. Provider name validated
+  against configured-providers allowlist (path-traversal protection).
+- **Checkpoint persistence of provider health** (`agentd/src/checkpoint.rs`):
+  `ProviderHealthCheckpoint { recovery_kind, reason, since }` struct; `credential_health:
+  HashMap<String, ProviderHealthCheckpoint>` on `SchedulerCheckpoint` with `#[serde(default)]`
+  for backward compat (FORMAT_VERSION stays at 4). Early checkpoint peek in `main.rs` restores
+  health state before `CredentialGateway::start()`.
+- **`credential_attention_required`** and **`credential_recovered`** flight event kinds
+  (`agentd/src/events.rs`, `docs/CONVENTIONS.md`).
+- **Re-auth path for `agentctl auth google`** (`agentctl/src/auth/google_device.rs` +
+  `util.rs`): reads existing `google.json` when no CLI credentials provided; `--force` guard
+  only applies to new credentials; `write_secrets_file_ext()` preserves `token_url` across
+  re-auth; `sync_all()` in `write_state_atomic()` for crash-safe OAuth state writes.
+
 ## [v0.83.0] - 2026-07-13
 
 ### Changed (cred.6 — CoS broker migration)

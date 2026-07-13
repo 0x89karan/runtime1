@@ -126,6 +126,8 @@ Phase 0 kinds (canonical — do not rename):
 | `credential_not_provisioned` | requested provider is not configured in [credential_gateway.providers] (provider, hint) (cred.3+) |
 | `credential_denied` | MCP server's allowed_providers list does not include the requested provider (agent_id, provider) (cred.3+) |
 | `credential_cap_exceeded` | per-agent per-provider request-count cap reached; request rejected with 429 (agent_id, provider, count, limit) (cred.4+) |
+| `credential_attention_required` | OAuth provider health transitioned to AttentionRequired after a non-retryable failure; operator must re-authenticate (provider, recovery_kind, reason) (cred.7+) |
+| `credential_recovered` | provider health transitioned back to Healthy after a successful credential operation (provider, source: "foreground_request" | "proactive_refresh" | "reset_attention") (cred.7+) |
 | `orchestrator_dispatched` | orchestrator spawned an agent in waiting mode (agent_id, task_preview) (orch.1+) |
 | `orchestrator_injected` | orchestrator injected a new user turn into a waiting agent (agent_id, text_len: usize) (orch.1+) |
 | `orchestrator_turn_complete` | orchestrated agent completed a turn and parked, awaiting next inject (agent_id, answer) (orch.1+) |
