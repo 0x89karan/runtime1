@@ -4805,6 +4805,9 @@ mod tests {
             last_refresh_at: Some(1_700_000_000),
             expires_at: None,
             last_error: last_error.map(|s| s.to_string()),
+            attention_reason: None,
+            recovery_kind: None,
+            attention_since: None,
         }
     }
 
