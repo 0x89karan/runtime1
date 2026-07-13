@@ -2243,4 +2243,58 @@ mod tests {
         assert!(out.contains("[?]"));
         assert!(out.contains("attention: 0 need attention"), "eval-unavailable alone is not 'needs attention'");
     }
+
+    #[test]
+    fn render_plain_mixed_needing_and_unavailable_shows_both_counts() {
+        // Coverage gap: `attention_counts`'s (n, m) match arm — both a genuinely-flagged agent
+        // AND a separate couldn't-evaluate agent present in the same fleet snapshot — was never
+        // exercised; every existing test hit either (0,0), (n,0), or (0,m) but not both counts
+        // positive at once. A swapped format arg or wrong separator in that third arm would
+        // have compiled and passed every other test here.
+        let snap = Snapshot {
+            agents: vec![
+                make_agent_with_attention(
+                    "scout-1",
+                    vec![signal(reader::AttentionReason::ApprovalPending, Some("act_1"))],
+                ),
+                make_agent_with_attention(
+                    "scout-2",
+                    vec![signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway"))],
+                ),
+            ],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(
+            out.contains("attention: 1 need attention, 1 unavailable"),
+            "mixed needing+unavailable branch must report both counts together, not just one: {out}"
+        );
+    }
+
+    #[test]
+    fn render_plain_label_text_matches_each_attention_reason() {
+        // Coverage gap: only `AttentionReason::ApprovalPending`'s label() string
+        // ("approval pending") was ever asserted verbatim elsewhere in this file. A typo in
+        // the Degraded/BudgetRisk/EvaluationUnavailable label() arms (reader.rs) would compile
+        // and pass every existing test — the glyph/routing/count tests exercise those branches
+        // structurally but never check the actual label text they render.
+        let snap = Snapshot {
+            agents: vec![make_agent_with_attention(
+                "scout-1",
+                vec![
+                    signal(reader::AttentionReason::Degraded, Some("google")),
+                    signal(reader::AttentionReason::BudgetRisk, Some("92%")),
+                    signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway")),
+                ],
+            )],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_plain(&app_from_snap(snap));
+        assert!(out.contains("degraded (google)"), "Degraded label text must render verbatim: {out}");
+        assert!(out.contains("budget risk (92%)"), "BudgetRisk label text must render verbatim: {out}");
+        assert!(
+            out.contains("evaluation unavailable (credential_gateway)"),
+            "EvaluationUnavailable label text must render verbatim: {out}"
+        );
+    }
 }
