@@ -149,6 +149,17 @@ a genuine follow-up (a design decision beyond Option A's "smallest change" scope
 `http_fetch`/`web_search`) can no longer reach `cos:7999`'s unauthenticated management API on the
 Compose bridge. Verified via `docker compose config` showing each service's resolved network.
 
+## cos-dev — Open items
+
+- **cos-dev-01 (P3) — `write_file` silently fails in dev mode if `./output/` doesn't exist.**
+  `FsWrite { prefix = "./output" }` is granted and the orchestrator task calls
+  `write_file(path='./output/brief-{TODAY}.md', ...)`, but the native `write_file` tool does not
+  create missing parent directories. Result: the brief lands in `ops:briefs` KB only with no
+  filesystem copy; the orchestrator reports a capability-denied error that looks like a permission
+  problem rather than a missing directory. Fix (either): pre-create `agentd/output/` with a
+  `.gitkeep` so it exists when `cargo run` is invoked from the repo root, OR have `write_file`
+  call `fs::create_dir_all` on the parent before writing. `agentd/src/tools/native.rs`.
+
 ## v0.60 whole-system audit (2026-07-06)
 
 Read-only audit: 7 parallel reviewers (Claude + Codex) across every crate + docs, main @ e2ec0e47.

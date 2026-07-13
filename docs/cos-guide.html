@@ -19,6 +19,9 @@
     --link: #7EB8F0;
     --inline-code-bg: rgba(255,255,255,0.07);
     --inline-code-text: #A8C4E0;
+    --new-bg: rgba(60,184,130,0.10);
+    --new-border: rgba(60,184,130,0.35);
+    --new-text: #3CB882;
   }
 
   @media (prefers-color-scheme: light) {
@@ -38,6 +41,9 @@
       --link: #1A6AC0;
       --inline-code-bg: rgba(0,0,0,0.06);
       --inline-code-text: #1A4A80;
+      --new-bg: rgba(30,120,80,0.08);
+      --new-border: rgba(30,120,80,0.3);
+      --new-text: #1A7A50;
     }
   }
 
@@ -59,6 +65,9 @@
     --link: #7EB8F0;
     --inline-code-bg: rgba(255,255,255,0.07);
     --inline-code-text: #A8C4E0;
+    --new-bg: rgba(60,184,130,0.10);
+    --new-border: rgba(60,184,130,0.35);
+    --new-text: #3CB882;
   }
 
   :root[data-theme="light"] {
@@ -78,6 +87,9 @@
     --link: #1A6AC0;
     --inline-code-bg: rgba(0,0,0,0.06);
     --inline-code-text: #1A4A80;
+    --new-bg: rgba(30,120,80,0.08);
+    --new-border: rgba(30,120,80,0.3);
+    --new-text: #1A7A50;
   }
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -141,6 +153,53 @@
     line-height: 1.5;
   }
 
+  /* What's new banner */
+  .whats-new {
+    background: var(--new-bg);
+    border: 1px solid var(--new-border);
+    border-left: 3px solid var(--new-text);
+    padding: 14px 20px;
+    margin-bottom: 32px;
+  }
+
+  .whats-new-label {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--new-text);
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+
+  .whats-new ul {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .whats-new li {
+    font-size: 13.5px;
+    color: var(--muted);
+    padding-left: 16px;
+    position: relative;
+    line-height: 1.55;
+  }
+
+  .whats-new li::before {
+    content: '›';
+    position: absolute;
+    left: 0;
+    color: var(--new-text);
+    opacity: 0.7;
+  }
+
+  .whats-new li strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
   /* Prerequisites */
   .prereqs {
     background: var(--surface);
@@ -183,6 +242,21 @@
 
   .prereqs li strong {
     color: var(--text);
+    font-weight: 600;
+  }
+
+  .prereqs li .req-new {
+    font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', Consolas, monospace;
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--new-text);
+    background: var(--new-bg);
+    border: 1px solid var(--new-border);
+    padding: 1px 5px;
+    border-radius: 2px;
+    vertical-align: middle;
+    margin-left: 6px;
     font-weight: 600;
   }
 
@@ -278,6 +352,11 @@
     vertical-align: middle;
     font-weight: 600;
     line-height: 20px;
+  }
+
+  .step-tag.tag-new {
+    color: var(--new-text);
+    background: var(--new-bg);
   }
 
   .step p {
@@ -383,14 +462,15 @@
   }
 
   /* Syntax-ish colors */
-  .k { color: #7AB8F0; }  /* keywords/flags */
-  .s { color: #8ED4A8; }  /* strings */
-  .c { color: #3A5A7A; }  /* comments */
-  .v { color: #F0A030; }  /* variables */
-  .p { color: #6090C0; }  /* punctuation */
-  .cmd { color: #C8D8EE; } /* commands */
-  .flag { color: #7AB8F0; } /* flags */
+  .k { color: #7AB8F0; }
+  .s { color: #8ED4A8; }
+  .c { color: #3A5A7A; }
+  .v { color: #F0A030; }
+  .p { color: #6090C0; }
+  .cmd { color: #C8D8EE; }
+  .flag { color: #7AB8F0; }
   .path { color: #8ED4A8; }
+  .cnew { color: #3CB882; opacity: 0.8; }
 
   /* Note box */
   .note {
@@ -436,6 +516,18 @@
   }
 
   .note li strong {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .note > p {
+    font-size: 13.5px;
+    color: var(--muted);
+    line-height: 1.6;
+    margin-top: 10px;
+  }
+
+  .note > p strong {
     color: var(--text);
     font-weight: 600;
   }
@@ -511,11 +603,21 @@
     <p class="header-sub">Three-agent Gmail orchestrator: cron trigger → inbox reader → KB curator → daily brief.</p>
   </div>
 
+  <div class="whats-new">
+    <div class="whats-new-label">v0.83.0 — What's new</div>
+    <ul>
+      <li><strong>Credential broker</strong> — the <code>google_oauth</code> sidecar no longer holds the raw refresh token in memory. A credential gateway reads <code>google.json</code> once and issues short-lived access tokens per request. No changes to the setup flow below.</li>
+      <li><strong>Management API exposed on :7999</strong> — <code>agentctl watch</code> now runs on your Mac host with <code>--url http://localhost:7999</code>. No more <code>docker exec</code>.</li>
+      <li><strong>Semantic KB requires OpenAI</strong> — <code>OPENAI_API_KEY</code> is now a required environment variable for email dedup and semantic search.</li>
+    </ul>
+  </div>
+
   <div class="prereqs">
     <div class="prereqs-label">Before you start</div>
     <ul>
       <li><strong>Docker Desktop</strong> installed and running on your Mac</li>
       <li><strong>Anthropic API key</strong> (<code>sk-ant-...</code>)</li>
+      <li><strong>OpenAI API key</strong> (<code>sk-...</code>) <span class="req-new">required</span> — for email embeddings</li>
       <li><strong>Google Cloud account</strong> — free tier works</li>
       <li><strong>Rust + Cargo</strong> — to build <code>agentctl</code> once</li>
     </ul>
@@ -529,7 +631,7 @@
     <div class="step">
       <div class="step-num">01</div>
       <div class="step-title">Build agentctl <span class="step-tag">once</span></div>
-      <p>You need <code>agentctl</code> on your Mac to complete the Google OAuth flow. Build it from the repo root:</p>
+      <p>You need <code>agentctl</code> on your Mac to complete the Google OAuth flow and to watch the agents from your terminal. Build it from the repo root:</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
@@ -554,14 +656,14 @@
         <li>Application type: <strong>Desktop app</strong> — name it anything</li>
         <li>Copy the <strong>Client ID</strong> and <strong>Client Secret</strong> — no redirect URI to register</li>
       </ol>
-      <p>Desktop app clients allow <code>127.0.0.1</code> loopback redirects automatically per <a href="#">RFC 8252</a> — there is no redirect URI field in the Google Cloud Console for this client type. <code>agentctl auth google</code> uses port <code>8585</code> by default; pass <code>--port &lt;N&gt;</code> if that port is in use.</p>
+      <p>Desktop app clients allow <code>127.0.0.1</code> loopback redirects automatically per RFC 8252 — there is no redirect URI field in the Google Cloud Console for this client type. <code>agentctl auth google</code> uses port <code>8585</code> by default; pass <code>--port &lt;N&gt;</code> if that port is in use.</p>
       <p>⚠️ <strong>Publish to Production before authorizing.</strong> On the <strong>OAuth consent screen</strong>, change <em>Publishing status</em> to <strong>Published</strong>. Testing-mode refresh tokens expire after 7 days. For <code>gmail.readonly</code> (a non-sensitive scope), unverified Production apps work fine — Google shows a warning screen but tokens stay valid indefinitely.</p>
     </div>
 
     <div class="step">
       <div class="step-num">03</div>
       <div class="step-title">Authorize Gmail access <span class="step-tag">once</span></div>
-      <p>Run the PKCE OAuth flow on your Mac. A browser window will open — sign in with your Google account and grant Gmail read access. The refresh token is saved locally.</p>
+      <p>Run the PKCE OAuth flow on your Mac. A browser window will open — sign in with your Google account and grant Gmail read access. The refresh token is saved locally and picked up by the credential broker at runtime.</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
@@ -571,7 +673,7 @@
   --client-id</span>     <span class="s">"YOUR_CLIENT_ID.apps.googleusercontent.com"</span> <span class="flag">\
   --client-secret</span> <span class="s">"YOUR_CLIENT_SECRET"</span></code></pre>
       </div>
-      <p>On success, credentials are written to <code>~/.agentos-secrets/google.json</code>. The container mounts this file read-only — no credentials are passed via environment variables.</p>
+      <p>On success, credentials are written to <code>~/.agentos-secrets/google.json</code>. The container mounts this file read-only — the credential broker reads it once at startup and issues short-lived access tokens from there. The raw refresh token never lives in the agent process.</p>
     </div>
 
     <div class="step">
@@ -609,32 +711,35 @@
     <div class="step">
       <div class="step-num">06</div>
       <div class="step-title">Start the CoS</div>
-      <p>Set your Anthropic key and run. <code>TRIGGER_INTERVAL=every 2m</code> fires the cron quickly for testing — change it to a cron expression like <code>0 8 * * *</code> for production use.</p>
+      <p>Set your API keys and run. <code>TRIGGER_INTERVAL=every 2m</code> fires the cron quickly for testing — change it to a cron expression like <code>0 8 * * *</code> for production use. The management API is bound to <code>127.0.0.1:7999</code> so <code>agentctl watch</code> can connect from your Mac terminal directly.</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
           <div class="code-lang">bash</div>
         </div>
         <pre><code><span class="k">export</span> <span class="v">ANTHROPIC_API_KEY</span>=sk-ant-...
+<span class="k">export</span> <span class="v">OPENAI_API_KEY</span>=sk-...
 
 <span class="cmd">docker run</span> <span class="flag">--rm -it \
-  --name agentos-cos \
+  --name</span> agentos-cos <span class="flag">\
   --privileged \
+  -p</span> <span class="s">127.0.0.1:7999:7999</span> <span class="flag">\
   -e</span> ANTHROPIC_API_KEY <span class="flag">\
+  -e</span> OPENAI_API_KEY <span class="flag">\
   -e</span> <span class="s">"TRIGGER_INTERVAL=every 2m"</span> <span class="flag">\
   -v</span> <span class="path">~/.agentos-secrets:/run/secrets:ro</span> <span class="flag">\
   -v</span> <span class="path">~/.agentos-output:/data/output</span> <span class="flag">\
   -v</span> <span class="path">~/.agentos-data:/data</span> <span class="flag">\
   </span>ghcr.io/0x89karan/runtime1:full cos</code></pre>
       </div>
-      <p>The container boots agentd, patches the config, and parks the orchestrator agent in a cron wait loop. Logs stream to your terminal.</p>
+      <p>The container starts the credential gateway, connects MCP servers, and parks the orchestrator in a cron wait loop. Logs stream to your terminal.</p>
 
       <div class="expect">
         <div class="expect-label">What happens in the first 3 minutes</div>
         <div class="timeline">
           <div class="timeline-item">
             <div class="timeline-time">0:00</div>
-            <div class="timeline-desc"><strong>agentd starts.</strong> MCP servers (cron, oauth) connect. Orchestrator agent begins its loop.</div>
+            <div class="timeline-desc"><strong>agentd starts.</strong> Credential broker reads <code>google.json</code>. MCP servers connect. Orchestrator parks in cron loop.</div>
           </div>
           <div class="timeline-item">
             <div class="timeline-time">~0:30</div>
@@ -642,15 +747,15 @@
           </div>
           <div class="timeline-item">
             <div class="timeline-time">~1:00</div>
-            <div class="timeline-desc"><strong>Inbox agent reads Gmail.</strong> Calls the OAuth sidecar → fetches last 24h of messages → returns structured JSON.</div>
+            <div class="timeline-desc"><strong>Inbox agent reads Gmail.</strong> Credential broker issues a short-lived access token → Gmail API fetches last 24 h of messages → returns structured JSON.</div>
           </div>
           <div class="timeline-item">
             <div class="timeline-time">~1:30</div>
-            <div class="timeline-desc"><strong>Curator agent persists to KB.</strong> Writes briefs + entities to the redb memory store.</div>
+            <div class="timeline-desc"><strong>Curator agent persists to KB.</strong> Writes briefs + entities to the redb memory store; semantic embeddings go to Qdrant via OpenAI.</div>
           </div>
           <div class="timeline-item">
             <div class="timeline-time">~2:00</div>
-            <div class="timeline-desc"><strong>Brief written.</strong> Orchestrator writes <code>brief-YYYY-MM-DD.md</code> and parks for next trigger.</div>
+            <div class="timeline-desc"><strong>Brief written.</strong> Orchestrator writes <code>brief-YYYY-MM-DD.md</code> and parks for the next trigger.</div>
           </div>
         </div>
       </div>
@@ -658,22 +763,22 @@
 
     <div class="step">
       <div class="step-num">07</div>
-      <div class="step-title">Watch the agents <span class="step-tag">optional</span></div>
-      <p>In a second terminal, watch the live cockpit — per-agent status, last tool call, and the flight log — from inside the running container:</p>
+      <div class="step-title">Watch the agents <span class="step-tag tag-new">updated</span></div>
+      <p>Open a second terminal on your Mac — no <code>docker exec</code> needed. The management API is forwarded to <code>localhost:7999</code>:</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
           <div class="code-lang">bash</div>
         </div>
-        <pre><code><span class="cmd">docker exec</span> <span class="flag">-it</span> agentos-cos <span class="cmd">agentctl</span> watch</code></pre>
+        <pre><code><span class="cmd">agentctl watch</span> <span class="flag">--url</span> http://localhost:7999</code></pre>
       </div>
-      <p>Requires the <code>--name agentos-cos</code> from step 6. Press <code>q</code> to exit the cockpit (the agents keep running).</p>
+      <p>Use the <code>[c]</code> key for credentials, <code>[a]</code> for approvals, <code>[i]</code> for the flight log inspector. Press <code>q</code> to exit the cockpit — the agents keep running.</p>
     </div>
 
     <div class="step">
       <div class="step-num">08</div>
       <div class="step-title">Read the brief</div>
-      <p>In a second terminal, once the first cycle completes:</p>
+      <p>Once the first cycle completes, the brief lands on your host:</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
@@ -695,28 +800,27 @@
   <div class="note">
     <div class="note-label">Stopping the CoS (run vs compose)</div>
     <ul>
-      <li><strong>Started with <code>docker run … cos</code> (this guide):</strong> press <code>Ctrl+C</code> in its terminal — <code>--rm</code> stops <em>and</em> removes the container automatically. If one is left over (still running elsewhere, or holding the <code>agentos-cos</code> name), remove it with <code>docker rm -f agentos-cos</code>. You do <em>not</em> need <code>docker compose down</code> here.</li>
-      <li><strong>Started with <code>docker compose up</code> / <code>run</code> (the dev / build-from-source path):</strong> use <code>docker compose down</code> to stop and remove the compose containers + network.</li>
+      <li><strong>Started with <code>docker run … cos</code> (this guide):</strong> press <code>Ctrl+C</code> in its terminal — <code>--rm</code> stops <em>and</em> removes the container automatically. If one is left over, remove it with <code>docker rm -f agentos-cos</code>. You do <em>not</em> need <code>docker compose down</code> here.</li>
+      <li><strong>Started with <code>docker compose up</code> (the dev / build-from-source path):</strong> use <code>docker compose down</code> to stop and remove the compose containers + network.</li>
       <li><strong>Not sure what's running?</strong> <code>docker ps -a --filter name=agentos</code> lists every AgentOS container; remove leftovers with <code>docker rm -f &lt;name&gt;</code>.</li>
-      <li><strong>Your data is safe.</strong> State (checkpoint, memory, briefs, flight log) lives in the host mounts <code>~/.agentos-data</code> and <code>~/.agentos-output</code> — removing a container never touches them, so the next run resumes. The only destructive command is <code>docker compose down <span class="k">-v</span></code>, which also deletes compose <em>named volumes</em> (state loss); plain <code>down</code> keeps them.</li>
+      <li><strong>Your data is safe.</strong> State lives in the host mounts <code>~/.agentos-data</code> and <code>~/.agentos-output</code> — removing a container never touches them. The only destructive command is <code>docker compose down -v</code>, which also deletes named volumes.</li>
     </ul>
   </div>
 
   <div class="note">
     <div class="note-label">After every release — re-pull</div>
     <ul>
-      <li><strong>The image is the code.</strong> Fixes ship as new <code>agentos:full</code> / <code>:latest</code> builds; a running container never updates itself. After a release, re-pull to get the fix — e.g. the <code>v0.73.0 → v0.73.1</code> Gmail-auth fix. <strong>A stale local image is the #1 cause of "a fix landed but nothing changed."</strong></li>
+      <li><strong>The image is the code.</strong> Fixes ship as new <code>agentos:full</code> builds; a running container never updates itself. <strong>A stale local image is the #1 cause of "a fix landed but nothing changed."</strong></li>
     </ul>
     <div class="code-block">
       <div class="code-header">
         <div class="code-dots"><span></span><span></span><span></span></div>
         <div class="code-lang">bash</div>
       </div>
-      <pre><code><span class="c"># 1. Pull the newest build (re-checks the registry by digest)</span>
+      <pre><code><span class="c"># 1. Pull the newest build</span>
 <span class="cmd">docker pull</span> ghcr.io/0x89karan/runtime1:full
 
-<span class="c"># 2. Remove the old container before re-running (--rm cleans it on exit,</span>
-<span class="c">#    but a still-running or leftover one holds the name)</span>
+<span class="c"># 2. Remove the old container</span>
 <span class="cmd">docker rm</span> <span class="flag">-f</span> agentos-cos <span class="p">2&gt;/dev/null || true</span>
 
 <span class="c"># 3. Re-run step 6 with the fresh image</span></code></pre>
@@ -726,7 +830,7 @@
   <div class="note">
     <div class="note-label">Clean re-test after a fix (drop stale / failed agents)</div>
     <ul>
-      <li><strong>A restart resumes prior agents from the checkpoint</strong> — by design (the CoS survives restarts and picks up its cron loop). But that includes any agent that <em>failed</em> in an earlier run, so after pulling a fix you want a fresh start rather than reloading a broken state. <code>docker rm</code> alone doesn't do this — the checkpoint lives on the host mount, not in the container.</li>
+      <li><strong>A restart resumes prior agents from the checkpoint</strong> — by design. But that includes any agent that <em>failed</em> in an earlier run. After pulling a fix, start fresh rather than reloading broken state.</li>
     </ul>
     <div class="code-block">
       <div class="code-header">
@@ -736,55 +840,44 @@
       <pre><code><span class="c"># 1. Stop the old container</span>
 <span class="cmd">docker rm</span> <span class="flag">-f</span> agentos-cos <span class="p">2&gt;/dev/null || true</span>
 
-<span class="c"># 2. Drop the checkpoint so no stale/failed agents reload</span>
+<span class="c"># 2. Drop the checkpoint so no stale agents reload</span>
 <span class="cmd">rm -f</span> <span class="path">~/.agentos-data/checkpoint.json</span> <span class="p">2&gt;/dev/null || true</span>
 
 <span class="c"># 3. Pull the fixed image</span>
 <span class="cmd">docker pull</span> ghcr.io/0x89karan/runtime1:full
 
-<span class="c"># 4. Re-run step 6 — a fresh orchestrator starts, no carryover</span></code></pre>
+<span class="c"># 4. Re-run step 6</span></code></pre>
     </div>
-    <p><strong>Full reset</strong> (only if a run <em>still</em> reloads stale state): <code>rm -rf ~/.agentos-data/*</code> regenerates the memory store, flight log, and signing keys from scratch. Your Google credentials live in <code>~/.agentos-secrets</code> and are <strong>not</strong> touched.</p>
-  </div>
-
-  <div class="note">
-    <div class="note-label">Clean up stale images &amp; check versions</div>
-    <ul>
-      <li><strong>See what you have:</strong> <code>docker image ls ghcr.io/0x89karan/runtime1</code> and <code>docker ps -a --filter name=agentos</code>.</li>
-      <li><strong>Remove old images:</strong> <code>docker image prune</code> clears dangling layers; <code>docker rmi &lt;image-id&gt;</code> removes a specific old tag. Frees disk and stops you accidentally running yesterday's build.</li>
-      <li><strong>Confirm what a build is:</strong> <code>docker image inspect ghcr.io/0x89karan/runtime1:full --format '{{.Created}}'</code> shows its build date; the boot logs also print the agentos version.</li>
-      <li><strong>Building locally instead of pulling?</strong> <code>docker pull</code> already fetches the newest by digest, but a local <code>docker compose</code> build caches — force a clean one with <code>docker compose build --no-cache</code>.</li>
-      <li><strong>Pin a version for reproducibility:</strong> use an exact tag like <code>ghcr.io/0x89karan/runtime1:v0.73.1</code> instead of <code>:full</code>/<code>:latest</code> when you want an unchanging build.</li>
-    </ul>
+    <p><strong>Full reset</strong> (only if stale state persists): <code>rm -rf ~/.agentos-data/*</code> regenerates the memory store, flight log, and signing keys. Google credentials in <code>~/.agentos-secrets</code> are <strong>not</strong> touched.</p>
   </div>
 
   <div class="note">
     <div class="note-label">Troubleshooting</div>
     <ul>
-      <li><strong>Inbox agent stuck at "Not authenticated" / "no active session" (with a valid <code>google.json</code>):</strong> your image predates the <code>v0.73.2</code> Gmail-auth fix. Re-pull <code>agentos:full</code> (see <em>Updating &amp; older images</em> above) and restart — older images never refresh the stored token, so <code>oauth_check_auth</code> returns <code>no_session</code>.</li>
-      <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker run</code>. Re-<code>export</code> it in this terminal, or use the <code>agentos.env</code> approach below.</li>
-      <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> port <code>8585</code> was already in use when <code>agentctl auth google</code> started. Re-run with <code>--port &lt;free-port&gt;</code> — Desktop app clients accept any loopback port automatically.</li>
-      <li><strong>No brief after a few minutes:</strong> check the cron fired and Gmail was reached — <code>jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail</code>. An empty result means the trigger hasn't fired yet.</li>
-      <li><strong>Can't <code>docker exec</code> to watch:</strong> the container must have been started with <code>--name agentos-cos</code> (step 6).</li>
+      <li><strong>Inbox agent stuck at "Not authenticated" / "no active session":</strong> your image predates the credential broker. Re-pull <code>agentos:full</code> (≥ v0.83.0) and restart.</li>
+      <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker run</code>. Re-<code>export</code> it, or put <code>ANTHROPIC_API_KEY=sk-ant-...</code> in <code>~/.agentos-secrets/agentos.env</code> (the entrypoint sources it).</li>
+      <li><strong>Semantic KB not working / "OPENAI_API_KEY is not set":</strong> add <code>-e OPENAI_API_KEY</code> to the <code>docker run</code> command and make sure the key is exported in the same shell.</li>
+      <li><strong><code>agentctl watch</code> can't connect:</strong> confirm the container is running with <code>-p 127.0.0.1:7999:7999</code> — older invocations without this flag won't expose the port. Verify with <code>curl -s http://localhost:7999/healthz</code>.</li>
+      <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> port <code>8585</code> was already in use. Re-run with <code>--port &lt;free-port&gt;</code> — Desktop app clients accept any loopback port automatically.</li>
+      <li><strong>No brief after a few minutes:</strong> check the cron fired — <code>jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail</code>.</li>
+      <li><strong>Logs &amp; receipts:</strong> inspect <code>~/.agentos-data/flight.jsonl</code> with <code>jq</code>; verify the signed action-receipt chain with <code>agentctl verify ~/.agentos-data/evidence.jsonl</code>.</li>
     </ul>
   </div>
 
   <div class="note">
     <div class="note-label">Notes</div>
     <ul>
-      <li><strong>Schedule:</strong> <code>TRIGGER_INTERVAL="every 2m"</code> (used above) is for testing and only accepts <code>every N(s|m|h)</code>. For a daily brief use the <em>separate</em> cron variable: <code>-e "TRIGGER_CRON=0 8 * * *"</code> (08:00 UTC). A cron expression in <code>TRIGGER_INTERVAL</code> will not parse.</li>
-      <li><strong>API key across shells:</strong> <code>-e ANTHROPIC_API_KEY</code> forwards it from the shell you <code>export</code>ed in — run <code>docker run</code> in that <em>same</em> terminal, or put <code>ANTHROPIC_API_KEY=sk-ant-...</code> in <code>~/.agentos-secrets/agentos.env</code> (the entrypoint sources it) so it survives across shells.</li>
+      <li><strong>Schedule:</strong> <code>TRIGGER_INTERVAL="every 2m"</code> (used above) only accepts <code>every N(s|m|h)</code>. For a daily brief use <code>-e "TRIGGER_CRON=0 8 * * *"</code> (08:00 UTC). A cron expression in <code>TRIGGER_INTERVAL</code> will not parse.</li>
+      <li><strong>API key across shells:</strong> <code>-e ANTHROPIC_API_KEY</code> forwards it from the shell you <code>export</code>ed in — run <code>docker run</code> in that same terminal.</li>
       <li><strong>Talk to it interactively:</strong> instead of the autonomous cron brief, run the orchestrator REPL — <code>docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate</code>.</li>
       <li><strong>Stopping:</strong> Ctrl+C triggers a graceful checkpoint. State is preserved in <code>~/.agentos-data</code> — the next run resumes from where it left off.</li>
-      <li><strong>Google auth on subsequent runs:</strong> The refresh token in <code>google.json</code> handles re-authorization automatically. No browser needed.</li>
-      <li><strong>If OAuth fails:</strong> Re-run <code>agentctl auth google</code> with the same flags — it overwrites the token file.</li>
-      <li><strong>Logs &amp; receipts:</strong> everything the agents do is recorded in <code>~/.agentos-data/flight.jsonl</code> — inspect it with <code>jq</code>. The signed action receipts are separate: verify the chain with <code>agentctl verify ~/.agentos-data/evidence.jsonl</code>.</li>
-      <li><strong>Building agentctl:</strong> macOS has no prebuilt binary, so step 1's <code>cargo build</code> is required; on Linux you can download <code>agentctl</code> from GitHub Releases instead.</li>
+      <li><strong>Google auth on subsequent runs:</strong> The refresh token in <code>google.json</code> is read by the credential broker; no browser re-auth needed. If the token expires, re-run <code>agentctl auth google</code> with the same flags.</li>
+      <li><strong>Privacy — email embeddings:</strong> The CoS sends email body content (up to 8 KB per message) to OpenAI's Embeddings API for vectorisation. Review OpenAI's data usage policies before enabling on inboxes with sensitive content. To run without OpenAI (BM25 only), omit <code>OPENAI_API_KEY</code> and remove the semantic-kb block from <code>cos.agents.toml</code>.</li>
     </ul>
   </div>
 
   <div style="margin-top:8px;font-family:'JetBrains Mono','SF Mono',Consolas,monospace;font-size:11px;color:var(--muted);text-align:center;letter-spacing:0.04em;">
-    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.73.2 (Gmail auth fixed)
+    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.83.0
   </div>
 
 </div>
