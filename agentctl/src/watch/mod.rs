@@ -389,8 +389,16 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
     // Any key clears the post-inject banner (no-op in the main loop where it's None).
     app.spawn_banner = None;
     // Capture BEFORE dispatch: q quits only if we were already on the Dashboard,
-    // not if we just navigated back to it.
+    // not if we just navigated back to it. ux.1 bug caught by /qa's interactive pass:
+    // this check didn't know about the chat rail's text-capture focus, so typing an
+    // ordinary word containing 'q' (e.g. "qa", "quick") into the rail queued
+    // Effect::Quit and killed the whole TUI mid-keystroke — 'q' WAS correctly
+    // captured as literal rail input by handle_dashboard_key, but this outer,
+    // rail-focus-unaware check fired anyway right after. Must also gate on the
+    // rail's focus state as it was BEFORE dispatch (same "before, not after"
+    // capture discipline as `was_dashboard` itself, for the same reason).
     let was_dashboard = app.view == View::Dashboard;
+    let rail_was_focused = app.converse_view.rail_focused;
     match app.view {
         View::Dashboard => handle_dashboard_key(key.code, app, source),
         View::AgentDetail | View::System => {
@@ -417,7 +425,7 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
         }
     }
     let mut effects = vec![Effect::Redraw];
-    if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
+    if matches!(key.code, KeyCode::Char('q')) && was_dashboard && !rail_was_focused {
         effects.push(Effect::Quit);
     }
     if app.spawn_view.pending_exec.is_some() {
@@ -1873,6 +1881,25 @@ mod tests {
         let effects = step_key(&mut app, key('q'), &TestSource);
         assert!(!effects.contains(&Effect::Quit));
         assert_eq!(app.view, View::Dashboard, "memory 'q' navigates back, not quit");
+    }
+
+    #[test]
+    fn step_key_q_while_rail_focused_types_not_quits() {
+        // Real crash caught by /qa's interactive pass against the compiled binary:
+        // typing an ordinary word containing 'q' (e.g. "qa") into the chat rail
+        // triggered an unwanted quit mid-keystroke. handle_dashboard_key correctly
+        // captured 'q' as literal rail input, but step_key's outer "q quits the
+        // Dashboard" convenience check didn't know about rail focus and fired
+        // anyway, since app.view is still Dashboard while the rail has focus (the
+        // rail is part of Dashboard, not a separate View). This test exercises the
+        // FULL step_key pipeline, not handle_dashboard_key in isolation — the bug
+        // lived specifically in the interaction between the two.
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.converse_view.rail_focused = true;
+        let effects = step_key(&mut app, key('q'), &TestSource);
+        assert!(!effects.contains(&Effect::Quit), "'q' must not quit while the rail has text focus");
+        assert_eq!(app.converse_view.input, "q", "'q' must be captured as literal chat input");
+        assert_eq!(app.view, View::Dashboard);
     }
 
     #[test]
