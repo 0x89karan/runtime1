@@ -3,6 +3,66 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.85.0] - 2026-07-13
+
+### Added (ux.2a — Attention)
+- **Outcome/risk signals on the cockpit Dashboard**: `AttentionReason` enum (`ApprovalPending |
+  Degraded | BudgetRisk | EvaluationUnavailable`, declaration order doubles as tie-break/
+  routing priority) + `AttentionSignal` struct (`surfaces/src/snapshot.rs`), added to
+  `AgentSnapshot` and served over both FUSE (`/agents/<id>/attention`, new `OFF_ATTENTION`
+  offset) and the management HTTP API (reused `AgentSnapshot`'s `Serialize` impl).
+- **`derive_attention()`** (`agentd/src/scheduler.rs`): computes Approval-pending (reads
+  `pending_approvals` directly, not the `.take(100)`-capped snapshot vector), Budget-risk (via
+  `memory::context::assess()`), and Degraded (fires on `!token_fresh` OR
+  `attention_reason.is_some()`, closing a gap where cred.7's health-state-machine flags for
+  ApiKey providers were invisible while `token_fresh` stayed true) signals from already-existing
+  scheduler/credential state — no new instrumentation.
+- **Dashboard rendering** (`agentctl/src/watch/views.rs`): new `ATTN` column, always-visible
+  summary line ("N need attention · M unavailable"), stacked reason line per flagged agent,
+  persistent `AgentDetail` attention strip, `--plain` markers + reason text — reused glyph/
+  classification logic (`classify_attention`, `attention_glyph_and_style`) shared by all three
+  render paths so they can't drift apart.
+- **Actionability-driven Enter-key routing** (`agentctl/src/watch/mod.rs`): `ApprovalPending` →
+  `View::Approvals`, `Degraded` → `View::Credentials`, else → `View::AgentDetail` — a
+  deliberately separate axis from severity-driven row color (Approval always wins routing even
+  though Degraded is more severe).
+- Reframe of the original "Observe" plan (`docs/plans/ux.2-observe.md`, preserved for
+  reference) toward outcome/risk signals per CEO dual-voice review; full CEO/Design/Eng/DX
+  review in `docs/plans/ux.2-attention-evidence.md`. Does **not** close `cos-ux-01` — the Idle
+  signal needs new `AgentTask` fields that don't exist yet, deferred to **ux.2b**.
+
+### Fixed (ship-review findings — 3 rounds of dual-voice adversarial review)
+- Two CRITICAL bugs from the initial `/review` pass: `AttentionSignal.since` was rendered as a
+  raw Unix epoch instead of elapsed time; `EvaluationUnavailable` was dead code, never actually
+  constructed, so a failed FUSE/HTTP read silently degraded to "clean" instead of a distinct
+  not-evaluated state.
+- FUSE `lookup()` had no match arm for `"attention"` under `ParentKind::AgentDir` — `readdir`
+  listed the file but opening it by path on a real FUSE mount returned ENOENT, making the
+  feature unreachable via the primary native transport. The identical, pre-existing gap for
+  `"credentials"` (cred.5) was fixed in the same pass.
+- `BudgetRisk`/`EvaluationUnavailable`(config-drift)/`Degraded`(never-tracked-onset) signals
+  recomputed `since: now` (or fell back to it) on every scheduler tick — displayed as a
+  misleading "0s ago" for potentially long-standing issues. Now render as "active" via a
+  shared `age_display()` helper.
+- `read_agent_attention`'s `read_trimmed()` collapsed every `io::Error` (not just `NotFound`)
+  to `None` → Clean, contradicting the documented "never silently collapse to Clean"
+  guarantee. New `read_trimmed_checked()` distinguishes error kinds.
+- `--plain` output concatenated the attention marker directly against the status bracket
+  (`"[OK][failed]"`) with no separator — a positional-parser regression risk for the CI/
+  non-TTY mode this format exists for.
+
+### Deferred (logged in `TODOS.md`)
+- `filter_agent_id` on `ApprovalsViewState` (P1, upgraded from P2): Enter-routing to Approvals
+  resets to `selected_idx: 0` instead of the specific approval, which can highlight the wrong
+  agent's request when 2+ approvals are pending simultaneously.
+- `Vec<AttentionSignal>` deserialization is all-or-nothing (P2): a single unrecognized future
+  reason (from ux.2b, not yet built) would wipe all signals for an agent. Not exploitable
+  until ux.2b adds new variants.
+- ux.2b (P1): Idle + Error attention signals, closes `cos-ux-01` fully.
+
+1377 workspace tests (up from 1327 at v0.84.0), clippy clean (including `make clippy-linux`
+for the Linux-gated FUSE changes).
+
 ## [v0.84.0] - 2026-07-13
 
 ### Added (cred.7 — credential resilience)
