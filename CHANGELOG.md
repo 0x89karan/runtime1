@@ -3,6 +3,85 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.86.0] - 2026-07-13
+
+### Added (ux.1 — Converse)
+- **Permanent chat rail on `agentctl watch`'s Dashboard view** (agent table `Min(72)` |
+  rail `Length(32)`), honoring the project's locked D1 "one unified screen" decision
+  instead of a 10th full-screen tab, as the rough scope originally proposed.
+- **`agentd/src/events.rs`**: `EventKind::InferenceStreamDelta` — one text chunk of a
+  streaming inference response, recorded per-chunk on the hot streaming path
+  (`scheduler.rs`'s `make_infer_future`/`print_fut`) so remote SSE subscribers (the chat
+  rail) see live token-by-token output. Previously, streamed chunks were written only to
+  `agentd`'s own local stdout and never reached `/api/v1/events` — a false premise the
+  original plan assumed away, independently confirmed by three separate traces (manual +
+  Claude subagent + Codex) during `/autoplan` Eng review.
+- **`agentd/src/flight_recorder.rs`**: `FlightRecorder::record_streamed()` — broadcasts
+  the full chunk text live over SSE while capping the `flight.jsonl` disk copy at 256
+  bytes (`STREAM_DELTA_DISK_TEXT_CAP`), preserving the log's existing preview/audit-metadata
+  contract rather than turning it into a full model-output transcript store.
+- **`agentctl/src/watch/converse.rs`** (new): `ConverseState` per-target state machine
+  (Idle → Dispatching → Streaming → flush), `ConverseView` (`HashMap<AgentId,
+  ConverseState>` — per-target, so a backgrounded conversation keeps streaming while
+  another is focused), `dispatch()` (spawn-or-resume, ported verbatim from
+  `orchestrate.rs`), and the four terminal-event field-path lookups ported byte-for-byte
+  rather than re-derived — `orchestrator_exited`'s top-level `agent` field is a hardcoded
+  literal `"agentd"` (only `data.agent_id` is valid), and `agent_failed` has no
+  `data.agent_id` at all. 64KB `current_reply` cap, 200-turn history ring, chunk_seq gap
+  detection (dropped-chunk note, not silent splicing), 30s client-side dispatch timeout.
+- **`Tab`** toggles rail focus (reusing `Memory`/`Spawn`'s existing sub-pane-cycling
+  idiom); **`r`** retargets the rail to the selected table row's agent. `[c]` stays bound
+  to Credentials — the rough scope's original `[c]`-for-chat proposal collided with the
+  already-shipped Credentials hotkey (cred.5, v0.68.0), caught during Design review.
+- `agentctl orchestrate`'s CLI shares the same `converse.rs` helpers; its
+  `orchestrator_turn_complete`-driven block-then-print behavior is unchanged (does not
+  gain live token streaming in this increment) but now sees un-truncated replies as a
+  byproduct of the same fix (the 512-char `answer` cap only ever mattered because there
+  was no other way to see the full text remotely).
+- `docs/INTERFACE.md` §3 annotated as superseded-by-shipped-implementation (stale
+  number-key/tab-bar keymap sketch, predates Phase 6).
+- **`/autoplan` review found and fixed two critical issues before implementation**: (1)
+  this branch was cut ahead of `ux.2a-attention` in violation of the roadmap's own
+  sequencing — paused, merged ux.2a first, re-cut clean; (2) the live-streaming premise
+  above. `/review`'s adversarial pass (Codex + manual critical pass) then caught and fixed
+  five more real bugs post-implementation: acceptance criterion 3 (scroll/follow — the
+  transcript had no scroll offset at all, meaning it silently clipped at the top on any
+  conversation longer than the visible area) was never implemented; a missing
+  double-submit guard (a second `Enter` mid-turn would call `dispatch()` again and,
+  since the agent is no longer `"waiting"` server-side, attempt to re-spawn the SAME
+  `agent_id` instead of injecting); `Tab` unconditionally focused the chat rail even when
+  a narrow terminal hides it, silently swallowing every keystroke into an invisible input
+  box; two `state.history.push_back()` call sites in `mod.rs` bypassed the 200-turn ring
+  cap and unread counter by writing to the `VecDeque` directly instead of through
+  `ConverseState::push_history()`; and a duplicated `200` `max_turns` magic-number literal
+  (independently matching `orchestrate.rs`'s own CLI default by coincidence, not by
+  reference) was unified into `converse::DEFAULT_MAX_TURNS`. A separate adversarial
+  subagent pass then caught 5 more, sharper bugs: a **critical panic** — byte-index
+  slicing at the 64KB truncation cap (`&text[..remaining]`) crashes the whole TUI the
+  moment the cutoff lands mid-UTF8-character (em dash, smart quotes, emoji — all common
+  in normal model output), fixed with a stable-Rust `floor_char_boundary` walk-back; the
+  30s dispatch timeout was measured from dispatch *start*, not last activity, so any turn
+  streaming longer than 30s total got killed mid-stream and its real reply silently
+  discarded — fixed by refreshing `last_event_at` on every delta instead of only at
+  dispatch time; deltas were validated only by `chunk_seq` (which resets to 0 every turn)
+  with no `turn_seq` check, allowing a stale/late delta from a previous turn to be spliced
+  into a new one — fixed by rejecting any delta whose `turn_seq` doesn't match the turn
+  currently accumulating; a stray delta arriving after `flush()` unconditionally reopened
+  `Streaming` with no `last_event_at` set, permanently wedging the target behind the
+  double-submit guard with no timeout escape — fixed by rejecting deltas while `Idle`; and
+  the `▼ N new` unread counter incremented once per delta CHUNK instead of once per
+  logical reply, showing "▼ 200+ new" for a single streamed message — fixed by gating the
+  bump to the first delta of each turn. Full plan + dual-voice review trail:
+  `docs/plans/ux.1-converse.md`.
+- Two architectural findings from the adversarial pass — `dispatch()` blocking the whole
+  TUI for up to ~8s worst case, and the shared SSE broadcast channel now carrying much
+  higher-frequency traffic — are real but bounded (not correctness bugs) and filed as
+  TODOs rather than fixed in this pass; see `TODOS.md`'s ux.1 section.
+- 1402 workspace tests total (+34 new: 4 in agentd's `scheduler`/`flight_recorder`, 30 in
+  agentctl's `converse`/`mod`/`views`, several rewritten mid-review to match corrected
+  semantics); otel's `event_kind_coverage` exhaustiveness guard updated for the new
+  `EventKind` variant.
+
 ## [v0.85.0] - 2026-07-13
 
 ### Added (ux.2a — Attention)

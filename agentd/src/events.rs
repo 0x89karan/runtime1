@@ -4,7 +4,7 @@ use serde::Serialize;
 ///
 /// Every meaningful step an agent takes emits one of these variants.
 /// Keep this in sync with `docs/CONVENTIONS.md`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     AgentSpawned,
@@ -80,6 +80,13 @@ pub enum EventKind {
     /// SSE streaming inference completed successfully.
     /// data: { agent_id, text_chunks_emitted: u64, input_tokens: u32, output_tokens: u32 }
     InferenceStreamCompleted,
+    /// One text chunk of a streaming inference response. Recorded per-chunk on the hot
+    /// streaming path (agentd/src/scheduler.rs's print_fut loop) so remote SSE subscribers
+    /// (e.g. agentctl watch's chat rail, ux.1) can render live token-by-token output —
+    /// before this event existed, chunks were only ever written to agentd's own local
+    /// stdout and never reached `/api/v1/events`.
+    /// data: { agent_id, turn_seq: u64, chunk_seq: u64, text }
+    InferenceStreamDelta,
     /// Operator wrote a valid spawn command to /agents/control; agent queued.
     /// data: { task_preview, id }
     FuseControlReceived,

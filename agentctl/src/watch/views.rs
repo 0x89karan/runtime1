@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::app::{App, MemoryAbsence, MemoryPane, SpawnFocus, View};
 use super::approvals::ApprovalsMode;
+use super::converse::{ConversePhase, TurnRole};
 use super::memory::{
     filter_entries, filter_short_term, read_agent_memory, read_kb_segments, MAX_DISPLAY_ENTRIES,
     MAX_SEARCH_ENTRIES,
@@ -24,6 +25,32 @@ fn sanitize(s: &str) -> String {
 
 const MIN_TOPOLOGY_WIDTH: u16 = 60;
 const MIN_MEMORY_WIDTH:   u16 = 50;
+
+/// ux.1: below this total terminal width, the chat rail hides entirely and Dashboard
+/// falls back to the table-only layout (Design Pass 6, corrected arithmetic: table's own
+/// column floor is Min(20)+20+4+10+12+6=72 raw cols + ~8 border/padding ≈ 80, rail needs
+/// ≥30 cols of prose width + ~4 border ≈ 34, + 1 divider column = 115).
+const MIN_TOTAL_WIDTH_FOR_RAIL: u16 = 115;
+/// ux.1: below this height, the rail hides too — 3 rows for the input box (border top,
+/// text line, border bottom) + 5 minimally-useful transcript rows (Design Pass 6).
+const MIN_RAIL_HEIGHT: u16 = 8;
+/// ux.1: fixed width of the chat rail pane — a fixed `Length`, not a `Percentage`, so the
+/// agent table always keeps its own `Min(72)` floor regardless of terminal width (Design
+/// Pass 1 finding: a naive percentage split would crush the table below its own columns).
+const CONVERSE_RAIL_WIDTH: u16 = 32;
+/// ux.1: protects the existing 6-column table (Min(20)+20+4+10+12+6 = 72) from being
+/// squeezed by the rail split.
+const CONVERSE_TABLE_MIN_WIDTH: u16 = 72;
+
+/// Pure width/height gate for whether the chat rail fits — extracted so the exact
+/// floor arithmetic (Design Pass 6) is unit-testable without a full terminal render,
+/// and so `handle_dashboard_key` (mod.rs) can check rail visibility before letting
+/// `Tab` focus it (caught during /review's adversarial pass — Tab previously focused
+/// the rail unconditionally, silently swallowing all keystrokes on narrow terminals
+/// where the rail is actually hidden).
+pub fn converse_rail_fits(width: u16, height: u16) -> bool {
+    width >= MIN_TOTAL_WIDTH_FOR_RAIL && height >= MIN_RAIL_HEIGHT
+}
 
 pub fn render(f: &mut Frame, app: &App) {
     match app.view {
@@ -228,6 +255,24 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         );
     }
 
+    // ux.1: horizontal split for the chat rail — only when the terminal is wide/tall
+    // enough (Design Pass 6's corrected floor); below it, the table gets the full
+    // content_area exactly as before this increment (zero layout change at narrow widths).
+    let rail_fits = converse_rail_fits(content_area.width, content_area.height);
+    let (table_area, rail_area) = if rail_fits {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(CONVERSE_TABLE_MIN_WIDTH), Constraint::Length(CONVERSE_RAIL_WIDTH)])
+            .split(content_area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (content_area, None)
+    };
+
+    if let Some(rail_rect) = rail_area {
+        render_converse_rail(f, app, rail_rect);
+    }
+
     // Agent table
     let selected_idx = app.selected_index();
     let header_row = Row::new(vec![
@@ -277,7 +322,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         f.render_widget(
             Paragraph::new(msg)
                 .block(Block::default().borders(Borders::ALL).title(" agents ")),
-            content_area,
+            table_area,
         );
     } else {
         let table = Table::new(
@@ -293,7 +338,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         )
         .header(header_row)
         .block(Block::default().borders(Borders::ALL).title(" agents "));
-        f.render_widget(table, content_area);
+        f.render_widget(table, table_area);
     }
 
     // Footer: key hints line + ux.2a legend line (a genuine 2-row layout change from the
@@ -303,7 +348,16 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(footer_area);
-    let hints = " ↑/↓ select  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector  q quit ";
+    // ux.1: 3-state footer (DX Pass 1 — the single biggest discoverability gap found in
+    // review). `r` is listed first and set apart from the `[x]` nav-key bracket style,
+    // since it's a different key *category* (act on the selected row, not navigate away).
+    let hints = if !rail_fits {
+        " ↑/↓ select  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector  q quit  (resize to 115+ cols / 8+ rows for chat) ".to_string()
+    } else if app.converse_view.rail_focused {
+        " Esc/Tab: back to table  Enter: send  ↑/↓: scroll  End: follow  Ctrl-c: cancel ".to_string()
+    } else {
+        " ↑/↓ select  r retarget chat  Tab: chat  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector  q quit ".to_string()
+    };
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_chunks[0],
@@ -314,6 +368,111 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(legend).style(Style::default().fg(Color::DarkGray)),
         footer_chunks[1],
+    );
+}
+
+/// ux.1: middle-ellipsis truncation for the border-title target selector, so a long
+/// agent id can't overflow or corrupt the rail's fixed-width border (Design dual-voice
+/// finding item 7). Budget chosen to comfortably fit `┤ → {name} ├` inside
+/// CONVERSE_RAIL_WIDTH; short ids pass through unchanged.
+fn truncate_target_label(id: &str, budget: usize) -> String {
+    if id.chars().count() <= budget {
+        return id.to_string();
+    }
+    let half = budget.saturating_sub(1) / 2;
+    let chars: Vec<char> = id.chars().collect();
+    let head: String = chars[..half].iter().collect();
+    let tail: String = chars[chars.len().saturating_sub(half)..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// ux.1: the Dashboard chat rail — a permanent pane beside the agent table (not a
+/// separate `View`), honoring the project's locked "one unified screen" decision
+/// (docs/ROADMAP.md:1089) rather than a 10th full-screen tab.
+fn render_converse_rail(f: &mut Frame, app: &App, area: Rect) {
+    let target = &app.converse_view.active_target;
+    let label = truncate_target_label(target, 20);
+    let border_style = if app.converse_view.rail_focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(area);
+    let (transcript_area, input_area) = (chunks[0], chunks[1]);
+
+    // Transcript: flushed history + the in-progress current_reply (green while streaming).
+    let mut lines: Vec<Line> = Vec::new();
+    let target_state = app.converse_view.targets.get(target);
+    match target_state {
+        None => {
+            lines.push(Line::from(format!("No conversation yet with {label} — press Enter to start")));
+        }
+        Some(state) => {
+            if state.history.is_empty() && state.current_reply.is_empty() {
+                lines.push(Line::from(format!("No conversation yet with {label} — press Enter to start")));
+            }
+            for turn in &state.history {
+                let (prefix, style) = match turn.role {
+                    TurnRole::Operator  => ("you: ", Style::default()),
+                    TurnRole::Assistant => ("agent: ", Style::default()),
+                    TurnRole::System    => ("! ", Style::default().fg(Color::Yellow)),
+                };
+                lines.push(Line::from(Span::styled(format!("{prefix}{}", sanitize(&turn.text)), style)));
+            }
+            if !state.current_reply.is_empty() || state.phase == ConversePhase::Streaming {
+                let prefix = if state.phase == ConversePhase::Dispatching { "... " } else { "agent: " };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{}", sanitize(&state.current_reply)),
+                    Style::default().fg(Color::Green),
+                )));
+            } else if state.phase == ConversePhase::Dispatching {
+                lines.push(Line::from(Span::styled("...", Style::default().fg(Color::Green))));
+            }
+        }
+    }
+
+    // ux.1 acceptance criterion 3: streaming never yanks the scroll when the operator
+    // has scrolled up. `follow` (default) always shows the tail; a manual scroll-up
+    // pins the view and shows a `▼ N new` indicator instead of jumping back down.
+    let inner_height = transcript_area.height.saturating_sub(2); // borders top+bottom
+    let total_lines = lines.len() as u16;
+    let bottom_offset = total_lines.saturating_sub(inner_height);
+    let (scroll_offset, title) = match target_state {
+        Some(state) if !state.follow => {
+            let offset = bottom_offset.saturating_sub(state.scroll_up_lines.min(bottom_offset));
+            let suffix = if state.new_since_scroll > 0 {
+                format!(" ▼ {} new ", state.new_since_scroll)
+            } else {
+                String::new()
+            };
+            (offset, format!("┤ → {label} ├{suffix}"))
+        }
+        _ => (bottom_offset, format!("┤ → {label} ├")),
+    };
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title).border_style(border_style))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((scroll_offset, 0)),
+        transcript_area,
+    );
+
+    // Input box: fixed 3-row height (border top, text line, border bottom) — same
+    // idiom as header_footer_layout's Constraint::Length usage elsewhere in this file.
+    let input_display = if app.converse_view.rail_focused {
+        format!("{}█", app.converse_view.input) // simple block cursor while typing
+    } else {
+        app.converse_view.input.clone()
+    };
+    f.render_widget(
+        Paragraph::new(input_display)
+            .block(Block::default().borders(Borders::ALL).border_style(border_style)),
+        input_area,
     );
 }
 
@@ -1521,6 +1680,37 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.apply_snapshot(snap);
         app
+    }
+
+    // ── ux.1 chat rail: width/height floor + border-title truncation ─────────
+
+    #[test]
+    fn min_total_width_for_rail_115_hides_rail_below_floor() {
+        assert!(!converse_rail_fits(114, 20), "114 cols must hide the rail");
+        assert!(converse_rail_fits(115, 20), "115 cols must show the rail");
+    }
+
+    #[test]
+    fn min_rail_height_8_hides_rail_below_floor() {
+        assert!(!converse_rail_fits(200, 7), "7 rows must hide the rail");
+        assert!(converse_rail_fits(200, 8), "8 rows must show the rail");
+    }
+
+    #[test]
+    fn border_title_truncation_with_unread_badge_fits_32_cols() {
+        // Budget of 20 chars for the target label leaves room for "┤ → " (4) + " ├" (2)
+        // = 26, comfortably inside CONVERSE_RAIL_WIDTH (32) even for a long agent id.
+        let long_id = "scout-a1b2c3d4-e5f6-9f3d-worker-99";
+        let truncated = truncate_target_label(long_id, 20);
+        assert!(truncated.chars().count() <= 20, "truncated label must respect the budget: {truncated}");
+        assert!(truncated.contains('…'), "long id must be middle-truncated: {truncated}");
+        let full_title = format!("┤ → {truncated} ├");
+        assert!(full_title.chars().count() <= CONVERSE_RAIL_WIDTH as usize, "title must fit in the rail width: {full_title}");
+    }
+
+    #[test]
+    fn short_target_label_passes_through_unchanged() {
+        assert_eq!(truncate_target_label("orch-default", 20), "orch-default");
     }
 
     // ── render_plain: empty state ─────────────────────────────────────────────

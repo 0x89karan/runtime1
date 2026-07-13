@@ -1,5 +1,7 @@
 use clap::Args;
 
+use crate::watch::converse::DEFAULT_MAX_TURNS;
+
 #[derive(Args, Debug)]
 pub struct OrchestrateArgs {
     /// Initial message to send (if omitted, prompt is shown on stdin)
@@ -9,7 +11,7 @@ pub struct OrchestrateArgs {
     #[arg(long, default_value = "orch-default")]
     pub agent_id: String,
     /// Maximum turns for the orchestrated agent
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, default_value_t = DEFAULT_MAX_TURNS)]
     pub max_turns: u32,
     /// Management API URL (required for orchestration)
     #[arg(long, env = "AGENTCTL_URL")]
@@ -153,6 +155,15 @@ fn drain_until_turn_complete<R: std::io::Read>(
         };
 
         let kind = v["kind"].as_str().unwrap_or("");
+
+        // ux.1: this SSE connection now also carries per-token `inference_stream_delta`
+        // events (added so `agentctl watch`'s chat rail can render live). The CLI REPL
+        // doesn't consume them (it stays block-until-terminal-event, DX Pass 5 — "NOT in
+        // scope: orchestrate.rs does not gain live streaming") — skip them cheaply
+        // rather than scanning through every match arm below for each one.
+        if kind == "inference_stream_delta" {
+            continue;
+        }
 
         if kind == "orchestrator_turn_complete" {
             let event_agent = v["data"]["agent_id"].as_str().unwrap_or("");

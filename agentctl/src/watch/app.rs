@@ -450,7 +450,23 @@ pub struct App {
     pub dropped_events:  usize,
     /// Count of stream gaps (reconnect / lag / parse-fail) seen (F3/C4).
     pub event_gaps:      usize,
+    /// ux.1: per-target chat state for the Dashboard chat rail.
+    pub converse_view:   super::converse::ConverseView,
+    /// ux.1: last-known terminal size `(cols, rows)`, refreshed once per tick in
+    /// `run_tui_loop` (NOT queried ad-hoc from key-handling logic — that broke a test
+    /// under `cargo test`'s no-TTY environment and would be equally fragile in any
+    /// headless/piped real-world context, caught during /review). Defaults to a
+    /// comfortably-wide guess so the chat rail is available before the first real
+    /// frame renders and in unit tests that never populate this field.
+    pub term_size:       (u16, u16),
 }
+
+/// Default target the chat rail starts bound to on a fresh `agentctl watch` session.
+pub const DEFAULT_CONVERSE_TARGET: &str = "orch-default";
+/// Optimistic default for `App::term_size` before the first real terminal-size query —
+/// comfortably above `views::MIN_TOTAL_WIDTH_FOR_RAIL`/`MIN_RAIL_HEIGHT` so tests and the
+/// very first frame don't spuriously see the rail as hidden.
+pub const DEFAULT_TERM_SIZE: (u16, u16) = (200, 50);
 
 /// ux.0: cap on the in-memory event ring (tail-drop), mirroring MAX_DISPLAY_ENTRIES
 /// discipline elsewhere. Bounds memory regardless of SSE event rate.
@@ -483,6 +499,8 @@ impl App {
             events:          std::collections::VecDeque::new(),
             dropped_events:  0,
             event_gaps:      0,
+            converse_view:   super::converse::ConverseView::new(DEFAULT_CONVERSE_TARGET),
+            term_size:       DEFAULT_TERM_SIZE,
         }
     }
 

@@ -1,5 +1,61 @@
 # TODOS
 
+## ux.1 — Open (deferred from CEO review, 2026-07-13)
+
+- **D1 "one unified screen" scope decision** (P3): `docs/ROADMAP.md:1089` / `docs/plans/
+  ux-cockpit.md:49` record a 2026-07-10 "Locked decision" that the cockpit should be one
+  unified screen ("not more `[key]` tabs"), but three increments running (ux.0's prerequisite
+  refactor, ux.9, ux.2a) all continued the full-screen tab model instead. ux.1 is the first to
+  partially honor D1 — a permanent chat rail on `Dashboard` only, per CEO-review pause
+  resolution (dual-voice finding, both Claude subagent and Codex independently flagged the
+  sequencing + layout drift). Decide whether D1 extends to the other 8 views (Topology,
+  Memory, Spawn, Inspector, Approvals, Credentials, System, AgentDetail) or gets formally
+  re-scoped to "Dashboard is the unified home screen; specialized views stay tabbed, reached
+  from it." Leaving the written decision and actual practice diverged a 4th time just defers
+  the same re-litigation onto the next cockpit increment. Depends on: none.
+- **Unread/background-activity badge on the chat rail's target selector** (P3, from ux.1's
+  T13 — explicitly deferred during build, not silently dropped): when a backgrounded
+  target's `ConverseState` transitions (new streaming activity, turn completes) while the
+  operator is looking at a different target, nothing in the border title signals it — the
+  Design dual-voice review's proposed fix (`┤ → orchestrator ├ [scout-3: ●2]`, reusing the
+  attention-summary-line glyph+count idiom already in `views.rs`) was never implemented.
+  Requires new per-target "unseen" state in `ConverseState` (`agentctl/src/watch/converse.rs`)
+  with reset semantics on retarget/focus — not just cosmetic, needs its own small design
+  pass on exactly when the counter clears. Depends on: none.
+- **`converse::dispatch()` blocks the whole TUI, not just the rail, for up to ~8s worst
+  case** (P2, found by /review's adversarial pass): `Enter` calls `dispatch()` synchronously
+  on the render/key-poll thread (`agentctl/src/watch/mod.rs`'s Enter handler) — it calls
+  `source.load_snapshot()` (5s timeout, `source.rs`) then `source.spawn()` (3s) or
+  `source.inject()` (500ms). This mirrors the EXISTING Approvals approve/deny pattern
+  (same "blocking call on the main thread" architecture, documented at `mod.rs:328` as
+  deliberate) but with much longer timeouts on what's now the cockpit's highest-frequency
+  interaction (chat) instead of an occasional approval. Worst case: sending a chat message
+  freezes the ENTIRE Dashboard — including already-streaming background conversations,
+  redraws, and Ctrl-C — for several seconds. Proper fix needs an async/background-thread
+  dispatch path with a channel-based result delivery back into `step()`, not a quick patch.
+  Depends on: none, but touches the Option B event-loop architecture (ux.0) — read
+  `mod.rs`'s Option B doc comment before starting.
+- **Shared SSE broadcast channel (`agentd/src/main.rs:114`, capacity 1024) now carries
+  per-token delta traffic on top of every other event kind** (P2, found by /review's
+  adversarial pass): `EventKind::InferenceStreamDelta` fires once per streamed chunk on
+  the hot inference path — orders of magnitude higher frequency than any event kind that
+  existed when this channel's capacity was chosen. A lagged SSE consumer (slow network, or
+  blocked by the dispatch-freeze TODO above) drops a *contiguous* range of buffered
+  messages indiscriminately — not just deltas, but potentially `agent_failed`,
+  `orchestrator_exited`, `approval_required`, etc. sharing the same channel. Wasn't a live
+  risk before ux.1 (event volume was low); is now. Needs either a capacity bump (cheap,
+  partial mitigation) or a dedicated channel for high-frequency delta events so a burst
+  from one streaming agent can't starve delivery of higher-stakes events to every
+  subscriber. Depends on: none.
+- **Retargeting `r` onto a non-orchestrated agent produces a slow, generic error** (P3,
+  found by /review's adversarial pass): the collision guard rejects the spawn attempt
+  server-side (`agentd/src/scheduler.rs`, "agent ID already in use") without ever sending
+  `confirm_tx`, so the HTTP spawn endpoint times out after its full 2s window
+  (`agentd/src/management.rs`) and returns a generic 503 "timed out waiting for agent
+  creation" instead of the actual collision reason — on top of the dispatch-freeze TODO
+  above, a real if low-severity papercut for a fleet with non-orchestrated agents.
+  Depends on: none.
+
 ## ux.9 — Open (deferred from build + /review adversarial pass, 2026-07-12)
 
 Cockpit mode (zero-agent `cockpit` entrypoint, now the Dockerfile default). `/review` dispatched

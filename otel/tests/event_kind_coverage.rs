@@ -92,6 +92,10 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::IsolationProbed => false,
         EventKind::CredentialAttentionRequired => false,
         EventKind::CredentialRecovered => false,
+        // Fires once per streamed token chunk (ux.1) — mapping it to its own span would
+        // cause a span-per-token explosion; the streaming operation as a whole is already
+        // covered by InferenceStreamStarted/InferenceStreamCompleted's span mapping above.
+        EventKind::InferenceStreamDelta => false,
         EventKind::Error => false,
     }
 }

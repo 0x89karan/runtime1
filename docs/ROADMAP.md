@@ -1126,8 +1126,23 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   mechanism (new `AgentTask` fields, `CallTools`-dispatch-site fix) — re-verify against
   current `main` before implementing. Wires into ux.2a's existing `AttentionSignal`/routing
   mechanism as two additional enum variants, no redesign needed.
-- **ux.1** — Converse: fold `orchestrate.rs` into the cockpit as the chat rail (`[c]`); streaming
-  green; retarget any agent via the selected row; `follow`/`▼ N new`; inline errors, never hang.
+- ~~**ux.1** — Converse~~ ✅ **shipped** — permanent chat rail on the Dashboard view (agent
+  table `Min(72)` | rail `Length(32)`), honoring the D1 "one unified screen" locked decision
+  (not a 10th full-screen tab, as the rough scope originally proposed). `Tab` toggles rail
+  focus (`[c]` was already Credentials — a shipped collision the review caught and fixed);
+  `r` retargets to the selected row; per-target `ConverseState` (`HashMap<AgentId,
+  ConverseState>`) keeps a backgrounded target streaming while another is focused. `/autoplan`
+  found and fixed two critical issues before implementation: (1) this branch was cut ahead of
+  `ux.2a-attention` in violation of the roadmap's own sequencing — paused, merged ux.2a first;
+  (2) the plan's live-streaming premise was false — `agentd` never actually emitted per-token
+  events onto the wire (`text_delta` existed only in the local-stdout print path) — 3-way
+  independently confirmed, closed by adding `EventKind::InferenceStreamDelta` (`agentd/src/
+  scheduler.rs`'s streaming path, `flight.jsonl` text truncated per-chunk via
+  `FlightRecorder::record_streamed`, full text still broadcast live over SSE). `agentctl
+  orchestrate`'s CLI shares the same `watch/converse.rs` spawn/resume + event-recognition
+  helpers (ported verbatim from the four terminal events' inconsistent field paths — one
+  landmine found: `orchestrator_exited`'s top-level `agent` field is a hardcoded literal
+  `"agentd"`, not the real target). Full plan + dual-voice review: `docs/plans/ux.1-converse.md`.
 - **ux.3** — Spawn custom on the fly (closes **p7.3-ar-02**): repoint the Spawn view from
   exec-a-2nd-agentd to `POST /api/v1/spawn` into the running instance; `⟨custom⟩` mode (deny-by-default
   caps + tool/connector select); modal-over-live-dashboard; preview before launch; auto-drop into the
@@ -1159,8 +1174,8 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
 > status/debug/control console (k9s/htop for agents), not an optional tool. ux.9 makes it the default;
 > ux.0/2/1/8 make it live, watchable, chattable, tunable.
 
-Sequencing (updated 2026-07-13 — ux.2 reframed + split): core **ux.0 → ux.9 (boot into TUI) →
-ux.2a (attention, ✅ shipped) → ux.1 (chat — *bumped*) → ux.8 (budgets) → ux.3**, then expansions
+Sequencing (updated 2026-07-13 — ux.1 shipped): core **ux.0 → ux.9 (boot into TUI) →
+ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → ux.8 (budgets) → ux.3**, then expansions
 **ux.6 → ux.4 → ux.5 → ux.7 → ux.2b (idle/error, closes cos-ux-01 fully)**, then
 **skills (Phase 11) last**. One increment per branch, `main` shippable at each step. **Parallel, independent
 of the cockpit — do first (makes the CoS usable today):** `cos-polish` (`docs/plans/cos-polish.md` — the

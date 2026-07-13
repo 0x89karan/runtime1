@@ -81,6 +81,18 @@ to view it — browser absent in QEMU; HTTP server grows `agentd`); Tauri/iced/e
 
 ## 3. Views
 
+> **Note (ux.1, 2026-07-13):** this section is the pre-implementation Phase 6 design
+> sketch — number-key/`Tab` view switching, as written below, was never what shipped.
+> The actual keymap is single-letter shortcuts per view (`[s]ystem`, `[t]opology`,
+> `[m]emory`, `[n]ew`, `[a]pprove`, `[c]reds`, `[i]nspector`, `q` quit — see
+> `agentctl/src/watch/mod.rs`'s `handle_dashboard_key`), and `Tab` is used for
+> intra-view sub-pane focus cycling (Memory's short-term/long-term/KB panes, and —
+> as of ux.1 — Dashboard's chat-rail focus toggle), not view switching. Dashboard
+> also gained a permanent chat rail beside the agent table (`Tab` focuses it, `r`
+> retargets it to the selected row) rather than a numbered tab. Kept here for
+> historical context on the original design intent; do not treat the ASCII sketches
+> below as accurate to the shipped keymap.
+
 `agentctl` is a single full-screen TUI with a tab bar; number keys / `Tab` switch
 views. Footer shows global state always. ASCII sketches are illustrative, not pixel
 specs.

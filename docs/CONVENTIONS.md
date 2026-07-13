@@ -101,6 +101,7 @@ Phase 0 kinds (canonical — do not rename):
 | `mcp_http_error` | HTTP MCP server returned non-2xx or JSON-RPC error (server_name, http_status: u16, method) (p7.1+) |
 | `inference_stream_started` | SSE streaming inference started for an agent turn (agent_id, model) (p7.2+) |
 | `inference_stream_completed` | SSE streaming inference completed successfully (agent_id, text_chunks_emitted: u64, input_tokens: u32, output_tokens: u32) (p7.2+) |
+| `inference_stream_delta` | one text chunk of a streaming inference response, recorded per-chunk so remote SSE subscribers see live output (agent_id, turn_seq: u64, chunk_seq: u64, text) (ux.1+) |
 | `inference_transport_retried` | stale pooled connection caused connect error; request retried once and succeeded (agent_id, model, retries: u32) (con.1+) |
 | `fuse_control_received` | operator wrote a valid spawn command to `/agents/control`; agent queued (task_preview, id) (p7.3+) |
 | `fuse_control_error` | operator command via `/agents/control` could not be dispatched (error, is_error: true) (p7.3+) |
