@@ -512,11 +512,32 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
                     state.push_history(converse::TurnRole::Operator, text.clone());
                     match converse::dispatch(source, &target, &text, converse::DEFAULT_MAX_TURNS) {
                         Ok(resolved_id) => {
-                            app.converse_view.active_target = resolved_id.clone();
-                            if let Some(state) = app.converse_view.targets.get_mut(&resolved_id) {
-                                state.phase = converse::ConversePhase::Dispatching;
-                                state.last_event_at = Some(std::time::Instant::now());
+                            // If the server resolved a different id than requested (e.g.
+                            // HttpSource::spawn's "operator-agent" fallback when the response
+                            // omits `agent_id`), the just-pushed echo lives under the stale
+                            // `target` key, which will never receive the real agent's events
+                            // (those are tagged with `resolved_id`). Move it across rather
+                            // than orphaning it (found by /ship's Step 9 testing +
+                            // maintainability specialists — two views of the same bug).
+                            if resolved_id != target {
+                                if let Some(abandoned) = app.converse_view.targets.remove(&target) {
+                                    let dest =
+                                        app.converse_view.targets.entry(resolved_id.clone()).or_default();
+                                    for turn in abandoned.history {
+                                        dest.push_history(turn.role, turn.text);
+                                    }
+                                }
                             }
+                            app.converse_view.active_target = resolved_id.clone();
+                            // entry().or_default(), not get_mut(): resolved_id's entry may not
+                            // exist yet even after the move above (e.g. `target` had no prior
+                            // state to move). get_mut on a fresh resolved_id would silently
+                            // no-op, dropping this state update and, since every subsequent
+                            // event for the real agent is looked up by this same key, wedging
+                            // the conversation forever.
+                            let state = app.converse_view.targets.entry(resolved_id).or_default();
+                            state.phase = converse::ConversePhase::Dispatching;
+                            state.last_event_at = Some(std::time::Instant::now());
                         }
                         Err(e) => {
                             if let Some(state) = app.converse_view.targets.get_mut(&target) {
@@ -1287,6 +1308,61 @@ mod tests {
         assert_eq!(app.converse_view.input, "second message", "input must be preserved, not cleared, while busy");
         let state = app.converse_view.targets.get("orch-default").unwrap();
         assert!(state.history.is_empty(), "no dispatch (and no optimistic echo) must happen while busy");
+    }
+
+    // Server can resolve a different agent id than requested (HttpSource::spawn falls
+    // back to the literal "operator-agent" when the response omits `agent_id`). Found by
+    // /ship's Step 9 testing + maintainability specialists as two views of the same bug:
+    // get_mut(&resolved_id) silently dropped the state update (testing), and the
+    // optimistic echo pushed under the pre-dispatch `target` key was orphaned, never
+    // reachable again since future events are tagged with `resolved_id` (maintainability).
+    struct ResolvesDifferentIdSource;
+    impl DataSource for ResolvesDifferentIdSource {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+        fn deny(&self, _id: &str, _reason: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+        fn spawn(&self, _req: &crate::watch::source::SpawnRequest) -> Result<String, String> {
+            Ok("operator-agent".to_string())
+        }
+    }
+
+    #[test]
+    fn enter_moves_echo_and_creates_state_when_server_resolves_a_different_id() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("requested-id");
+        app.converse_view.input = "hello".to_string();
+
+        handle_dashboard_key(KeyCode::Enter, &mut app, &ResolvesDifferentIdSource);
+
+        assert_eq!(app.converse_view.active_target, "operator-agent", "rail must follow the server-resolved id");
+        assert!(
+            !app.converse_view.targets.contains_key("requested-id"),
+            "the stale pre-dispatch key must not linger, orphaning the echo behind it"
+        );
+        let state = app.converse_view.targets.get("operator-agent")
+            .expect("a state entry must exist for the server-resolved id, not silently dropped");
+        assert_eq!(state.phase, super::converse::ConversePhase::Dispatching);
+        assert_eq!(
+            state.history.back().map(|t| t.text.as_str()),
+            Some("hello"),
+            "the optimistic echo must be moved across, not lost"
+        );
+
+        // A subsequent delta tagged with the resolved id must be accepted, not dropped.
+        let delta = serde_json::json!({
+            "kind": "inference_stream_delta",
+            "data": { "agent_id": "operator-agent", "turn_seq": 0, "chunk_seq": 0, "text": "hi" }
+        });
+        app.converse_view.on_flight_event(&delta);
+        assert_eq!(
+            app.converse_view.targets.get("operator-agent").unwrap().current_reply,
+            "hi",
+            "delta for the server-resolved id must not be silently discarded"
+        );
     }
 
     #[test]
