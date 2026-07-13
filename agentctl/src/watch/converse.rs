@@ -617,4 +617,77 @@ mod tests {
         let state = ConverseState::default();
         assert!(!state.is_dispatch_timed_out(Instant::now()));
     }
+
+    // ── dispatch(): spawn-or-resume branch coverage ─────────────────────────────
+    //
+    // Gap found during coverage audit: every existing caller of `dispatch()` (mod.rs's
+    // handle_dashboard_key tests) uses a `TestSource` whose `load_snapshot()` always
+    // returns an empty agent list — so `agent_alive` is always `false` and only the
+    // "spawn" arm (and only its `Err` path, since the mock's default `spawn()` returns
+    // `Err`) has ever executed. The "target is already `waiting` → inject instead of
+    // re-spawning" branch — the exact case the double-submit guard in mod.rs exists to
+    // protect (re-spawning a live agent_id would corrupt turn order) — had zero coverage
+    // anywhere in the diff. This is the regression test for that branch.
+    struct MockSource {
+        waiting_agent: Option<String>,
+        injected: std::sync::Mutex<Vec<(String, String)>>,
+        spawned:  std::sync::Mutex<Vec<String>>,
+    }
+
+    impl DataSource for MockSource {
+        fn load_snapshot(&self) -> super::super::reader::Snapshot {
+            let agents = match &self.waiting_agent {
+                Some(id) => vec![super::super::reader::AgentInfo {
+                    id:              id.clone(),
+                    status:          "waiting".to_string(),
+                    status_detail:   None,
+                    context_tokens:  0,
+                    budget:          super::super::reader::BudgetKind::Unlimited,
+                    tools:           vec![],
+                    parent_id:       None,
+                    sandbox:         None,
+                    egress_brokered: 0,
+                    egress_denied:   0,
+                    tier:            "native".to_string(),
+                    isolation:       String::new(),
+                    pid:             0,
+                    attention:       vec![],
+                }],
+                None => vec![],
+            };
+            super::super::reader::Snapshot {
+                agents, budget: None, queue: None, sandbox: None, provider: None,
+                isolation: None, credentials: None, error: None,
+            }
+        }
+        fn load_approvals(&self) -> Vec<super::super::reader::PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+        fn deny(&self, _id: &str, _reason: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+        fn inject(&self, agent_id: &str, text: &str) -> Result<(), String> {
+            self.injected.lock().unwrap().push((agent_id.to_string(), text.to_string()));
+            Ok(())
+        }
+        fn spawn(&self, req: &SpawnRequest) -> Result<String, String> {
+            let id = req.id.clone().unwrap_or_default();
+            self.spawned.lock().unwrap().push(id.clone());
+            Ok(id)
+        }
+    }
+
+    #[test]
+    fn dispatch_injects_into_an_already_waiting_agent_instead_of_respawning() {
+        let source = MockSource {
+            waiting_agent: Some("orch-default".to_string()),
+            injected: std::sync::Mutex::new(vec![]),
+            spawned:  std::sync::Mutex::new(vec![]),
+        };
+        let result = dispatch(&source, "orch-default", "hello again", DEFAULT_MAX_TURNS);
+        assert_eq!(result, Ok("orch-default".to_string()));
+        assert_eq!(
+            source.injected.lock().unwrap().as_slice(),
+            &[("orch-default".to_string(), "hello again".to_string())],
+            "a target already `waiting` must be injected into, not re-spawned"
+        );
+        assert!(source.spawned.lock().unwrap().is_empty(), "must not spawn a duplicate of a live agent_id");
+    }
 }
