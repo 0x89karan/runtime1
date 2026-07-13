@@ -618,6 +618,42 @@ mod tests {
         assert!(!state.is_dispatch_timed_out(Instant::now()));
     }
 
+    #[test]
+    fn check_dispatch_timeouts_flushes_only_timed_out_targets_and_reports_change() {
+        // Found by /ship's Step 9 testing specialist: only the underlying per-state
+        // predicate (is_dispatch_timed_out) had a direct test — the view-level loop that
+        // actually gets called from the render tick (mod.rs) had none.
+        let mut view = ConverseView::new("still-fresh");
+        view.targets.insert(
+            "timed-out".to_string(),
+            ConverseState {
+                phase: ConversePhase::Dispatching,
+                last_event_at: Some(Instant::now() - Duration::from_secs(31)),
+                ..Default::default()
+            },
+        );
+        view.targets.insert(
+            "still-fresh".to_string(),
+            ConverseState {
+                phase: ConversePhase::Dispatching,
+                last_event_at: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
+
+        assert!(view.check_dispatch_timeouts(), "must report a change when a target timed out");
+        let timed_out = view.targets.get("timed-out").unwrap();
+        assert_eq!(timed_out.phase, ConversePhase::Idle, "timed-out target must flush back to Idle");
+        assert!(
+            timed_out.history.back().is_some_and(|t| t.text.contains("No response after 30s")),
+            "must leave a system line explaining the timeout"
+        );
+        let fresh = view.targets.get("still-fresh").unwrap();
+        assert_eq!(fresh.phase, ConversePhase::Dispatching, "a target within the window must be untouched");
+
+        assert!(!view.check_dispatch_timeouts(), "no new timeout should fire on the next call");
+    }
+
     // ── dispatch(): spawn-or-resume branch coverage ─────────────────────────────
     //
     // Gap found during coverage audit: every existing caller of `dispatch()` (mod.rs's

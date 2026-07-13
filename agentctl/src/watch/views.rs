@@ -52,6 +52,19 @@ pub fn converse_rail_fits(width: u16, height: u16) -> bool {
     width >= MIN_TOTAL_WIDTH_FOR_RAIL && height >= MIN_RAIL_HEIGHT
 }
 
+/// Fixed chrome rows `render_dashboard` always reserves outside `content_area`: header,
+/// attention summary, and footer, plus one more row when a spawn banner is showing.
+/// Single source of truth for both `render_dashboard`'s own `Layout` constraints and
+/// `handle_dashboard_key` (mod.rs)'s pre-render Tab-visibility estimate — found by
+/// `/ship`'s Step 9 maintainability specialist as a duplicated literal that could
+/// silently desync if the layout ever changes.
+pub fn dashboard_chrome_rows(has_spawn_banner: bool) -> u16 {
+    let header_and_summary = 2;
+    let footer = 2;
+    let banner = if has_spawn_banner { 1 } else { 0 };
+    header_and_summary + footer + banner
+}
+
 pub fn render(f: &mut Frame, app: &App) {
     match app.view {
         View::Dashboard   => render_dashboard(f, app),
@@ -193,8 +206,11 @@ fn attention_counts(agents: &[reader::AgentInfo]) -> (usize, usize) {
 fn render_dashboard(f: &mut Frame, app: &App) {
     let area = f.area();
 
-    // When a spawn banner is active, carve out an extra line below the header.
+    // When a spawn banner is active, carve out an extra line below the header. Row counts
+    // here must match `dashboard_chrome_rows()` above — that function is the single source
+    // of truth `handle_dashboard_key` (mod.rs) uses to estimate this same layout.
     let (header_area, summary_area, banner_area, content_area, footer_area) = if app.spawn_banner.is_some() {
+        debug_assert_eq!(dashboard_chrome_rows(true), 5);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -207,6 +223,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
             .split(area);
         (chunks[0], chunks[1], Some(chunks[2]), chunks[3], chunks[4])
     } else {
+        debug_assert_eq!(dashboard_chrome_rows(false), 4);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1694,6 +1711,12 @@ mod tests {
     fn min_rail_height_8_hides_rail_below_floor() {
         assert!(!converse_rail_fits(200, 7), "7 rows must hide the rail");
         assert!(converse_rail_fits(200, 8), "8 rows must show the rail");
+    }
+
+    #[test]
+    fn dashboard_chrome_rows_accounts_for_spawn_banner() {
+        assert_eq!(dashboard_chrome_rows(false), 4, "header(1) + summary(1) + footer(2)");
+        assert_eq!(dashboard_chrome_rows(true), 5, "+1 more when the spawn banner is showing");
     }
 
     #[test]

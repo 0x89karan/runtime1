@@ -589,12 +589,14 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
         // must be a no-op on a terminal too small for the rail, or it would silently
         // swallow every subsequent keystroke into an input box the operator can't see.
         KeyCode::Tab => {
-            // Fixed chrome rows render_dashboard always reserves before content_area:
-            // header(1) + attention summary(1) + footer(2), +1 more if a spawn banner
-            // is showing. A slightly-too-generous estimate here is harmless — worst
-            // case Tab focuses the rail one tick before render's own (authoritative)
-            // check hides it again; a silent freeze is the bug this guards against.
-            let chrome_rows = if app.spawn_banner.is_some() { 5 } else { 4 };
+            // Fixed chrome rows render_dashboard always reserves before content_area —
+            // derived from views::dashboard_chrome_rows(), the single source of truth
+            // (found duplicated as an independent literal here by /ship's Step 9
+            // maintainability specialist). A slightly-too-generous estimate here is
+            // harmless — worst case Tab focuses the rail one tick before render's own
+            // (authoritative) check hides it again; a silent freeze is the bug this guards
+            // against.
+            let chrome_rows = views::dashboard_chrome_rows(app.spawn_banner.is_some());
             let (w, h) = app.term_size;
             if views::converse_rail_fits(w, h.saturating_sub(chrome_rows)) {
                 app.converse_view.rail_focused = true;
