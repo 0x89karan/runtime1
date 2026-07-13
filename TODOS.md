@@ -74,6 +74,29 @@
   — the two now have duplicated, independently-maintained copies of the same
   spawn-or-resume and field-path-lookup logic, with only the `DEFAULT_MAX_TURNS` constant
   actually shared. Depends on: none.
+- **`record_streamed()` takes a blocking `Mutex<File>` write once per streamed chunk on
+  the hot inference path** (P2, found by `/ship`'s Step 9 performance specialist):
+  `scheduler.rs`'s `print_fut` calls `FlightRecorder::record_streamed()` inside the
+  per-chunk `while let Some(chunk) = rx.recv().await` loop, and `record_streamed()` does a
+  synchronous, blocking `writeln!` under a process-wide `std::sync::Mutex<File>` directly
+  on the tokio worker thread (no `spawn_blocking`). Every other event kind fires once per
+  turn/tool-call; this one fires once per SSE chunk — hundreds of blocking mutex-acquire +
+  syscall pairs per streamed reply instead of one. Since the mutex is shared across every
+  agent via the single `Arc<FlightRecorder>`, concurrently streaming agents (multi-agent
+  mode) now serialize on this lock at token frequency — one agent's chunk write can stall
+  other agents' worker threads. Related to, but distinct from, the already-filed
+  broadcast-channel-capacity TODO above (that's about channel backpressure; this is about
+  the disk-write path itself). Needs either batching/coalescing writes or moving the write
+  off the async path via `tokio::task::spawn_blocking`. Depends on: none.
+- **`render_converse_rail()` re-sanitizes and rebuilds the full transcript on every
+  redraw tick** (P3, found by `/ship`'s Step 9 performance specialist): it iterates all of
+  `state.history` (up to `MAX_HISTORY_TURNS=200`) plus the full `current_reply` (up to
+  `CURRENT_REPLY_CAP_BYTES=64KiB`) and re-runs `sanitize()` (an allocating filter) on all
+  of it every render, rather than caching already-rendered lines and only processing the
+  newly-appended tail. Redraws are coalesced to roughly one per ~30ms tick, and
+  `InferenceStreamDelta` now drives a redraw on effectively every tick during an active
+  stream — a long-running, near-full-history rail could re-scan/re-allocate a
+  non-trivial amount of text ~30x/second instead of amortizing the cost. Depends on: none.
 
 ## ux.9 — Open (deferred from build + /review adversarial pass, 2026-07-12)
 
