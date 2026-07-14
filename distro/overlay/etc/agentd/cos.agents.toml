@@ -125,6 +125,12 @@ capabilities = [
     "gmail.googleapis.com",
   ], ports = [443] } },
   # FsRead /run/secrets intentionally absent — broker mode (cred.6).
+  # REQUIRED for broker mode: main.rs builds the credential proxy token's
+  # allowed_providers list from THIS server's own capabilities (not the
+  # agent-level list below) — without this, every google_oauth API call is
+  # rejected with credential_denied/no_providers_configured even though the
+  # OAuth session itself is valid.
+  { Credential = { provider = "Google" } },
 ]
 
 # ---------------------------------------------------------------------------
