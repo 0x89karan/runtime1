@@ -481,8 +481,20 @@ whole TUI) and a logic bug where the 30s dispatch timeout was measured from disp
 last activity, killing any turn that streamed longer than 30s total — see CHANGELOG.md for the full
 list. Two remaining architectural findings (blocking dispatch can freeze the TUI ~8s worst case; the
 shared SSE broadcast channel now carries much higher-frequency traffic) are bounded, not correctness
-bugs, and filed as TODOs rather than fixed in this pass. Full plan + dual-voice review trail:
-`docs/plans/ux.1-converse.md`; 1402 workspace tests (+34).
+bugs, and filed as TODOs rather than fixed in this pass. Interactive QA against the real binaries then
+caught a critical bug the whole pipeline above missed: typing `q` into the focused chat rail quit the
+entire TUI (`step_key`'s outer quit-check didn't know about rail focus). `/ship`'s own Step 9-11 review
+pipeline (coverage audit, specialist review army, red team, cross-model adversarial pass) then found and
+fixed 6 more real bugs, including one as severe as anything above: the chat rail was silently, completely
+non-functional whenever `agentctl watch` runs over FUSE instead of `--url` HTTP (the default local mode on
+AgentOS's own target Linux platform) — `FuseSource` supports neither `spawn()` nor `event_stream_url()`,
+so every message hung at "Dispatching..." for 30s, forever, since this session's QA only exercised `--url`
+mode. Also fixed: the 64KB reply cap didn't actually cap anything past the first overflow (unbounded
+marker-repeat growth); turn completion was discarding the full streamed text and using the server's
+512-char preview instead; resize below the rail's fit floor left it invisibly focused; the scroll offset
+counted logical turns instead of wrapped visual rows. See CHANGELOG.md and TODOS.md's ux.1 section for
+the complete list, including further findings filed as TODOs rather than fixed under ship-time pressure.
+Full plan + dual-voice review trail: `docs/plans/ux.1-converse.md`; 1420 workspace tests (+52).
 
 ## How to work here
 

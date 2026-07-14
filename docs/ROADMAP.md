@@ -61,7 +61,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 7. ~~**memory-routing** (v0.81.0)~~ ✅ shipped — raw emails → h8.1 semantic L2 (OpenAI text-embedding-3-small); CoS email dedup via `kb_get`; fixes ~820k token/run blowup.
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. **cred.7** — credential resilience (on top of broker mode).
-10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 → ux.8 → ux.3 → ux.2b (idle/error).
+10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → ux.8 → ux.3 → ux.2b (idle/error).
 11. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
@@ -1138,11 +1138,20 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   events onto the wire (`text_delta` existed only in the local-stdout print path) — 3-way
   independently confirmed, closed by adding `EventKind::InferenceStreamDelta` (`agentd/src/
   scheduler.rs`'s streaming path, `flight.jsonl` text truncated per-chunk via
-  `FlightRecorder::record_streamed`, full text still broadcast live over SSE). `agentctl
-  orchestrate`'s CLI shares the same `watch/converse.rs` spawn/resume + event-recognition
-  helpers (ported verbatim from the four terminal events' inconsistent field paths — one
-  landmine found: `orchestrator_exited`'s top-level `agent` field is a hardcoded literal
-  `"agentd"`, not the real target). Full plan + dual-voice review: `docs/plans/ux.1-converse.md`.
+  `FlightRecorder::record_streamed`, full text still broadcast live over SSE). `watch/
+  converse.rs`'s spawn/resume + event-recognition logic was ported verbatim from
+  `agentctl orchestrate`'s CLI (one landmine found in the four terminal events'
+  inconsistent field paths: `orchestrator_exited`'s top-level `agent` field is a hardcoded
+  literal `"agentd"`, not the real target) — but `orchestrate.rs` itself was never
+  refactored onto the new shared module as the plan called for; it still has its own
+  duplicated copy, and its CLI still shows the server's 512-char-truncated reply rather
+  than consuming the new delta stream. Both filed as TODOs (see `TODOS.md`'s ux.1
+  section), not fixed in this pass. `/ship`'s own review pipeline (coverage audit,
+  specialist review army, red team, cross-model adversarial pass) found and fixed 6 more
+  real bugs after `/review`'s own 10, including the chat rail being silently
+  non-functional over FUSE (the default local mode on AgentOS's actual target platform) —
+  see CHANGELOG.md for the complete list. Full plan + dual-voice review:
+  `docs/plans/ux.1-converse.md`.
 - **ux.3** — Spawn custom on the fly (closes **p7.3-ar-02**): repoint the Spawn view from
   exec-a-2nd-agentd to `POST /api/v1/spawn` into the running instance; `⟨custom⟩` mode (deny-by-default
   caps + tool/connector select); modal-over-live-dashboard; preview before launch; auto-drop into the
