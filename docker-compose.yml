@@ -135,8 +135,11 @@ services:
     volumes:
       - qdrant-data:/qdrant/storage
     # Qdrant is only reachable by services on agent-net — not exposed to the host.
+    # qdrant/qdrant's image has no curl/wget/nc; use bash's /dev/tcp for a pure TCP
+    # health check instead (confirmed present in the image; curl-based check always
+    # failed with "exec: curl: not found" regardless of whether qdrant was healthy).
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:6333/healthz"]
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/6333"]
       interval: 10s
       timeout: 5s
       retries: 5
