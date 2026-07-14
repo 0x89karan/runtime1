@@ -204,6 +204,14 @@ capabilities = [
   ], ports = [443] } },
   # FsRead /run/secrets intentionally absent — broker mode means the sidecar
   # never reads the credential file; the Rust gateway owns that boundary.
+  # REQUIRED for broker mode: main.rs builds the credential proxy token's
+  # allowed_providers list from THIS server's own capabilities (not the
+  # agent-level list below) — without this, the token is issued with an
+  # empty allowed_providers, and every google_oauth API call gets rejected
+  # with credential_denied/no_providers_configured even though the OAuth
+  # session itself is valid. Found live: CoS Inbox agent could never read
+  # Gmail despite `agentctl auth google` completing successfully.
+  { Credential = { provider = "Google" } },
 ]
 
 # ---------------------------------------------------------------------------

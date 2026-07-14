@@ -1923,6 +1923,48 @@ allow_insecure_local = true
     }
 
     #[test]
+    fn cos_agents_toml_google_oauth_server_has_credential_capability() {
+        // Broker mode (cred.6): main.rs builds the credential proxy token's
+        // allowed_providers list from the google_oauth MCP SERVER's own
+        // `capabilities` (not the agent-level capabilities list, which grants
+        // Credential separately for a different check). Omitting it here means
+        // every google_oauth API call is rejected with
+        // credential_denied/no_providers_configured even though the OAuth
+        // session itself is valid — found live testing the CoS Inbox agent.
+        use crate::capability::CredentialProvider;
+
+        let dev_raw = include_str!("../cos.agents.toml");
+        let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
+        for (label, raw) in [("dev", dev_raw), ("overlay", overlay_raw)] {
+            let cfg: Config = toml::from_str(raw).expect("must parse");
+            let server = cfg
+                .tools
+                .mcp_servers
+                .iter()
+                .find(|s| s.name == "google_oauth")
+                .unwrap_or_else(|| panic!("{label}: no google_oauth MCP server defined"));
+            let has_credential_cap = server
+                .capabilities
+                .as_ref()
+                .map(|caps| {
+                    caps.iter().any(|c| {
+                        matches!(
+                            c,
+                            Capability::Credential { provider: CredentialProvider::Google }
+                        )
+                    })
+                })
+                .unwrap_or(false);
+            assert!(
+                has_credential_cap,
+                "{label}: google_oauth MCP server must have its own \
+                 {{ Credential = {{ provider = \"Google\" }} }} capability (broker mode) — \
+                 the agent-level Credential grant does not cover this",
+            );
+        }
+    }
+
+    #[test]
     fn cos_agents_toml_kb_segments_are_known() {
         // Derive valid segment names from the parsed [[memory.segments]] config —
         // no hardcoded list. Adding a new segment to [[memory.segments]] automatically
