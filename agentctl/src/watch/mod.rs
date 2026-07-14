@@ -510,6 +510,23 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
                     // Optimistic echo: the sent message appears instantly, before the
                     // network round-trip completes (Hour 1 narrative, CEO Step 0E).
                     state.push_history(converse::TurnRole::Operator, text.clone());
+                    // FUSE-mode DataSources don't support spawn() or event_stream_url()
+                    // (found by /ship's Step 9 red team pass): a spawn always fails, and
+                    // even a successful inject can never surface a reply, since
+                    // ConverseView is driven entirely by SSE events. Without this gate the
+                    // rail would sit at "Dispatching..." until the 30s timeout on every
+                    // single message, forever — fail fast instead, mirroring
+                    // orchestrate.rs's existing `event_stream_url().ok_or_else(...)` gate.
+                    if source.event_stream_url().is_none() {
+                        state.push_history(
+                            converse::TurnRole::System,
+                            "Chat requires the management API — restart agentctl with \
+                             --url http://HOST:PORT (agentd needs [management] enabled=true) \
+                             to use the chat rail."
+                                .to_string(),
+                        );
+                        return;
+                    }
                     match converse::dispatch(source, &target, &text, converse::DEFAULT_MAX_TURNS) {
                         Ok(resolved_id) => {
                             // If the server resolved a different id than requested (e.g.
@@ -1280,9 +1297,11 @@ mod tests {
         assert_eq!(app.view, View::AgentDetail, "existing Enter routing must be unchanged when the table has focus");
 
         // Rail-focused: Enter sends the typed input as a chat message instead.
-        // TestSource doesn't implement spawn/inject (default trait impl → Err), so the
-        // optimistic echo is followed by a rejection system line — this test asserts
-        // the echo happened first, which is the behavior under test here.
+        // TestSource doesn't implement event_stream_url (default trait impl → None), so
+        // the optimistic echo is followed by the FUSE-capability-gate system line, not a
+        // dispatch attempt — this test asserts the echo happened first, which is the
+        // behavior under test here. See the dedicated gate test below for the full
+        // no-SSE-support behavior.
         let mut app2 = app_with_agents(&["a"]);
         app2.converse_view.rail_focused = true;
         app2.converse_view.input = "hello".to_string();
@@ -1292,6 +1311,31 @@ mod tests {
         let state = app2.converse_view.targets.get(&app2.converse_view.active_target).unwrap();
         assert_eq!(state.history.front().unwrap().text, "hello", "optimistic echo must show the sent message immediately");
         assert_eq!(state.history.front().unwrap().role, super::converse::TurnRole::Operator);
+    }
+
+    #[test]
+    fn enter_fails_fast_with_clear_message_when_source_has_no_event_stream() {
+        // Found by /ship's Step 9 red team pass: FuseSource supports neither spawn() nor
+        // event_stream_url() (falls to the DataSource trait's defaults), so without this
+        // gate the rail would sit at "Dispatching..." until the 30s timeout on every
+        // single message over the default local FUSE mode, forever. TestSource also
+        // doesn't override event_stream_url() (defaults to None), so it doubles as the
+        // "no SSE support" case here.
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.input = "hello".to_string();
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
+        assert!(app.converse_view.input.is_empty(), "input box clears after send");
+        let state = app.converse_view.targets.get(&app.converse_view.active_target).unwrap();
+        assert_eq!(state.history.len(), 2, "the echo plus the gate's explanation, nothing more");
+        assert_eq!(state.history[0].role, super::converse::TurnRole::Operator, "the echo must still show what was typed");
+        assert_eq!(state.history[1].role, super::converse::TurnRole::System);
+        assert!(
+            state.history[1].text.contains("management API"),
+            "the operator must be told WHY nothing happens, not left staring at a silent hang"
+        );
+        assert_eq!(state.phase, super::converse::ConversePhase::Idle, "must not enter Dispatching -- nothing was actually dispatched");
     }
 
     #[test]
@@ -1328,6 +1372,9 @@ mod tests {
         fn deny(&self, _id: &str, _reason: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
         fn spawn(&self, _req: &crate::watch::source::SpawnRequest) -> Result<String, String> {
             Ok("operator-agent".to_string())
+        }
+        fn event_stream_url(&self) -> Option<String> {
+            Some("http://test/api/v1/events".to_string())
         }
     }
 
