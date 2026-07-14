@@ -82,10 +82,45 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   TUI for up to ~8s worst case, and the shared SSE broadcast channel now carrying much
   higher-frequency traffic — are real but bounded (not correctness bugs) and filed as
   TODOs rather than fixed in this pass; see `TODOS.md`'s ux.1 section.
-- 1402 workspace tests total (+34 new: 4 in agentd's `scheduler`/`flight_recorder`, 30 in
-  agentctl's `converse`/`mod`/`views`, several rewritten mid-review to match corrected
-  semantics); otel's `event_kind_coverage` exhaustiveness guard updated for the new
-  `EventKind` variant.
+- **Interactive QA against the real compiled binaries then found one critical bug the
+  entire review pipeline above had missed**: typing the letter `q` into the focused chat
+  rail quit the whole TUI mid-keystroke — `handle_dashboard_key` correctly captured it as
+  literal input, but `step_key`'s outer "`q` quits the Dashboard" check didn't know about
+  rail focus and fired anyway. Fixed by gating that check on `!rail_focused`. Also fixed:
+  the `Tab` handler's chrome-row estimate and `render_dashboard`'s own layout constants
+  were two independently-maintained copies of the same literal — unified into
+  `views::dashboard_chrome_rows()`.
+- **`/ship`'s own review pipeline (Steps 7-11) then found and fixed 6 more real bugs on
+  top of all of the above** — a coverage audit found `dispatch()`'s "target already
+  waiting → inject, not spawn" branch had zero test coverage anywhere (every caller used
+  a mock reporting an empty agent list); a review-army specialist pass found the Enter
+  handler's `Ok(resolved_id)` arm used `get_mut` instead of `entry().or_default()`,
+  silently dropping all state (and permanently discarding the operator's just-sent
+  message) whenever the server resolves a different agent id than requested; a red-team
+  pass then found the entire chat rail was silently, completely non-functional whenever
+  `agentctl watch` runs over FUSE instead of `--url` HTTP (the default local mode on
+  AgentOS's own target Linux platform) — `FuseSource` supports neither `spawn()` nor
+  `event_stream_url()`, so every message either failed outright or hung at
+  "Dispatching..." for the full 30s timeout, forever, since this session's own QA only
+  ever exercised `--url` mode. Fixed with a capability gate mirroring `orchestrate.rs`'s
+  existing `event_stream_url()` check. A cross-model adversarial pass (Claude subagent +
+  2 independent Codex passes, all converging on the same core defects) then found: the
+  64KB `current_reply` cap didn't actually cap anything past the first overflow (it kept
+  re-appending its own truncation marker on every subsequent chunk, growing unboundedly);
+  `orchestrator_turn_complete` was discarding the full text already accumulated via
+  streaming deltas and using the server's 512-char preview instead, collapsing every long
+  reply back down to a snippet the instant it finished; resizing the terminal below the
+  rail's fit floor hid the rail but left it focused, silently swallowing keystrokes; and
+  the rail's scroll offset counted logical turns instead of wrapped visual rows, pinning
+  long streamed replies to the top instead of following the live tail. Plan completion
+  audit and CEO scope decisions filed 8 further findings (dispatch-collision error
+  messages, cross-turn guards not surviving an `agentd` crash, unbounded `ConverseView`
+  growth, a still-unshared `orchestrate.rs`/`converse.rs` helper, and others) as TODOs —
+  see `TODOS.md`'s ux.1 section for the complete list.
+- 1420 workspace tests total (+52 new versus the pre-`/ship` baseline: coverage-audit,
+  review-army, and adversarial-pass regression tests across agentd's
+  `scheduler`/`flight_recorder` and agentctl's `converse`/`mod`/`views`); otel's
+  `event_kind_coverage` exhaustiveness guard updated for the new `EventKind` variant.
 
 ## [v0.85.0] - 2026-07-13
 
