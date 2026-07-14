@@ -604,8 +604,9 @@
   </div>
 
   <div class="whats-new">
-    <div class="whats-new-label">v0.83.0 — What's new</div>
+    <div class="whats-new-label">v0.86.0 — What's new</div>
     <ul>
+      <li><strong>Chat rail on the Dashboard</strong> — <code>agentctl watch</code> now has a permanent chat pane beside the agent table. Press <code>Tab</code> to focus it, type a message, <code>Enter</code> to send — replies stream in live, token by token, over the same management API connection you're already using below. See step 07.</li>
       <li><strong>Credential broker</strong> — the <code>google_oauth</code> sidecar no longer holds the raw refresh token in memory. A credential gateway reads <code>google.json</code> once and issues short-lived access tokens per request. No changes to the setup flow below.</li>
       <li><strong>Management API exposed on :7999</strong> — <code>agentctl watch</code> now runs on your Mac host with <code>--url http://localhost:7999</code>. No more <code>docker exec</code>.</li>
       <li><strong>Semantic KB requires OpenAI</strong> — <code>OPENAI_API_KEY</code> is now a required environment variable for email dedup and semantic search.</li>
@@ -773,6 +774,16 @@
         <pre><code><span class="cmd">agentctl watch</span> <span class="flag">--url</span> http://localhost:7999</code></pre>
       </div>
       <p>Use the <code>[c]</code> key for credentials, <code>[a]</code> for approvals, <code>[i]</code> for the flight log inspector. Press <code>q</code> to exit the cockpit — the agents keep running.</p>
+
+      <p><strong>Chat with an agent directly <span class="step-tag tag-new">new</span></strong> — the Dashboard now has a chat rail beside the agent table. Press <code>Tab</code> to focus it (the border turns white), select an agent row and press <code>r</code> to retarget the rail to it, type a message, then <code>Enter</code> to send. The reply streams in live, token by token, in green. <code>Esc</code> or <code>Tab</code> again returns focus to the table; <code>↑</code>/<code>↓</code> scroll the transcript while focused, <code>End</code> jumps back to the live tail.</p>
+      <div class="expect">
+        <div class="expect-label">Note</div>
+        <div class="timeline">
+          <div class="timeline-item">
+            <div class="timeline-desc">Chat needs the management API connection (<code>--url</code>, exactly what step 07 uses) — it streams replies over the same SSE connection as the rest of the cockpit. If you run <code>agentctl watch --agents-dir /agents</code> against the FUSE mount instead (no <code>--url</code>), the chat rail will accept a typed message but never show a reply — retarget with <code>Tab</code>/<code>r</code> or use <code>--url</code> as shown above.</div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <div class="step">
@@ -858,6 +869,7 @@
       <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker run</code>. Re-<code>export</code> it, or put <code>ANTHROPIC_API_KEY=sk-ant-...</code> in <code>~/.agentos-secrets/agentos.env</code> (the entrypoint sources it).</li>
       <li><strong>Semantic KB not working / "OPENAI_API_KEY is not set":</strong> add <code>-e OPENAI_API_KEY</code> to the <code>docker run</code> command and make sure the key is exported in the same shell.</li>
       <li><strong><code>agentctl watch</code> can't connect:</strong> confirm the container is running with <code>-p 127.0.0.1:7999:7999</code> — older invocations without this flag won't expose the port. Verify with <code>curl -s http://localhost:7999/healthz</code>.</li>
+      <li><strong>Chat rail sends a message but the reply never appears:</strong> you're likely connected via <code>--agents-dir /agents</code> (FUSE) instead of <code>--url http://localhost:7999</code> — the chat rail needs the management API's streaming connection, which FUSE mode doesn't provide. After ~30s you'll see an inline "No response after 30s" hint; reconnect with <code>--url</code> as shown in step 07.</li>
       <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> port <code>8585</code> was already in use. Re-run with <code>--port &lt;free-port&gt;</code> — Desktop app clients accept any loopback port automatically.</li>
       <li><strong>No brief after a few minutes:</strong> check the cron fired — <code>jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail</code>.</li>
       <li><strong>Logs &amp; receipts:</strong> inspect <code>~/.agentos-data/flight.jsonl</code> with <code>jq</code>; verify the signed action-receipt chain with <code>agentctl verify ~/.agentos-data/evidence.jsonl</code>.</li>
@@ -877,7 +889,7 @@
   </div>
 
   <div style="margin-top:8px;font-family:'JetBrains Mono','SF Mono',Consolas,monospace;font-size:11px;color:var(--muted);text-align:center;letter-spacing:0.04em;">
-    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.83.0
+    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.86.0
   </div>
 
 </div>
