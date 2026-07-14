@@ -590,20 +590,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         // field) means no credential access — providers must be granted explicitly.
         let credential_env: std::collections::HashMap<String, String> =
             if let (Some(ref gw), Some(ref gw_url)) = (&maybe_cred_gw, &cred_gw_url) {
-                let allowed: Vec<String> = match &server.capabilities {
-                    None => vec![],
-                    Some(caps) => caps.iter().filter_map(|cap| {
-                        if let Capability::Credential { provider } = cap {
-                            Some(match provider {
-                                CredentialProvider::Google      => "google".to_string(),
-                                CredentialProvider::BraveSearch => "brave-search".to_string(),
-                                CredentialProvider::Custom(s)   => s.clone(),
-                            })
-                        } else {
-                            None
-                        }
-                    }).collect(),
-                };
+                let allowed = credential_allowed_providers(&server.capabilities);
                 let token = uuid::Uuid::new_v4().to_string();
                 // ar-07: attribute the token to the owning agent principal.
                 // In multi-agent mode mcp_servers is a flat shared pool — use "shared"
@@ -1487,6 +1474,36 @@ async fn run_probe(prompt: &str, log_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Derive a credential broker token's `allowed_providers` list from an MCP server's
+/// OWN `capabilities` field (not the owning agent's capabilities list, which grants
+/// `Credential` separately for a different check — `Mcp{server=...}` tool visibility).
+/// `None` (no capabilities field) means no credential access at all — deny-by-default.
+///
+/// Found by /review (testing specialist, 2026-07-15): this logic previously lived only
+/// inline in the credential_env construction below, duplicated by hand in
+/// `none_capabilities_yields_empty_credential_providers` — neither the production
+/// closure nor the pre-existing capability-declaration tests actually exercised each
+/// other, so a regression here could ship undetected. Extracted so both do.
+fn credential_allowed_providers(caps: &Option<Vec<Capability>>) -> Vec<String> {
+    match caps {
+        None => vec![],
+        Some(cap_list) => cap_list
+            .iter()
+            .filter_map(|cap| {
+                if let Capability::Credential { provider } = cap {
+                    Some(match provider {
+                        CredentialProvider::Google      => "google".to_string(),
+                        CredentialProvider::BraveSearch => "brave-search".to_string(),
+                        CredentialProvider::Custom(s)   => s.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    }
+}
+
 /// Return the agent principal to attribute a shared MCP server credential token to.
 ///
 /// ar-07: tokens must be attributed to the agent principal, not the MCP server name.
@@ -2023,41 +2040,58 @@ mod tests {
     fn none_capabilities_yields_empty_credential_providers() {
         use agentd::capability::Capability;
 
-        fn build_allowed(caps: &Option<Vec<Capability>>) -> Vec<String> {
-            use agentd::capability::CredentialProvider;
-            match caps {
-                None => vec![],
-                Some(cap_list) => cap_list.iter().filter_map(|cap| {
-                    if let Capability::Credential { provider } = cap {
-                        Some(match provider {
-                            CredentialProvider::Google      => "google".to_string(),
-                            CredentialProvider::BraveSearch => "brave-search".to_string(),
-                            CredentialProvider::Custom(s)   => s.clone(),
-                        })
-                    } else {
-                        None
-                    }
-                }).collect(),
-            }
-        }
+        // Calls the REAL production function (credential_allowed_providers, defined
+        // above main.rs's MCP-spawn loop) instead of a hand-copied duplicate — found by
+        // /review (testing specialist, 2026-07-15): the duplicate meant this test could
+        // never catch a regression in the actual credential_env construction closure.
 
         // None capabilities → empty list (deny-by-default)
         assert!(
-            build_allowed(&None).is_empty(),
+            credential_allowed_providers(&None).is_empty(),
             "None capabilities must not grant any credential providers"
         );
 
         // Some([]) → empty list (explicit empty grant)
         assert!(
-            build_allowed(&Some(vec![])).is_empty(),
+            credential_allowed_providers(&Some(vec![])).is_empty(),
             "Empty capabilities list must not grant any credential providers"
         );
 
         // Some([Credential{Google}]) → ["google"]
-        let allowed = build_allowed(&Some(vec![Capability::Credential {
+        let allowed = credential_allowed_providers(&Some(vec![Capability::Credential {
             provider: agentd::capability::CredentialProvider::Google,
         }]));
         assert_eq!(allowed, ["google"]);
+    }
+
+    // Closes the loop end-to-end: loads the REAL cos.agents.toml files' google_oauth
+    // server through the REAL production function, rather than a hand-built Capability
+    // list (the test above) or a TOML-structure-only check (config.rs's
+    // cos_agents_toml_google_oauth_server_has_credential_capability). Found by /review
+    // (adversarial pass, 2026-07-15) as the suggested closing check.
+    #[test]
+    fn cos_agents_toml_google_oauth_yields_google_allowed_provider() {
+        for (raw, label) in [
+            (include_str!("../cos.agents.toml"), "agentd/cos.agents.toml"),
+            (
+                include_str!("../../distro/overlay/etc/agentd/cos.agents.toml"),
+                "distro overlay cos.agents.toml",
+            ),
+        ] {
+            let cfg: agentd::config::Config = toml::from_str(raw).expect("must parse");
+            let server = cfg
+                .tools
+                .mcp_servers
+                .iter()
+                .find(|s| s.name == "google_oauth")
+                .unwrap_or_else(|| panic!("{label}: no google_oauth MCP server defined"));
+            let allowed = credential_allowed_providers(&server.capabilities);
+            assert_eq!(
+                allowed, ["google"],
+                "{label}: google_oauth's own capabilities must derive exactly \
+                 allowed_providers=[\"google\"] through the real production function"
+            );
+        }
     }
 
     // ── p5.8 CONVENTIONS.md event taxonomy completeness check ─────────────────
