@@ -89,9 +89,14 @@ to view it — browser absent in QEMU; HTTP server grows `agentd`); Tauri/iced/e
 > intra-view sub-pane focus cycling (Memory's short-term/long-term/KB panes, and —
 > as of ux.1 — Dashboard's chat-rail focus toggle), not view switching. Dashboard
 > also gained a permanent chat rail beside the agent table (`Tab` focuses it, `r`
-> retargets it to the selected row) rather than a numbered tab. Kept here for
-> historical context on the original design intent; do not treat the ASCII sketches
-> below as accurate to the shipped keymap.
+> retargets it to the selected row) rather than a numbered tab. Replies stream over
+> the management API's SSE endpoint (`event_stream_url()`); the plain FUSE
+> `DataSource` doesn't implement it, so chat is unavailable in FUSE-only mode
+> (`agentctl watch --agents-dir /agents` with no `--url`) — the rail fails fast with
+> an inline system message instead of hanging (`agentctl/src/watch/mod.rs`'s
+> `handle_dashboard_key` gate on `source.event_stream_url().is_none()`, added during
+> `/ship`'s review pipeline). Kept here for historical context on the original design
+> intent; do not treat the ASCII sketches below as accurate to the shipped keymap.
 
 `agentctl` is a single full-screen TUI with a tab bar; number keys / `Tab` switch
 views. Footer shows global state always. ASCII sketches are illustrative, not pixel
