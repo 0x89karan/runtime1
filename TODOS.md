@@ -1,5 +1,186 @@
 # TODOS
 
+## ux.1 — Open (deferred from CEO review, 2026-07-13)
+
+- **D1 "one unified screen" scope decision** (P3): `docs/ROADMAP.md:1089` / `docs/plans/
+  ux-cockpit.md:49` record a 2026-07-10 "Locked decision" that the cockpit should be one
+  unified screen ("not more `[key]` tabs"), but three increments running (ux.0's prerequisite
+  refactor, ux.9, ux.2a) all continued the full-screen tab model instead. ux.1 is the first to
+  partially honor D1 — a permanent chat rail on `Dashboard` only, per CEO-review pause
+  resolution (dual-voice finding, both Claude subagent and Codex independently flagged the
+  sequencing + layout drift). Decide whether D1 extends to the other 8 views (Topology,
+  Memory, Spawn, Inspector, Approvals, Credentials, System, AgentDetail) or gets formally
+  re-scoped to "Dashboard is the unified home screen; specialized views stay tabbed, reached
+  from it." Leaving the written decision and actual practice diverged a 4th time just defers
+  the same re-litigation onto the next cockpit increment. Depends on: none.
+- **Unread/background-activity badge on the chat rail's target selector** (P3, from ux.1's
+  T13 — explicitly deferred during build, not silently dropped): when a backgrounded
+  target's `ConverseState` transitions (new streaming activity, turn completes) while the
+  operator is looking at a different target, nothing in the border title signals it — the
+  Design dual-voice review's proposed fix (`┤ → orchestrator ├ [scout-3: ●2]`, reusing the
+  attention-summary-line glyph+count idiom already in `views.rs`) was never implemented.
+  Requires new per-target "unseen" state in `ConverseState` (`agentctl/src/watch/converse.rs`)
+  with reset semantics on retarget/focus — not just cosmetic, needs its own small design
+  pass on exactly when the counter clears. Depends on: none.
+- **`converse::dispatch()` blocks the whole TUI, not just the rail, for up to ~8s worst
+  case** (P2, found by /review's adversarial pass): `Enter` calls `dispatch()` synchronously
+  on the render/key-poll thread (`agentctl/src/watch/mod.rs`'s Enter handler) — it calls
+  `source.load_snapshot()` (5s timeout, `source.rs`) then `source.spawn()` (3s) or
+  `source.inject()` (500ms). This mirrors the EXISTING Approvals approve/deny pattern
+  (same "blocking call on the main thread" architecture, documented at `mod.rs:328` as
+  deliberate) but with much longer timeouts on what's now the cockpit's highest-frequency
+  interaction (chat) instead of an occasional approval. Worst case: sending a chat message
+  freezes the ENTIRE Dashboard — including already-streaming background conversations,
+  redraws, and Ctrl-C — for several seconds. Proper fix needs an async/background-thread
+  dispatch path with a channel-based result delivery back into `step()`, not a quick patch.
+  Depends on: none, but touches the Option B event-loop architecture (ux.0) — read
+  `mod.rs`'s Option B doc comment before starting.
+- **Shared SSE broadcast channel (`agentd/src/main.rs:114`, capacity 1024) now carries
+  per-token delta traffic on top of every other event kind** (P2, found by /review's
+  adversarial pass): `EventKind::InferenceStreamDelta` fires once per streamed chunk on
+  the hot inference path — orders of magnitude higher frequency than any event kind that
+  existed when this channel's capacity was chosen. A lagged SSE consumer (slow network, or
+  blocked by the dispatch-freeze TODO above) drops a *contiguous* range of buffered
+  messages indiscriminately — not just deltas, but potentially `agent_failed`,
+  `orchestrator_exited`, `approval_required`, etc. sharing the same channel. Wasn't a live
+  risk before ux.1 (event volume was low); is now. Needs either a capacity bump (cheap,
+  partial mitigation) or a dedicated channel for high-frequency delta events so a burst
+  from one streaming agent can't starve delivery of higher-stakes events to every
+  subscriber. Depends on: none.
+- **Retargeting `r` onto a non-orchestrated agent produces a slow, generic error** (P3,
+  found by /review's adversarial pass): the collision guard rejects the spawn attempt
+  server-side (`agentd/src/scheduler.rs`, "agent ID already in use") without ever sending
+  `confirm_tx`, so the HTTP spawn endpoint times out after its full 2s window
+  (`agentd/src/management.rs`) and returns a generic 503 "timed out waiting for agent
+  creation" instead of the actual collision reason — on top of the dispatch-freeze TODO
+  above, a real if low-severity papercut for a fleet with non-orchestrated agents.
+  Depends on: none.
+- **`agentctl orchestrate`'s CLI still truncates replies at 512 chars** (P1, found by
+  `/ship`'s Step 8 plan-completion audit): the plan (`docs/plans/ux.1-converse.md` Pass 5)
+  explicitly decided to fix this as a byproduct of the streaming-delta work, by having
+  `orchestrate.rs`'s `drain_until_turn_complete` consume `InferenceStreamDelta` events for
+  display instead of relying on the server-capped `orchestrator_turn_complete.answer`
+  field. What actually shipped (T10) only adds a cheap early-continue on delta events —
+  they're skipped, not accumulated — so the CLI REPL still shows the same 512-char-capped
+  reply for any operator running against a non-colocated `agentd` as before this branch.
+  CHANGELOG.md/CLAUDE.md briefly claimed this was fixed; corrected in the same commit that
+  files this TODO. Depends on: none.
+- **`agentctl orchestrate`'s CLI never adopted `converse.rs`'s shared `dispatch()`/
+  `on_flight_event()` helpers** (P2, found by `/ship`'s Step 8 plan-completion audit): T3
+  in the plan called for `orchestrate.rs` to be refactored onto the new shared helper (a
+  "net LOC decrease" per the plan's architecture section) instead of keeping its own
+  parallel spawn/inject + 4-event field-path logic. `converse.rs` was built as the shared
+  module and is used by the Dashboard rail, but `orchestrate.rs` was never ported onto it
+  — the two now have duplicated, independently-maintained copies of the same
+  spawn-or-resume and field-path-lookup logic, with only the `DEFAULT_MAX_TURNS` constant
+  actually shared. Depends on: none.
+- **`record_streamed()` takes a blocking `Mutex<File>` write once per streamed chunk on
+  the hot inference path** (P2, found by `/ship`'s Step 9 performance specialist):
+  `scheduler.rs`'s `print_fut` calls `FlightRecorder::record_streamed()` inside the
+  per-chunk `while let Some(chunk) = rx.recv().await` loop, and `record_streamed()` does a
+  synchronous, blocking `writeln!` under a process-wide `std::sync::Mutex<File>` directly
+  on the tokio worker thread (no `spawn_blocking`). Every other event kind fires once per
+  turn/tool-call; this one fires once per SSE chunk — hundreds of blocking mutex-acquire +
+  syscall pairs per streamed reply instead of one. Since the mutex is shared across every
+  agent via the single `Arc<FlightRecorder>`, concurrently streaming agents (multi-agent
+  mode) now serialize on this lock at token frequency — one agent's chunk write can stall
+  other agents' worker threads. Related to, but distinct from, the already-filed
+  broadcast-channel-capacity TODO above (that's about channel backpressure; this is about
+  the disk-write path itself). Needs either batching/coalescing writes or moving the write
+  off the async path via `tokio::task::spawn_blocking`. Depends on: none.
+- **`render_converse_rail()` re-sanitizes and rebuilds the full transcript on every
+  redraw tick** (P3, found by `/ship`'s Step 9 performance specialist): it iterates all of
+  `state.history` (up to `MAX_HISTORY_TURNS=200`) plus the full `current_reply` (up to
+  `CURRENT_REPLY_CAP_BYTES=64KiB`) and re-runs `sanitize()` (an allocating filter) on all
+  of it every render, rather than caching already-rendered lines and only processing the
+  newly-appended tail. Redraws are coalesced to roughly one per ~30ms tick, and
+  `InferenceStreamDelta` now drives a redraw on effectively every tick during an active
+  stream — a long-running, near-full-history rail could re-scan/re-allocate a
+  non-trivial amount of text ~30x/second instead of amortizing the cost. Depends on: none.
+- **`dispatch()` can't tell "never spawned" from "exists and still running"** (P1, found
+  by `/ship`'s Step 9 red team pass): `converse.rs`'s `dispatch()` only checks whether the
+  target's snapshot status is exactly `"waiting"` — everything else (including "agent
+  exists but is mid-turn, not yet parked back to waiting") falls into the `spawn()`
+  branch. The server (`scheduler.rs`'s spawn-collision guard) correctly rejects a spawn
+  for an id already in `state.agents`/`state.outcomes`, but that rejection happens before
+  the oneshot `confirm_tx` is ever wired up, so `management.rs`'s `/api/v1/spawn` handler
+  sees the confirmation channel close and returns a generic 503 "scheduler closed
+  confirmation channel" instead of the real, actionable server-side reason ("agent ID
+  already in use"). Reachable in normal operation: reconnecting/restarting `agentctl
+  watch` while a previously-dispatched orchestrated agent is still mid-turn (the fresh
+  client-side `ConverseState` starts `Idle`, so the double-submit guard doesn't block the
+  retry), or the client's own 30s `DISPATCH_TIMEOUT` false-positiving on a legitimately
+  slow turn and the operator's retry racing the still-running original into this exact
+  collision path — in both cases the new message is silently dropped behind a confusing
+  error while the original turn continues untouched. Fix: when the target id already
+  appears in the snapshot at all (regardless of "waiting" status), try `inject()` first
+  and only fall back to `spawn()` when the id is genuinely absent; consider also not
+  dropping `req.confirm_tx` silently in the server's collision guard so the real reason
+  reaches the HTTP caller. Depends on: none.
+- **Cross-turn contamination guard doesn't survive an `agentd` crash/restart mid-stream**
+  (P2, found by `/ship`'s Step 9 red team pass): `append_delta()`'s guard rejects a delta
+  only when its `turn_seq` differs from the turn currently accumulating; `chunk_seq` is
+  local to one invocation of `print_fut` and always restarts at 0. `turn_seq` is `agentd`'s
+  persisted per-agent turn counter, restored verbatim from checkpoint on crash/restart —
+  if `agentd` crashes mid-turn N and resumes, the resumed process redispatches inference
+  for the SAME `turn_seq=N` with `chunk_seq` starting again at 0. A client that survived
+  the disconnect without giving up on that turn accepts the new `chunk_seq=0` chunk as a
+  continuation (0 is neither a duplicate nor a detected gap), silently splicing the fresh
+  post-restart reply onto the stale pre-crash partial text with no gap-note or visual
+  break. Fix: make chunk identity unique per physical inference attempt (e.g. an
+  `attempt` id set once at scheduler startup), or reset `current_turn_seq`/`current_reply`
+  whenever `chunk_seq` goes backward to 0 mid-stream. Depends on: none.
+- **`ConverseView.targets` grows unbounded for the life of the `agentctl watch` process**
+  (P3, found by `/ship`'s Step 9 red team pass): `retarget()` and the Enter-key handler
+  both insert a `ConverseState` (up to `MAX_HISTORY_TURNS=200` turns) via
+  `entry().or_default()` for any agent id the operator ever retargets to, but nothing ever
+  evicts an entry once the corresponding agent leaves the fleet (completes, fails, is
+  reaped). In this project's typical usage (a CoS/orchestrator spawning many short-lived
+  scout/worker agents over a long-running dashboard session), briefly inspecting each
+  ephemeral agent accumulates one permanent `ConverseState` per agent id for the life of
+  the TUI process. Fix: evict target entries whose agent id no longer appears in the
+  latest snapshot and isn't `active_target`, or cap tracked targets with an LRU policy.
+  Depends on: none.
+- **Terminal-event handlers (`orchestrator_turn_complete`/`agent_failed`/
+  `orchestrator_exited`) have no turn-identity guard, unlike `append_delta`'s `turn_seq`
+  check** (P1, found by `/ship`'s Step 11 adversarial pass, Claude subagent): a stale,
+  delayed completion event for a PREVIOUS turn can flush and corrupt a DIFFERENT, currently
+  in-flight turn for the same `agent_id`. Reachable: (1) the 30s dead-air timeout fires on
+  a legitimately slow-first-token turn A and flushes it to `Idle`; (2) the operator
+  retries, a fresh `load_snapshot()` shows the agent already back to `"waiting"` (turn A
+  actually completed server-side, the SSE event just lagged — plausible given the
+  already-filed broadcast-channel TODO), so `inject()` starts turn B; (3) turn A's stale
+  `orchestrator_turn_complete` finally arrives, tagged with the same `agent_id` — the
+  handler has no way to tell it belongs to a different, already-abandoned turn, so it
+  `flush()`es, silently destroying turn B's already-accumulated live content AND falsely
+  disarming the double-submit guard (`phase` resets to `Idle`) mid-turn-B. Root cause is
+  partly server-side: `scheduler.rs` records these three event kinds with `turn: None` and
+  no `turn_seq` in `data`, unlike `InferenceStreamDelta` — a full fix needs the server to
+  thread a turn identifier onto these three kinds the same way it already does for deltas.
+  Depends on: none, but touches `agentd`'s event schema for 3 pre-existing event kinds
+  (orch.1/orch.2), not just the ux.1 diff.
+- **`resolved_id` merge in the Enter handler can clobber an unrelated, already-in-flight
+  target's state** (P3, found by `/ship`'s Step 11 adversarial pass, Claude subagent —
+  classified INVESTIGATE, narrow): if `resolved_id` (from `HttpSource::spawn`'s documented
+  `"operator-agent"` id-collision fallback) already had its own independent
+  `ConverseState` with an in-flight turn, the Enter handler's `entry(resolved_id)
+  .or_default()` + unconditional `phase = Dispatching` forcibly resets that unrelated
+  turn's phase/`last_event_at`, potentially interfering with its own double-submit guard
+  and dead-air timeout. Only reachable through the id-fallback quirk plus a coincidental
+  pre-existing entry for that literal id — narrow, not confirmed to manifest in practice.
+  Depends on: none.
+- **`flight.jsonl` growth rate amplified by orders of magnitude with no rotation
+  mechanism** (P3, found by `/ship`'s Step 11 adversarial pass, Claude subagent —
+  classified INVESTIGATE; pre-existing gap, accelerated by this branch): before ux.1,
+  `flight.jsonl` grew roughly one line per turn/tool-call; after ux.1 it grows one line per
+  streamed token CHUNK (each individually capped at 256 bytes, but the line COUNT is
+  unbounded and proportional to reply length). No log rotation/truncation exists at all.
+  Related to, but distinct from, the already-filed lock-contention TODO (that one is about
+  write latency; this is about unbounded disk consumption over a session's lifetime).
+  Verified the OTEL sidecar does NOT amplify this into telemetry — `InferenceStreamDelta`
+  is deliberately excluded from span mapping (`otel/tests/event_kind_coverage.rs`) to avoid
+  a span-per-token explosion. Depends on: none.
+
 ## ux.9 — Open (deferred from build + /review adversarial pass, 2026-07-12)
 
 Cockpit mode (zero-agent `cockpit` entrypoint, now the Dockerfile default). `/review` dispatched

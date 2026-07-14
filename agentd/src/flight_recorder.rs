@@ -89,6 +89,68 @@ impl FlightRecorder {
             let _ = tx.send(line);
         }
     }
+
+    /// Like `record`, but writes a different `data` payload to disk than what's
+    /// broadcast over SSE. Used only by `InferenceStreamDelta` (ux.1): the full chunk
+    /// text is broadcast live so `agentctl watch`'s chat rail can render it token-by-
+    /// token, but the durable `flight.jsonl` copy keeps the existing preview/audit-
+    /// metadata contract (bounded field sizes) rather than becoming a full model-output
+    /// transcript store — every other event kind still goes through plain `record()`.
+    pub fn record_streamed(
+        &self,
+        agent: &str,
+        turn: Option<u32>,
+        kind: EventKind,
+        disk_data: serde_json::Value,
+        broadcast_data: serde_json::Value,
+    ) {
+        #[derive(Serialize)]
+        struct Event<'a> {
+            ts: String,
+            agent: &'a str,
+            turn: Option<u32>,
+            kind: EventKind,
+            data: serde_json::Value,
+        }
+
+        let ts = chrono::Utc::now().to_rfc3339();
+
+        let disk_line = match serde_json::to_string(&Event {
+            ts: ts.clone(),
+            agent,
+            turn,
+            kind,
+            data: disk_data,
+        }) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("flight record serialization failed: {e}");
+                return;
+            }
+        };
+
+        let Some(mut file) = self.file.lock().ok() else {
+            tracing::warn!("flight recorder mutex poisoned; dropping event");
+            return;
+        };
+        if let Err(e) = writeln!(file, "{disk_line}") {
+            tracing::warn!("flight record write failed: {e}");
+        }
+        drop(file);
+
+        if let Some(tx) = &self.broadcast_tx {
+            let broadcast_line = serde_json::to_string(&Event {
+                ts,
+                agent,
+                turn,
+                kind,
+                data: broadcast_data,
+            });
+            if let Ok(line) = broadcast_line {
+                let _ = tx.send(line);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,5 +280,52 @@ mod tests {
     fn unwritable_path_returns_error() {
         // Manual test: create a file, chmod 000, verify FlightRecorder::new returns Err.
         // Do not run in CI; test manually with: chmod 000 /tmp/unwritable && cargo test -- --ignored
+    }
+
+    #[test]
+    fn record_streamed_broadcasts_full_text_but_truncates_disk_copy() {
+        let tmp = NamedTempFile::new().unwrap();
+        let (tx, mut rx) = broadcast::channel(16);
+        let recorder = FlightRecorder::new(tmp.path()).unwrap().with_broadcast(tx);
+
+        recorder.record_streamed(
+            "agent-1",
+            Some(3),
+            EventKind::InferenceStreamDelta,
+            serde_json::json!({"agent_id": "agent-1", "turn_seq": 3, "chunk_seq": 0, "text": "sho"}),
+            serde_json::json!({"agent_id": "agent-1", "turn_seq": 3, "chunk_seq": 0, "text": "short-but-full-text"}),
+        );
+
+        // Broadcast subscriber sees the FULL text.
+        let line = rx.try_recv().expect("broadcast should have one message");
+        let broadcast_event: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(broadcast_event["kind"], "inference_stream_delta");
+        assert_eq!(broadcast_event["data"]["text"], "short-but-full-text");
+
+        // Disk copy has the TRUNCATED text.
+        let mut content = String::new();
+        File::open(tmp.path()).unwrap().read_to_string(&mut content).unwrap();
+        let disk_event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(disk_event["data"]["text"], "sho");
+        assert_eq!(disk_event["turn"], 3);
+    }
+
+    #[test]
+    fn record_streamed_without_broadcast_only_writes_disk() {
+        let tmp = NamedTempFile::new().unwrap();
+        let recorder = FlightRecorder::new(tmp.path()).unwrap(); // no with_broadcast
+
+        recorder.record_streamed(
+            "agent-1",
+            None,
+            EventKind::InferenceStreamDelta,
+            serde_json::json!({"text": "disk"}),
+            serde_json::json!({"text": "full"}),
+        );
+
+        let mut content = String::new();
+        File::open(tmp.path()).unwrap().read_to_string(&mut content).unwrap();
+        let disk_event: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(disk_event["data"]["text"], "disk");
     }
 }

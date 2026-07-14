@@ -447,6 +447,54 @@ ship-review found and fixed 2 CRITICAL bugs (`since` rendered as raw epoch inste
 `EvaluationUnavailable` was dead code, never constructed, so a failed FUSE/HTTP read silently degraded to
 "clean") plus a FUSE `lookup()` gap (no match arm for `"attention"`, mirroring a pre-existing `"credentials"`
 gap fixed in the same pass) and a `--plain` output concatenation bug; 1377 workspace tests (+50).
+**ux.1 complete (v0.86.0).** Converse — permanent chat rail on `agentctl watch`'s Dashboard view (agent
+table `Min(72)` | rail `Length(32)`), honoring the project's locked D1 "one unified screen" decision instead
+of a 10th full-screen tab as the rough scope originally proposed. `/autoplan` found and fixed two critical
+issues before implementation: (1) this branch was cut ahead of `ux.2a-attention` in violation of the
+roadmap's own sequencing — paused, merged ux.2a first, re-cut clean; (2) the plan's live-streaming premise
+was false — three independent traces (manual + Claude subagent + Codex) confirmed `agentd` never actually
+emitted per-token events onto the wire (`text_delta` existed only in the local-stdout print path inside
+`scheduler.rs`'s `make_infer_future`) — closed by adding `EventKind::InferenceStreamDelta`, recorded
+per-chunk via a new `FlightRecorder::record_streamed()` that broadcasts the full chunk live over SSE while
+capping the `flight.jsonl` disk copy at 256 bytes (preserves the log's preview/audit-metadata contract).
+`agentctl/src/watch/converse.rs` (new): `ConverseState` per-target state machine (Idle → Dispatching →
+Streaming → flush) in a `HashMap<AgentId, ConverseState>` so a backgrounded conversation keeps streaming
+while another is focused; `dispatch()` (spawn-or-resume) and the four terminal-event field-path lookups
+ported byte-for-byte from `orchestrate.rs` rather than re-derived as "shared general knowledge" — Eng
+review found the four kinds are NOT uniform (`orchestrator_exited`'s top-level `agent` field is a hardcoded
+literal `"agentd"`, only `data.agent_id` is valid; `agent_failed` has no `data.agent_id` at all). `Tab`
+toggles rail focus (reusing `Memory`/`Spawn`'s existing sub-pane-cycling idiom, including `Spawn`'s
+`TaskField` Esc-capture idiom for the input box) via a `handle_dashboard_key` retrofit that reads focus
+internally (mirrors `handle_spawn_key`'s exact shape — zero call-site changes for the ~15 pre-existing
+tests); `r` retargets to the selected row. `[c]` stays bound to Credentials — the rough scope's original
+`[c]`-for-chat proposal collided with the already-shipped Credentials hotkey (cred.5, v0.68.0), caught
+during Design review alongside a corrected minimum-rail-width floor (95→115 cols, arithmetic from the
+table's real column constraints). `agentctl orchestrate`'s CLI does NOT share converse.rs's helpers (kept
+its own duplicated spawn/inject + field-path logic) and does NOT consume the delta stream — it still
+block-then-prints the server-capped 512-char `answer`, unchanged from before this branch. The plan called
+for both; `/ship`'s Step 8 plan-completion audit caught that neither landed and that this note (and
+CHANGELOG.md) had claimed otherwise — corrected here, follow-up filed as TODOs.
+docs/INTERFACE.md §3 annotated as superseded-by-shipped-implementation. `/review`'s adversarial pass
+(Codex + Claude subagent) then found and fixed 10 more real bugs post-implementation, including one
+critical panic (byte-index truncation at the 64KB cap could slice mid-UTF8-character and crash the
+whole TUI) and a logic bug where the 30s dispatch timeout was measured from dispatch start rather than
+last activity, killing any turn that streamed longer than 30s total — see CHANGELOG.md for the full
+list. Two remaining architectural findings (blocking dispatch can freeze the TUI ~8s worst case; the
+shared SSE broadcast channel now carries much higher-frequency traffic) are bounded, not correctness
+bugs, and filed as TODOs rather than fixed in this pass. Interactive QA against the real binaries then
+caught a critical bug the whole pipeline above missed: typing `q` into the focused chat rail quit the
+entire TUI (`step_key`'s outer quit-check didn't know about rail focus). `/ship`'s own Step 9-11 review
+pipeline (coverage audit, specialist review army, red team, cross-model adversarial pass) then found and
+fixed 6 more real bugs, including one as severe as anything above: the chat rail was silently, completely
+non-functional whenever `agentctl watch` runs over FUSE instead of `--url` HTTP (the default local mode on
+AgentOS's own target Linux platform) — `FuseSource` supports neither `spawn()` nor `event_stream_url()`,
+so every message hung at "Dispatching..." for 30s, forever, since this session's QA only exercised `--url`
+mode. Also fixed: the 64KB reply cap didn't actually cap anything past the first overflow (unbounded
+marker-repeat growth); turn completion was discarding the full streamed text and using the server's
+512-char preview instead; resize below the rail's fit floor left it invisibly focused; the scroll offset
+counted logical turns instead of wrapped visual rows. See CHANGELOG.md and TODOS.md's ux.1 section for
+the complete list, including further findings filed as TODOs rather than fixed under ship-time pressure.
+Full plan + dual-voice review trail: `docs/plans/ux.1-converse.md`; 1420 workspace tests (+52).
 
 ## How to work here
 

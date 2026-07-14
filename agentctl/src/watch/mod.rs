@@ -16,6 +16,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 pub mod app;
 pub mod approvals;
+pub mod converse;
 pub mod inspector;
 pub mod memory;
 pub mod pump;
@@ -233,6 +234,21 @@ fn run_tui(
     Ok(())
 }
 
+/// Clear chat-rail focus if a resize just made the rail no longer fit. Found by /ship's
+/// Step 11 adversarial pass (Codex structured review + adversarial exec, independently
+/// confirmed): without this, `render_dashboard` hides the rail but `rail_focused` stays
+/// true, so `handle_dashboard_key` (which checks `rail_focused` before checking
+/// visibility) keeps capturing every keystroke into an invisible input box until the
+/// operator guesses Esc/Tab. Extracted as a pure `App`-mutating function (rather than
+/// inlined in the crossterm event loop) so this logic is unit-testable without a real
+/// `Terminal`.
+fn on_resize(app: &mut App, w: u16, h: u16) {
+    let chrome_rows = views::dashboard_chrome_rows(app.spawn_banner.is_some());
+    if !views::converse_rail_fits(w, h.saturating_sub(chrome_rows)) {
+        app.converse_view.rail_focused = false;
+    }
+}
+
 /// The single event-pushed render loop (Option B). One bounded channel, two detached
 /// producer threads (snapshot + optional SSE), a 30 ms crossterm key poll, and a
 /// coalesced redraw. Replaces the two prior sync poll-render loops (F9). The render
@@ -246,6 +262,12 @@ fn run_tui_loop(
 ) -> anyhow::Result<()> {
     // Producers stop when `_producers`/`rx`/`wake_tx` drop at loop exit (detached; never joined — F7).
     let (rx, wake_tx, _producers) = spawn_producers(Arc::clone(source), interval);
+    // ux.1: seed the real terminal size once at startup (crossterm::event::Resize keeps
+    // it current after this — see the Event::Resize arm below); App::term_size otherwise
+    // defaults to DEFAULT_TERM_SIZE, which is only a placeholder for tests/pre-first-frame.
+    if let Ok(size) = crossterm::terminal::size() {
+        app.term_size = size;
+    }
     loop {
         // Checked every tick (~30ms) so an out-of-band SIGTERM/SIGINT unwinds
         // normally instead of hitting the default signal disposition — see
@@ -258,6 +280,12 @@ fn run_tui_loop(
         if drain_events(&rx, app, source.as_ref(), &wake_tx, MAX_DRAIN_PER_TICK) {
             return Ok(()); // a step returned Quit
         }
+        // ux.1: check for client-side dispatch timeouts once per tick (cheap — small
+        // HashMap) before the key poll, so a hung target surfaces its resume hint even
+        // if the operator isn't actively pressing keys.
+        if app.converse_view.check_dispatch_timeouts() {
+            app.dirty = true;
+        }
         // Poll for a key, capped at 30 ms so the loop stays responsive.
         if event::poll(Duration::from_millis(30))? {
             match event::read()? {
@@ -266,7 +294,11 @@ fn run_tui_loop(
                         return Ok(());
                     }
                 }
-                Event::Resize(_, _) => app.dirty = true,
+                Event::Resize(w, h) => {
+                    app.term_size = (w, h);
+                    on_resize(app, w, h);
+                    app.dirty = true;
+                }
                 _ => {}
             }
         }
@@ -331,6 +363,11 @@ fn step(app: &mut App, ev: AppEvent, source: &dyn DataSource) -> Vec<Effect> {
             vec![Effect::Redraw]
         }
         AppEvent::Flight(value) => {
+            // ux.1: fold into per-target chat state unconditionally, regardless of the
+            // active view — a backgrounded target's reply keeps accumulating even while
+            // the operator is on Topology/Memory/etc. (Eng Phase 1 "dashboard behind
+            // stays live" requirement). No-op for any agent_id not already tracked.
+            app.converse_view.on_flight_event(&value);
             app.push_event(value);
             vec![Effect::Redraw]
         }
@@ -368,10 +405,18 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
     // Any key clears the post-inject banner (no-op in the main loop where it's None).
     app.spawn_banner = None;
     // Capture BEFORE dispatch: q quits only if we were already on the Dashboard,
-    // not if we just navigated back to it.
+    // not if we just navigated back to it. ux.1 bug caught by /qa's interactive pass:
+    // this check didn't know about the chat rail's text-capture focus, so typing an
+    // ordinary word containing 'q' (e.g. "qa", "quick") into the rail queued
+    // Effect::Quit and killed the whole TUI mid-keystroke — 'q' WAS correctly
+    // captured as literal rail input by handle_dashboard_key, but this outer,
+    // rail-focus-unaware check fired anyway right after. Must also gate on the
+    // rail's focus state as it was BEFORE dispatch (same "before, not after"
+    // capture discipline as `was_dashboard` itself, for the same reason).
     let was_dashboard = app.view == View::Dashboard;
+    let rail_was_focused = app.converse_view.rail_focused;
     match app.view {
-        View::Dashboard => handle_dashboard_key(key.code, app),
+        View::Dashboard => handle_dashboard_key(key.code, app, source),
         View::AgentDetail | View::System => {
             if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                 app.view = View::Dashboard;
@@ -396,7 +441,7 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
         }
     }
     let mut effects = vec![Effect::Redraw];
-    if matches!(key.code, KeyCode::Char('q')) && was_dashboard {
+    if matches!(key.code, KeyCode::Char('q')) && was_dashboard && !rail_was_focused {
         effects.push(Effect::Quit);
     }
     if app.spawn_view.pending_exec.is_some() {
@@ -446,8 +491,155 @@ fn handle_memory_key(code: KeyCode, app: &mut App) {
     }
 }
 
-fn handle_dashboard_key(code: KeyCode, app: &mut App) {
+/// ux.1: reuses Spawn's exact tuple-match idiom (`handle_spawn_key`'s `let focus =
+/// app.spawn_view.focus.clone(); match (&focus, code)`) — focus is read from `App` state
+/// internally, not threaded in by the caller, so `step_key`'s Dashboard call site and
+/// every existing test call site are unaffected by this retrofit's signature.
+fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
+    let rail_focused = app.converse_view.rail_focused;
+
+    // Rail-focused: captures all input (Spawn's TaskField Esc-capture idiom, mod.rs:518-526)
+    // until Esc or Tab returns focus to the table. Enter sends the current input as a
+    // chat message via the shared converse::dispatch helper instead of table routing.
+    if rail_focused {
+        match code {
+            KeyCode::Esc | KeyCode::Tab => {
+                app.converse_view.rail_focused = false;
+            }
+            KeyCode::Enter => {
+                let target = app.converse_view.active_target.clone();
+                // Double-submit guard (CEO Section 1 state machine, caught missing during
+                // /review): Enter is a no-op while the active target is DISPATCHING/
+                // STREAMING — otherwise a second Enter mid-turn would call `dispatch()`
+                // again, and since the agent is no longer "waiting" from the server's
+                // point of view, it would attempt to re-spawn the SAME agent_id instead
+                // of injecting, corrupting turn order. Input is preserved, not cleared,
+                // so the operator can just wait and press Enter again once idle.
+                let is_busy = app.converse_view.targets.get(&target)
+                    .is_some_and(|s| s.phase != converse::ConversePhase::Idle);
+                if is_busy {
+                    return;
+                }
+                let text = std::mem::take(&mut app.converse_view.input);
+                if !text.is_empty() {
+                    let state = app.converse_view.targets.entry(target.clone()).or_default();
+                    // Optimistic echo: the sent message appears instantly, before the
+                    // network round-trip completes (Hour 1 narrative, CEO Step 0E).
+                    state.push_history(converse::TurnRole::Operator, text.clone());
+                    // FUSE-mode DataSources don't support spawn() or event_stream_url()
+                    // (found by /ship's Step 9 red team pass): a spawn always fails, and
+                    // even a successful inject can never surface a reply, since
+                    // ConverseView is driven entirely by SSE events. Without this gate the
+                    // rail would sit at "Dispatching..." until the 30s timeout on every
+                    // single message, forever — fail fast instead, mirroring
+                    // orchestrate.rs's existing `event_stream_url().ok_or_else(...)` gate.
+                    if source.event_stream_url().is_none() {
+                        state.push_history(
+                            converse::TurnRole::System,
+                            "Chat requires the management API — restart agentctl with \
+                             --url http://HOST:PORT (agentd needs [management] enabled=true) \
+                             to use the chat rail."
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    match converse::dispatch(source, &target, &text, converse::DEFAULT_MAX_TURNS) {
+                        Ok(resolved_id) => {
+                            // If the server resolved a different id than requested (e.g.
+                            // HttpSource::spawn's "operator-agent" fallback when the response
+                            // omits `agent_id`), the just-pushed echo lives under the stale
+                            // `target` key, which will never receive the real agent's events
+                            // (those are tagged with `resolved_id`). Move it across rather
+                            // than orphaning it (found by /ship's Step 9 testing +
+                            // maintainability specialists — two views of the same bug).
+                            if resolved_id != target {
+                                if let Some(abandoned) = app.converse_view.targets.remove(&target) {
+                                    let dest =
+                                        app.converse_view.targets.entry(resolved_id.clone()).or_default();
+                                    for turn in abandoned.history {
+                                        dest.push_history(turn.role, turn.text);
+                                    }
+                                }
+                            }
+                            app.converse_view.active_target = resolved_id.clone();
+                            // entry().or_default(), not get_mut(): resolved_id's entry may not
+                            // exist yet even after the move above (e.g. `target` had no prior
+                            // state to move). get_mut on a fresh resolved_id would silently
+                            // no-op, dropping this state update and, since every subsequent
+                            // event for the real agent is looked up by this same key, wedging
+                            // the conversation forever.
+                            let state = app.converse_view.targets.entry(resolved_id).or_default();
+                            state.phase = converse::ConversePhase::Dispatching;
+                            state.last_event_at = Some(std::time::Instant::now());
+                        }
+                        Err(e) => {
+                            if let Some(state) = app.converse_view.targets.get_mut(&target) {
+                                state.push_history(
+                                    converse::TurnRole::System,
+                                    format!("Spawn rejected: {e} — press Enter to retry"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            // ux.1: while the rail is focused it captures all printable characters as
+            // chat text (Spawn's TaskField idiom) — scroll/follow MUST use non-printable
+            // keys only (arrows, End), never 'j'/'k'/'G' letter aliases, or typing an
+            // ordinary word containing those letters would hijack the transcript instead
+            // of being entered as text. This is deliberately different from the
+            // TABLE-focused idiom below, which has no text-capture concern.
+            KeyCode::Up => {
+                if let Some(state) = app.converse_view.targets.get_mut(&app.converse_view.active_target) {
+                    state.scroll_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(state) = app.converse_view.targets.get_mut(&app.converse_view.active_target) {
+                    state.scroll_down();
+                }
+            }
+            KeyCode::End => {
+                if let Some(state) = app.converse_view.targets.get_mut(&app.converse_view.active_target) {
+                    state.re_follow();
+                }
+            }
+            KeyCode::Backspace => {
+                app.converse_view.input.pop();
+            }
+            KeyCode::Char(c) => {
+                app.converse_view.input.push(c);
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match code {
+        // ux.1: Tab focuses the chat rail; r retargets it to the selected row's agent —
+        // both only active while the table (not the rail) has focus. Gated on the rail
+        // actually being visible (caught during /review's adversarial Codex pass) — Tab
+        // must be a no-op on a terminal too small for the rail, or it would silently
+        // swallow every subsequent keystroke into an input box the operator can't see.
+        KeyCode::Tab => {
+            // Fixed chrome rows render_dashboard always reserves before content_area —
+            // derived from views::dashboard_chrome_rows(), the single source of truth
+            // (found duplicated as an independent literal here by /ship's Step 9
+            // maintainability specialist). A slightly-too-generous estimate here is
+            // harmless — worst case Tab focuses the rail one tick before render's own
+            // (authoritative) check hides it again; a silent freeze is the bug this guards
+            // against.
+            let chrome_rows = views::dashboard_chrome_rows(app.spawn_banner.is_some());
+            let (w, h) = app.term_size;
+            if views::converse_rail_fits(w, h.saturating_sub(chrome_rows)) {
+                app.converse_view.rail_focused = true;
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(agent) = app.selected_agent() {
+                app.converse_view.retarget(&agent.id.clone());
+            }
+        }
         KeyCode::Up | KeyCode::Char('k')   => app.select_prev(),
         KeyCode::Down | KeyCode::Char('j') => app.select_next(),
         KeyCode::Enter                     => {
@@ -838,7 +1030,7 @@ mod tests {
 
     use super::{
         drain_events, handle_approvals_key, handle_dashboard_key, handle_memory_key,
-        handle_spawn_key, step, step_key, App, Effect, View,
+        handle_spawn_key, on_resize, step, step_key, App, Effect, View,
     };
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
@@ -927,14 +1119,15 @@ mod tests {
     #[test]
     fn dashboard_key_down_arrow_advances_selection() {
         let mut app = app_with_agents(&["a", "b", "c"]);
-        handle_dashboard_key(KeyCode::Down, &mut app);
+        handle_dashboard_key(KeyCode::Down, &mut app, &TestSource);
+
         assert_eq!(app.selected_id.as_deref(), Some("b"));
     }
 
     #[test]
     fn dashboard_key_j_advances_selection() {
         let mut app = app_with_agents(&["a", "b"]);
-        handle_dashboard_key(KeyCode::Char('j'), &mut app);
+        handle_dashboard_key(KeyCode::Char('j'), &mut app, &TestSource);
         assert_eq!(app.selected_id.as_deref(), Some("b"));
     }
 
@@ -942,7 +1135,8 @@ mod tests {
     fn dashboard_key_up_arrow_decrements_selection() {
         let mut app = app_with_agents(&["a", "b", "c"]);
         app.selected_id = Some("b".to_string());
-        handle_dashboard_key(KeyCode::Up, &mut app);
+        handle_dashboard_key(KeyCode::Up, &mut app, &TestSource);
+
         assert_eq!(app.selected_id.as_deref(), Some("a"));
     }
 
@@ -950,7 +1144,7 @@ mod tests {
     fn dashboard_key_k_decrements_selection() {
         let mut app = app_with_agents(&["a", "b"]);
         app.selected_id = Some("b".to_string());
-        handle_dashboard_key(KeyCode::Char('k'), &mut app);
+        handle_dashboard_key(KeyCode::Char('k'), &mut app, &TestSource);
         assert_eq!(app.selected_id.as_deref(), Some("a"));
     }
 
@@ -958,7 +1152,8 @@ mod tests {
     fn dashboard_key_enter_switches_to_agent_detail_when_selection_present() {
         let mut app = app_with_agents(&["a"]);
         assert_eq!(app.view, View::Dashboard);
-        handle_dashboard_key(KeyCode::Enter, &mut app);
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
         assert_eq!(app.view, View::AgentDetail);
     }
 
@@ -972,7 +1167,8 @@ mod tests {
             since: 10,
             evidence: Some("act_1".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app);
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
         assert_eq!(app.view, View::Approvals);
     }
 
@@ -984,7 +1180,8 @@ mod tests {
             since: 10,
             evidence: Some("google".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app);
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
         assert_eq!(app.view, View::Credentials);
     }
 
@@ -996,7 +1193,8 @@ mod tests {
             since: 10,
             evidence: Some("92%".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app);
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
         assert_eq!(app.view, View::AgentDetail);
     }
 
@@ -1015,14 +1213,16 @@ mod tests {
             since: 10,
             evidence: Some("act_1".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app);
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
         assert_eq!(app.view, View::Approvals);
     }
 
     #[test]
     fn dashboard_key_enter_does_not_switch_view_when_no_agents() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Enter, &mut app);
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
         assert_eq!(app.view, View::Dashboard,
             "Enter with no agents must not navigate to AgentDetail");
     }
@@ -1030,14 +1230,14 @@ mod tests {
     #[test]
     fn dashboard_key_s_switches_to_system_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('s'), &mut app);
+        handle_dashboard_key(KeyCode::Char('s'), &mut app, &TestSource);
         assert_eq!(app.view, View::System);
     }
 
     #[test]
     fn dashboard_key_t_switches_to_topology_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('t'), &mut app);
+        handle_dashboard_key(KeyCode::Char('t'), &mut app, &TestSource);
         assert_eq!(app.view, View::Topology);
     }
 
@@ -1045,22 +1245,262 @@ mod tests {
     fn dashboard_key_other_is_noop() {
         let mut app = app_with_agents(&["a"]);
         let original_id = app.selected_id.clone();
-        handle_dashboard_key(KeyCode::F(1), &mut app);
+        handle_dashboard_key(KeyCode::F(1), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard);
         assert_eq!(app.selected_id, original_id);
+    }
+
+    // ── ux.1 Dashboard focus retrofit ───────────────────────────────────────────
+
+    #[test]
+    fn tab_toggles_rail_focus_both_directions() {
+        let mut app = app_with_agents(&["a"]);
+        assert!(!app.converse_view.rail_focused);
+        handle_dashboard_key(KeyCode::Tab, &mut app, &TestSource);
+        assert!(app.converse_view.rail_focused, "Tab should focus the rail from the table");
+        handle_dashboard_key(KeyCode::Tab, &mut app, &TestSource);
+        assert!(!app.converse_view.rail_focused, "Tab should return focus to the table from the rail");
+    }
+
+    #[test]
+    fn tab_is_a_noop_when_terminal_too_narrow_for_rail() {
+        // Caught during /review's adversarial Codex pass: Tab previously focused the
+        // rail unconditionally, silently swallowing every subsequent keystroke into an
+        // input box the operator can't even see on a narrow/short terminal.
+        let mut app = app_with_agents(&["a"]);
+        app.term_size = (80, 24); // below MIN_TOTAL_WIDTH_FOR_RAIL (115)
+        handle_dashboard_key(KeyCode::Tab, &mut app, &TestSource);
+        assert!(!app.converse_view.rail_focused, "Tab must not focus a rail that isn't visible");
+    }
+
+    #[test]
+    fn resize_below_rail_floor_clears_focus() {
+        // Found by /ship's Step 11 adversarial pass (Codex structured review +
+        // adversarial exec, independently confirmed): shrinking the terminal while the
+        // rail was focused used to leave rail_focused true even though render_dashboard
+        // now hides the rail — every keystroke vanished into an invisible input box.
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        on_resize(&mut app, 80, 24); // below MIN_TOTAL_WIDTH_FOR_RAIL (115)
+        assert!(!app.converse_view.rail_focused, "focus must clear when the rail no longer fits");
+    }
+
+    #[test]
+    fn resize_that_keeps_rail_visible_leaves_focus_untouched() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        on_resize(&mut app, 200, 50); // comfortably above the floor
+        assert!(app.converse_view.rail_focused, "focus must be preserved when the rail still fits");
+    }
+
+    #[test]
+    fn esc_returns_focus_to_table_from_rail() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        handle_dashboard_key(KeyCode::Esc, &mut app, &TestSource);
+        assert!(!app.converse_view.rail_focused);
+    }
+
+    #[test]
+    fn rail_focused_char_input_does_not_trigger_view_shortcut() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        handle_dashboard_key(KeyCode::Char('s'), &mut app, &TestSource);
+        assert_eq!(app.view, View::Dashboard, "'s' must be captured as chat input, not a view switch, while the rail has focus");
+        assert_eq!(app.converse_view.input, "s");
+    }
+
+    #[test]
+    fn r_retargets_only_when_table_focused() {
+        let mut app = app_with_agents(&["a", "b"]);
+        app.select_next(); // select "b"
+        handle_dashboard_key(KeyCode::Char('r'), &mut app, &TestSource);
+        assert_eq!(app.converse_view.active_target, "b", "r should retarget to the selected row while the table has focus");
+
+        // While rail-focused, 'r' is literal input, not a retarget.
+        app.converse_view.rail_focused = true;
+        app.converse_view.active_target = "orch-default".to_string();
+        handle_dashboard_key(KeyCode::Char('r'), &mut app, &TestSource);
+        assert_eq!(app.converse_view.active_target, "orch-default", "r must not retarget while the rail has focus");
+        assert_eq!(app.converse_view.input, "r");
+    }
+
+    #[test]
+    fn enter_routes_to_chat_send_when_rail_focused_vs_existing_routing_when_table_focused() {
+        // Table-focused: Enter keeps its existing AgentDetail/Approvals/Credentials routing.
+        let mut app = app_with_agents(&["a"]);
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        assert_eq!(app.view, View::AgentDetail, "existing Enter routing must be unchanged when the table has focus");
+
+        // Rail-focused: Enter sends the typed input as a chat message instead.
+        // TestSource doesn't implement event_stream_url (default trait impl → None), so
+        // the optimistic echo is followed by the FUSE-capability-gate system line, not a
+        // dispatch attempt — this test asserts the echo happened first, which is the
+        // behavior under test here. See the dedicated gate test below for the full
+        // no-SSE-support behavior.
+        let mut app2 = app_with_agents(&["a"]);
+        app2.converse_view.rail_focused = true;
+        app2.converse_view.input = "hello".to_string();
+        handle_dashboard_key(KeyCode::Enter, &mut app2, &TestSource);
+        assert_eq!(app2.view, View::Dashboard, "sending a chat message must not change the view");
+        assert!(app2.converse_view.input.is_empty(), "input box clears after send");
+        let state = app2.converse_view.targets.get(&app2.converse_view.active_target).unwrap();
+        assert_eq!(state.history.front().unwrap().text, "hello", "optimistic echo must show the sent message immediately");
+        assert_eq!(state.history.front().unwrap().role, super::converse::TurnRole::Operator);
+    }
+
+    #[test]
+    fn enter_fails_fast_with_clear_message_when_source_has_no_event_stream() {
+        // Found by /ship's Step 9 red team pass: FuseSource supports neither spawn() nor
+        // event_stream_url() (falls to the DataSource trait's defaults), so without this
+        // gate the rail would sit at "Dispatching..." until the 30s timeout on every
+        // single message over the default local FUSE mode, forever. TestSource also
+        // doesn't override event_stream_url() (defaults to None), so it doubles as the
+        // "no SSE support" case here.
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.input = "hello".to_string();
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
+        assert!(app.converse_view.input.is_empty(), "input box clears after send");
+        let state = app.converse_view.targets.get(&app.converse_view.active_target).unwrap();
+        assert_eq!(state.history.len(), 2, "the echo plus the gate's explanation, nothing more");
+        assert_eq!(state.history[0].role, super::converse::TurnRole::Operator, "the echo must still show what was typed");
+        assert_eq!(state.history[1].role, super::converse::TurnRole::System);
+        assert!(
+            state.history[1].text.contains("management API"),
+            "the operator must be told WHY nothing happens, not left staring at a silent hang"
+        );
+        assert_eq!(state.phase, super::converse::ConversePhase::Idle, "must not enter Dispatching -- nothing was actually dispatched");
+    }
+
+    #[test]
+    fn enter_is_a_noop_while_target_is_busy_double_submit_guard() {
+        // Caught during /review: without this guard, a second Enter mid-turn would call
+        // dispatch() again — since the agent is no longer "waiting" server-side, it would
+        // attempt to re-spawn the SAME agent_id instead of injecting, corrupting turn order.
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("orch-default");
+        app.converse_view.targets.get_mut("orch-default").unwrap().phase = super::converse::ConversePhase::Dispatching;
+        app.converse_view.input = "second message".to_string();
+
+        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+
+        assert_eq!(app.converse_view.input, "second message", "input must be preserved, not cleared, while busy");
+        let state = app.converse_view.targets.get("orch-default").unwrap();
+        assert!(state.history.is_empty(), "no dispatch (and no optimistic echo) must happen while busy");
+    }
+
+    // Server can resolve a different agent id than requested (HttpSource::spawn falls
+    // back to the literal "operator-agent" when the response omits `agent_id`). Found by
+    // /ship's Step 9 testing + maintainability specialists as two views of the same bug:
+    // get_mut(&resolved_id) silently dropped the state update (testing), and the
+    // optimistic echo pushed under the pre-dispatch `target` key was orphaned, never
+    // reachable again since future events are tagged with `resolved_id` (maintainability).
+    struct ResolvesDifferentIdSource;
+    impl DataSource for ResolvesDifferentIdSource {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+        fn deny(&self, _id: &str, _reason: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+        fn spawn(&self, _req: &crate::watch::source::SpawnRequest) -> Result<String, String> {
+            Ok("operator-agent".to_string())
+        }
+        fn event_stream_url(&self) -> Option<String> {
+            Some("http://test/api/v1/events".to_string())
+        }
+    }
+
+    #[test]
+    fn enter_moves_echo_and_creates_state_when_server_resolves_a_different_id() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("requested-id");
+        app.converse_view.input = "hello".to_string();
+
+        handle_dashboard_key(KeyCode::Enter, &mut app, &ResolvesDifferentIdSource);
+
+        assert_eq!(app.converse_view.active_target, "operator-agent", "rail must follow the server-resolved id");
+        assert!(
+            !app.converse_view.targets.contains_key("requested-id"),
+            "the stale pre-dispatch key must not linger, orphaning the echo behind it"
+        );
+        let state = app.converse_view.targets.get("operator-agent")
+            .expect("a state entry must exist for the server-resolved id, not silently dropped");
+        assert_eq!(state.phase, super::converse::ConversePhase::Dispatching);
+        assert_eq!(
+            state.history.back().map(|t| t.text.as_str()),
+            Some("hello"),
+            "the optimistic echo must be moved across, not lost"
+        );
+
+        // A subsequent delta tagged with the resolved id must be accepted, not dropped.
+        let delta = serde_json::json!({
+            "kind": "inference_stream_delta",
+            "data": { "agent_id": "operator-agent", "turn_seq": 0, "chunk_seq": 0, "text": "hi" }
+        });
+        app.converse_view.on_flight_event(&delta);
+        assert_eq!(
+            app.converse_view.targets.get("operator-agent").unwrap().current_reply,
+            "hi",
+            "delta for the server-resolved id must not be silently discarded"
+        );
+    }
+
+    #[test]
+    fn rail_focused_up_down_scroll_transcript_not_typed_as_text() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("orch-default");
+        handle_dashboard_key(KeyCode::Up, &mut app, &TestSource);
+        let state = app.converse_view.targets.get("orch-default").unwrap();
+        assert_eq!(state.scroll_up_lines, 1, "Up must scroll, not type, while the rail has focus");
+        assert!(app.converse_view.input.is_empty(), "Up must not be captured as text input");
+    }
+
+    #[test]
+    fn rail_focused_letter_j_k_g_are_captured_as_text_not_scroll_shortcuts() {
+        // Critical: 'j'/'k'/'G' must NOT be scroll shortcuts while the rail has text
+        // focus, or typing an ordinary word containing those letters would hijack the
+        // transcript instead of being entered (this was caught and fixed during /review).
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        for c in ['j', 'k', 'G'] {
+            handle_dashboard_key(KeyCode::Char(c), &mut app, &TestSource);
+        }
+        assert_eq!(app.converse_view.input, "jkG", "j/k/G must be captured as literal chat text while the rail has focus");
+    }
+
+    #[test]
+    fn rail_focused_end_re_arms_follow() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("orch-default");
+        {
+            let state = app.converse_view.targets.get_mut("orch-default").unwrap();
+            state.scroll_up();
+            state.push_history(super::converse::TurnRole::Assistant, "msg".to_string());
+        }
+        handle_dashboard_key(KeyCode::End, &mut app, &TestSource);
+        let state = app.converse_view.targets.get("orch-default").unwrap();
+        assert!(state.follow, "End must re-arm follow");
+        assert_eq!(state.new_since_scroll, 0, "End must clear the unread counter");
     }
 
     #[test]
     fn dashboard_key_m_switches_to_memory_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('m'), &mut app);
+        handle_dashboard_key(KeyCode::Char('m'), &mut app, &TestSource);
         assert_eq!(app.view, View::Memory);
     }
 
     #[test]
     fn dashboard_key_n_switches_to_spawn_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('n'), &mut app);
+        handle_dashboard_key(KeyCode::Char('n'), &mut app, &TestSource);
         assert_eq!(app.view, View::Spawn,
             "[n] must switch to Spawn view");
         assert!(app.spawn_view.loaded,
@@ -1165,7 +1605,7 @@ mod tests {
         app.memory_view.kb_scroll         = 3;
         app.memory_view.search_query      = "old query".to_string();
         app.memory_view.search_active     = true;
-        handle_dashboard_key(KeyCode::Char('m'), &mut app);
+        handle_dashboard_key(KeyCode::Char('m'), &mut app, &TestSource);
         assert_eq!(app.memory_view.short_term_scroll, 0, "short_term_scroll must reset");
         assert_eq!(app.memory_view.long_term_scroll,  0, "long_term_scroll must reset");
         assert_eq!(app.memory_view.kb_scroll,         0, "kb_scroll must reset");
@@ -1383,7 +1823,7 @@ mod tests {
     #[test]
     fn dashboard_key_a_switches_to_approvals_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('a'), &mut app);
+        handle_dashboard_key(KeyCode::Char('a'), &mut app, &TestSource);
         assert_eq!(app.view, View::Approvals, "[a] must switch to Approvals view");
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "entering Approvals view must reset mode to List");
@@ -1602,6 +2042,25 @@ mod tests {
         let effects = step_key(&mut app, key('q'), &TestSource);
         assert!(!effects.contains(&Effect::Quit));
         assert_eq!(app.view, View::Dashboard, "memory 'q' navigates back, not quit");
+    }
+
+    #[test]
+    fn step_key_q_while_rail_focused_types_not_quits() {
+        // Real crash caught by /qa's interactive pass against the compiled binary:
+        // typing an ordinary word containing 'q' (e.g. "qa") into the chat rail
+        // triggered an unwanted quit mid-keystroke. handle_dashboard_key correctly
+        // captured 'q' as literal rail input, but step_key's outer "q quits the
+        // Dashboard" convenience check didn't know about rail focus and fired
+        // anyway, since app.view is still Dashboard while the rail has focus (the
+        // rail is part of Dashboard, not a separate View). This test exercises the
+        // FULL step_key pipeline, not handle_dashboard_key in isolation — the bug
+        // lived specifically in the interaction between the two.
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.converse_view.rail_focused = true;
+        let effects = step_key(&mut app, key('q'), &TestSource);
+        assert!(!effects.contains(&Effect::Quit), "'q' must not quit while the rail has text focus");
+        assert_eq!(app.converse_view.input, "q", "'q' must be captured as literal chat input");
+        assert_eq!(app.view, View::Dashboard);
     }
 
     #[test]

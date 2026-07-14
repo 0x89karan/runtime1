@@ -1026,10 +1026,17 @@ fn handle_agent_terminal(
 /// via `tokio::join!`, and records `InferenceStreamStarted`/`InferenceStreamCompleted`
 /// events. When false, calls `infer()` directly. Both paths produce an
 /// `EffectResult::Inference`.
+/// Disk copy of `InferenceStreamDelta`'s `text` field is capped to this many bytes —
+/// preserves `flight.jsonl`'s existing preview/audit-metadata contract (bounded field
+/// sizes) instead of turning it into a full model-output transcript store. The live SSE
+/// broadcast always carries the full, untruncated chunk (ux.1 Eng Section 4 Taste call).
+const STREAM_DELTA_DISK_TEXT_CAP: usize = 256;
+
 #[allow(clippy::too_many_arguments)]
 fn make_infer_future(
     req: InferenceRequest,
     id: String,
+    turn: u32,
     is_multi: bool,
     gw: Arc<dyn InferenceGateway + Send + Sync>,
     recorder: Arc<FlightRecorder>,
@@ -1042,7 +1049,7 @@ fn make_infer_future(
         Box::pin(async move {
             recorder.record(
                 &id,
-                None,
+                Some(turn),
                 EventKind::InferenceStreamStarted,
                 json!({ "agent_id": &id, "model": &model }),
             );
@@ -1050,11 +1057,38 @@ fn make_infer_future(
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let infer_fut = gw.infer_with_stream(req, tx);
             let agent_id_label = id.clone();
+            let delta_recorder  = Arc::clone(&recorder);
+            let delta_agent_id  = id.clone();
             let print_fut = async move {
                 use tokio::io::AsyncWriteExt;
                 let mut stdout = tokio::io::stdout();
                 let mut chunks_emitted: u64 = 0;
+                let mut chunk_seq: u64 = 0;
                 while let Some(chunk) = rx.recv().await {
+                    // Record BEFORE the chunk text is consumed into the (possibly
+                    // agent-prefixed) stdout line below — the SSE broadcast/flight
+                    // event always carries the raw chunk, independent of the local
+                    // multi-agent stdout prefix, which is a terminal-display-only concern.
+                    let disk_text: String = chunk.chars().take(STREAM_DELTA_DISK_TEXT_CAP).collect();
+                    delta_recorder.record_streamed(
+                        &delta_agent_id,
+                        Some(turn),
+                        EventKind::InferenceStreamDelta,
+                        json!({
+                            "agent_id":  &delta_agent_id,
+                            "turn_seq":  turn,
+                            "chunk_seq": chunk_seq,
+                            "text":      disk_text,
+                        }),
+                        json!({
+                            "agent_id":  &delta_agent_id,
+                            "turn_seq":  turn,
+                            "chunk_seq": chunk_seq,
+                            "text":      &chunk,
+                        }),
+                    );
+                    chunk_seq += 1;
+
                     let line = if is_multi {
                         format!("[{agent_id_label}] {chunk}")
                     } else {
@@ -1094,7 +1128,7 @@ fn make_infer_future(
                 }
                 recorder.record(
                     &id,
-                    None,
+                    Some(turn),
                     EventKind::InferenceStreamCompleted,
                     json!({
                         "agent_id": &id,
@@ -1107,7 +1141,7 @@ fn make_infer_future(
                 if resp.transport_retries > 0 {
                     recorder.record(
                         &id,
-                        None,
+                        Some(turn),
                         EventKind::InferenceTransportRetried,
                         json!({
                             "agent_id": &id,
@@ -1216,13 +1250,14 @@ fn drain_deferred(
             EventKind::AgentScheduled,
             json!({ "reason": "slot_opened", "in_flight": state.in_flight }),
         );
-        let gw  = Arc::clone(gateway);
-        let rec = Arc::clone(recorder);
-        let sa  = Arc::clone(&state.streamed_agents);
-        let sl  = Arc::clone(&state.stdout_lock);
-        let eg  = state.egress.clone();
-        let id  = d.agent_id;
-        state.pending.push(make_infer_future(d.request, id, is_multi, gw, rec, sa, sl, eg));
+        let gw   = Arc::clone(gateway);
+        let rec  = Arc::clone(recorder);
+        let sa   = Arc::clone(&state.streamed_agents);
+        let sl   = Arc::clone(&state.stdout_lock);
+        let eg   = state.egress.clone();
+        let id   = d.agent_id;
+        let turn = d.turn;
+        state.pending.push(make_infer_future(d.request, id, turn, is_multi, gw, rec, sa, sl, eg));
     }
 }
 
@@ -1261,7 +1296,7 @@ fn enqueue_or_defer(
                 let eg       = state.egress.clone();
                 let is_multi = state.agents.len() > 1;
                 let id       = agent_id;
-                state.pending.push(make_infer_future(req, id, is_multi, gw, rec, sa, sl, eg));
+                state.pending.push(make_infer_future(req, id, turn, is_multi, gw, rec, sa, sl, eg));
             } else if !budget_ok {
                 recorder.record(
                     &agent_id,
@@ -4116,6 +4151,86 @@ mod tests {
         assert!(log.contains("\"inference_stream_started\""), "missing inference_stream_started event");
         assert!(log.contains("\"inference_stream_completed\""), "missing inference_stream_completed event");
         assert!(log.contains("\"text_chunks_emitted\""), "missing text_chunks_emitted in payload");
+    }
+
+    // ── ux.1 streaming-delta events ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn stream_delta_recorded_per_chunk_with_monotonic_chunk_seq() {
+        let resp = end_turn("streamed answer", 20, 10);
+        let gw = StreamingMockGateway {
+            chunks:   vec!["chunk1".to_string(), "chunk2".to_string(), "chunk3".to_string()],
+            response: resp.clone(),
+        };
+
+        let mut cfg = agent_cfg("delta-agent", "delta task");
+        let mut mcfg = model_cfg();
+        mcfg.streaming = true;
+        cfg.max_turns = 1;
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &mcfg,
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let outcomes = sched.run().await;
+        assert!(outcomes.get("delta-agent").expect("agent not found").is_ok());
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        let delta_lines: Vec<&str> = log.lines().filter(|l| l.contains("\"inference_stream_delta\"")).collect();
+        assert_eq!(delta_lines.len(), 3, "expected one inference_stream_delta per chunk, got: {delta_lines:?}");
+
+        for (i, line) in delta_lines.iter().enumerate() {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["data"]["chunk_seq"], i as u64, "chunk_seq must be monotonic starting at 0");
+            assert_eq!(v["data"]["agent_id"], "delta-agent");
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_delta_disk_text_truncated_at_cap() {
+        let long_chunk = "x".repeat(STREAM_DELTA_DISK_TEXT_CAP + 100);
+        let resp = end_turn("streamed answer", 20, 10);
+        let gw = StreamingMockGateway {
+            chunks:   vec![long_chunk.clone()],
+            response: resp.clone(),
+        };
+
+        let mut cfg = agent_cfg("cap-agent", "cap task");
+        let mut mcfg = model_cfg();
+        mcfg.streaming = true;
+        cfg.max_turns = 1;
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![cfg],
+            &mcfg,
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        ).unwrap();
+
+        let outcomes = sched.run().await;
+        assert!(outcomes.get("cap-agent").expect("agent not found").is_ok());
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        let delta_line = log.lines().find(|l| l.contains("\"inference_stream_delta\"")).expect("no delta event");
+        let v: serde_json::Value = serde_json::from_str(delta_line).unwrap();
+        let disk_text = v["data"]["text"].as_str().unwrap();
+        assert_eq!(
+            disk_text.chars().count(), STREAM_DELTA_DISK_TEXT_CAP,
+            "flight.jsonl copy must be capped at STREAM_DELTA_DISK_TEXT_CAP chars, got {}",
+            disk_text.chars().count()
+        );
+        assert!(long_chunk.len() > disk_text.len(), "disk copy must be shorter than the original chunk");
     }
 
     #[tokio::test]

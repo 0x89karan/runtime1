@@ -765,6 +765,12 @@ agentctl watch --url http://localhost:7999
 
 Key views:
 - **Dashboard** (default): shows orchestrator + spawned inbox/curator agents, budget, status.
+  Also has a permanent chat rail (`Tab` to focus, `r` to retarget to the selected row,
+  `Enter` to send — ux.1, v0.86.0) for talking to an agent directly from the table.
+  **Chat requires the management API with SSE support** — it does *not* work over the
+  plain FUSE surface, so the `docker compose exec cos agentctl watch --agents-dir /agents`
+  invocation above will show an inline "Chat requires the management API" message instead
+  of a reply. Use the `--url http://localhost:7999` invocation below for a working chat rail.
 - **Topology** (`[t]`): spawn tree — orchestrator → inbox-YYYY-MM-DD + curator-YYYY-MM-DD.
 - **Approvals** (`[a]`): approve/deny pending requests (OAuth URL on first run; L1 send drafts).
 - **Inspector** (`[i]`): flight log with filter for Sandbox/CapDenied events.

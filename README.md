@@ -141,6 +141,13 @@ injecting into the cockpit you're looking at (tracked as ux.9-ar-07 in TODOS.md)
 a guaranteed single dedicated agent without `--privileged`, use `orchestrate` or
 `agent` mode instead.
 
+The Dashboard also has a permanent chat rail (`Tab` to focus it, `r` to retarget it to
+the selected row, `Enter` to send — ux.1, v0.86.0). It's the mirror image of the spawn
+caveat above: chat needs the management API's SSE stream to show a reply, so it works
+out of the box in the default unprivileged/HTTP-fallback cockpit shown above, but
+**not** when the container is `--privileged` and FUSE-mounted — there, sending a
+message shows a clear inline error instead of hanging.
+
 If the package is private, set it to Public once: GitHub repo → Packages →
 agentos → Package Settings → Change visibility → Public.
 
