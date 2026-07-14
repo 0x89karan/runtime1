@@ -122,6 +122,33 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `scheduler`/`flight_recorder` and agentctl's `converse`/`mod`/`views`); otel's
   `event_kind_coverage` exhaustiveness guard updated for the new `EventKind` variant.
 
+### Fixed (post-ship, no version bump — landed 2026-07-15)
+- **CoS Inbox agent could never read Gmail despite a valid, broker-managed OAuth session**
+  — every Gmail API call was rejected with 403 `credential_denied`/`no_providers_configured`.
+  Root cause: `agentd/src/main.rs`'s credential proxy token derives its `allowed_providers`
+  list from the `google_oauth` MCP **server's own** `capabilities` field, not the owning
+  agent's — `cos.agents.toml`'s `google_oauth` server only granted `Net` access, so the
+  broker registered an empty `allowed_providers` regardless of the OAuth token's validity.
+  Fixed in both `agentd/cos.agents.toml` and the distro overlay copy. `/review` on the fix
+  (security + adversarial passes, both clean) confirmed it's minimally scoped and
+  non-exploitable, and found a real testability gap: the pre-existing regression test
+  hand-duplicated the credential-derivation logic instead of exercising the real function —
+  extracted to `credential_allowed_providers()`, called from both the production closure and
+  the tests (now including an end-to-end check against the real config files). Two related,
+  pre-existing findings (Curator's over-broad Gmail credential inheritance via spawn; three
+  older templates still on the pre-cred.6 raw-secret pattern) filed as `cos-dev-02`/`03` in
+  `TODOS.md`, not fixed in these commits.
+- **`docs/cos-guide.html`'s Step 06 CoS-start instructions were broken** — following them
+  exactly (a bare `docker run ... cos`) failed immediately with a DNS lookup error for
+  `semantic-kb-mcp`, since h8.1/memory-routing made the semantic KB sidecar a Compose-only
+  dependency. Replaced with `docker compose up cos`.
+- **Local Qdrant healthcheck failed permanently** — `qdrant/qdrant:v1.13.6`'s image has no
+  `curl`/`wget`/`nc`, so the `CMD curl` healthcheck in `docker-compose.yml` always failed at
+  the exec step, blocking `docker compose up cos` on "dependency unhealthy" even though Qdrant
+  was actually serving. Switched to a pure TCP probe via bash's `/dev/tcp`.
+- 1422 workspace tests (+2 versus the ux.1 baseline above: the google_oauth capability guard
+  from the credential fix, plus the end-to-end regression test added during its `/review`).
+
 ## [v0.85.0] - 2026-07-13
 
 ### Added (ux.2a — Attention)

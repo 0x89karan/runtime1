@@ -341,6 +341,34 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   `.gitkeep` so it exists when `cargo run` is invoked from the repo root, OR have `write_file`
   call `fs::create_dir_all` on the parent before writing. `agentd/src/tools/native.rs`.
 
+- **cos-dev-02 (P2) — Curator agent inherits Gmail credential + tool access it never needs.**
+  Found by `/review`'s adversarial pass on PR #122 (google_oauth Credential capability fix,
+  2026-07-15): `cos-orchestrator`'s agent-level capabilities include
+  `Credential{provider=Google}` and `Mcp{server=google_oauth}` (`agentd/cos.agents.toml`), and
+  the task prompt states "spawned agents inherit the parent's full capability set." The
+  **Curator** child (KB-only writer — persists briefs/entities, never touches Gmail) therefore
+  also inherits Gmail credential + tool access via spawn, since capability inheritance is
+  all-or-nothing per spawned child, not scoped per child's actual task. Not a live bug (Curator's
+  task prompt doesn't call the OAuth tools), but a real least-privilege gap: a
+  prompt-injection-compromised Curator, or a future task-prompt change, could reach Gmail with no
+  code-level guard against it. Fix needs per-child capability scoping at `spawn_agent` call sites
+  (currently spawned children get the parent's full set unconditionally) — larger scope than a
+  quick capability tweak. Depends on: none, but touches the `Spawn` capability's inheritance model.
+- **cos-dev-03 (P3) — Older Google OAuth templates still on the pre-cred.6 raw-secret pattern.**
+  Found by the same `/review` pass: `templates/cos-inbox.template.toml`,
+  `templates/google-agent.template.toml`, and `templates/cos-orchestrator.template.toml` all
+  spawn `google_oauth`/`oauth_mcp.py` but have no `[credential_gateway]` section — they still pass
+  `OAUTH_CLIENT_SECRET`/`OAUTH_REFRESH_TOKEN` directly via `passenv` to the Python sidecar
+  (pre-cred.6 pattern). Since `credential_gateway.enabled` defaults to `false`, this specific
+  bug class (missing server-level `Credential` capability) doesn't apply to them — they never
+  build a broker token at all. But it means these templates diverge from the hardened
+  `agentd/cos.agents.toml`/distro-overlay pattern: the raw OAuth secret still reaches the Python
+  sidecar process for anyone using these templates instead of the CoS config. Migrate them to
+  broker mode for consistency, or explicitly document why they're intentionally exempt (e.g.
+  simpler single-agent demo templates where the broker's operational overhead isn't worth it).
+  `templates/github-agent.template.toml` is already correctly on the broker pattern — no fix
+  needed there. Depends on: none.
+
 ## v0.60 whole-system audit (2026-07-06)
 
 Read-only audit: 7 parallel reviewers (Claude + Codex) across every crate + docs, main @ e2ec0e47.
