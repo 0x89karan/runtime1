@@ -164,22 +164,38 @@ impl ConverseState {
             if chunk_seq > last + 1 {
                 self.current_reply.push_str("[response may be incomplete — connection was busy] ");
             }
+        } else if chunk_seq != 0 {
+            // First delta of a turn, but not chunk 0: the gap check above only runs when
+            // `last_chunk_seq` is already `Some`, so a dropped PREFIX (the turn's very
+            // first chunk(s) never arriving) was silently invisible — only a gap between
+            // chunks already seen got flagged. Found by /ship's Step 11 adversarial pass.
+            self.current_reply.push_str("[response may be incomplete — connection was busy] ");
         }
         self.last_chunk_seq = Some(chunk_seq);
         self.last_event_at = Some(Instant::now());
         self.phase = ConversePhase::Streaming;
 
-        if self.current_reply.len() + text.len() > CURRENT_REPLY_CAP_BYTES {
-            let remaining = CURRENT_REPLY_CAP_BYTES.saturating_sub(self.current_reply.len());
-            // Byte-safe truncation: `remaining` is a raw byte count with no relationship
-            // to `text`'s UTF-8 char boundaries. Slicing at an arbitrary byte offset
-            // panics if it falls mid-character (em dash, smart quotes, emoji — all
-            // common in normal model output). Walk back to the nearest valid boundary.
-            let safe_end = floor_char_boundary(text, remaining.min(text.len()));
-            self.current_reply.push_str(&text[..safe_end]);
-            self.current_reply.push_str("[...truncated at 64KB — full reply may be longer]");
-        } else {
-            self.current_reply.push_str(text);
+        // Found by /ship's Step 11 adversarial pass (Claude + Codex, independently
+        // confirmed): once `current_reply.len() >= CURRENT_REPLY_CAP_BYTES`, `remaining`
+        // becomes 0 on every LATER call too, so a naive "> CAP → truncate" check kept
+        // re-entering this branch and re-appending the marker string forever — the exact
+        // unbounded-growth failure mode the cap was supposed to prevent. Guard on the
+        // CURRENT length, not the post-append length, and once truncated for this turn,
+        // drop all further text for it silently instead of re-truncating.
+        if self.current_reply.len() < CURRENT_REPLY_CAP_BYTES {
+            if self.current_reply.len() + text.len() > CURRENT_REPLY_CAP_BYTES {
+                let remaining = CURRENT_REPLY_CAP_BYTES - self.current_reply.len();
+                // Byte-safe truncation: `remaining` is a raw byte count with no
+                // relationship to `text`'s UTF-8 char boundaries. Slicing at an arbitrary
+                // byte offset panics if it falls mid-character (em dash, smart quotes,
+                // emoji — all common in normal model output). Walk back to the nearest
+                // valid boundary.
+                let safe_end = floor_char_boundary(text, remaining.min(text.len()));
+                self.current_reply.push_str(&text[..safe_end]);
+                self.current_reply.push_str("[...truncated at 64KB — full reply may be longer]");
+            } else {
+                self.current_reply.push_str(text);
+            }
         }
         // Bump the unread counter once per logical reply (first delta of a turn), not
         // once per chunk — otherwise a single streamed reply while scrolled up shows
@@ -283,8 +299,21 @@ impl ConverseView {
                 // real id here (consistent, unlike orchestrator_exited below).
                 let agent_id = value["agent"].as_str().or_else(|| value["data"]["agent_id"].as_str()).unwrap_or("");
                 let Some(state) = self.targets.get_mut(agent_id) else { return };
-                let answer = value["data"]["answer"].as_str().unwrap_or("").to_string();
-                state.flush(TurnRole::Assistant, answer);
+                // Found by /ship's Step 11 adversarial pass (Claude + Codex, independently
+                // confirmed): `data.answer` is the server's 512-char-capped preview
+                // (scheduler.rs) — the whole point of InferenceStreamDelta was to deliver
+                // the FULL text via `current_reply` while streaming, but this branch was
+                // discarding that already-accumulated full text and flushing the stale
+                // truncated preview instead, collapsing a fully-streamed long reply back
+                // down to 512 chars at the exact moment it finished. Prefer the
+                // accumulated text; fall back to `answer` only when no deltas arrived at
+                // all (e.g. an older agentd that doesn't emit InferenceStreamDelta yet).
+                let text = if !state.current_reply.is_empty() {
+                    state.current_reply.clone()
+                } else {
+                    value["data"]["answer"].as_str().unwrap_or("").to_string()
+                };
+                state.flush(TurnRole::Assistant, text);
             }
             "agent_failed" => {
                 // Field path verbatim from orchestrate.rs:165 — top-level `agent` ONLY;
@@ -423,6 +452,29 @@ mod tests {
     }
 
     #[test]
+    fn missing_prefix_at_turn_start_also_appends_gap_note() {
+        // Found by /ship's Step 11 adversarial pass (Claude subagent): the old gap check
+        // only ran once `last_chunk_seq` was already `Some`, so a dropped PREFIX (the
+        // turn's very first chunk(s) never arriving at all) was invisible -- only a gap
+        // between chunks already seen got flagged.
+        let mut view = ConverseView::new("t");
+        retarget_and_dispatch(&mut view, "t");
+        view.on_flight_event(&delta("t", 3, "late start")); // chunks 0..2 never arrived
+        let text = &view.targets.get("t").unwrap().current_reply;
+        assert!(text.contains("may be incomplete"), "missing-prefix gap note missing: {text}");
+        assert!(text.ends_with("late start"));
+    }
+
+    #[test]
+    fn turn_starting_at_chunk_zero_gets_no_spurious_gap_note() {
+        let mut view = ConverseView::new("t");
+        retarget_and_dispatch(&mut view, "t");
+        view.on_flight_event(&delta("t", 0, "clean start"));
+        let text = &view.targets.get("t").unwrap().current_reply;
+        assert!(!text.contains("may be incomplete"), "the normal, gapless case must not get a false gap note: {text}");
+    }
+
+    #[test]
     fn buffer_overflow_truncates_at_cap() {
         let mut view = ConverseView::new("t");
         retarget_and_dispatch(&mut view, "t");
@@ -431,6 +483,35 @@ mod tests {
         let text = &view.targets.get("t").unwrap().current_reply;
         assert!(text.contains("truncated at 64KB"));
         assert!(text.len() < big.len());
+    }
+
+    #[test]
+    fn truncation_marker_is_not_reappended_on_every_delta_after_the_cap() {
+        // Found by /ship's Step 11 adversarial pass (Claude + Codex, independently
+        // confirmed): once current_reply.len() >= CAP, `remaining` was 0 on every LATER
+        // delta too, so the old "> CAP" check kept re-entering the truncate branch and
+        // re-appending the marker string forever — unbounded growth, the exact failure
+        // mode the cap exists to prevent.
+        let mut view = ConverseView::new("t");
+        retarget_and_dispatch(&mut view, "t");
+        let big = "x".repeat(CURRENT_REPLY_CAP_BYTES + 100);
+        view.on_flight_event(&delta("t", 0, &big));
+        let len_after_first_overflow = view.targets.get("t").unwrap().current_reply.len();
+
+        // Ten more deltas arrive after the cap was already hit.
+        for i in 1..=10 {
+            view.on_flight_event(&delta("t", i, "more streamed text "));
+        }
+
+        let final_state = view.targets.get("t").unwrap();
+        assert_eq!(
+            final_state.current_reply.len(), len_after_first_overflow,
+            "current_reply must stop growing entirely once truncated — no repeated markers"
+        );
+        assert_eq!(
+            final_state.current_reply.matches("truncated at 64KB").count(), 1,
+            "the truncation marker must appear exactly once, not once per subsequent chunk"
+        );
     }
 
     #[test]
@@ -474,6 +555,52 @@ mod tests {
         let state = view.targets.get("t").unwrap();
         assert_eq!(state.phase, ConversePhase::Idle);
         assert!(state.history.back().unwrap().text.contains("budget_exceeded"));
+    }
+
+    #[test]
+    fn turn_complete_preserves_full_streamed_text_not_the_512_char_server_preview() {
+        // Found by /ship's Step 11 adversarial pass (Claude + Codex, independently
+        // confirmed): `data.answer` is the server's 512-char-capped preview
+        // (scheduler.rs) -- the whole point of InferenceStreamDelta was to deliver the
+        // FULL text via current_reply while streaming, but flush() was discarding that
+        // and using the truncated preview instead, collapsing a fully-streamed long
+        // reply back down to 512 chars the instant it finished.
+        let mut view = ConverseView::new("t");
+        retarget_and_dispatch(&mut view, "t");
+        let full_text = "x".repeat(1000); // well over the server's 512-char preview cap
+        view.on_flight_event(&delta("t", 0, &full_text));
+
+        let ev = serde_json::json!({
+            "kind": "orchestrator_turn_complete",
+            "agent": "t",
+            "data": { "answer": "x".repeat(512) } // the server's truncated preview
+        });
+        view.on_flight_event(&ev);
+
+        let state = view.targets.get("t").unwrap();
+        assert_eq!(
+            state.history.back().unwrap().text.len(), 1000,
+            "must flush the accumulated full text (1000 chars), not the 512-char server preview"
+        );
+    }
+
+    #[test]
+    fn turn_complete_falls_back_to_answer_when_no_deltas_were_ever_received() {
+        // Older agentd without InferenceStreamDelta support: current_reply stays empty
+        // the whole turn, so `answer` (however truncated) is the only text available.
+        let mut view = ConverseView::new("t");
+        view.retarget("t");
+        view.targets.get_mut("t").unwrap().phase = ConversePhase::Dispatching;
+
+        let ev = serde_json::json!({
+            "kind": "orchestrator_turn_complete",
+            "agent": "t",
+            "data": { "answer": "the only text we ever got" }
+        });
+        view.on_flight_event(&ev);
+
+        let state = view.targets.get("t").unwrap();
+        assert_eq!(state.history.back().unwrap().text, "the only text we ever got");
     }
 
     #[test]

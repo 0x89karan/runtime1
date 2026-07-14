@@ -403,6 +403,18 @@ fn truncate_target_label(id: &str, budget: usize) -> String {
     format!("{head}…{tail}")
 }
 
+/// Approximate the number of visual rows `Paragraph::wrap` will render a `Line` as, so
+/// the chat rail's scroll offset (visual rows, not logical lines) can account for a long
+/// turn/streamed reply that wraps across multiple rows in the narrow rail. Not
+/// pixel-perfect (doesn't replicate ratatui's exact word-break algorithm), but far more
+/// accurate than assuming one row per line — found by /ship's Step 11 adversarial pass.
+fn wrapped_row_count(line: &Line, width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    let char_count: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+    let rows = char_count.saturating_sub(1) / width + 1;
+    rows as u16
+}
+
 /// ux.1: the Dashboard chat rail — a permanent pane beside the agent table (not a
 /// separate `View`), honoring the project's locked "one unified screen" decision
 /// (docs/ROADMAP.md:1089) rather than a 10th full-screen tab.
@@ -456,7 +468,14 @@ fn render_converse_rail(f: &mut Frame, app: &App, area: Rect) {
     // has scrolled up. `follow` (default) always shows the tail; a manual scroll-up
     // pins the view and shows a `▼ N new` indicator instead of jumping back down.
     let inner_height = transcript_area.height.saturating_sub(2); // borders top+bottom
-    let total_lines = lines.len() as u16;
+    // `lines.len()` counts logical turns, not the visual rows `Paragraph::wrap` actually
+    // renders — found by /ship's Step 11 adversarial pass (Codex structured review): a
+    // long streamed current_reply that wraps across many rows in the narrow rail left
+    // `bottom_offset` near 0, pinning follow-mode to the TOP of that reply instead of its
+    // live tail, making ongoing output appear to vanish below the viewport. Sum
+    // per-line wrapped-row estimates instead of counting lines 1:1.
+    let inner_width = transcript_area.width.saturating_sub(2); // borders left+right
+    let total_lines: u16 = lines.iter().map(|line| wrapped_row_count(line, inner_width)).sum();
     let bottom_offset = total_lines.saturating_sub(inner_height);
     let (scroll_offset, title) = match target_state {
         Some(state) if !state.follow => {
@@ -1717,6 +1736,28 @@ mod tests {
     fn dashboard_chrome_rows_accounts_for_spawn_banner() {
         assert_eq!(dashboard_chrome_rows(false), 4, "header(1) + summary(1) + footer(2)");
         assert_eq!(dashboard_chrome_rows(true), 5, "+1 more when the spawn banner is showing");
+    }
+
+    #[test]
+    fn wrapped_row_count_accounts_for_line_wrapping() {
+        // Found by /ship's Step 11 adversarial pass (Codex structured review): counting
+        // lines.len() (logical turns) instead of wrapped visual rows left the chat
+        // rail's follow-mode scroll offset near 0 for a long current_reply, pinning the
+        // view to the TOP of a wrapping reply instead of its live tail.
+        let short = Line::from("hi");
+        assert_eq!(wrapped_row_count(&short, 30), 1, "text shorter than the width is one row");
+
+        let exact = Line::from("x".repeat(30));
+        assert_eq!(wrapped_row_count(&exact, 30), 1, "text exactly filling the width is still one row");
+
+        let one_over = Line::from("x".repeat(31));
+        assert_eq!(wrapped_row_count(&one_over, 30), 2, "one char over the width needs a second row");
+
+        let three_rows = Line::from("x".repeat(61));
+        assert_eq!(wrapped_row_count(&three_rows, 30), 3);
+
+        let empty = Line::from("");
+        assert_eq!(wrapped_row_count(&empty, 30), 1, "even an empty line occupies one row");
     }
 
     #[test]

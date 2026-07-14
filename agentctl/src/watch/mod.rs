@@ -234,6 +234,21 @@ fn run_tui(
     Ok(())
 }
 
+/// Clear chat-rail focus if a resize just made the rail no longer fit. Found by /ship's
+/// Step 11 adversarial pass (Codex structured review + adversarial exec, independently
+/// confirmed): without this, `render_dashboard` hides the rail but `rail_focused` stays
+/// true, so `handle_dashboard_key` (which checks `rail_focused` before checking
+/// visibility) keeps capturing every keystroke into an invisible input box until the
+/// operator guesses Esc/Tab. Extracted as a pure `App`-mutating function (rather than
+/// inlined in the crossterm event loop) so this logic is unit-testable without a real
+/// `Terminal`.
+fn on_resize(app: &mut App, w: u16, h: u16) {
+    let chrome_rows = views::dashboard_chrome_rows(app.spawn_banner.is_some());
+    if !views::converse_rail_fits(w, h.saturating_sub(chrome_rows)) {
+        app.converse_view.rail_focused = false;
+    }
+}
+
 /// The single event-pushed render loop (Option B). One bounded channel, two detached
 /// producer threads (snapshot + optional SSE), a 30 ms crossterm key poll, and a
 /// coalesced redraw. Replaces the two prior sync poll-render loops (F9). The render
@@ -281,6 +296,7 @@ fn run_tui_loop(
                 }
                 Event::Resize(w, h) => {
                     app.term_size = (w, h);
+                    on_resize(app, w, h);
                     app.dirty = true;
                 }
                 _ => {}
@@ -1014,7 +1030,7 @@ mod tests {
 
     use super::{
         drain_events, handle_approvals_key, handle_dashboard_key, handle_memory_key,
-        handle_spawn_key, step, step_key, App, Effect, View,
+        handle_spawn_key, on_resize, step, step_key, App, Effect, View,
     };
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
@@ -1255,6 +1271,26 @@ mod tests {
         app.term_size = (80, 24); // below MIN_TOTAL_WIDTH_FOR_RAIL (115)
         handle_dashboard_key(KeyCode::Tab, &mut app, &TestSource);
         assert!(!app.converse_view.rail_focused, "Tab must not focus a rail that isn't visible");
+    }
+
+    #[test]
+    fn resize_below_rail_floor_clears_focus() {
+        // Found by /ship's Step 11 adversarial pass (Codex structured review +
+        // adversarial exec, independently confirmed): shrinking the terminal while the
+        // rail was focused used to leave rail_focused true even though render_dashboard
+        // now hides the rail — every keystroke vanished into an invisible input box.
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        on_resize(&mut app, 80, 24); // below MIN_TOTAL_WIDTH_FOR_RAIL (115)
+        assert!(!app.converse_view.rail_focused, "focus must clear when the rail no longer fits");
+    }
+
+    #[test]
+    fn resize_that_keeps_rail_visible_leaves_focus_untouched() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        on_resize(&mut app, 200, 50); // comfortably above the floor
+        assert!(app.converse_view.rail_focused, "focus must be preserved when the rail still fits");
     }
 
     #[test]
