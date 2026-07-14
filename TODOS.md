@@ -97,6 +97,50 @@
   `InferenceStreamDelta` now drives a redraw on effectively every tick during an active
   stream — a long-running, near-full-history rail could re-scan/re-allocate a
   non-trivial amount of text ~30x/second instead of amortizing the cost. Depends on: none.
+- **`dispatch()` can't tell "never spawned" from "exists and still running"** (P1, found
+  by `/ship`'s Step 9 red team pass): `converse.rs`'s `dispatch()` only checks whether the
+  target's snapshot status is exactly `"waiting"` — everything else (including "agent
+  exists but is mid-turn, not yet parked back to waiting") falls into the `spawn()`
+  branch. The server (`scheduler.rs`'s spawn-collision guard) correctly rejects a spawn
+  for an id already in `state.agents`/`state.outcomes`, but that rejection happens before
+  the oneshot `confirm_tx` is ever wired up, so `management.rs`'s `/api/v1/spawn` handler
+  sees the confirmation channel close and returns a generic 503 "scheduler closed
+  confirmation channel" instead of the real, actionable server-side reason ("agent ID
+  already in use"). Reachable in normal operation: reconnecting/restarting `agentctl
+  watch` while a previously-dispatched orchestrated agent is still mid-turn (the fresh
+  client-side `ConverseState` starts `Idle`, so the double-submit guard doesn't block the
+  retry), or the client's own 30s `DISPATCH_TIMEOUT` false-positiving on a legitimately
+  slow turn and the operator's retry racing the still-running original into this exact
+  collision path — in both cases the new message is silently dropped behind a confusing
+  error while the original turn continues untouched. Fix: when the target id already
+  appears in the snapshot at all (regardless of "waiting" status), try `inject()` first
+  and only fall back to `spawn()` when the id is genuinely absent; consider also not
+  dropping `req.confirm_tx` silently in the server's collision guard so the real reason
+  reaches the HTTP caller. Depends on: none.
+- **Cross-turn contamination guard doesn't survive an `agentd` crash/restart mid-stream**
+  (P2, found by `/ship`'s Step 9 red team pass): `append_delta()`'s guard rejects a delta
+  only when its `turn_seq` differs from the turn currently accumulating; `chunk_seq` is
+  local to one invocation of `print_fut` and always restarts at 0. `turn_seq` is `agentd`'s
+  persisted per-agent turn counter, restored verbatim from checkpoint on crash/restart —
+  if `agentd` crashes mid-turn N and resumes, the resumed process redispatches inference
+  for the SAME `turn_seq=N` with `chunk_seq` starting again at 0. A client that survived
+  the disconnect without giving up on that turn accepts the new `chunk_seq=0` chunk as a
+  continuation (0 is neither a duplicate nor a detected gap), silently splicing the fresh
+  post-restart reply onto the stale pre-crash partial text with no gap-note or visual
+  break. Fix: make chunk identity unique per physical inference attempt (e.g. an
+  `attempt` id set once at scheduler startup), or reset `current_turn_seq`/`current_reply`
+  whenever `chunk_seq` goes backward to 0 mid-stream. Depends on: none.
+- **`ConverseView.targets` grows unbounded for the life of the `agentctl watch` process**
+  (P3, found by `/ship`'s Step 9 red team pass): `retarget()` and the Enter-key handler
+  both insert a `ConverseState` (up to `MAX_HISTORY_TURNS=200` turns) via
+  `entry().or_default()` for any agent id the operator ever retargets to, but nothing ever
+  evicts an entry once the corresponding agent leaves the fleet (completes, fails, is
+  reaped). In this project's typical usage (a CoS/orchestrator spawning many short-lived
+  scout/worker agents over a long-running dashboard session), briefly inspecting each
+  ephemeral agent accumulates one permanent `ConverseState` per agent id for the life of
+  the TUI process. Fix: evict target entries whose agent id no longer appears in the
+  latest snapshot and isn't `active_target`, or cap tracked targets with an LRU policy.
+  Depends on: none.
 
 ## ux.9 — Open (deferred from build + /review adversarial pass, 2026-07-12)
 
