@@ -711,8 +711,8 @@
 
     <div class="step">
       <div class="step-num">06</div>
-      <div class="step-title">Start the CoS</div>
-      <p>Set your API keys and run. <code>TRIGGER_INTERVAL=every 2m</code> fires the cron quickly for testing — change it to a cron expression like <code>0 8 * * *</code> for production use. The management API is bound to <code>127.0.0.1:7999</code> so <code>agentctl watch</code> can connect from your Mac terminal directly.</p>
+      <div class="step-title">Start the CoS <span class="step-tag tag-new">updated</span></div>
+      <p>Set your API keys and run <strong>via <code>docker compose</code></strong>, not a bare <code>docker run</code> — since h8.1/memory-routing, <code>cos.agents.toml</code>'s semantic KB needs the <code>semantic-kb-mcp</code> sidecar (backed by Qdrant), and that hostname only resolves on the Compose network. A standalone <code>docker run</code> now fails immediately with a DNS error (<code>failed to lookup address information</code> for <code>semantic-kb-mcp</code>). <code>docker compose up cos</code> brings up <code>qdrant</code> + <code>semantic-kb-mcp</code> automatically as dependencies. <code>TRIGGER_INTERVAL=every 2m</code> fires the cron quickly for testing — change it to a cron expression like <code>0 8 * * *</code> for production use. The management API is bound to <code>127.0.0.1:7999</code> so <code>agentctl watch</code> can connect from your Mac terminal directly.</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
@@ -720,20 +720,13 @@
         </div>
         <pre><code><span class="k">export</span> <span class="v">ANTHROPIC_API_KEY</span>=sk-ant-...
 <span class="k">export</span> <span class="v">OPENAI_API_KEY</span>=sk-...
+<span class="c"># Use the published image instead of building from source:</span>
+<span class="k">export</span> <span class="v">AGENTOS_IMAGE</span>=ghcr.io/0x89karan/runtime1:full
 
-<span class="cmd">docker run</span> <span class="flag">--rm -it \
-  --name</span> agentos-cos <span class="flag">\
-  --privileged \
-  -p</span> <span class="s">127.0.0.1:7999:7999</span> <span class="flag">\
-  -e</span> ANTHROPIC_API_KEY <span class="flag">\
-  -e</span> OPENAI_API_KEY <span class="flag">\
-  -e</span> <span class="s">"TRIGGER_INTERVAL=every 2m"</span> <span class="flag">\
-  -v</span> <span class="path">~/.agentos-secrets:/run/secrets:ro</span> <span class="flag">\
-  -v</span> <span class="path">~/.agentos-output:/data/output</span> <span class="flag">\
-  -v</span> <span class="path">~/.agentos-data:/data</span> <span class="flag">\
-  </span>ghcr.io/0x89karan/runtime1:full cos</code></pre>
+<span class="cmd">docker compose up</span> cos</code></pre>
       </div>
-      <p>The container starts the credential gateway, connects MCP servers, and parks the orchestrator in a cron wait loop. Logs stream to your terminal.</p>
+      <p>The container starts the credential gateway, connects MCP servers (including the semantic KB sidecar), and parks the orchestrator in a cron wait loop. Logs stream to your terminal.</p>
+      <p>Run from source instead (no published image)? Omit <code>AGENTOS_IMAGE</code> — Compose falls back to building the <code>runtime-full</code> target locally (<code>make dev-image</code> does the same thing, tagged <code>agentos:dev</code>, which is the default when <code>AGENTOS_IMAGE</code> is unset).</p>
 
       <div class="expect">
         <div class="expect-label">What happens in the first 3 minutes</div>
@@ -809,12 +802,12 @@
   <div class="section-label">Updating &amp; older images</div>
 
   <div class="note">
-    <div class="note-label">Stopping the CoS (run vs compose)</div>
+    <div class="note-label">Stopping the CoS</div>
     <ul>
-      <li><strong>Started with <code>docker run … cos</code> (this guide):</strong> press <code>Ctrl+C</code> in its terminal — <code>--rm</code> stops <em>and</em> removes the container automatically. If one is left over, remove it with <code>docker rm -f agentos-cos</code>. You do <em>not</em> need <code>docker compose down</code> here.</li>
-      <li><strong>Started with <code>docker compose up</code> (the dev / build-from-source path):</strong> use <code>docker compose down</code> to stop and remove the compose containers + network.</li>
+      <li><strong>Ctrl+C</strong> in the terminal running <code>docker compose up cos</code> stops the <code>cos</code> container with a graceful checkpoint. <code>qdrant</code> and <code>semantic-kb-mcp</code> keep running in the background (cheap to leave up between sessions).</li>
+      <li><strong>Stop everything</strong> (cos + qdrant + semantic-kb-mcp): <code>docker compose down</code> — removes the containers + network, but keeps named volumes (your data).</li>
       <li><strong>Not sure what's running?</strong> <code>docker ps -a --filter name=agentos</code> lists every AgentOS container; remove leftovers with <code>docker rm -f &lt;name&gt;</code>.</li>
-      <li><strong>Your data is safe.</strong> State lives in the host mounts <code>~/.agentos-data</code> and <code>~/.agentos-output</code> — removing a container never touches them. The only destructive command is <code>docker compose down -v</code>, which also deletes named volumes.</li>
+      <li><strong>Your data is safe.</strong> State lives in the host mounts <code>~/.agentos-data</code> and <code>~/.agentos-output</code> — removing a container never touches them. The only destructive command is <code>docker compose down -v</code>, which also deletes named volumes (including Qdrant's index — re-embeds from scratch on next run).</li>
     </ul>
   </div>
 
@@ -848,8 +841,8 @@
         <div class="code-dots"><span></span><span></span><span></span></div>
         <div class="code-lang">bash</div>
       </div>
-      <pre><code><span class="c"># 1. Stop the old container</span>
-<span class="cmd">docker rm</span> <span class="flag">-f</span> agentos-cos <span class="p">2&gt;/dev/null || true</span>
+      <pre><code><span class="c"># 1. Stop the old containers</span>
+<span class="cmd">docker compose down</span>
 
 <span class="c"># 2. Drop the checkpoint so no stale agents reload</span>
 <span class="cmd">rm -f</span> <span class="path">~/.agentos-data/checkpoint.json</span> <span class="p">2&gt;/dev/null || true</span>
@@ -866,8 +859,9 @@
     <div class="note-label">Troubleshooting</div>
     <ul>
       <li><strong>Inbox agent stuck at "Not authenticated" / "no active session":</strong> your image predates the credential broker. Re-pull <code>agentos:full</code> (≥ v0.83.0) and restart.</li>
-      <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker run</code>. Re-<code>export</code> it, or put <code>ANTHROPIC_API_KEY=sk-ant-...</code> in <code>~/.agentos-secrets/agentos.env</code> (the entrypoint sources it).</li>
-      <li><strong>Semantic KB not working / "OPENAI_API_KEY is not set":</strong> add <code>-e OPENAI_API_KEY</code> to the <code>docker run</code> command and make sure the key is exported in the same shell.</li>
+      <li><strong><code>agentd exited with error: connecting to HTTP MCP server 'semantic-kb': ... dns error: failed to lookup address information</code>:</strong> you started <code>cos</code> with a bare <code>docker run</code> instead of <code>docker compose up cos</code>. <code>semantic-kb-mcp</code> is a separate sidecar container (h8.1/memory-routing) reachable only by its Compose service name — there is no standalone-<code>docker run</code> path for <code>cos</code> mode anymore. Use step 06's <code>docker compose up cos</code> command.</li>
+      <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker compose up</code>. Re-<code>export</code> it, or put <code>ANTHROPIC_API_KEY=sk-ant-...</code> in <code>~/.agentos-secrets/agentos.env</code> (the entrypoint sources it).</li>
+      <li><strong>Semantic KB not working / "OPENAI_API_KEY is not set":</strong> make sure <code>OPENAI_API_KEY</code> is exported in the same shell before <code>docker compose up cos</code> — it's forwarded by the <code>cos</code> and <code>semantic-kb-mcp</code> services' <code>environment:</code> blocks.</li>
       <li><strong><code>agentctl watch</code> can't connect:</strong> confirm the container is running with <code>-p 127.0.0.1:7999:7999</code> — older invocations without this flag won't expose the port. Verify with <code>curl -s http://localhost:7999/healthz</code>.</li>
       <li><strong>Chat rail sends a message but the reply never appears:</strong> you're likely connected via <code>--agents-dir /agents</code> (FUSE) instead of <code>--url http://localhost:7999</code> — the chat rail needs the management API's streaming connection, which FUSE mode doesn't provide. After ~30s you'll see an inline "No response after 30s" hint; reconnect with <code>--url</code> as shown in step 07.</li>
       <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> port <code>8585</code> was already in use. Re-run with <code>--port &lt;free-port&gt;</code> — Desktop app clients accept any loopback port automatically.</li>
@@ -880,7 +874,7 @@
     <div class="note-label">Notes</div>
     <ul>
       <li><strong>Schedule:</strong> <code>TRIGGER_INTERVAL="every 2m"</code> (used above) only accepts <code>every N(s|m|h)</code>. For a daily brief use <code>-e "TRIGGER_CRON=0 8 * * *"</code> (08:00 UTC). A cron expression in <code>TRIGGER_INTERVAL</code> will not parse.</li>
-      <li><strong>API key across shells:</strong> <code>-e ANTHROPIC_API_KEY</code> forwards it from the shell you <code>export</code>ed in — run <code>docker run</code> in that same terminal.</li>
+      <li><strong>API key across shells:</strong> Compose's bare <code>- ANTHROPIC_API_KEY</code> (no <code>=value</code>) forwards it from the shell you <code>export</code>ed in — run <code>docker compose up cos</code> in that same terminal.</li>
       <li><strong>Talk to it interactively:</strong> instead of the autonomous cron brief, run the orchestrator REPL — <code>docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate</code>.</li>
       <li><strong>Stopping:</strong> Ctrl+C triggers a graceful checkpoint. State is preserved in <code>~/.agentos-data</code> — the next run resumes from where it left off.</li>
       <li><strong>Google auth on subsequent runs:</strong> The refresh token in <code>google.json</code> is read by the credential broker; no browser re-auth needed. If the token expires, re-run <code>agentctl auth google</code> with the same flags.</li>
