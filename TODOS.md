@@ -141,6 +141,45 @@
   the TUI process. Fix: evict target entries whose agent id no longer appears in the
   latest snapshot and isn't `active_target`, or cap tracked targets with an LRU policy.
   Depends on: none.
+- **Terminal-event handlers (`orchestrator_turn_complete`/`agent_failed`/
+  `orchestrator_exited`) have no turn-identity guard, unlike `append_delta`'s `turn_seq`
+  check** (P1, found by `/ship`'s Step 11 adversarial pass, Claude subagent): a stale,
+  delayed completion event for a PREVIOUS turn can flush and corrupt a DIFFERENT, currently
+  in-flight turn for the same `agent_id`. Reachable: (1) the 30s dead-air timeout fires on
+  a legitimately slow-first-token turn A and flushes it to `Idle`; (2) the operator
+  retries, a fresh `load_snapshot()` shows the agent already back to `"waiting"` (turn A
+  actually completed server-side, the SSE event just lagged — plausible given the
+  already-filed broadcast-channel TODO), so `inject()` starts turn B; (3) turn A's stale
+  `orchestrator_turn_complete` finally arrives, tagged with the same `agent_id` — the
+  handler has no way to tell it belongs to a different, already-abandoned turn, so it
+  `flush()`es, silently destroying turn B's already-accumulated live content AND falsely
+  disarming the double-submit guard (`phase` resets to `Idle`) mid-turn-B. Root cause is
+  partly server-side: `scheduler.rs` records these three event kinds with `turn: None` and
+  no `turn_seq` in `data`, unlike `InferenceStreamDelta` — a full fix needs the server to
+  thread a turn identifier onto these three kinds the same way it already does for deltas.
+  Depends on: none, but touches `agentd`'s event schema for 3 pre-existing event kinds
+  (orch.1/orch.2), not just the ux.1 diff.
+- **`resolved_id` merge in the Enter handler can clobber an unrelated, already-in-flight
+  target's state** (P3, found by `/ship`'s Step 11 adversarial pass, Claude subagent —
+  classified INVESTIGATE, narrow): if `resolved_id` (from `HttpSource::spawn`'s documented
+  `"operator-agent"` id-collision fallback) already had its own independent
+  `ConverseState` with an in-flight turn, the Enter handler's `entry(resolved_id)
+  .or_default()` + unconditional `phase = Dispatching` forcibly resets that unrelated
+  turn's phase/`last_event_at`, potentially interfering with its own double-submit guard
+  and dead-air timeout. Only reachable through the id-fallback quirk plus a coincidental
+  pre-existing entry for that literal id — narrow, not confirmed to manifest in practice.
+  Depends on: none.
+- **`flight.jsonl` growth rate amplified by orders of magnitude with no rotation
+  mechanism** (P3, found by `/ship`'s Step 11 adversarial pass, Claude subagent —
+  classified INVESTIGATE; pre-existing gap, accelerated by this branch): before ux.1,
+  `flight.jsonl` grew roughly one line per turn/tool-call; after ux.1 it grows one line per
+  streamed token CHUNK (each individually capped at 256 bytes, but the line COUNT is
+  unbounded and proportional to reply length). No log rotation/truncation exists at all.
+  Related to, but distinct from, the already-filed lock-contention TODO (that one is about
+  write latency; this is about unbounded disk consumption over a session's lifetime).
+  Verified the OTEL sidecar does NOT amplify this into telemetry — `InferenceStreamDelta`
+  is deliberately excluded from span mapping (`otel/tests/event_kind_coverage.rs`) to avoid
+  a span-per-token explosion. Depends on: none.
 
 ## ux.9 — Open (deferred from build + /review adversarial pass, 2026-07-12)
 
