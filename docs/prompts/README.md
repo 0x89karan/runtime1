@@ -9,6 +9,7 @@ and marked `✅ Shipped` for reference (see the banner at the top of each).
 | Prompt | What | Status |
 |---|---|---|
 | **`12-build-queue-single-lane.md`** | **Master queue** — dx.6 → cheap wins → ux.0 (solo) → split into CoS + cockpit lanes | **active — start here** |
+| **`14-full-system-audit.md`** | **Full end-to-end audit** — tactical + structural + strategic; 11 dimensions, Skills (Phase 11) deep-dive, future-directions, `docs/plans/`-style deliverable. Seed: `14-full-system-audit-findings.md` | on-demand (fresh session) |
 | **`13-parallel-dev-rules.md`** | **Rules of engagement when 2+ sessions build in parallel** — lanes, worktree isolation, the gstack loop, merge discipline | **standing — give to every session** |
 | `09-ux-cockpit.md` | Cockpit lane (Track UX) detail — resume at ux.9 after ux.0 merges | pending (post-split) |
 | `10-skills-subsystem.md` | Phase 11 — skills subsystem | future |
