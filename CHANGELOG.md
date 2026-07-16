@@ -122,6 +122,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `scheduler`/`flight_recorder` and agentctl's `converse`/`mod`/`views`); otel's
   `event_kind_coverage` exhaustiveness guard updated for the new `EventKind` variant.
 
+## [v0.86.2] - 2026-07-16
+
+### Fixed
+- **CoS orchestrator's `write_file` calls were silently denied in Docker despite
+  a correctly-configured `FsWrite` grant** — `docker/entrypoint.sh`'s `cos)` sed
+  pipeline rewrote the `FsWrite` capability grant (`prefix = "./output"` ->
+  `/data/output`) but never touched the matching `write_file(path='./output/...')`
+  instruction baked into the same TOML's task prompt. At runtime the grant became
+  absolute while the LLM was still told to call `write_file` with a relative path,
+  which can never satisfy an absolute-prefix capability check under
+  `agentd/src/capability.rs`'s `satisfies()`. Root-caused via live `flight.jsonl`
+  `capability_denied` events, not the orchestrator's own self-report (which
+  claimed a vague "operator should enable FsWrite" — a misdiagnosis of the same
+  class as v0.86.1's Gmail bug). Fixed by extending the sed pipeline to rewrite
+  the prompt instruction alongside the grant, plus a fail-fast startup guard that
+  now exits with a clear error if this literal ever desyncs again instead of
+  denying writes silently. `/review` (adversarial pass) confirmed exact
+  single-match correctness with no collateral rewrite side effects; `/qa`
+  verified live in Docker against real Gmail — a real brief landed on disk with
+  zero `capability_denied` events post-fix.
+
 ## [v0.86.1] - 2026-07-15
 
 ### Fixed

@@ -604,9 +604,10 @@
   </div>
 
   <div class="whats-new">
-    <div class="whats-new-label">v0.86.1 — What's new</div>
+    <div class="whats-new-label">v0.86.2 — What's new</div>
     <ul>
-      <li><strong>Gmail actually works now</strong> <span class="step-tag tag-new">fixed</span> — earlier v0.86.x images rejected every Gmail API call with <code>credential_denied</code>/<code>no_providers_configured</code> even after a successful <code>agentctl auth google</code>, because the <code>google_oauth</code> MCP server was missing its own broker capability grant. Fixed at the config level; no setup changes needed. If you still see this error, re-pull the image (≥ v0.86.1).</li>
+      <li><strong>Brief writes actually work now</strong> <span class="step-tag tag-new">fixed</span> — earlier v0.86.x images silently denied every <code>write_file</code> call from the CoS orchestrator ("File write" showed as a "known environment constraint" in the daily brief). Root cause: the FsWrite capability grant and the prompt's write path drifted out of sync during Docker's config rewrite. Fixed at the config level; no setup changes needed. If you still see briefs delivered inline instead of written to disk, re-pull the image (≥ v0.86.2).</li>
+      <li><strong>Gmail actually works now</strong> — earlier v0.86.x images rejected every Gmail API call with <code>credential_denied</code>/<code>no_providers_configured</code> even after a successful <code>agentctl auth google</code>, because the <code>google_oauth</code> MCP server was missing its own broker capability grant. Fixed at the config level; no setup changes needed. If you still see this error, re-pull the image (≥ v0.86.1).</li>
       <li><strong>Chat rail on the Dashboard</strong> — <code>agentctl watch</code> now has a permanent chat pane beside the agent table. Press <code>Tab</code> to focus it, type a message, <code>Enter</code> to send — replies stream in live, token by token, over the same management API connection you're already using below. See step 07.</li>
       <li><strong>Credential broker</strong> — the <code>google_oauth</code> sidecar no longer holds the raw refresh token in memory. A credential gateway reads <code>google.json</code> once and issues short-lived access tokens per request. No changes to the setup flow below.</li>
       <li><strong>Management API exposed on :7999</strong> — <code>agentctl watch</code> now runs on your Mac host with <code>--url http://localhost:7999</code>. No more <code>docker exec</code>.</li>
@@ -861,6 +862,7 @@
     <ul>
       <li><strong>Inbox agent stuck at "Not authenticated" / "no active session":</strong> your image predates the credential broker. Re-pull <code>agentos:full</code> (≥ v0.83.0) and restart.</li>
       <li><strong>Gmail calls return 403 <code>credential_denied</code> / <code>no_providers_configured</code>, even though <code>agentctl auth google</code> succeeded and <code>oauth_check_auth</code> reports "ready":</strong> your image predates v0.86.1 — the <code>google_oauth</code> MCP server was missing its own broker capability grant (agent-level <code>Credential</code> alone isn't enough; the server needs one too). Re-pull <code>agentos:full</code> (≥ v0.86.1) and restart. If building from source, make sure your checkout includes commit <code>f5b3555f</code> or later.</li>
+      <li><strong>Daily brief says "File write: FsWrite capability denied" / brief only shows up inline in the orchestrator's reply, never on disk at <code>~/.agentos-output</code>:</strong> your image predates v0.86.2 — the Docker config rewrite updated the FsWrite grant to an absolute path but not the matching <code>write_file</code> prompt instruction, so every write was silently denied. Re-pull <code>agentos:full</code> (≥ v0.86.2) and restart.</li>
       <li><strong><code>agentd exited with error: connecting to HTTP MCP server 'semantic-kb': ... dns error: failed to lookup address information</code>:</strong> you started <code>cos</code> with a bare <code>docker run</code> instead of <code>docker compose up cos</code>. <code>semantic-kb-mcp</code> is a separate sidecar container (h8.1/memory-routing) reachable only by its Compose service name — there is no standalone-<code>docker run</code> path for <code>cos</code> mode anymore. Use step 06's <code>docker compose up cos</code> command.</li>
       <li><strong>Container exits with "ANTHROPIC_API_KEY is not set":</strong> the key wasn't in the shell that ran <code>docker compose up</code>. Re-<code>export</code> it, or put <code>ANTHROPIC_API_KEY=sk-ant-...</code> in <code>~/.agentos-secrets/agentos.env</code> (the entrypoint sources it).</li>
       <li><strong>Semantic KB not working / "OPENAI_API_KEY is not set":</strong> make sure <code>OPENAI_API_KEY</code> is exported in the same shell before <code>docker compose up cos</code> — it's forwarded by the <code>cos</code> and <code>semantic-kb-mcp</code> services' <code>environment:</code> blocks.</li>
@@ -885,7 +887,7 @@
   </div>
 
   <div style="margin-top:8px;font-family:'JetBrains Mono','SF Mono',Consolas,monospace;font-size:11px;color:var(--muted);text-align:center;letter-spacing:0.04em;">
-    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.86.1
+    Source of truth: <code>docs/DEPLOYMENT.md</code> → Path 1 (Mac + Docker) · agentos v0.86.2
   </div>
 
 </div>
