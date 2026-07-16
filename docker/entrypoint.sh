@@ -150,7 +150,18 @@ case "${1:-shell}" in
       -e 's|evidence_path = "evidence\.jsonl"|evidence_path = "/data/evidence.jsonl"|' \
       -e 's|key_path      = "egress-key\.pkcs8"|key_path      = "/data/egress-key.pkcs8"|' \
       -e 's|prefix = "\./output"|prefix = "/data/output"|' \
+      -e "s|write_file(path='\\./output/|write_file(path='/data/output/|" \
       /etc/agentd/cos.agents.toml > /data/cos.agents.toml
+    # Fail fast if the FsWrite grant and the write_file prompt instruction
+    # ever desync again (the exact bug this rewrite fixes): a silent mismatch
+    # here means every write_file call gets denied with capability_denied,
+    # discoverable only by reading flight.jsonl inside a running container.
+    grep -q "write_file(path='/data/output/" /data/cos.agents.toml || {
+      echo "ERROR: cos.agents.toml path rewrite failed — write_file prompt path" >&2
+      echo "       doesn't match the rewritten FsWrite grant. Check the sed" >&2
+      echo "       patterns in docker/entrypoint.sh still match the source TOML." >&2
+      exit 1
+    }
     cd /data
     exec agentd /data/cos.agents.toml
     ;;
