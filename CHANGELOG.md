@@ -122,7 +122,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `scheduler`/`flight_recorder` and agentctl's `converse`/`mod`/`views`); otel's
   `event_kind_coverage` exhaustiveness guard updated for the new `EventKind` variant.
 
-### Fixed (post-ship, no version bump — landed 2026-07-15)
+## [v0.86.1] - 2026-07-15
+
+### Fixed
 - **CoS Inbox agent could never read Gmail despite a valid, broker-managed OAuth session**
   — every Gmail API call was rejected with 403 `credential_denied`/`no_providers_configured`.
   Root cause: `agentd/src/main.rs`'s credential proxy token derives its `allowed_providers`
