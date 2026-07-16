@@ -61,7 +61,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 7. ~~**memory-routing** (v0.81.0)~~ ✅ shipped — raw emails → h8.1 semantic L2 (OpenAI text-embedding-3-small); CoS email dedup via `kb_get`; fixes ~820k token/run blowup.
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. **cred.7** — credential resilience (on top of broker mode).
-10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → ux.8 → ux.3 → ux.2b (idle/error).
+10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → ux.10 (TUI polish) → ux.8 → ux.3 → ux.2b (idle/error).
 11. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
@@ -1170,6 +1170,12 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
 - **ux.8** — Live budget control (added 2026-07-11): a cockpit panel to view + set per-agent and global
   token budgets over a new management-API budget endpoint. Fixes the live-run "500k too small" finding.
   `/plan-eng-review` (live config writes).
+- **ux.10** — TUI polish: log streaming + input ergonomics (added 2026-07-16): (1) new `[g]` Logs view
+  tailing `docker compose logs --follow` as a subprocess into a 2 000-line ring buffer with per-service
+  filter + `/` search + follow mode; Docker-context-gated (absent on bare agentd); (2) replace all
+  hand-rolled char-accumulation inputs with `tui-input` (converse rail, Memory/Inspector/Logs search,
+  deny reason) and `tui-textarea` (Spawn task field); (3) `color-eyre` panic hook for guaranteed
+  terminal restore. No new management API endpoints. Full plan: `docs/plans/ux.10-tui-polish.md`.
 - ~~**ux.9** — Cockpit mode~~ ✅ **shipped (v0.82.0)** — `docker/entrypoint.sh`'s `cockpit)` case:
   the new zero-arg Docker default, cold-starts `agentd` with a zero-agent config
   (`docker/cockpit.toml`) and attaches `agentctl watch` (non-exec'd, preserving signal handling).
