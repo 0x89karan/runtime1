@@ -425,7 +425,8 @@ their task prompts.
 services, no profile flag needed):
 
 ```bash
-OPENAI_API_KEY=sk-... AGENT_TASK="..." TEMPLATE_NAME=librarian-semantic \
+ANTHROPIC_API_KEY=sk-ant-... OPENAI_API_KEY=sk-... \
+  AGENT_TASK="..." TEMPLATE_NAME=librarian-semantic \
   docker compose run --rm agent
 ```
 
@@ -461,13 +462,17 @@ url                  = "http://semantic-kb-mcp:8020"
 allow_insecure_local = true   # Docker-internal plaintext HTTP is intentional
 tool_override        = true   # shadows native kb_put/kb_get/kb_search
 
-[capabilities]
-mcp = [{ server = "semantic-kb", tools = ["kb_put", "kb_get", "kb_search"] }]
+# Capabilities go on the AGENT (a top-level [capabilities] table is not agent.toml syntax):
+[agent]
+capabilities = [
+  { Mcp = { server = "semantic-kb", tools = ["kb_put", "kb_get", "kb_search"] } },
+]
 ```
 
 Use the `librarian-semantic` template for a ready-made config:
 ```bash
-TEMPLATE_NAME=librarian-semantic AGENT_TASK="..." OPENAI_API_KEY=sk-... \
+ANTHROPIC_API_KEY=sk-ant-... OPENAI_API_KEY=sk-... \
+  TEMPLATE_NAME=librarian-semantic AGENT_TASK="..." \
   docker compose run --rm agent
 ```
 

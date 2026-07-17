@@ -16,7 +16,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   an agent whose every `kb_put` fails. Badge, warning, card wording, and
   `docs/MCP_SERVERS.md` (full env table + two dead `--profile semantic` commands) now
   match the code. A token-consistency test fails if a template ever names an env var
-  nothing in the product reads.
+  that appears nowhere in the product's sources (`docker/`, `agentd/src`).
 - **A missed path rewrite at container boot now refuses to boot instead of failing
   silently at runtime** — the `cos)`/`agent)` sed pipeline gained general negative
   assertions (both quote styles, positive-form path-key check, args-line anchoring) that

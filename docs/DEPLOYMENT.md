@@ -394,8 +394,8 @@ After editing `agentd/cos.agents.toml` (or the entrypoint's sed rules), verify t
 container-boot rewrite and its path guards without any secrets:
 
 ```bash
-make dev-image                                            # rebuild after each edit
-docker run --rm -e DRY_RUN_ONLY=1 agentos:full cos        # prints rewritten config, exit 0
+make dev-image                                            # rebuild after each edit (tags agentos:dev)
+docker run --rm -e DRY_RUN_ONLY=1 agentos:dev cos         # prints rewritten config, exit 0
 # agent mode needs a template + a dummy key (only checked for non-emptiness):
 docker compose run --rm -e DRY_RUN_ONLY=1 -e ANTHROPIC_API_KEY=x \
   -e TEMPLATE_NAME=scout -e AGENT_TASK=x agent

@@ -1213,6 +1213,10 @@ permits Docker-internal `http://` URLs. `templates/librarian-semantic.template.t
 `--profile semantic` for zero-config start. 7 self-tests; SSRF guard on `QDRANT_URL`.
 (Note: HelixDB was evaluated but uses a graph-DSL API incompatible with the sidecar model;
 Qdrant selected for its simple REST vector API.)
+*(As shipped in v0.64.0. Since superseded: embeddings switched to OpenAI
+`text-embedding-3-small` in memory-routing/v0.81.0, and the `--profile semantic` flag is
+gone — `qdrant` + `semantic-kb-mcp` are always-on Compose services. Current usage:
+`docs/MCP_SERVERS.md`.)*
 
 **h8.2 — `agentos:full` Docker distribution** [HARNESS] ✅ v0.73.0
 Formally packages the harness into a versioned Docker image pair. `agentos:core` contains
