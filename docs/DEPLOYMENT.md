@@ -388,6 +388,24 @@ when `AGENTD_CREDENTIAL_GATEWAY_URL` is set — credential broker path, availabl
 
 ## Troubleshooting
 
+### Verifying config changes (dry run — no credentials needed)
+
+After editing `agentd/cos.agents.toml` (or the entrypoint's sed rules), verify the
+container-boot rewrite and its path guards without any secrets:
+
+```bash
+make dev-image                                            # rebuild after each edit (tags agentos:dev)
+docker run --rm -e DRY_RUN_ONLY=1 agentos:dev cos         # prints rewritten config, exit 0
+# agent mode needs a template + a dummy key (only checked for non-emptiness):
+docker compose run --rm -e DRY_RUN_ONLY=1 -e ANTHROPIC_API_KEY=x \
+  -e TEMPLATE_NAME=scout -e AGENT_TASK=x agent
+```
+
+Success prints the fully-rewritten TOML and exits 0. A failed rewrite exits 1 and
+names the surviving line (the boot guards catch any relative path the sed rules
+missed). `AGENTOS_SKIP_PATH_GUARDS=1` overrides the guards if your custom config
+legitimately contains quoted relative paths.
+
 ```bash
 # Was the agent started?
 sudo journalctl -u agentos-cos --no-pager | grep -i "agentd\|error\|panic"

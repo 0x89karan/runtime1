@@ -61,8 +61,9 @@ remaining work — one increment per branch, `main` shippable between, each thro
 7. ~~**memory-routing** (v0.81.0)~~ ✅ shipped — raw emails → h8.1 semantic L2 (OpenAI text-embedding-3-small); CoS email dedup via `kb_get`; fixes ~820k token/run blowup.
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. ~~**cred.7** (v0.84.0)~~ ✅ shipped — credential resilience (on top of broker mode).
-10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → ux.10 (TUI polish) → ux.8 → ux.3 → ux.2b (idle/error).
-11. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
+10. **Audit remediation** (from `docs/AUDIT-v0.86.md` §6/§9): ~~**audit.1** (v0.87.0)~~ ✅ shipped — P0 hotfix + guard batch (`docs/plans/audit.1-p0-hotfix-guards.md`) → **ci.1** (CI tests the artifact) → then cap.1/cap.2/run.1/par.1-2 interleave per the audit build order.
+11. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → **ux.8 (budgets; ux.8′ scope — moved ahead of ux.10 at the audit.1 review gate 2026-07-17: budget truth before TUI polish)** → ux.10 (TUI polish) → ux.3 → ux.2b (idle/error).
+12. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
 
@@ -1212,6 +1213,10 @@ permits Docker-internal `http://` URLs. `templates/librarian-semantic.template.t
 `--profile semantic` for zero-config start. 7 self-tests; SSRF guard on `QDRANT_URL`.
 (Note: HelixDB was evaluated but uses a graph-DSL API incompatible with the sidecar model;
 Qdrant selected for its simple REST vector API.)
+*(As shipped in v0.64.0. Since superseded: embeddings switched to OpenAI
+`text-embedding-3-small` in memory-routing/v0.81.0, and the `--profile semantic` flag is
+gone — `qdrant` + `semantic-kb-mcp` are always-on Compose services. Current usage:
+`docs/MCP_SERVERS.md`.)*
 
 **h8.2 — `agentos:full` Docker distribution** [HARNESS] ✅ v0.73.0
 Formally packages the harness into a versioned Docker image pair. `agentos:core` contains

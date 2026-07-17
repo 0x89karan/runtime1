@@ -1,0 +1,12 @@
+# Negative-control fixture for config_parse_all (audit.1 /review finding).
+# Parses and lowers cleanly, but two agents share an id — the scheduler rejects
+# this at boot ("duplicate agent id" ensure!), so check_spec must reject it too.
+# This file lives in tests/fixtures/, OUTSIDE the directories the positive test globs.
+
+[[agents]]
+id = "dup"
+task = "first"
+
+[[agents]]
+id = "dup"
+task = "second"

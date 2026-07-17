@@ -75,6 +75,8 @@ native = ["all"]                      # built-in tools: "all" or a list like ["r
 # To use kv / KB tools, list them explicitly (they are NOT included in "all"):
 #   [tools]
 #   native = ["read_file", "list_dir", "kv_get", "kv_set", "kb_put", "kb_get", "kb_search"]
+# KB capabilities go on the AGENT (not [tools] — ToolsConfig rejects unknown keys):
+#   [agent]
 #   capabilities = [
 #     { KbWrite = { segment = "agent:scratch" } },
 #     { KbRead  = { segment = "agent:scratch" } },

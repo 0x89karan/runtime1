@@ -11,7 +11,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 
 ### P0
 
-- **audit86-P0-1 (P0) [new] — Default QEMU boot config does not parse.**
+- ~~**audit86-P0-1 (P0) [new] — Default QEMU boot config does not parse.**~~ **[FIXED in audit.1 (v0.87.0): `model_id` → `model`; `config_parse_all.rs` proves every checked-in spec parses.]**
   `distro/overlay/etc/agentd/agent.toml:16` uses `model_id`; `ModelConfig` (`config.rs:503-509`,
   `deny_unknown_fields`) has no such field — the key never existed. Reproduced: agentd
   exits with an unknown-field error at line 16. `/init:67` falls back to this file for any
@@ -51,7 +51,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   `agents_fs.rs`), `sandbox` (34), and `otel` (34) test suites are never executed in CI on
   any target, and their clippy is not reliably denied. The "1420 workspace tests" figure is
   a local-only guarantee. Fix: `cargo test/clippy --workspace --all-targets` from repo root. → `ci.1`.
-- **audit86-P1-5 (P1) [new] — entrypoint sed-rewrite pipeline has zero test coverage.**
+- **audit86-P1-5 (P1→ci.1 remainder) — entrypoint sed-rewrite pipeline has zero test coverage.** **[PARTIAL in audit.1 (v0.87.0): general negative-assertion guards (both quote styles, positive-form path-key, args-anchored), cos+agent DRY_RUN_ONLY hooks, escape hatch — verified live in Docker by /qa. Remaining for ci.1: the CI job invoking the dry-runs + the two unexercised guard branches (grep rc>=2 refusal, extra-pattern concat).]**
   `entrypoint.sh:242-247`'s `DRY_RUN_ONLY` hook (cred.2) is invoked by nothing; the v0.86.2
   guard (`:159`) covers 1 of 6 `cos)` rewrite rules and checks the *prompt* half of the
   v0.86.2 pair, not the *grant* half (`prefix = "./output"`), so the inverse desync passes.
@@ -66,7 +66,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   derive from Cargo.toml, artifacts from `GITHUB_REF_NAME` — they can diverge). This is the
   v0.86.0-tag-behind-main incident with no guard. Fix: two-line ancestry + version-match
   check in publish-docker. → `ci.1`.
-- **audit86-P1-7 (P1) [new] — No parse check for any checked-in TOML outside `templates/`.**
+- ~~**audit86-P1-7 (P1) [new] — No parse check for any checked-in TOML outside `templates/`.**~~ **[FIXED in audit.1 (v0.87.0): `agentd/tests/config_parse_all.rs` — parse + validate + lowering + dup-id over docker/, agentd/, distro overlay, with negative-control fixtures.]**
   `template.rs` has catalogue tests, but nothing globs `docker/*.toml`, `agentd/*.toml`, or
   `distro/overlay/etc/agentd/*.toml`; audit86-P0-1 is the proof. Fix:
   `agentd/tests/config_parse_all.rs` asserting `Config` deserializes each (~1 h). → `audit.1`.
@@ -201,7 +201,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   (nullified by `env_clear()`); `agentd/README.md:63` streaming default documented backwards;
   CONVENTIONS event table missing `mcp_passenv_forwarded` + FUSE table missing 5 files & all of
   `/agents/system/`; README self-contradicts on version. → `doc.1` + CONVENTIONS-completeness test.
-- **Reconciliation — fixed-but-not-struck TODOS entries (verify, then move to Completed):**
+- ~~**Reconciliation — fixed-but-not-struck TODOS entries (verify, then move to Completed):**~~ **[DONE in audit.1 (2026-07-17): all 6 entries verified against code and struck in place — see each entry's FIXED/SUPERSEDED annotation.]**
   `audit-S1`/`audit-S2` (`TODOS.md:387,392`; closed in cred.3.1 / v0.61.0 as cred.3-ar-S1/S2);
   `F-012` (`:1583`; = F-05/audit-C3, fsync landed v0.70.0 — corroborated by the ops pass at
   `checkpoint.rs:36-65,187-204`); `F-015` (`:1588`; `extra_env` blocklist enforced at
@@ -594,12 +594,12 @@ pass surfaced.
 Wave 2 = C1,C3,C4,C5,C8,S5,S6,S7 · Wave 3 (docs, one pass) = D1–D5,S4 · Wave 4 = O3,O4,C6,C7,C9.
 
 ### Tier 1 — security & integrity (the trust-story gap)
-- **audit-S1 (P1) [new] — Ed25519 receipt-signing key readable by any MCP server with `FsRead`.**
+- ~~**audit-S1 (P1) [new] — Ed25519 receipt-signing key readable by any MCP server with `FsRead`.**~~ **[FIXED in v0.61.0 (cred.3.1) as cred.3-ar-S1: OV-1 boot `ensure!` rejects startup when `egress.key_path` falls inside any MCP FsRead/FsWrite prefix — `main.rs:1003-1019`. Verified 2026-07-17 (audit.1).]**
   Startup blocks `FsWrite` over the evidence log but not `FsRead` over `egress-key.pkcs8` (CWD default)
   → a malicious tool reads the key and forges valid receipts. Fix: reject startup if `egress.key_path`
   resolves under any MCP `FsRead`/`FsWrite` prefix; default the key outside any MCP-accessible tree.
   `config.rs:181`, `main.rs:859`, `evidence.rs:88`.
-- **audit-S2 (P1) [new] — `content_audited: true` hardcoded but nothing audits content.**
+- ~~**audit-S2 (P1) [new] — `content_audited: true` hardcoded but nothing audits content.**~~ **[FIXED in v0.61.0 (cred.3.1) as cred.3-ar-S2: claim dropped from EgressBrokered; regression test T23 (`credential/mod.rs:2425-2434`) fails if it returns. Verified 2026-07-17 (audit.1).]**
   Flight event + receipt assert an audit that never happens; the receipt doesn't cover forwarded bytes.
   Fix: hash the forwarded body into the receipt, or drop the claim. `egress.rs:150`.
 - **audit-S3 (P1) [new] — `SecretRewriter` / `BoundarySecretRedacted` claimed shipped (v0.39.0) but ABSENT.**
@@ -1319,7 +1319,7 @@ scope_set: HashSet<OAuthScope> }` checked against the token's actual scopes at t
 - **Where to start:** `agentd/src/capability.rs` (`Credential` variant) + `agentd/src/credential/`
   (token scope introspection at refresh) + `agentctl auth google` (scope selection UI).
 
-**cred.3-ar-02 (P2) — `credential_refresh_failed` persistence for agentctl when not attached**
+~~**cred.3-ar-02 (P2) — `credential_refresh_failed` persistence for agentctl when not attached**~~ **[SUPERSEDED: cred.5 credential visibility surface (FUSE+API+TUI, v0.68.0) + cred.7 `ProviderHealthState` checkpoint persistence (`checkpoint.rs:148`, v0.84.0) make refresh failures durable and visible without a live SSE client. Verified 2026-07-17 (audit.1).]**
 
 The plan says `credential_refresh_failed` must produce a visible agentctl alert. But agentctl
 may not be attached when the failure happens (overnight CoS run). The management API SSE
@@ -1504,7 +1504,7 @@ imply this feature is active when it is not.
 - **Where to start:** `docs/THREAT_MODEL.md` + `CLAUDE.md` (p7.5 summary) + `TODOS.md`
   (file this as ongoing P2 work).
 
-**cred.3.1-adv-01 (P2) — OAuthTokenCache loses in-memory rotated refresh token on daemon restart**
+~~**cred.3.1-adv-01 (P2) — OAuthTokenCache loses in-memory rotated refresh token on daemon restart**~~ **[FIXED: `load_from_disk()` pre-populates the cache from `state_path` at startup (cred.3.1-ar-06, test T21 `credential/mod.rs:2303`) + cred.7 checkpoint persistence. Verified 2026-07-17 (audit.1).]**
 
 When the broker refreshes a token, the provider may return a new refresh token (rotation).
 `get_or_refresh()` stores it in memory, and `write_state_atomic()` persists it to `state_path`.
@@ -1571,7 +1571,7 @@ handler level.
 - **Where to start:** `agentd/src/loopback_proxy.rs` (add helper) + `agentd/src/egress.rs` +
   `agentd/src/credential/mod.rs` (delegate both handlers to the new helper).
 
-**cred.3.2-ar-02 (P3) — canonical status line (anti-recurrence for version/doc drift)**
+~~**cred.3.2-ar-02 (P3) — canonical status line (anti-recurrence for version/doc drift)**~~ **[IMPLEMENTED in audit.1: CLAUDE.md `**Current version:**` canonical line, test-enforced against `agentd/Cargo.toml` by `agentd/tests/repo_consistency.rs` — a stale line now fails `cargo test`.]**
 
 cred.3.2 fixed stale version headers in RUNBOOK.md and THREAT_MODEL.md, but did not add an
 anti-recurrence mechanism. CLAUDE.md "Current status" is a long prose log; there is no single
@@ -1790,12 +1790,12 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - `scheduler.rs:608-609`: a single inference can overshoot the ceiling by up to one inference.
 - Fix: document "soft ceiling, overshoot ≤ one in-flight inference per agent" in ROADMAP/NOTES.
 
-**F-012 (P2) — No `fsync` before/after checkpoint rename**
+~~**F-012 (P2) — No `fsync` before/after checkpoint rename**~~ **[FIXED in v0.70.0 (orch.2) = F-05/audit-C3: `sync_all()` after write (`checkpoint.rs:64`) + parent-dir fsync after rename (`checkpoint.rs:196-200`). Verified 2026-07-17 (audit.1).]**
 - `checkpoint.rs:47,117`: `write_all` not followed by `sync_all()`; parent dir not fsynced after rename.
   On real power loss the rename or tmp data blocks may not be durable.
 - Fix: `f.sync_all().await?` after `write_all`; `File::open(parent).sync_all()` after rename.
 
-**F-015 (P2) — `extra_env` can re-inject secrets via operator config**
+~~**F-015 (P2) — `extra_env` can re-inject secrets via operator config**~~ **[FIXED: `extra_env` loop applies `PASSENV_BLOCKLIST` (`tools/mcp.rs:141-146`) — credential vars are blocked with a warning. Verified 2026-07-17 (audit.1).]**
 - `tools/mcp.rs:100-102`: the `extra_env` loop from `McpServerConfig.env` runs after `env_clear()` with
   no denylist. An operator (or compromised `agents.toml`) can write `ANTHROPIC_API_KEY = "sk-…"` to pass
   the key explicitly to an MCP subprocess — defeating the F-001 env isolation.

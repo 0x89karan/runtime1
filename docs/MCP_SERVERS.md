@@ -42,7 +42,7 @@ package installs). Use paths relative to the directory where agentd is invoked
 | `docker/cron_mcp.py`     | `wait_for_trigger` | none | `TRIGGER_CRON` or `TRIGGER_INTERVAL` |
 | `docker/fs_watch_mcp.py` | `wait_for_trigger` | `FsRead { prefix = "/..." }` | `TRIGGER_WATCH_PATH` |
 | `docker/webhook_mcp.py`  | `wait_for_trigger` | `Net { ports = [PORT] }` | `TRIGGER_WEBHOOK_PORT` (optional) |
-| `docker/semantic_kb_mcp.py` | `kb_put`, `kb_get`, `kb_search` | `KbRead`/`KbWrite { segment }` | `VOYAGE_API_KEY` |
+| `docker/semantic_kb_mcp.py` | `kb_put`, `kb_get`, `kb_search` | `KbRead`/`KbWrite { segment }` | `OPENAI_API_KEY` |
 
 Self-test (no API key required):
 ```bash
@@ -52,7 +52,7 @@ python3 docker/search_mcp.py --test
 python3 docker/cron_mcp.py  --test
 python3 docker/fs_watch_mcp.py --test
 python3 docker/webhook_mcp.py  --test
-VOYAGE_MOCK_EMBEDDINGS=1 python3 docker/semantic_kb_mcp.py --test
+MOCK_EMBEDDINGS=1 python3 docker/semantic_kb_mcp.py --test
 ```
 
 ### shell_exec
@@ -415,19 +415,22 @@ restart — it is not persisted across crashes (only clean exits reset the count
 
 `docker/semantic_kb_mcp.py` is a Layer-2 semantic memory sidecar. It exposes
 the same `kb_put` / `kb_get` / `kb_search` interface as the built-in BM25
-Layer-1 store (p5.5), but backed by Qdrant (vector database) + Voyage AI
-(embeddings). With `tool_override = true`, it silently replaces the native
-BM25 tools so agents can be upgraded to vector search without changing their
-task prompts.
+Layer-1 store (p5.5), but backed by Qdrant (vector database) + the OpenAI
+Embeddings API (`text-embedding-3-small`; switched from Voyage AI in
+memory-routing/v0.81.0). With `tool_override = true`, it silently replaces the
+native BM25 tools so agents can be upgraded to vector search without changing
+their task prompts.
 
-**Quick-start** (Docker Compose):
+**Quick-start** (Docker Compose — `qdrant` and `semantic-kb-mcp` are always-on
+services, no profile flag needed):
 
 ```bash
-VOYAGE_API_KEY=sk-... AGENT_TASK="..." TEMPLATE_NAME=librarian-semantic \
-  docker compose --profile semantic up
+ANTHROPIC_API_KEY=sk-ant-... OPENAI_API_KEY=sk-... \
+  AGENT_TASK="..." TEMPLATE_NAME=librarian-semantic \
+  docker compose run --rm agent
 ```
 
-This starts three containers: `agent` (agentd), `qdrant` (vector store), and
+This uses three containers: `agent` (agentd), `qdrant` (vector store), and
 `semantic-kb-mcp` (the sidecar). Qdrant data persists in the `qdrant-data` named volume.
 
 ### Tools
@@ -442,11 +445,13 @@ This starts three containers: `agent` (agentd), `qdrant` (vector store), and
 
 | Var | Default | Description |
 |-----|---------|-------------|
-| `VOYAGE_API_KEY` | *(required)* | Voyage AI embedding API key. |
-| `VOYAGE_MODEL` | `voyage-3-lite` | Model to use (also: `voyage-3`, `voyage-code-3`). |
+| `OPENAI_API_KEY` | *(required unless `MOCK_EMBEDDINGS=1`)* | OpenAI embedding API key. |
+| `EMBED_MODEL` | `text-embedding-3-small` | Embedding model (1536 dims). |
 | `QDRANT_URL` | `http://qdrant:6333` | Qdrant base URL. Must resolve to a private/loopback address (SSRF guard at startup). |
-| `VOYAGE_MOCK_EMBEDDINGS` | `0` | Set to `1` to use zero vectors instead of calling Voyage AI (testing only). |
+| `MOCK_EMBEDDINGS` | `0` | Set to `1` to use zero vectors instead of calling the embeddings API (testing only). |
 | `PORT` | `8020` | HTTP port the MCP server listens on. |
+| `SEMANTIC_MAX_AGE_DAYS` | `30` | Evict entries older than N days at startup (`0` disables). |
+| `SEMANTIC_MAX_ENTRIES` | `10000` | Evict oldest entries beyond this count per namespace (`0` disables). |
 
 ### TOML config snippet
 
@@ -457,20 +462,24 @@ url                  = "http://semantic-kb-mcp:8020"
 allow_insecure_local = true   # Docker-internal plaintext HTTP is intentional
 tool_override        = true   # shadows native kb_put/kb_get/kb_search
 
-[capabilities]
-mcp = [{ server = "semantic-kb", tools = ["kb_put", "kb_get", "kb_search"] }]
+# Capabilities go on the AGENT (a top-level [capabilities] table is not agent.toml syntax):
+[agent]
+capabilities = [
+  { Mcp = { server = "semantic-kb", tools = ["kb_put", "kb_get", "kb_search"] } },
+]
 ```
 
 Use the `librarian-semantic` template for a ready-made config:
 ```bash
-TEMPLATE_NAME=librarian-semantic AGENT_TASK="..." VOYAGE_API_KEY=... \
-  docker compose --profile semantic up
+ANTHROPIC_API_KEY=sk-ant-... OPENAI_API_KEY=sk-... \
+  TEMPLATE_NAME=librarian-semantic AGENT_TASK="..." \
+  docker compose run --rm agent
 ```
 
 ### Self-test
 
 ```bash
-VOYAGE_MOCK_EMBEDDINGS=1 python3 docker/semantic_kb_mcp.py --test
+MOCK_EMBEDDINGS=1 python3 docker/semantic_kb_mcp.py --test
 ```
 
-Runs 16 self-tests (T1–T16) without requiring Qdrant or a Voyage AI key.
+Runs the self-tests without requiring Qdrant or an OpenAI key.

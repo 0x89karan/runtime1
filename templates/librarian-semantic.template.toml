@@ -7,9 +7,9 @@ sample_tasks = [
 
 [template]
 name           = "librarian-semantic"
-description    = "Research librarian with Layer-2 semantic (vector) memory via Qdrant + Voyage AI."
+description    = "Research librarian with Layer-2 semantic (vector) memory via Qdrant + OpenAI embeddings."
 showcases      = "kb_put, kb_get, kb_search (vector similarity), long-term semantic retrieval"
-gated_requires = "VOYAGE_API_KEY"
+gated_requires = "OPENAI_API_KEY"
 
 [capabilities]
 # kb_read/kb_write are intentionally absent: tool_override = true replaces the native
@@ -21,7 +21,7 @@ fs_read  = ["/workspace"]
 
 [card]
 name           = "Librarian (Semantic)"
-description    = "Semantic research librarian backed by Qdrant vector search + Voyage AI embeddings."
+description    = "Semantic research librarian backed by Qdrant vector search + OpenAI embeddings (text-embedding-3-small)."
 skills         = ["research", "semantic-search", "knowledge-management"]
 suggested_caps = [
   { Mcp = { server = "semantic-kb", tools = ["kb_put", "kb_get", "kb_search"] } },
@@ -29,6 +29,9 @@ suggested_caps = [
 ]
 
 # The semantic-kb MCP server runs as a Docker peer service (http://semantic-kb-mcp:8020).
+# LIMITATION: that hostname resolves only under docker compose with the semantic-kb-mcp
+# service up. Host dev mode and bare `docker run` (outside compose) cannot reach it —
+# the 8020 URL is not rewritten by the entrypoint (tracked as audit86 P3).
 # allow_insecure_local = true permits Docker-internal plaintext HTTP.
 # tool_override = true means kb_put / kb_get / kb_search from this server silently shadow
 # the built-in BM25 Layer-1 tools — agents upgrade transparently.

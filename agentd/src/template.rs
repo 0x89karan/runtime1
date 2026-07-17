@@ -254,7 +254,7 @@ pub struct TemplateEntry {
     pub showcases: String,
     /// Example task strings from `sample_tasks` in the template file.
     pub sample_tasks: Vec<String>,
-    /// If set, this template requires a specific env var (e.g. `VOYAGE_API_KEY`).
+    /// If set, this template requires a specific env var (e.g. `OPENAI_API_KEY`).
     /// `agentctl list-templates` shows a `[gated]` badge for these entries.
     pub gated_requires: Option<String>,
 }
@@ -1078,8 +1078,10 @@ task = "t"
             .expect("librarian-semantic must be resolvable");
         assert_eq!(
             cfg.template.gated_requires.as_deref(),
-            Some("VOYAGE_API_KEY"),
-            "librarian-semantic must be gated on VOYAGE_API_KEY"
+            Some("OPENAI_API_KEY"),
+            "librarian-semantic must be gated on OPENAI_API_KEY — the var its sidecar \
+             (docker/semantic_kb_mcp.py) actually reads (audit.1; was wrongly the \
+             stale Voyage var, which nothing in the product reads)"
         );
         let config = cfg
             .to_agent_config(Some("index docs"), vec![])
