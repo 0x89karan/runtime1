@@ -345,7 +345,8 @@ impl Config {
     /// Returns AgentConfigs from either the `[agent]` or `[[agents]]` TOML form.
     /// Errors if both are set (ambiguous), or neither is set unless
     /// `[scheduler] allow_empty_agents = true` (in which case returns an empty
-    /// Vec). Also errors on any duplicate agent id.
+    /// Vec). Duplicate agent ids are NOT checked here — the scheduler rejects
+    /// them at registration/spawn time (`scheduler.rs`, "already in use").
     pub fn agent_configs(&self) -> anyhow::Result<Vec<AgentConfig>> {
         match (&self.agent, self.agents.is_empty()) {
             (Some(_), false) => anyhow::bail!(
