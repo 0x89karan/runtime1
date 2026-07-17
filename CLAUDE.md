@@ -24,9 +24,15 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Latest shipped:** ux.1 (v0.86.0) — Converse: permanent chat rail on `agentctl watch`'s
-Dashboard view, streaming inference deltas end-to-end (agentd -> SSE -> TUI). 1420
-workspace tests. **Next:** ux.8 (budgets) or ux.3.
+**Current version:** v0.87.0 (shipped 2026-07-17)
+<!-- Updated on every release; test-enforced against agentd/Cargo.toml by
+     agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
+
+**Latest shipped:** audit.1 (v0.87.0) — P0 hotfix + guard batch from the v0.86.2
+full-system audit: unbootable QEMU default config fixed, every checked-in config
+parse-proven in CI, boot guards with dry-run verification, truthful librarian
+template gate, TODOS/status reconciliation. 1428+ workspace tests.
+**Next:** ci.1 → ux.8 (budgets; ux.8′ scope per `docs/AUDIT-v0.86.md` §9) → ux.10.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 
@@ -44,6 +50,10 @@ Full per-increment completion notes: `docs/STATUS.md`.
 - **Build, lint, and test before every commit:** `cargo build && cargo clippy --
   -D warnings && cargo test`. Do not commit code that does not compile or that
   has clippy warnings.
+- **Every version bump updates the "Current version" line in this file.** The
+  line at the top of "Current status" is test-enforced against
+  `agentd/Cargo.toml` (`agentd/tests/repo_consistency.rs`) — a release commit
+  that bumps Cargo.toml without updating CLAUDE.md fails CI.
 - **Linux-gated code requires a Linux clippy pass before pushing.** Any code
   under `#[cfg(target_os = "linux")]` (e.g. `surfaces/src/agents_fs.rs`) is
   never compiled on macOS, so local clippy is a false green. Run

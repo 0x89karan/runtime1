@@ -1,0 +1,12 @@
+# Negative-control fixture for config_parse_all (audit.1).
+# Parses cleanly but fails McpServerConfig::validate(): a plaintext http:// MCP URL
+# without `allow_insecure_local = true` is rejected (tokens would travel in clear).
+# This file lives in tests/fixtures/, OUTSIDE the directories the positive test globs.
+
+[agent]
+id = "invalid-http-fixture"
+task = "never runs"
+
+[[tools.mcp_servers]]
+name = "plaintext-http"
+url  = "http://example.internal:8020"

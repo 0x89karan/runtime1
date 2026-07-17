@@ -3,6 +3,101 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.87.0] - 2026-07-17
+
+### Fixed
+- **The default QEMU boot config could never boot** — `distro/overlay/etc/agentd/agent.toml`
+  used `model_id`, a key that has never existed on `ModelConfig` (`deny_unknown_fields`),
+  so every non-CoS QEMU boot panicked PID-1 at config parse (audit86-P0-1). Renamed to
+  `model`; a new parse-all test keeps every checked-in config bootable from now on.
+- **The librarian-semantic template told operators to set the wrong API key** — its
+  `[gated]` badge and spawn warning named `VOYAGE_API_KEY` while its sidecar
+  (`semantic_kb_mcp.py`) reads `OPENAI_API_KEY`, so following the instructions produced
+  an agent whose every `kb_put` fails. Badge, warning, card wording, and
+  `docs/MCP_SERVERS.md` (full env table + two dead `--profile semantic` commands) now
+  match the code. A token-consistency test fails if a template ever names an env var
+  nothing in the product reads.
+- **A missed path rewrite at container boot now refuses to boot instead of failing
+  silently at runtime** — the `cos)`/`agent)` sed pipeline gained general negative
+  assertions (both quote styles, positive-form path-key check, args-line anchoring) that
+  name the surviving line, both remediations, a credential-free repro command, and an
+  `AGENTOS_SKIP_PATH_GUARDS=1` escape hatch. This kills the v0.86.2 bug class (silent
+  `capability_denied` discoverable only inside a running container).
+- **Boot-guard hardening from adversarial review** — a task prompt quoting a repo path
+  (e.g. `"../docker/x"`) no longer bricks the boot (guards are line-anchored, never
+  whole-file over user text); the sed rewrite no longer corrupts task text that mentions
+  "args"; guard grep errors fail the boot instead of passing silently; behavior flags
+  (`DRY_RUN_ONLY`, `AGENTOS_SKIP_PATH_GUARDS`) and grep-behavior vars can no longer be
+  injected via the secrets file.
+
+### Added
+- **`agentd/tests/config_parse_all.rs`** — every checked-in agent-spec TOML (docker/,
+  agentd/, distro overlay) is parse+validate+lowering-proven in `cargo test`, with
+  negative-control fixtures (unknown key, insecure HTTP server, duplicate agent id).
+- **`agentd/tests/repo_consistency.rs`** — CLAUDE.md's canonical `**Current version:**`
+  line is test-enforced against `agentd/Cargo.toml` (a stale status line now fails the
+  build — closes cred.3.2-ar-02 after three drift recurrences), and template
+  `gated_requires` env vars must exist in product sources.
+- **`cos` dry-run mode** — `docker run --rm -e DRY_RUN_ONLY=1 <image> cos` verifies the
+  config rewrite + guards with zero credentials; documented in DEPLOYMENT.md
+  ("Verifying config changes") alongside the `agent`-mode dry run.
+
+### Changed
+- CHANGELOG reordered newest-first (v0.86.1/v0.86.2 had been appended below v0.86.0).
+- TODOS.md: six long-fixed entries verified against code and struck (audit-S1/S2,
+  F-012, F-015, cred.3-ar-02, cred.3.1-adv-01); build order updated — ux.8 (budget
+  truth) now ships before ux.10 (TUI polish) per the audit.1 review-gate decision.
+
+## [v0.86.2] - 2026-07-16
+
+### Fixed
+- **CoS orchestrator's `write_file` calls were silently denied in Docker despite
+  a correctly-configured `FsWrite` grant** — `docker/entrypoint.sh`'s `cos)` sed
+  pipeline rewrote the `FsWrite` capability grant (`prefix = "./output"` ->
+  `/data/output`) but never touched the matching `write_file(path='./output/...')`
+  instruction baked into the same TOML's task prompt. At runtime the grant became
+  absolute while the LLM was still told to call `write_file` with a relative path,
+  which can never satisfy an absolute-prefix capability check under
+  `agentd/src/capability.rs`'s `satisfies()`. Root-caused via live `flight.jsonl`
+  `capability_denied` events, not the orchestrator's own self-report (which
+  claimed a vague "operator should enable FsWrite" — a misdiagnosis of the same
+  class as v0.86.1's Gmail bug). Fixed by extending the sed pipeline to rewrite
+  the prompt instruction alongside the grant, plus a fail-fast startup guard that
+  now exits with a clear error if this literal ever desyncs again instead of
+  denying writes silently. `/review` (adversarial pass) confirmed exact
+  single-match correctness with no collateral rewrite side effects; `/qa`
+  verified live in Docker against real Gmail — a real brief landed on disk with
+  zero `capability_denied` events post-fix.
+
+## [v0.86.1] - 2026-07-15
+
+### Fixed
+- **CoS Inbox agent could never read Gmail despite a valid, broker-managed OAuth session**
+  — every Gmail API call was rejected with 403 `credential_denied`/`no_providers_configured`.
+  Root cause: `agentd/src/main.rs`'s credential proxy token derives its `allowed_providers`
+  list from the `google_oauth` MCP **server's own** `capabilities` field, not the owning
+  agent's — `cos.agents.toml`'s `google_oauth` server only granted `Net` access, so the
+  broker registered an empty `allowed_providers` regardless of the OAuth token's validity.
+  Fixed in both `agentd/cos.agents.toml` and the distro overlay copy. `/review` on the fix
+  (security + adversarial passes, both clean) confirmed it's minimally scoped and
+  non-exploitable, and found a real testability gap: the pre-existing regression test
+  hand-duplicated the credential-derivation logic instead of exercising the real function —
+  extracted to `credential_allowed_providers()`, called from both the production closure and
+  the tests (now including an end-to-end check against the real config files). Two related,
+  pre-existing findings (Curator's over-broad Gmail credential inheritance via spawn; three
+  older templates still on the pre-cred.6 raw-secret pattern) filed as `cos-dev-02`/`03` in
+  `TODOS.md`, not fixed in these commits.
+- **`docs/cos-guide.html`'s Step 06 CoS-start instructions were broken** — following them
+  exactly (a bare `docker run ... cos`) failed immediately with a DNS lookup error for
+  `semantic-kb-mcp`, since h8.1/memory-routing made the semantic KB sidecar a Compose-only
+  dependency. Replaced with `docker compose up cos`.
+- **Local Qdrant healthcheck failed permanently** — `qdrant/qdrant:v1.13.6`'s image has no
+  `curl`/`wget`/`nc`, so the `CMD curl` healthcheck in `docker-compose.yml` always failed at
+  the exec step, blocking `docker compose up cos` on "dependency unhealthy" even though Qdrant
+  was actually serving. Switched to a pure TCP probe via bash's `/dev/tcp`.
+- 1422 workspace tests (+2 versus the ux.1 baseline above: the google_oauth capability guard
+  from the credential fix, plus the end-to-end regression test added during its `/review`).
+
 ## [v0.86.0] - 2026-07-13
 
 ### Added (ux.1 — Converse)
@@ -121,56 +216,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   review-army, and adversarial-pass regression tests across agentd's
   `scheduler`/`flight_recorder` and agentctl's `converse`/`mod`/`views`); otel's
   `event_kind_coverage` exhaustiveness guard updated for the new `EventKind` variant.
-
-## [v0.86.2] - 2026-07-16
-
-### Fixed
-- **CoS orchestrator's `write_file` calls were silently denied in Docker despite
-  a correctly-configured `FsWrite` grant** — `docker/entrypoint.sh`'s `cos)` sed
-  pipeline rewrote the `FsWrite` capability grant (`prefix = "./output"` ->
-  `/data/output`) but never touched the matching `write_file(path='./output/...')`
-  instruction baked into the same TOML's task prompt. At runtime the grant became
-  absolute while the LLM was still told to call `write_file` with a relative path,
-  which can never satisfy an absolute-prefix capability check under
-  `agentd/src/capability.rs`'s `satisfies()`. Root-caused via live `flight.jsonl`
-  `capability_denied` events, not the orchestrator's own self-report (which
-  claimed a vague "operator should enable FsWrite" — a misdiagnosis of the same
-  class as v0.86.1's Gmail bug). Fixed by extending the sed pipeline to rewrite
-  the prompt instruction alongside the grant, plus a fail-fast startup guard that
-  now exits with a clear error if this literal ever desyncs again instead of
-  denying writes silently. `/review` (adversarial pass) confirmed exact
-  single-match correctness with no collateral rewrite side effects; `/qa`
-  verified live in Docker against real Gmail — a real brief landed on disk with
-  zero `capability_denied` events post-fix.
-
-## [v0.86.1] - 2026-07-15
-
-### Fixed
-- **CoS Inbox agent could never read Gmail despite a valid, broker-managed OAuth session**
-  — every Gmail API call was rejected with 403 `credential_denied`/`no_providers_configured`.
-  Root cause: `agentd/src/main.rs`'s credential proxy token derives its `allowed_providers`
-  list from the `google_oauth` MCP **server's own** `capabilities` field, not the owning
-  agent's — `cos.agents.toml`'s `google_oauth` server only granted `Net` access, so the
-  broker registered an empty `allowed_providers` regardless of the OAuth token's validity.
-  Fixed in both `agentd/cos.agents.toml` and the distro overlay copy. `/review` on the fix
-  (security + adversarial passes, both clean) confirmed it's minimally scoped and
-  non-exploitable, and found a real testability gap: the pre-existing regression test
-  hand-duplicated the credential-derivation logic instead of exercising the real function —
-  extracted to `credential_allowed_providers()`, called from both the production closure and
-  the tests (now including an end-to-end check against the real config files). Two related,
-  pre-existing findings (Curator's over-broad Gmail credential inheritance via spawn; three
-  older templates still on the pre-cred.6 raw-secret pattern) filed as `cos-dev-02`/`03` in
-  `TODOS.md`, not fixed in these commits.
-- **`docs/cos-guide.html`'s Step 06 CoS-start instructions were broken** — following them
-  exactly (a bare `docker run ... cos`) failed immediately with a DNS lookup error for
-  `semantic-kb-mcp`, since h8.1/memory-routing made the semantic KB sidecar a Compose-only
-  dependency. Replaced with `docker compose up cos`.
-- **Local Qdrant healthcheck failed permanently** — `qdrant/qdrant:v1.13.6`'s image has no
-  `curl`/`wget`/`nc`, so the `CMD curl` healthcheck in `docker-compose.yml` always failed at
-  the exec step, blocking `docker compose up cos` on "dependency unhealthy" even though Qdrant
-  was actually serving. Switched to a pure TCP probe via bash's `/dev/tcp`.
-- 1422 workspace tests (+2 versus the ux.1 baseline above: the google_oauth capability guard
-  from the credential fix, plus the end-to-end regression test added during its `/review`).
 
 ## [v0.85.0] - 2026-07-13
 
