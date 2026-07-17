@@ -530,3 +530,26 @@ D7. **Skills timing:** hold Phase 11 behind cap.2 + ux.8′ as recommended, or p
     denial-surfacing and spawn-attenuation guards exist.)
 D8. **personal.1:** commission an /autoplan pass now (it's unblocked and pure harness)
     or leave it parked behind the cockpit track? Nothing in this audit forces either.
+
+---
+
+## 9. Ratified decisions (operator, 2026-07-17)
+
+All eight open questions were decided; each took the audit's recommendation.
+
+| # | Decision |
+|---|---|
+| D1 | **Docker-first, distro-derived.** Docker is the declared source of truth. par.2 makes one config serve both platforms (deletes the sed pipeline + overlay fork); ci.1 keeps QEMU parse-checked; boot-test quarterly. |
+| D2 | **Rolling daily window + reset API.** `global_token_budget` becomes a per-24h-window ceiling (`budget_reset_interval`), plus a management-API budget-reset endpoint. Implemented by ux.8′. |
+| D3 | **TOML wins for config on restart.** On divergence, config fields (prompt, model, budget) re-seed from TOML with a logged warning; conversation state still restores from the checkpoint. |
+| D4 | **Hard error** for HTTP MCP servers carrying `capabilities`/`isolation` fields. A security field that does nothing must not parse. |
+| D5 | **All TODOS re-ratings accepted** (ux.0b-ar-02, ux.9-ar-05, orch.2-ar-03, cos-polish-adv-F2, flight-growth → P2; cos-dev-02 → P1). The findings table becomes the TODOS delta in the audit.1 PR. |
+| D6 | **sec.2 gates on the second user.** The moment a second person's credential or a second operator is planned, sec.2 is a blocking milestone; until then it is a named, scheduled-later gate. |
+| D7 | **Skills held behind cap.2 + ux.8′.** Phase 11 does not start before denial surfacing and spawn attenuation exist; realistically next quarter's track. |
+| D8 | **personal.1 stays parked.** No /autoplan pass now; interleave later when there's slack. |
+
+Confirmed build order: **audit.1 → ci.1 → ux.8′ → ux.10 → cap.1** (then cap.2, run.1,
+par.1/par.2 per §6). *Revised 2026-07-17 at the audit.1 review gate: the operator
+swapped ux.10 and ux.8′ after both review models flagged that leaving P0-2 (budget
+self-brick) three increments out contradicts the always-on product claim — budget
+truth now ships before TUI polish.*
