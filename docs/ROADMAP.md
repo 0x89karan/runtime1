@@ -56,11 +56,11 @@ remaining work — one increment per branch, `main` shippable between, each thro
 2. ~~**dx.3** (v0.69.0) · **dx.4** (v0.71.0)~~ ✅ shipped — Linux QEMU production path + prebuilt images + device auth (`agentctl auth google --device`) + install.sh.
 3. ~~**h8.2** (v0.73.0)~~ ✅ shipped — `agentos:core` (Rust-only) + `agentos:full` (Python harness) image split; CI publishes both tiers with shared GHA layer cache.
 4. ~~**dx.6** (v0.74.0)~~ ✅ shipped — `make dev-image` fast local loop; `publish-docker` gated to `workflow_dispatch`/`v*` tag; `AGENTOS_IMAGE` compose override; `.env.example`; DEPLOYMENT.md dev quickstart.
-5. **cheap wins** — Google OAuth app → Production (kills weekly 7-day Testing-mode token expiry; `MCP_SERVERS.md` fix); secret-redaction (`oauth_mcp.py:430`, `credential/mod.rs:341,371`; folds `cred.5-ar-01`). Ships independently.
-6. **cos-polish (rest)** — brief → file (`FsWrite` cap on orchestrator), KB findability (colon-segment reader, `kb_search` scope), inbox budget, orchestrate REPL race fix, `max_turns` guard.
+5. ~~**cheap wins** (v0.75.0)~~ ✅ shipped — Google OAuth app → Production (kills weekly 7-day Testing-mode token expiry; `MCP_SERVERS.md` fix); secret-redaction (`oauth_mcp.py:430`, `credential/mod.rs:341,371`; folds `cred.5-ar-01`).
+6. ~~**cos-polish (rest)** (v0.79.0)~~ ✅ shipped — brief → file (`FsWrite` cap on orchestrator), KB findability (colon-segment reader, `kb_search` scope), inbox budget, orchestrate REPL race fix, `max_turns` guard.
 7. ~~**memory-routing** (v0.81.0)~~ ✅ shipped — raw emails → h8.1 semantic L2 (OpenAI text-embedding-3-small); CoS email dedup via `kb_get`; fixes ~820k token/run blowup.
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
-9. **cred.7** — credential resilience (on top of broker mode).
+9. ~~**cred.7** (v0.84.0)~~ ✅ shipped — credential resilience (on top of broker mode).
 10. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → ux.10 (TUI polish) → ux.8 → ux.3 → ux.2b (idle/error).
 11. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 

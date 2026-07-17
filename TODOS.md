@@ -1,5 +1,215 @@
 # TODOS
 
+## Full-system audit (v0.86.2) — Open (2026-07-17)
+
+Findings from the whole-system audit (`docs/AUDIT-v0.86.md`, prompt 14). Full evidence,
+structural analysis, and the recommended build order live in that doc; this section is
+the tracked-debt delta. `[new]` = not previously tracked; `[re-rate]` = existed at a
+lower priority, raised here with reasoning. The build-order increment IDs referenced
+below (`audit.1`, `ci.1`, `cap.1`, `cap.2`, `run.1`, `par.1/2`, `doc.1`, `sec.2`, etc.)
+are defined in `docs/AUDIT-v0.86.md §6`.
+
+### P0
+
+- **audit86-P0-1 (P0) [new] — Default QEMU boot config does not parse.**
+  `distro/overlay/etc/agentd/agent.toml:16` uses `model_id`; `ModelConfig` (`config.rs:503-509`,
+  `deny_unknown_fields`) has no such field — the key never existed. Reproduced: agentd
+  exits with an unknown-field error at line 16. `/init:67` falls back to this file for any
+  boot without an `agentd.config=` cmdline, so `make run`/`make test`/prebuilt-image boots
+  panic PID-1. Production CoS (passes `agentd.config=cos.agents.toml`) is unaffected.
+  Invisible because `qemu-boot.yml` is `workflow_dispatch`-only and already red. Fix: rename
+  to `model`; add the parse-all test (audit86-P1-7) so the class can't recur. → `audit.1`.
+- **audit86-P0-2 (P0) [new] — Always-on CoS self-bricks in ~1–2 days.**
+  `cos.agents.toml:109-110` documents `global_token_budget` as a "hard daily spend ceiling",
+  but `tokens_spent` is lifetime-monotonic (`scheduler.rs:434,698`) and checkpoint-restored
+  (`checkpoint.rs:125`) with no reset path anywhere. The 24/7 flagship hits permanent
+  `agent_admission_denied`; the only shipped remedy (`rm checkpoint.json`, `cos.agents.toml:54`)
+  destroys all conversation state. Fix: budget reset window (`budget_reset_interval`
+  re-basing `tokens_spent`) and/or a management-API budget-reset endpoint; decide the
+  semantics first (see audit open question D2). → `ux.8′`.
+
+### P1
+
+- **audit86-P1-1 (P1) [re-rate; = audit-C1 mechanism] — Per-agent budget only enforced under `ToolUse`.**
+  `agent/mod.rs:624-636` is the sole check site; `step_need_infer` (`:413-556`) checks
+  `max_turns` but never the budget, so a text-only orchestrated agent accrues unbounded spend
+  across the EndTurn→park→inject cycle. Fix: budget fail-fast at the top of `step_need_infer`. → `ux.8′`.
+- **audit86-P1-2 (P1) [re-rate from P3] — flight.jsonl has no rotation anywhere.**
+  `flight_recorder.rs:23-33` appends with no cap; nothing in `entrypoint.sh`, `overlay/init`,
+  or the image rotates it. The otel sidecar *detects* rotation nobody performs. With
+  streaming default-on, `InferenceStreamDelta` per SSE chunk ⇒ ~10–100 MB/day for a 24/7 CoS,
+  filling `cos-data` in months. Fix: size-threshold copy-truncate self-rotation in
+  `FlightRecorder::record` (the otel sentinel already survives copy-truncate). → `run.1`.
+- **audit86-P1-3 (P1) [re-rate; = p5.2-ar-01/audit-C8] — `short_term` grows unbounded for parked agents.**
+  `agent/mod.rs:67-68,475` only ever `extend`s; its sole consumer (distillation) runs
+  post-run only (`scheduler.rs:811`), which a never-terminating orchestrated agent never
+  reaches. Full-cloned into every checkpoint (interval 1 turn) and every snapshot tick ⇒
+  unbounded RAM + linearly growing per-turn checkpoint writes. Fix: cap depth + threshold
+  distillation for parked agents. → `run.1`.
+- **audit86-P1-4 (P1) [new] — CI tests only the agentd+agentctl packages.**
+  `ci.yml:44-61` pins `working-directory`; `surfaces` (96 tests incl. Linux-gated
+  `agents_fs.rs`), `sandbox` (34), and `otel` (34) test suites are never executed in CI on
+  any target, and their clippy is not reliably denied. The "1420 workspace tests" figure is
+  a local-only guarantee. Fix: `cargo test/clippy --workspace --all-targets` from repo root. → `ci.1`.
+- **audit86-P1-5 (P1) [new] — entrypoint sed-rewrite pipeline has zero test coverage.**
+  `entrypoint.sh:242-247`'s `DRY_RUN_ONLY` hook (cred.2) is invoked by nothing; the v0.86.2
+  guard (`:159`) covers 1 of 6 `cos)` rewrite rules and checks the *prompt* half of the
+  v0.86.2 pair, not the *grant* half (`prefix = "./output"`), so the inverse desync passes.
+  The `agent)` case (`:231-238`) has no guard at all. PR #124's bug class remains open on the
+  other rules. Fix: negative-assertion block after each rewrite (fail if `"../docker/`,
+  `"memory.redb"`, `"evidence.jsonl"`, `"egress-key.pkcs8"`, `"./output` survive) + a CI job
+  invoking `DRY_RUN_ONLY=1`. → `ci.1` / `audit.1`.
+- **audit86-P1-6 (P1) [new] — Any `v*` tag on a stale commit silently publishes `:latest`.**
+  `publish-docker` (`ci.yml:193-254`) and `release.yml` fire on any `v*` tag, check out the
+  tag ref, and push `:latest`/`:full`/`:core` + release binaries with no
+  `merge-base --is-ancestor origin/main` check and no tag==Cargo-version check (image tags
+  derive from Cargo.toml, artifacts from `GITHUB_REF_NAME` — they can diverge). This is the
+  v0.86.0-tag-behind-main incident with no guard. Fix: two-line ancestry + version-match
+  check in publish-docker. → `ci.1`.
+- **audit86-P1-7 (P1) [new] — No parse check for any checked-in TOML outside `templates/`.**
+  `template.rs` has catalogue tests, but nothing globs `docker/*.toml`, `agentd/*.toml`, or
+  `distro/overlay/etc/agentd/*.toml`; audit86-P0-1 is the proof. Fix:
+  `agentd/tests/config_parse_all.rs` asserting `Config` deserializes each (~1 h). → `audit.1`.
+- **audit86-P1-8 (P1) [new] — "Relative paths fail closed" is false; path identity is string identity.**
+  `capability.rs:27-29` documents fail-closed, but `normalize_path` (`:76-94`) strips `CurDir`,
+  so a relative grant matches a relative request textually and CWD-blind; production dev-mode
+  (`cos.agents.toml:247,375`) depends on the undocumented behavior. This is the v0.86.2 root
+  cause. Fix: `AbsPathPrefix` newtype absolutizing at deserialization + at
+  `required_capability_for` (`native.rs:88/128/169`, `main.rs:1345-1349`). → `cap.3`.
+- **audit86-P1-9 (P1) [new] — Wrong-tier capability grants are silent no-ops (6 of 9 combos inert).**
+  Agent-level `Credential` (`capability.rs:69`, "deferred") and `Net` (`:162`, returns true
+  unconditionally) are decorative; HTTP MCP servers discard `capabilities`/`isolation`
+  (`config.rs:604-628`, `main.rs:468-513`) and are *exempted* from `mcp_require_capabilities`
+  (`main.rs:361`, `.filter(!is_http())`) with no warning — the operator's mandatory-sandbox
+  switch does not cover remote tool servers. The Gmail-outage class. Fix: tier-legality
+  validation in `Config::validate()` (hard error for HTTP servers carrying security fields —
+  see open question D4; warn for inert agent-level grants) + a `CapabilitiesResolved` boot
+  event logging each agent's and server's effective set. → `cap.1`.
+- **audit86-P1-10 (P1) [re-rate; = cos-dev-02, was P2] — Spawn inheritance is all-or-nothing; Curator inherits live Gmail.**
+  `SpawnConfig` (`config.rs:412-422`) has no capabilities field; `dispatch_spawn`
+  (`scheduler.rs:1586`) does `parent_cap_set.clone()`. The Curator (processes
+  attacker-influenceable email text daily) inherits `Credential{Google}`, so a prompt-injection
+  payload surviving into curation can call live Gmail through the broker with every hardening
+  layer cooperating. Post-cred.6 the broker made capability scoping load-bearing; this makes
+  it decorative for children. The `cos.agents.toml:438-446` "inbox caps: Mcp{google_oauth}
+  only" comment is fiction. Fix: `capabilities: Option<Vec<Capability>>` on `SpawnConfig`,
+  validated ⊆ parent (subset check mandatory or the field becomes an escalation vector); merge
+  cos-polish-adv-F2 + F5 (`max_turns` passthrough, `scheduler.rs:1597`). → `cap.2`.
+
+### P2
+
+- **audit86-P2-1 (P2) [new] — Restart takes cfg/model/task/prompt from the checkpoint, overriding TOML.**
+  `scheduler.rs:183-184,243-247`, `agent/mod.rs:206-221`. Since the CoS never terminates, a
+  `docker compose pull && up` shipping a new prompt/budget/model silently changes nothing
+  until the checkpoint is deleted — image upgrades never reach the always-on agent. Fix:
+  fingerprint the TOML config into the checkpoint; warn/opt-in re-seed on divergence
+  (see open question D3). → `run.1`.
+- **audit86-P2-2 (P2) [new] — Checkpoint deleted immediately after restore; a crash-loop erases everything.**
+  `main.rs:1127-1129` removes `checkpoint.json` before any new save exists, so a second
+  crash (OOM/bad config) permanently loses the CoS conversation + tokens + parked children.
+  Fix: rename `.restored`, delete only after the first successful `checkpoint_all`. → `run.1`.
+- **audit86-P2-3 (P2) [new] — Missed cron fire silently skips the daily brief.**
+  `cron_mcp.py:196,247,253` keeps `_NEXT_FIRE_TS` in process memory only; a crash/restart
+  spanning a scheduled fire drops the brief (interval mode phase-shifts). Fix: persist
+  last-fired under `/data`; fire-on-startup-if-missed. → `run.1`.
+- **audit86-P2-4 (P2) [new] — evidence.jsonl cannot rotate safely.**
+  Hash chain (`evidence.rs:4-5,38`); `resume_chain` re-hashes the whole file at every boot
+  (`:184-197`, O(file) forever); rename-rotate is silently ignored; archive-and-restart
+  drops to GENESIS with no segment manifest. Fix: chain-aware segment rotation (new segment's
+  first `chain_prev_hash` = prior segment's last hash); teach `agentctl verify` non-genesis
+  starts. → `run.1`.
+- **audit86-P2-5 (P2) [new] — Terminal root agents + several scheduler maps leak/grow monotonically.**
+  Terminal agents are removed from `state.agents` only in the child branch (`scheduler.rs:959`);
+  `parent_map` is insert-only and checkpointed (`:1663,1934,2472`), as are
+  `spawn_depths`/`mailboxes`/`streamed_agents`/`outcomes`. A never-terminating deployment
+  with periodic operator spawns leaks whole conversations in RAM and grows checkpoint.json.
+  Fix: clear all per-agent map entries in `handle_agent_terminal` (`:941`). → `run.1`.
+- **audit86-P2-6 (P2) [new] — At-least-once turn replay can duplicate irreversible actions.**
+  `scheduler.rs:718-733`: a crash after tool execution but before the boundary checkpoint
+  re-runs the turn. CoS blast radius today: duplicate `ops:briefs` entry (append-only, ignores
+  the key, `cos.agents.toml:359`); a duplicate outbound email if L1 send is enabled. Fix:
+  keyed/idempotent brief writes; idempotency keys before any irreversible tool ships. → `run.1`.
+- **audit86-P2-7 (P2) [new] — Universal-tier inference spend excluded from the global budget.**
+  `egress.rs:127-165` never increments `state.tokens_spent` (only writers: `scheduler.rs:698,885`),
+  so "always accounted" is violated for an entire tier. Fix: plumb a shared counter from the
+  proxy into scheduler state. → `ux.8′`.
+- **audit86-P2-8 (P2) [new] — Docker base images pinned by mutable tag, not digest.**
+  `Dockerfile:3,55`, `Dockerfile.semantic-kb-mcp:1`. Fix: `@sha256` digests + Dependabot. → `sec.2`.
+- **audit86-P2-9 (P2) [new] — Embedding key bypasses the broker; librarian-semantic template is live-broken.**
+  `OPENAI_API_KEY` provisioned raw via compose (`docker-compose.yml:155-156`), the exact
+  thing ROADMAP:72-73 said must not happen. `templates/librarian-semantic.template.toml:10-12`
+  gates on `VOYAGE_API_KEY` (test-enforced, `template.rs:1081-1082`) while its sidecar requires
+  `OPENAI_API_KEY` (`semantic_kb_mcp.py:161`): export VOYAGE ⇒ every `kb_put` fails; export
+  OPENAI only ⇒ template hidden. Fix the gate now (`audit.1`); `EMBED_PROVIDER`/`EMBED_API_URL`
+  env triple + broker `Custom` provider as the increment (`eco.1`/future direction 3).
+- **audit86-P2-10 (P2) [new] — Python sidecar self-tests never run in CI.**
+  No workflow has a python step; oauth (30 checks incl. schema-drift), cron (6), fs_watch (6),
+  etc. run only locally. Fix: `for f in docker/*_mcp.py; do python3 "$f" --test; done`. → `ci.1`.
+- **audit86-P2-11 (P2) [new] — Published images are never executed before push.**
+  `publish-docker` builds and pushes without so much as `agentd --help`. Fix: image smoke run
+  pre-push; longer term a compose-boot job asserting flight.jsonl shape. → `ci.1`.
+- **audit86-P2-12 (P2) [new] — Shell env-sanitization denylist hand-duplicated across boot scripts.**
+  `entrypoint.sh:16-18` ≡ `overlay/init:49-51` verbatim; `shell_mcp.py:39` a third larger
+  variant; zero sync checks (a security addition to one won't propagate). Fix: golden-diff CI
+  test (a sourced lib is impossible — `init` is standalone busybox in an initramfs). → `par.1`.
+- **audit86-P2-13 (P2) [new] — agentctl matches flight-event kinds by raw string.**
+  `inspector.rs:48-54`, `reader.rs:340-341`, `converse.rs:289`, `orchestrate.rs:164`,
+  `views.rs:1194` — despite depending on the agentd crate; a rename in `events.rs` compiles
+  and silently blanks TUI filters/streams. Fix: export `EventKind::as_str()` and use it, or
+  copy the otel exhaustiveness-test pattern. → `par.1`.
+- **audit86-P2-14 (P2) [new] — QEMU CoS fork silently missing the entire memory-routing feature set.**
+  `distro/overlay/etc/agentd/cos.agents.toml` lacks the `semantic-kb` server, `mail:raw`
+  segment/caps, and the dedup prompt step — production QEMU CoS runs without email dedup. The
+  fork header's "Key differences" list doesn't mention it; cred.6 *was* mirrored into the fork,
+  memory-routing was *not* — mirror discipline is luck, not process. Fix: declare in the header
+  now; the normalized-diff parity test (`par.1`) is the real fix. → `par.1`.
+- **audit86-P2-15 (P2) [re-rate] — Priority bumps for existing items given broker-live + cockpit-default state:**
+  `ux.0b-ar-02` P3→P2 (`allow_non_loopback` unscoped bypass of an unauthenticated API that
+  is now default-on, with a bare-Linux quickstart documented); `ux.9-ar-05` P3→P2 (no CI job
+  builds the Docker image — Docker is now the primary distribution and two ux.9 criticals were
+  caught only by manual local runs — folded into `ci.1`); `orch.2-ar-03` P3→P2 (SSE broadcast
+  lag drops `OrchestratorTurnComplete`; per-token `InferenceStreamDelta` on the same 1024-slot
+  channel made "buffer fills" the expected case, not a rare one — fold with the ux.1 SSE-channel
+  TODO). `cos-polish-adv-F2` P3→P2 (same root cause + fix site as audit86-P1-10; merge into `cap.2`).
+
+### P3 and reconciliation
+
+- **audit86-P3-1 (P3) [new] — UTF-8 panic in the credential gateway.**
+  `credential/mod.rs:383,395,415` byte-slice `token_url[..len().min(64)]` can split a
+  multi-byte char and panic in the request handler (reachable via a malformed operator
+  secrets file). Char-boundary truncation helper. → `sec.2`/`cap.3`.
+- **audit86-P3-2 (P3) [new] — `oauth_mcp.py:733` interpolates a raw exception** into the error
+  response; sibling `:422` correctly scrubs to `type(exc).__name__`. Latent leak channel.
+- **audit86-P3-3 (P3) [new] — `.expect` on EffectResult agent lookup** (`scheduler.rs:687,724`)
+  holds today but `panic = "abort"` in release makes any future break (e.g. a `Kill` command)
+  whole-runtime death. Defensive `let Some(..) else { record; continue }`.
+- **audit86-P3-4 (P3) [new] — cred.7 added `credential_health` without a FORMAT_VERSION bump**
+  (`checkpoint.rs:148`; violates CONVENTIONS:225-226) — silent downgrade drop. Bump to 5 in
+  the next checkpoint-touching PR (`run.1`).
+- **audit86-P3-5 (P3) [new] — Misc single-source gaps:** crash-orphaned `checkpoint.json.*.tmp`
+  never swept (`checkpoint.rs:172-179`); `docker/cockpit.toml` lacks the `[memory]` eviction
+  block both cos configs have; port 7999 duplicated across ~10 files (`config.rs:222` is the
+  authority — the agentctl trio could share the constant today); port 8020/`semantic-kb-mcp`
+  URL not rewritten by the `cos)` sed (breaks `docker run` outside compose); template gating
+  hardcoded in `entrypoint.sh:176,180` duplicating `gated_requires`; `distro/Makefile:144-146`
+  copies 7 named MCP files vs Dockerfile's wildcard (new `*_mcp.py` silently absent from QEMU);
+  `agent.toml:76-81` comment places `capabilities` under `[tools]` (parse error if followed).
+- **audit86-P3-6 (P3) [new] — Documentation drift** (one confirmed instance per doc, full table
+  in `docs/AUDIT-v0.86.md §2`): THREAT_MODEL scoped to v0.62 with §1.2 contradicting the broker;
+  `DEPLOYMENT.md:203,396,402` + `cos-guide.html:872` jq probes select `mcp_tool_called` (no such
+  event kind — real is `tool_call`); `RUNBOOK.md:268` "set BRAVE_API_KEY where you launch agentd"
+  (nullified by `env_clear()`); `agentd/README.md:63` streaming default documented backwards;
+  CONVENTIONS event table missing `mcp_passenv_forwarded` + FUSE table missing 5 files & all of
+  `/agents/system/`; README self-contradicts on version. → `doc.1` + CONVENTIONS-completeness test.
+- **Reconciliation — fixed-but-not-struck TODOS entries (verify, then move to Completed):**
+  `audit-S1`/`audit-S2` (`TODOS.md:387,392`; closed in cred.3.1 / v0.61.0 as cred.3-ar-S1/S2);
+  `F-012` (`:1583`; = F-05/audit-C3, fsync landed v0.70.0 — corroborated by the ops pass at
+  `checkpoint.rs:36-65,187-204`); `F-015` (`:1588`; `extra_env` blocklist enforced at
+  `mcp.rs:144` — corroborated by the security pass); `cred.3-ar-02` (`:1112`; superseded by
+  cred.5 surface + cred.7 health state); `cred.3.1-adv-01` (`:1297`; `load_from_disk` startup
+  reload ar-06 + cred.7 checkpoint persistence). Left in place pending per-item verification
+  rather than blind-struck; that verification is part of `audit.1`.
+
 ## ux.1 — Open (deferred from CEO review, 2026-07-13)
 
 - **D1 "one unified screen" scope decision** (P3): `docs/ROADMAP.md:1089` / `docs/plans/
