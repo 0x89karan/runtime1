@@ -16,9 +16,88 @@ if [ -f /run/secrets/agentos.env ]; then
     case "$_agentos_key" in *[!A-Za-z0-9_]*|''|[0-9]*) continue ;; esac
     case "$_agentos_key" in BASH_ENV|LD_PRELOAD|LD_LIBRARY_PATH|PATH|IFS|ENV|PS4|CDPATH) continue ;; esac
     case "$_agentos_key" in PYTHONSTARTUP|PYTHONPATH|PYTHONUSERSITE|PYTHONINSPECT|RUBYOPT|NODE_OPTIONS) continue ;; esac
+    # Tool-behavior vars: GREP_OPTIONS/POSIXLY_CORRECT change how the boot
+    # guards' grep/sed behave — same class as the interpreter vars above.
+    case "$_agentos_key" in GREP_OPTIONS|POSIXLY_CORRECT) continue ;; esac
+    # Boot-behavior flags must come from the real container environment, never
+    # the secrets file: a stray line here could silently disable the path guards
+    # or turn a production cos boot into print-and-exit-0 (clean-looking outage).
+    case "$_agentos_key" in AGENTOS_SKIP_PATH_GUARDS|DRY_RUN_ONLY) continue ;; esac
     export "${_agentos_key}=${_agentos_val}"
   done < /run/secrets/agentos.env
 fi
+
+# ── boot guards (audit.1 / audit86-P1-5) ─────────────────────────────────────
+# After the sed rewrite, no relative path may survive in the shipped config: a
+# missed rewrite used to boot fine and then fail every affected tool call with
+# capability_denied, discoverable only by grepping flight.jsonl inside the
+# container (the v0.86.2 bug). These guards turn that into a boot-time failure
+# that names the offending line.
+#
+# Patterns are general (any quoted ./ or ../ in either quote style, plus
+# path-bearing keys whose value is not absolute) rather than a copy of the sed
+# LHS list — a third hand-maintained literal list would drift in lockstep with
+# the sed rules, which is the disease this guards against. POSIX [[:space:]]
+# only (\s is a GNU extension; busybox grep silently matches nothing).
+#
+# Comment lines are DELIBERATELY inside the cos scan: a future comment with a
+# quoted ./ path fails loudly at dev time rather than being silently excluded,
+# and a ^#-exclusion would false-negative on task = """ content lines that
+# legitimately begin with # (e.g. markdown headings in prompts).
+#
+# Escape hatch: AGENTOS_SKIP_PATH_GUARDS=1 skips these checks — for operators
+# whose bind-mounted config legitimately contains a quoted ./ in task prose.
+is_truthy() { case "${1:-}" in 1|true|yes) return 0 ;; *) return 1 ;; esac; }
+
+guard_no_relative_paths() {
+  _guard_file="$1"    # rewritten config to check
+  _guard_primary="$2" # main ERE (cos: whole-file quoted ./; agent: args-line-scoped)
+  _guard_extra="$3"   # additional ERE, may be empty
+  _guard_repro="$4"   # mode-specific dry-run repro command for the error text
+  if is_truthy "${AGENTOS_SKIP_PATH_GUARDS:-}"; then
+    echo "WARNING: AGENTOS_SKIP_PATH_GUARDS set — skipping boot path guards" >&2
+    return 0
+  fi
+  # grep exit 0/1 = match/no-match, both fine; exit >=2 (unreadable file, bad
+  # pattern, hostile GREP_OPTIONS) must FAIL the boot — a guard that errors must
+  # not silently pass. $? of a command substitution is grep's rc in THIS shell,
+  # so the exit below terminates the script (an exit inside the $() would not).
+  set +e
+  _guard_hits=$(grep -nE "$_guard_primary" "$_guard_file")
+  _guard_rc=$?
+  set -e
+  if [ "$_guard_rc" -gt 1 ]; then
+    echo "ERROR: boot guard grep failed (rc=$_guard_rc) on $_guard_file — refusing to boot unverified" >&2
+    exit 1
+  fi
+  if [ -n "$_guard_extra" ]; then
+    set +e
+    _guard_extra_hits=$(grep -nE "$_guard_extra" "$_guard_file")
+    _guard_rc=$?
+    set -e
+    if [ "$_guard_rc" -gt 1 ]; then
+      echo "ERROR: boot guard grep failed (rc=$_guard_rc) on $_guard_file — refusing to boot unverified" >&2
+      exit 1
+    fi
+    if [ -n "$_guard_extra_hits" ]; then
+      _guard_hits="${_guard_hits}${_guard_hits:+
+}${_guard_extra_hits}"
+    fi
+  fi
+  if [ -n "$_guard_hits" ]; then
+    echo "ERROR: relative path survived the boot rewrite in $_guard_file:" >&2
+    echo "$_guard_hits" | head -5 >&2
+    echo "" >&2
+    echo "  If this is a bind-mounted custom config: use absolute paths in" >&2
+    echo "  container configs (relative paths resolve against the container" >&2
+    echo "  CWD, not your host checkout)." >&2
+    echo "  If this is the baked config: a sed rule in docker/entrypoint.sh" >&2
+    echo "  drifted from the source TOML — add or fix the rewrite rule." >&2
+    echo "  Reproduce with the dry-run path:  $_guard_repro" >&2
+    echo "  Override (accept relative paths): AGENTOS_SKIP_PATH_GUARDS=1" >&2
+    exit 1
+  fi
+}
 
 check_api_key() {
   if [ -z "$ANTHROPIC_API_KEY" ]; then
@@ -105,6 +184,16 @@ case "${1:-shell}" in
   cos)
     # Chief of Staff — fully self-contained, no repo mount needed.
     # Runtime state (checkpoint, memory, briefs) goes to /data (named volume).
+
+    # DRY_RUN_ONLY=1|true|yes: run the config rewrite + boot guards, print the
+    # rendered config, exit 0. Bypasses ALL credential preflights (check_api_key
+    # included) — a dry run verifies the rewrite, not credentials, and must be
+    # runnable in CI and by operators with zero secrets:
+    #   docker run --rm -e DRY_RUN_ONLY=1 <image> cos
+    _COS_DRY_RUN=""
+    if is_truthy "${DRY_RUN_ONLY:-}"; then _COS_DRY_RUN=1; fi
+
+    if [ -z "$_COS_DRY_RUN" ]; then
     check_api_key
 
     # Secrets preflight: google.json must be provisioned before the CoS starts.
@@ -141,6 +230,7 @@ case "${1:-shell}" in
       echo ""
       exit 1
     fi
+    fi  # end of credential preflights (skipped under DRY_RUN_ONLY)
 
     mkdir -p /data /data/output
     # Patch the baked config: rewrite dev-mode relative paths to absolute paths.
@@ -156,12 +246,29 @@ case "${1:-shell}" in
     # ever desync again (the exact bug this rewrite fixes): a silent mismatch
     # here means every write_file call gets denied with capability_denied,
     # discoverable only by reading flight.jsonl inside a running container.
-    grep -q "write_file(path='/data/output/" /data/cos.agents.toml || {
-      echo "ERROR: cos.agents.toml path rewrite failed — write_file prompt path" >&2
-      echo "       doesn't match the rewritten FsWrite grant. Check the sed" >&2
-      echo "       patterns in docker/entrypoint.sh still match the source TOML." >&2
-      exit 1
-    }
+    # Gated behind the same escape hatch as the general guards: a bind-mounted
+    # custom config won't carry this baked-config literal, and the skip flag
+    # means "my config intentionally differs" (audit.1 /review, F5).
+    if ! is_truthy "${AGENTOS_SKIP_PATH_GUARDS:-}"; then
+      grep -q "write_file(path='/data/output/" /data/cos.agents.toml || {
+        echo "ERROR: cos.agents.toml path rewrite failed — write_file prompt path" >&2
+        echo "       doesn't match the rewritten FsWrite grant. Check the sed" >&2
+        echo "       patterns in docker/entrypoint.sh still match the source TOML." >&2
+        echo "       Override (custom config): AGENTOS_SKIP_PATH_GUARDS=1" >&2
+        exit 1
+      }
+    fi
+    # General negative assertion (audit.1): no quoted relative path — in either
+    # quote style — and no path-bearing key with a non-absolute value may survive
+    # the rewrite. Covers future relative paths no sed rule knows about yet.
+    guard_no_relative_paths /data/cos.agents.toml \
+      "[\"']\.\.?/" \
+      "^[[:space:]]*[a-z_]*_(path|dir)[[:space:]]*=[[:space:]]*[\"'][^/]" \
+      "docker run --rm -e DRY_RUN_ONLY=1 <image> cos"
+    if [ -n "$_COS_DRY_RUN" ]; then
+      cat /data/cos.agents.toml
+      exit 0
+    fi
     cd /data
     exec agentd /data/cos.agents.toml
     ;;
@@ -217,7 +324,10 @@ case "${1:-shell}" in
     esac
     mkdir -p /data
     # Lower template → TOML, rewrite MCP script paths to /etc/agentd/ (Docker path layout).
-    # Sed is scoped to 'args' lines to avoid rewriting task text that happens to match.
+    # Sed is anchored to lines STARTING with `args =` (a bare /args/ substring
+    # address would also rewrite task text that merely mentions "args" — real
+    # corruption, reproduced in review). Multi-line args arrays are not rewritten
+    # by these rules; the boot guard below catches them loudly instead.
     # Both path conventions used across the catalogue are handled:
     #   ../docker/        — dev-mode relative path (scout, librarian, google-agent, …)
     #   /usr/lib/agentos/docker/ — installed absolute path (cron-agent, watcher, webhook-agent)
@@ -229,22 +339,31 @@ case "${1:-shell}" in
       exit 1
     }
     printf '%s\n' "$_raw" | sed \
-      -e '/args/s|"\.\./docker/|"/etc/agentd/|g' \
-      -e '/args/s|"/usr/lib/agentos/docker/|"/etc/agentd/|g' \
+      -e '/^args[[:space:]]*=/s|"\.\./docker/|"/etc/agentd/|g' \
+      -e '/^args[[:space:]]*=/s|"/usr/lib/agentos/docker/|"/etc/agentd/|g' \
       > /data/agent.toml
     [ -s /data/agent.toml ] || {
       echo "ERROR: rendered config is empty for template '$TEMPLATE'" >&2
       exit 1
     }
+    # General negative assertion (audit.1): the dot-slash scan is anchored to
+    # `args =` lines and to line-START quoted paths (multi-line TOML arrays put
+    # each element on its own line). Deliberately NOT whole-file: AGENT_TASK is
+    # user input, and a task quoting "../docker/x" MID-line must not brick the
+    # boot (reproduced in review — toml renders such tasks as single lines where
+    # the path never sits at line start).
+    guard_no_relative_paths /data/agent.toml \
+      "^args[[:space:]]*=.*[\"']\.\.?/" \
+      "^[[:space:]]*[\"']\.\.?/|^[[:space:]]*\"/usr/lib/agentos/docker/" \
+      "docker compose run --rm -e DRY_RUN_ONLY=1 -e ANTHROPIC_API_KEY=x -e AGENT_TASK=x -e TEMPLATE_NAME='$TEMPLATE' agent"
     # Remove any stale checkpoint — each 'docker compose run' is a fresh invocation.
     # Without this, switching TEMPLATE_NAME on a reused volume would restore the wrong agent.
     rm -f /data/checkpoint.json
     # DRY_RUN_ONLY=1|true|yes: print rendered config and exit (smoke-test path rewriting)
-    case "${DRY_RUN_ONLY:-}" in 1|true|yes)
+    if is_truthy "${DRY_RUN_ONLY:-}"; then
       cat /data/agent.toml
       exit 0
-      ;;
-    esac
+    fi
     cd /data
     exec agentd /data/agent.toml
     ;;
