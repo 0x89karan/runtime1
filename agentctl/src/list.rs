@@ -78,7 +78,7 @@ mod tests {
             source:        TemplateSource::Repo,
             showcases:     "vector search".to_string(),
             sample_tasks:  vec![],
-            gated_requires: Some("VOYAGE_API_KEY".to_string()),
+            gated_requires: Some("OPENAI_API_KEY".to_string()),
         };
         // Capture stdout by just checking the badge logic, not by intercepting println.
         // The badge is conditionally appended when gated_requires is Some.
