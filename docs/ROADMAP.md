@@ -61,7 +61,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 7. ~~**memory-routing** (v0.81.0)~~ ✅ shipped — raw emails → h8.1 semantic L2 (OpenAI text-embedding-3-small); CoS email dedup via `kb_get`; fixes ~820k token/run blowup.
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. ~~**cred.7** (v0.84.0)~~ ✅ shipped — credential resilience (on top of broker mode).
-10. **Audit remediation** (from `docs/AUDIT-v0.86.md` §6/§9): ~~**audit.1** (v0.87.0)~~ ✅ shipped — P0 hotfix + guard batch (`docs/plans/audit.1-p0-hotfix-guards.md`) → **ci.1** (CI tests the artifact) → then cap.1/cap.2/run.1/par.1-2 interleave per the audit build order.
+10. **Audit remediation** (from `docs/AUDIT-v0.86.md` §6/§9): ~~**audit.1** (v0.87.0)~~ ✅ shipped — P0 hotfix + guard batch (`docs/plans/audit.1-p0-hotfix-guards.md`) → ~~**ci.1** (v0.88.0)~~ ✅ shipped — CI tests the artifact (`docs/plans/ci.1-ci-tests-the-artifact.md`): workspace-wide CI, sidecar marker contract, docker-smoke + negative fixture, fail-closed release guards, nightly mock E2E, monthly qemu cron; broker E2E deferred as named `ci.2` (TODOS) → then cap.1/cap.2/run.1/par.1-2 interleave per the audit build order.
 11. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → **ux.8 (budgets; ux.8′ scope — moved ahead of ux.10 at the audit.1 review gate 2026-07-17: budget truth before TUI polish)** → ux.10 (TUI polish) → ux.3 → ux.2b (idle/error).
 12. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 

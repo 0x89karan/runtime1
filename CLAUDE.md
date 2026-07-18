@@ -24,15 +24,17 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.87.0 (shipped 2026-07-17)
+**Current version:** v0.88.0 (shipped 2026-07-18)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** audit.1 (v0.87.0) — P0 hotfix + guard batch from the v0.86.2
-full-system audit: unbootable QEMU default config fixed, every checked-in config
-parse-proven in CI, boot guards with dry-run verification, truthful librarian
-template gate, TODOS/status reconciliation. 1428+ workspace tests.
-**Next:** ci.1 → ux.8 (budgets; ux.8′ scope per `docs/AUDIT-v0.86.md` §9) → ux.10.
+**Latest shipped:** ci.1 (v0.88.0) — CI tests the artifact: workspace-wide CI
+(surfaces/sandbox/otel first-ever CI coverage), sidecar self-test contract
+(rc==0 AND marker), docker-smoke against the built image with a PR-#124-class
+negative fixture, fail-closed release guards (24-scenario committed harness),
+nightly mock-provider E2E exercising the real tool loop, monthly qemu cron.
+1430 workspace tests.
+**Next:** ux.8 (budgets; ux.8′ scope per `docs/AUDIT-v0.86.md` §9) → ux.10.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 
@@ -47,9 +49,13 @@ Full per-increment completion notes: `docs/STATUS.md`.
 - **Preserve behavior across refactors.** Phase 1 begins by refactoring the loop
   into a steppable state machine; the single-agent path must keep working
   identically (the flight-recorder output for the demo should not regress).
-- **Build, lint, and test before every commit:** `cargo build && cargo clippy --
-  -D warnings && cargo test`. Do not commit code that does not compile or that
-  has clippy warnings.
+- **Build, lint, and test before every commit — workspace-wide, from the repo
+  root:** `cargo build --workspace && cargo clippy --workspace --all-targets --
+  -D warnings && cargo test --workspace`. CI enforces exactly this across all
+  five crates (ci.1) — per-crate commands from `agentd/` miss
+  surfaces/sandbox/otel lints and go red in CI. (First workspace run rebuilds
+  into the root `target/` — one-time cost.) Do not commit code that does not
+  compile or that has clippy warnings.
 - **Every version bump updates the "Current version" line in this file.** The
   line at the top of "Current status" is test-enforced against
   `agentd/Cargo.toml` (`agentd/tests/repo_consistency.rs`) — a release commit

@@ -70,8 +70,57 @@ git push origin v0.74.0
 # The CI workflow builds linux/amd64 + linux/arm64 and pushes :full, :latest, :v0.74.0
 ```
 
-The git tag version must match the `version` field in `agentd/Cargo.toml`.
-CI derives Docker tags from `cargo metadata` — a mismatch produces wrong Docker tags.
+### Release guards (ci.1) — what a refused publish means
+
+Every publish path runs `scripts/release-guard.sh` first. A refusal names its
+invariant; the exits:
+
+| Refusal | Meaning | Your exit |
+|---|---|---|
+| **tag not on main** | The tagged commit isn't an ancestor of `origin/main` (the v0.86.0 staleness class). | If the commit IS on main (tag raced the branch push): re-run the job. Otherwise delete the tag, re-tag the intended main commit, push. |
+| **version mismatch** | `vX.Y.Z` ≠ `agentd/Cargo.toml`. | Bump Cargo.toml (and CLAUDE.md's version line — test-enforced) and re-tag, or re-tag with the Cargo version. |
+| **non-monotonic tag** | The version isn't newer than every other `v*` tag — it would re-point `:latest` backwards. | Choose a version above the named one. |
+| **version already published** | This caller's artifact for `vX.Y.Z` already exists (checked on tag pushes AND `workflow_dispatch` — an unbumped dispatch must not overwrite a published version). | Never republish a used version. To redo intentionally: delete BOTH the GitHub release/tag AND the ghcr manifest, then re-tag. Otherwise bump. |
+| **probe failed (fail-closed)** | The reuse probe could not get an explicit not-found verdict (auth failure, rate limit, network error, missing ghcr login). The guard refuses rather than publish blind. | Fix the probe's environment (the error output names it) and re-run the job — nothing was published. |
+
+Tag format is strictly `vMAJOR.MINOR.PATCH` (no prereleases). Both workflows
+run on every tag push; each one's guard probes **only its own artifact**
+(`--check release` in release.yml, `--check image` in ci.yml publish-docker) —
+otherwise each would refuse on seeing the other's freshly created output.
+Consequence: after a successful publish, **"Re-run all jobs" correctly refuses**
+(the artifact now exists) — retry a flaked downstream job with **"Re-run failed
+jobs"**, which skips the already-green guard job (in BOTH workflows the guard is
+its own job for exactly this reason). Also note:
+
+- A `workflow_dispatch` publish pushes `:vCARGO_VERSION` images and thereby
+  **consumes that version for images** — tagging the same version later
+  half-publishes (Release created, images refused). Bump before tagging.
+- **Versioning is strictly linear** (deliberate: single-user OS, `:latest`
+  re-points on every release). A backport tag like v0.87.1 after v0.88.0
+  exists is refused by monotonicity — there is no override path.
+- **Don't push two release tags in close succession**: release.yml finishes in
+  minutes but publish-docker trails ~35–50 min behind `build-aarch64`, so a
+  newer tag arriving in that window makes the older tag's image publish refuse
+  on monotonicity (Release + binaries exist, images don't). Space tags by an
+  hour, or re-run the older publish after deleting the newer tag if the order
+  was a mistake.
+
+### Required status checks (branch protection — operator ops)
+
+Merges are gated by branch protection, not by workflows merely running. The
+load-bearing check names are `build-and-test`, `docker-smoke`,
+`sidecar-tests`, and `harness-tests` — **renaming a job silently un-gates it**
+until this setting is updated. Set (or restore after a flaky-check removal)
+with:
+
+```bash
+gh api -X PUT repos/0x89karan/runtime1/branches/main/protection/required_status_checks/contexts \
+  --input - <<< '["build-and-test","docker-smoke","sidecar-tests","harness-tests"]'
+```
+
+Remove a flaking check temporarily (ci.1 flake policy: a check that flakes twice
+in a week drops from required pending a fix — a bypassed red check is worse than
+none) by PUTting the list without it, then restore.
 
 ---
 

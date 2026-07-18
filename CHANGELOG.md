@@ -3,6 +3,53 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.88.0] - 2026-07-18
+
+### Added
+- **CI now tests the artifact, not just the source** (ci.1). Every PR builds the
+  real Docker image and boots it four ways: a credential-free CoS dry-run, an
+  agent dry-run that must render the requested template, a binary error probe,
+  and a negative-control fixture that must *refuse* to boot with the offending
+  line named — the PR-#124 "relative path survives the boot rewrite" class can
+  no longer land silently.
+- **A nightly end-to-end run of the shipped image against a mock provider** —
+  a real agent cycle (tool call included) at zero API cost. The mock dispatches
+  on request content, self-tests in CI, and refuses wrong endpoints, so a
+  regression in the agent loop, tool plumbing, or capability checks surfaces
+  the next morning instead of at a user's machine.
+- **Release guards that make bad publishes refuse instead of shipping**
+  (`scripts/release-guard.sh`): a tag must be on `main`, match Cargo.toml,
+  exceed every prior version, and target an unpublished version — probed
+  fail-closed (auth failures and network errors abort rather than pass) across
+  all three version manifests, with a serialized pre-push re-check closing the
+  race between concurrent publishes. A 24-scenario harness
+  (`scripts/test-release-guard.sh`) runs on every push, alongside self-tests
+  for the mock provider and negative controls proving the sidecar contract's
+  failure branch fires.
+- **Every bundled MCP sidecar self-tests in CI** — nine `docker/*_mcp.py`
+  servers must exit 0 *and* print their `self-test PASSED` marker (either
+  alone can lie). `weather_mcp.py` gained the `--test` mode it was missing.
+  `make test-harness` mirrors the same contract locally.
+- **The QEMU 2-boot continuity test now runs monthly** (was manual-only, and
+  red for months without anyone noticing), with a preflight that names the
+  missing secret instead of failing mysteriously in-VM, and QEMU stderr
+  captured for VM-level diagnosis.
+
+### Changed
+- **CI covers the whole workspace**: `surfaces` (96 tests, incl. Linux-gated
+  FUSE glue), `sandbox` (35), and `otel` (34) build, lint, and test in CI for
+  the first time — with FUSE headers installed up front, root-workspace caches
+  that actually hit (the old per-crate paths cached nothing), and the sandbox
+  crate added to both aarch64 clippy lanes so arch-conditional regressions
+  can't ship uncompiled.
+- **Tag publishes now wait for the sidecar and harness test jobs** — a red
+  self-test blocks `:latest` instead of riding along inside it.
+- Docker/QEMU boots share the same env denylist: `distro/overlay/init` mirrors
+  the entrypoint's `GREP_OPTIONS`/`POSIXLY_CORRECT`/guard-bypass filtering.
+- `docs/DEPLOYMENT.md` documents every guard refusal with its remediation,
+  the required-status-check setup, and the release operating rules (linear
+  versioning, tag spacing, safe re-run paths).
+
 ## [v0.87.0] - 2026-07-17
 
 ### Fixed
