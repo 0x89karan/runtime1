@@ -30,9 +30,9 @@ Working rules:
 
 ### Definition of done (every increment)
 
-- [ ] `cargo build` (debug + release) succeeds
-- [ ] `cargo clippy -- -D warnings` is clean
-- [ ] `cargo test` passes (new behavior has tests; loop/scheduler tests use the mock gateway, not the network)
+- [ ] `cargo build --workspace` (debug + release) succeeds from the repo root
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean (ci.1: CI enforces this across all five crates — per-crate runs miss surfaces/sandbox/otel)
+- [ ] `cargo test --workspace` passes (new behavior has tests; loop/scheduler tests use the mock gateway, not the network)
 - [ ] `/review` clean on the diff
 - [ ] `/qa` confirms the increment's acceptance criteria
 - [ ] Flight-recorder events added or preserved per `docs/CONVENTIONS.md`

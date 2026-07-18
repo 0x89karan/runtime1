@@ -64,10 +64,11 @@ Published images are **not** built on every merge to `main`. To publish:
 # Option A — manual dispatch (from the Actions UI, must be on main branch)
 # Go to: GitHub → Actions → CI → Run workflow → main
 
-# Option B — push a version tag
-git tag v0.74.0
-git push origin v0.74.0
-# The CI workflow builds linux/amd64 + linux/arm64 and pushes :full, :latest, :v0.74.0
+# Option B — push a version tag (must match agentd/Cargo.toml and exceed
+# every prior v* tag — see the release guards below)
+git tag vX.Y.Z
+git push origin vX.Y.Z
+# The CI workflow builds linux/amd64 + linux/arm64 and pushes :full, :latest, :vX.Y.Z
 ```
 
 ### Release guards (ci.1) — what a refused publish means
@@ -87,6 +88,10 @@ Tag format is strictly `vMAJOR.MINOR.PATCH` (no prereleases). Both workflows
 run on every tag push; each one's guard probes **only its own artifact**
 (`--check release` in release.yml, `--check image` in ci.yml publish-docker) —
 otherwise each would refuse on seeing the other's freshly created output.
+publish-docker additionally re-runs the guard as `--check image-prepush` inside
+its concurrency group just before the pushes (closing the concurrent-publish
+race); that mode refuses only a **complete** published manifest, so a partial
+manifest left by a crashed prior run stays repairable with a re-run.
 Consequence: after a successful publish, **"Re-run all jobs" correctly refuses**
 (the artifact now exists) — retry a flaked downstream job with **"Re-run failed
 jobs"**, which skips the already-green guard job (in BOTH workflows the guard is
@@ -249,7 +254,7 @@ docker pull ghcr.io/0x89karan/runtime1:full             # get the newest build
   `agentctl auth google` started, so the loopback callback couldn't bind. Re-run with `--port
   <free-port>` — Desktop clients accept any loopback port; there is nothing to register.
 - **No brief after a few minutes:** check the cron fired and Gmail was reached —
-  `jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail`.
+  `jq 'select(.kind=="tool_call")' ~/.agentos-data/flight.jsonl | tail`.
 - **Can't `docker exec` to watch:** the container must have been started with `--name agentos-cos`.
 
 ---
@@ -451,22 +456,24 @@ docker compose run --rm -e DRY_RUN_ONLY=1 -e ANTHROPIC_API_KEY=x \
 ```
 
 Success prints the fully-rewritten TOML and exits 0. A failed rewrite exits 1 and
-names the surviving line (the boot guards catch any relative path the sed rules
-missed). `AGENTOS_SKIP_PATH_GUARDS=1` overrides the guards if your custom config
-legitimately contains quoted relative paths.
+names the surviving line (the boot guards catch relative paths the sed rules
+missed — quoted `./`-style values and positive-form `*_path`/`*_dir` keys; a bare
+relative `path = "x"`/`dir = "x"` value without `./` is a known residual, see
+TODOS.md audit86-P1-5). `AGENTOS_SKIP_PATH_GUARDS=1` overrides the guards if your
+custom config legitimately contains quoted relative paths.
 
 ```bash
 # Was the agent started?
 sudo journalctl -u agentos-cos --no-pager | grep -i "agentd\|error\|panic"
 
 # Did it connect to Gmail?
-jq 'select(.kind == "mcp_tool_called")' /home/agentos/.agentos-output/flight.jsonl | head -5
+jq 'select(.kind == "tool_call")' /home/agentos/.agentos-output/flight.jsonl | head -5
 
 # Are credentials valid?
 agentctl verify /home/agentos/.agentos-output/evidence.jsonl   # signed receipt chain
 
 # Did cron fire?
-jq 'select(.kind == "mcp_tool_called") | select(.data.tool == "wait_for_trigger")' \
+jq 'select(.kind == "tool_call") | select(.data.tool == "wait_for_trigger")' \
    /home/agentos/.agentos-output/flight.jsonl | jq .data.result | tail -3
 
 # Management API reachable?

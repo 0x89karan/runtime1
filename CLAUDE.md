@@ -100,7 +100,8 @@ Available skills: `/office-hours`, `/plan-ceo-review`, `/plan-eng-review`, `/pla
 
 ## Commands
 
-Runtime code lives in `agentd/`; run cargo from there.
+Runtime code lives in `agentd/`; run agents from there. The pre-commit quality
+gate is workspace-wide and runs from the **repo root** (see "How to work here").
 
 ```bash
 cd agentd
@@ -109,9 +110,8 @@ cd agentd
 cargo build                      # debug
 cargo build --release            # ~2 MB size-optimized binary
 
-# Quality gate (run before committing)
-cargo clippy -- -D warnings
-cargo test
+# Quality gate (run before committing) — from the REPO ROOT, not agentd/
+(cd .. && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace)
 
 # Run an agent (logs to stderr; final answer to stdout; events to flight.jsonl)
 export ANTHROPIC_API_KEY=sk-...

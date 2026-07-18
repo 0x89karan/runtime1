@@ -99,6 +99,7 @@ Phase 0 kinds (canonical — do not rename):
 | `memory_evicted` | entry evicted from a KB segment by capacity or age floor (segment, key, reason: "capacity"\|"age") (p5.6+) |
 | `mcp_http_connected` | HTTP MCP server connected after initialize + tools/list (server_name, url, session_id_present: bool) (p7.1+) |
 | `mcp_http_error` | HTTP MCP server returned non-2xx or JSON-RPC error (server_name, http_status: u16, method) (p7.1+) |
+| `mcp_passenv_forwarded` | MCP server spawned with passenv; names which env vars were forwarded, blocked, or absent (server, forwarded: [str], blocked: [str], absent: [str]) (h7.1+) |
 | `inference_stream_started` | SSE streaming inference started for an agent turn (agent_id, model) (p7.2+) |
 | `inference_stream_completed` | SSE streaming inference completed successfully (agent_id, text_chunks_emitted: u64, input_tokens: u32, output_tokens: u32) (p7.2+) |
 | `inference_stream_delta` | one text chunk of a streaming inference response, recorded per-chunk so remote SSE subscribers see live output (agent_id, turn_seq: u64, chunk_seq: u64, text) (ux.1+) |
