@@ -1,9 +1,22 @@
 name: QEMU 2-boot continuity
 
-# Manual trigger only: costs Anthropic API credits and ~25 min on a cold cache.
-# Run before Phase 6 merges and after any change to distro/ or memory/.
+# Monthly cron (ci.1 / UC2, gate-decided 2026-07-18) + manual dispatch. Costs
+# Anthropic API credits (~one small agent run) and ~25 min on a cold cache.
+# Monthly keeps the boot signal fresh vs. the ratified "quarterly" reading.
+# CAVEAT (ship adversarial): GitHub's 60-day auto-disable of schedule:
+# workflows keys on REPOSITORY inactivity (commits), and cron executions do
+# not count — so if this repo idles >60 days the cron self-disables at ANY
+# cadence. If the repo goes dormant, re-enable via Actions → this workflow →
+# "Enable workflow" (GitHub emails a disable notice).
+# Also run manually before distro/ or memory/ changes merge.
 on:
+  schedule:
+    - cron: "43 4 3 * *"   # 04:43 UTC on the 3rd of every month
   workflow_dispatch:
+
+# Least-privilege: read-only checkout; nothing here publishes.
+permissions:
+  contents: read
 
 jobs:
   qemu-boot-test:
@@ -42,8 +55,12 @@ jobs:
       # Cache the full Buildroot build tree. Key covers the defconfig and kernel
       # fragment; a hit lets Buildroot skip toolchain + kernel compilation (~20 min)
       # and only repack the rootfs with the fresh agentd binary (~2 min).
-      - name: Cache Buildroot build tree
-        uses: actions/cache@v4
+      # Restore/save split: GHA evicts caches unused for 7 days, so an entry
+      # saved by a MONTHLY cron can never be restored by the next cron — saving
+      # on the schedule path is pure multi-GB quota churn. Cron runs still
+      # restore a warm tree when release.yml (same key) ran within the week.
+      - name: Restore Buildroot build tree
+        uses: actions/cache/restore@v4
         with:
           path: distro/build
           key: buildroot-2024.02.9-v2-${{ hashFiles('distro/buildroot.config', 'distro/kernel-extras.config') }}
@@ -56,11 +73,28 @@ jobs:
           make build
         working-directory: distro
 
+      # AFTER the build (red-team): cache/save is a plain sequential step, not
+      # a post-job hook like actions/cache@v4 — placed before the build it
+      # would save nothing on a miss and the split's intent would be dead code.
+      - name: Save Buildroot build tree
+        if: github.event_name != 'schedule'
+        uses: actions/cache/save@v4
+        with:
+          path: distro/build
+          key: buildroot-2024.02.9-v2-${{ hashFiles('distro/buildroot.config', 'distro/kernel-extras.config') }}
+
       - name: QEMU 2-boot continuity
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
+
+          # Preflight (ci.1/DX): a missing secret must fail with an operator
+          # action, not a mysterious in-VM auth failure 3 minutes later.
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error title=ANTHROPIC_API_KEY secret missing::this workflow boots a real agent — add the repo secret (Settings → Secrets → Actions → ANTHROPIC_API_KEY) and re-run"
+            exit 1
+          fi
 
           mkdir -p /tmp/agentos-secrets /tmp/agentos-memory /tmp/agentos-out
           printf 'ANTHROPIC_API_KEY=%s\n' "$ANTHROPIC_API_KEY" \
@@ -90,11 +124,13 @@ jobs:
               -virtfs local,path=/tmp/agentos-secrets,mount_tag=secrets0,security_model=none,id=secrets0 \
               -virtfs local,path=/tmp/agentos-memory,mount_tag=memory0,security_model=none,id=memory0 \
               -virtfs local,path=/tmp/agentos-out,mount_tag=output0,security_model=none,id=output0 \
-              -no-reboot 2>/dev/null || true
+              -no-reboot 2>/tmp/qemu-stderr.log || true
 
             if ! jq -e 'select(.kind == "agent_completed" or .kind == "budget_exceeded")' \
                 /tmp/agentos-out/flight.jsonl 2>/dev/null | head -1 | grep -q .; then
               echo "FAIL: no completion event after boot $n"
+              echo "--- qemu stderr (VM-level failures live here, not in flight.jsonl) ---"
+              cat /tmp/qemu-stderr.log 2>/dev/null || echo "(empty)"
               echo "--- flight.jsonl ---"
               cat /tmp/agentos-out/flight.jsonl 2>/dev/null || echo "(missing)"
               exit 1
