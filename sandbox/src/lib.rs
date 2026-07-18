@@ -869,7 +869,10 @@ mod tests {
         assert!(bpf.0.len() >= 2, "BPF program too short: {} insns", bpf.0.len());
     }
 
-    #[cfg(target_os = "linux")]
+    // x86_64-gated like the field itself (deny_spawn_requested exists only on
+    // that arch) — target_os alone breaks the aarch64-linux test build (E0609,
+    // found by ci.1's workspace clippy sweep).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deny_spawn_sets_deny_spawn_requested() {
         let rules = vec![SandboxRule::DenySpawn];
@@ -880,7 +883,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn no_deny_spawn_clears_deny_spawn_requested() {
         let rules = vec![SandboxRule::AllowFsRead { prefix: "/proc".to_string() }];
@@ -1012,6 +1015,20 @@ mod tests {
         assert_eq!(s.spawn_enforcement, "none");
     }
 
+    // The degraded-arch contract: DenySpawn on non-x86_64 must compile to NO
+    // seccomp filter and report spawn_enforcement "none" (ma.4 tier honesty —
+    // callers surface the degradation instead of assuming enforcement).
+    // Compile-checked today by the aarch64 clippy lane (ci.1); executes if a
+    // `cross test -p sandbox` lane is ever added.
+    #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+    #[test]
+    fn enforcement_status_deny_spawn_degrades_on_non_x86_64() {
+        let compiled = compile(&[SandboxRule::DenySpawn]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(!s.seccomp, "DenySpawn off x86_64 → no BPF program");
+        assert_eq!(s.spawn_enforcement, "none");
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn enforcement_status_deny_spawn_x86_64() {
@@ -1033,7 +1050,7 @@ mod tests {
         let compiled = compile(&rules).unwrap();
         let s = compiled.enforcement_status();
         // landlock_fd may be -1 on old kernels; accept both
-        assert_eq!(s.seccomp, true, "DenySpawn on x86_64 always sets seccomp");
+        assert!(s.seccomp, "DenySpawn on x86_64 always sets seccomp");
         assert_eq!(s.spawn_enforcement, "fork_vfork_only");
     }
 
