@@ -3,10 +3,44 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]*"   # not "v*": a non-release tag like `vendor-baseline` must not
+                    # produce a failed "Release" run at the strict-format check
+
+# Serialize runs (ship adversarial: the guard job and the Release-creating job
+# are separate — two near-simultaneous tag pushes could both pass the "release
+# missing" probe before either creates one). No cancel: a queued release run
+# must still execute and let its own guard judge it.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
+  release-guard:
+    # ci.1 (audit86-P1-6): runs FIRST — both build jobs `needs:` it, so a bad
+    # tag never creates a GitHub Release or uploads artifacts. Same script as
+    # publish-docker (scripts/release-guard.sh — one source of truth), but
+    # --check release: this workflow probes ONLY the GitHub Release it is about
+    # to create. Probing the ghcr manifest here would refuse a legitimate
+    # "Re-run all jobs" after ci.yml has already published the image — and ran
+    # unauthenticated anyway (no ghcr login in this workflow).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Release guards (ancestry, tag==Cargo, monotonicity, reuse)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/release-guard.sh --check release
+
   build-release:
+    needs: release-guard
     name: Build release binaries
     runs-on: ubuntu-latest
     permissions:
@@ -18,9 +52,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            agentd
-            agentctl
+          # Root workspace entry (ci.1): builds write to <repo-root>/target/ —
+          # the previous per-crate entries cached paths that never existed.
+          workspaces: .
 
       - name: Install musl target + tools
         run: |
@@ -57,7 +91,7 @@ jobs:
 
   build-distro-x86_64:
     name: Build x86_64 distro image
-    needs: build-release
+    needs: [release-guard, build-release]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
