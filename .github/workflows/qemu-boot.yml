@@ -36,21 +36,24 @@ jobs:
           sudo apt-get install -y qemu-system-x86 musl-tools jq \
             libelf-dev libssl-dev bc bison flex
 
-      - name: Build agentd (musl static)
-        # Root Cargo.toml is the workspace root; artifacts go to $GITHUB_WORKSPACE/target/
-        run: cargo build --release --target x86_64-unknown-linux-musl -p agentd
+      - name: Build agentd + agentctl (musl static)
+        # BOTH binaries: the distro Makefile requires agentctl in the rootfs
+        # too (dx.3) — building only agentd fails `make build` at its agentctl
+        # prerequisite. Mirrors release.yml. Root Cargo.toml is the workspace
+        # root; artifacts go to $GITHUB_WORKSPACE/target/.
+        run: cargo build --release --target x86_64-unknown-linux-musl -p agentd -p agentctl
 
-      - name: Locate binary
-        id: binary
+      - name: Locate binaries
         run: |
-          BIN="$GITHUB_WORKSPACE/target/x86_64-unknown-linux-musl/release/agentd"
-          if [ ! -f "$BIN" ]; then
-            echo "Expected path missing — searching..."
-            find "$GITHUB_WORKSPACE" -name "agentd" -type f ! -path "*/registry/*" 2>/dev/null
-            exit 1
-          fi
-          echo "path=$BIN" >> "$GITHUB_OUTPUT"
-          echo "Binary found: $BIN ($(du -sh "$BIN" | cut -f1))"
+          for b in agentd agentctl; do
+            BIN="$GITHUB_WORKSPACE/target/x86_64-unknown-linux-musl/release/$b"
+            if [ ! -f "$BIN" ]; then
+              echo "Expected path missing — searching..."
+              find "$GITHUB_WORKSPACE" -name "$b" -type f ! -path "*/registry/*" 2>/dev/null
+              exit 1
+            fi
+            echo "Binary found: $BIN ($(du -sh "$BIN" | cut -f1))"
+          done
 
       # Cache the full Buildroot build tree. Key covers the defconfig and kernel
       # fragment; a hit lets Buildroot skip toolchain + kernel compilation (~20 min)
@@ -68,8 +71,9 @@ jobs:
       - name: Build distro image
         run: |
           mkdir -p overlay/usr/bin
-          cp "${{ steps.binary.outputs.path }}" overlay/usr/bin/agentd
-          chmod +x overlay/usr/bin/agentd
+          cp "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-musl/release/agentd"   overlay/usr/bin/agentd
+          cp "$GITHUB_WORKSPACE/target/x86_64-unknown-linux-musl/release/agentctl" overlay/usr/bin/agentctl
+          chmod +x overlay/usr/bin/agentd overlay/usr/bin/agentctl
           make build
         working-directory: distro
 
