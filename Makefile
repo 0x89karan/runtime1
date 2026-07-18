@@ -46,6 +46,7 @@ clippy-aarch64:
 	@command -v cross >/dev/null 2>&1 || { echo "ERROR: cross not installed — run: cargo install cross --locked"; exit 1; }
 	(cd agentd && cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings)
 	(cd agentctl && cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings)
+	(cd sandbox && cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings)
 
 # Proves docker-compose.yml's cos/agent services are unaffected by the
 # Dockerfile's default CMD (ux.9 flipped it shell -> cockpit): both services
@@ -63,13 +64,23 @@ compose-config-check:
 	  fi; \
 	done
 
-# Run self-tests for the bundled standard MCP servers (no API key required).
-# Assumes python3 is on PATH.
+# Run self-tests for ALL bundled MCP servers (no API key required).
+# Mirrors CI's sidecar-tests job (ci.1): globs docker/*_mcp.py and requires
+# rc==0 AND the "self-test PASSED" stderr marker — marker alone passes a
+# sidecar that prints PASSED then crashes; rc alone false-passes a flagless
+# server EOFing on /dev/null stdin. Uses timeout/gtimeout when available
+# (stock macOS has neither — `brew install coreutils` for gtimeout).
 .PHONY: test-harness
 test-harness:
-	python3 docker/shell_mcp.py --test
-	python3 docker/http_mcp.py  --test
-	python3 docker/search_mcp.py --test
-	python3 docker/cron_mcp.py   --test
-	python3 docker/fs_watch_mcp.py --test
-	python3 docker/webhook_mcp.py  --test
+	@fail=0; TMOUT_CMD=""; \
+	command -v timeout >/dev/null 2>&1 && TMOUT_CMD="timeout 60"; \
+	[ -z "$$TMOUT_CMD" ] && command -v gtimeout >/dev/null 2>&1 && TMOUT_CMD="gtimeout 60"; \
+	for f in docker/*_mcp.py; do \
+	  extra_env=""; case "$$f" in *semantic_kb*) extra_env="MOCK_EMBEDDINGS=1" ;; esac; \
+	  rc=0; out=$$($$TMOUT_CMD env $$extra_env python3 "$$f" --test </dev/null 2>&1) || rc=$$?; \
+	  if [ $$rc -eq 0 ] && printf '%s' "$$out" | grep -q "self-test PASSED"; then \
+	    echo "PASS: $$f"; \
+	  else \
+	    echo "FAIL: $$f (rc=$$rc)"; printf '%s\n' "$$out" | tail -5; fail=1; \
+	  fi; \
+	done; exit $$fail
