@@ -5,6 +5,16 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [v0.88.0] - 2026-07-18
 
+### Fixed
+- **`AllowNetConnect` TCP port enforcement never worked on Landlock-active
+  kernels** — the sandbox passed rule type `3` to `landlock_add_rule`, but the
+  kernel ABI defines `LANDLOCK_RULE_NET_PORT = 2`, so every net-port rule was
+  rejected with `EINVAL` and `compile()` failed outright on kernels ≥ 6.7 with
+  Landlock enabled (it only "worked" where Landlock was inactive and the
+  sandbox degraded). Found by the very first CI run of the sandbox test suite
+  on a real Linux runner — the exact artifact-vs-source gap this release's CI
+  overhaul exists to close.
+
 ### Added
 - **CI now tests the artifact, not just the source** (ci.1). Every PR builds the
   real Docker image and boots it four ways: a credential-free CoS dry-run, an
