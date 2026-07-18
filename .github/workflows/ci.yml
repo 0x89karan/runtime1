@@ -3,10 +3,16 @@ name: CI
 on:
   push:
     branches: ["**"]
-    tags: ["v*"]        # tag pushes reach all jobs (required for publish-docker on release)
+    tags: ["v[0-9]*"]   # tag pushes reach all jobs (required for publish-docker on release);
+                        # v[0-9]* so a non-release tag like `vendor-baseline` can't turn the
+                        # pipeline red at the guard's strict-format check
   pull_request:
     branches: ["main"]
   workflow_dispatch:    # manual publish from Actions UI (constrained to main in publish-docker)
+
+# Least-privilege default; publish-docker declares its own packages: write.
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
@@ -21,44 +27,32 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            agentd
-            agentctl
+          # Root workspace entry (ci.1): workspace builds write to <repo-root>/target/,
+          # so the previous agentd/agentctl entries cached directories that never
+          # existed — every run rebuilt from scratch. First run on this config is cold.
+          workspaces: .
 
-      - name: Build agentd (debug)
-        run: cargo build --verbose
-        working-directory: agentd
+      # BEFORE the workspace build: surfaces' fuser dep resolves libfuse via
+      # pkg-config on Linux (same reason make clippy-linux apt-gets these) —
+      # without the headers the very first cargo build fails on ubuntu.
+      - name: Install FUSE headers (surfaces dep)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libfuse-dev pkg-config
 
-      - name: Build agentctl (debug)
-        run: cargo build --verbose
-        working-directory: agentctl
+      # Workspace-wide (ci.1 / audit86-P1-4): surfaces (96 tests incl. the
+      # Linux-gated fuser glue that local macOS clippy can never lint), sandbox
+      # (34) and otel (34, incl. the event-kind coverage guard) run in CI for the
+      # first time. --all-targets lints test + bench code too (F-13).
+      - name: Build workspace (debug)
+        run: cargo build --workspace --verbose
 
-      - name: Build agentd (release)
-        run: cargo build --release --verbose
-        working-directory: agentd
+      - name: Build workspace (release)
+        run: cargo build --workspace --release --verbose
 
-      - name: Build agentctl (release)
-        run: cargo build --release --verbose
-        working-directory: agentctl
+      - name: Clippy workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Clippy agentd
-        # --all-targets lints test + bench code too (F-13); test-only lints
-        # (held locks across await, items after a test module, redundant bounds)
-        # went uncaught for several Phase-5 sprints without it.
-        run: cargo clippy --all-targets -- -D warnings
-        working-directory: agentd
-
-      - name: Clippy agentctl
-        run: cargo clippy --all-targets -- -D warnings
-        working-directory: agentctl
-
-      - name: Test agentd
-        run: cargo test --verbose
-        working-directory: agentd
-
-      - name: Test agentctl
-        run: cargo test --verbose
-        working-directory: agentctl
+      - name: Test workspace
+        run: cargo test --workspace --verbose
 
       - name: Install musl target + tools
         run: |
@@ -99,7 +93,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: agentctl
+          # Root workspace entry (ci.1): agentctl is a root-workspace member, so
+          # even from agentctl/ cargo writes to <repo-root>/target/ — the old
+          # `workspaces: agentctl` cached a directory that never existed.
+          workspaces: .
 
       - name: Build agentctl (macOS)
         run: cargo build --verbose
@@ -129,9 +126,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            agentd
-            agentctl
+          # Root workspace entry (ci.1): cross also writes to <repo-root>/target/ —
+          # the old per-crate entries cached paths that never existed.
+          workspaces: .
           key: aarch64
 
       - name: Install cross
@@ -154,6 +151,15 @@ jobs:
       - name: Clippy agentctl (aarch64)
         run: cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
         working-directory: agentctl
+
+      - name: Clippy sandbox (aarch64)
+        # sandbox is the one crate with #[cfg(target_arch)]-conditional code (the
+        # DenySpawn gate); before ci.1 no aarch64 lane compiled it, so an
+        # x86_64-only field referenced from an ungated test (E0609) shipped
+        # undetected. surfaces/otel stay out: no arch-conditional code, and
+        # surfaces' fuser dep needs libfuse in the cross image.
+        run: cross clippy --all-targets --target aarch64-unknown-linux-musl -- -D warnings
+        working-directory: sandbox
 
       - name: Test agentd (aarch64, QEMU)
         # --lib runs unit tests only; integration tests in tests/ spawn agentd as a
@@ -186,8 +192,55 @@ jobs:
           MAX_BYTES=6291456  # 6 MB = 6 * 1024 * 1024
           [ "${SIZE}" -le "${MAX_BYTES}" ] || { echo "ERROR: binary ${SIZE} bytes exceeds 6 MB limit"; exit 1; }
 
+  release-guard:
+    # Own JOB, not a step inside publish-docker (ship adversarial F1): the
+    # guard must not re-run on "Re-run failed jobs" — a post-push cache-export
+    # failure re-running an in-job guard would refuse its own partial publish
+    # and permanently brick the release. As a separate green job it is skipped
+    # on retries, so re-running publish-docker overwrites the same-commit
+    # partial tags with identical bytes (the intended recovery).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: |
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: read   # manifest probe only; publish-docker holds write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: the release guard needs ancestry + tag comparisons.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release guards (ancestry, tag==Cargo, monotonicity, reuse)
+        # ci.1 (audit86-P1-6). AFTER the ghcr login deliberately: the reuse guard
+        # inspects the version manifests, which needs registry auth. Runs on the
+        # dispatch path too (dispatch also pushes :vCARGO_VERSION tags — an
+        # unbumped dispatch must not silently overwrite a published version).
+        # --check image: this workflow probes ONLY the ghcr manifests it is about
+        # to write — probing the GitHub Release here would deterministically
+        # refuse every tag publish (release.yml creates the Release long before
+        # publish-docker clears its needs: chain).
+        run: ./scripts/release-guard.sh --check image
+
   publish-docker:
-    needs: [build-and-test, build-aarch64, audit, build-macos]
+    # sidecar-tests + harness-tests in needs: (ship adversarial F2): they run
+    # on tag pushes but without needs: a tag would publish :latest with the
+    # sidecars baked in even while their self-tests are red on the same run.
+    # docker-smoke is deliberately absent — it does not run on tag refs, and a
+    # skipped needs-dependency would skip this job entirely; the tagged commit
+    # already passed smoke on its main push (ancestry guard enforces main).
+    needs: [release-guard, build-and-test, build-aarch64, audit, build-macos, sidecar-tests, harness-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 120  # arm64 QEMU build ~60-90 min on first push; GHA cache cuts subsequent runs to ~15 min
     if: |
@@ -201,6 +254,11 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags: the release guard needs ancestry + tag comparisons.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Get version
         id: version
@@ -222,6 +280,16 @@ jobs:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Reuse re-check (serialized, immediately pre-push)
+        # Codex P1: the release-guard JOB's verdict can go stale while this job
+        # waits ~40 min in the needs: chain + concurrency queue — a second
+        # same-version publish would otherwise push over the first with a stale
+        # green guard. This re-check runs INSIDE the concurrency group, right
+        # before the pushes. image-prepush semantics: refuse only a COMPLETE
+        # foreign publish (all 3 version manifests); tolerate partials so
+        # "Re-run failed jobs" can recover this run's own interrupted push.
+        run: ./scripts/release-guard.sh --check image-prepush
 
       - name: Build and push agentos:core
         uses: docker/build-push-action@v6
@@ -280,3 +348,200 @@ jobs:
 
       - name: Audit dependencies
         run: cargo audit
+
+  sidecar-tests:
+    # ci.1: every Python MCP sidecar's self-test runs in CI. The contract is
+    # rc==0 AND the stderr marker — rc alone false-passes an argv-less server
+    # EOFing on /dev/null stdin (weather_mcp.py did exactly that); marker alone
+    # passes a sidecar that prints PASSED then crashes. Sidecars are
+    # stdlib-only; the runner's python3 suffices.
+    runs-on: ubuntu-latest
+    # 15, not 10: worst case is every sidecar hanging to its 60 s cap (9 files
+    # today, glob auto-includes new ones) — the job timeout must leave room for
+    # the per-file diagnostics, not replace them with a generic cancellation.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run all sidecar self-tests (marker-checked)
+        run: |
+          set -u
+          fail=0
+          for f in docker/*_mcp.py; do
+            extra_env=""
+            case "$f" in *semantic_kb*) extra_env="MOCK_EMBEDDINGS=1" ;; esac
+            # `|| rc=$?` is load-bearing: this step runs under Actions' default
+            # `bash -e`, so a bare failing command substitution would abort the
+            # whole step BEFORE the diagnostics branch — exactly for the
+            # failures it exists to explain (adversarial-review F13).
+            # timeout 60 (not 120): 9 sidecars × the per-file cap must fit the
+            # job's timeout-minutes: 10 even if every one hangs; self-tests
+            # normally finish in <2 s.
+            rc=0
+            out=$(timeout 60 env $extra_env python3 "$f" --test </dev/null 2>&1) || rc=$?
+            # Contract: rc==0 AND marker. Marker alone would pass a sidecar
+            # that prints PASSED then crashes (F14); rc alone false-passes an
+            # argv-less server EOFing on /dev/null.
+            if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "self-test PASSED"; then
+              echo "PASS: $f"
+            else
+              echo "::error title=sidecar self-test failed::$f (rc=$rc) — output below"
+              printf '%s\n' "$out"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  harness-tests:
+    # ci.1: the release guard executes only at release time — the worst moment
+    # to discover a regression — so its scenario suite runs on every push.
+    # Also self-tests the nightly mock's dispatch contract and proves the
+    # sidecar rc+marker contract's FAIL branch actually fires (negative
+    # control — a broken `|| rc=$?` capture would otherwise false-green).
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Release-guard scenario suite (shimmed gh/docker)
+        # Scenario count is asserted inside the script (EXPECTED) — not here,
+        # so adding a scenario touches one file.
+        run: ./scripts/test-release-guard.sh
+
+      - name: Mock provider self-test (nightly dispatch contract)
+        run: |
+          set -u
+          rc=0
+          out=$(timeout 60 python3 .github/fixtures/mock_provider.py --test </dev/null 2>&1) || rc=$?
+          if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "self-test PASSED"; then
+            echo "PASS: mock_provider.py"
+          else
+            echo "::error title=mock provider self-test failed::rc=$rc — output below"
+            printf '%s\n' "$out"
+            exit 1
+          fi
+
+      - name: Sidecar contract negative control
+        # A stub that prints the marker then crashes, and one that exits 0
+        # without the marker, must BOTH be reported FAIL by the sidecar-tests
+        # loop body — proves the rc==0-AND-marker conjunction is live.
+        run: |
+          set -u
+          mkdir -p /tmp/neg
+          printf 'import sys\nprint("self-test PASSED (liar)", file=sys.stderr)\nsys.exit(3)\n' > /tmp/neg/liar_mcp.py
+          printf 'import sys\nfor line in sys.stdin: pass\n' > /tmp/neg/eof_mcp.py
+          fail=0
+          for f in /tmp/neg/*_mcp.py; do
+            rc=0
+            out=$(timeout 60 python3 "$f" --test </dev/null 2>&1) || rc=$?
+            if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "self-test PASSED"; then
+              echo "::error title=negative control PASSED::$f slipped through the rc+marker contract"
+              fail=1
+            else
+              echo "OK: $f correctly rejected (rc=$rc)"
+            fi
+          done
+          exit $fail
+
+  docker-smoke:
+    # ci.1 (ux.9-ar-05 + audit86-P1-5): build the actual image on PRs and run the
+    # audit.1 dry-run hooks against it. timeout-minutes is deliberately generous:
+    # <10 min is the WARM-cache budget; the first PRs after this lands are COLD
+    # (~20-40 min amd64 LTO release build) until a main push populates the cache.
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime-full (amd64, loaded into daemon)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime-full
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: agentos:smoke
+          # PRs READ main's scope but never write. (PR-created entries WOULD be
+          # restorable within the same PR's later pushes, but writing mode=max
+          # per-PR churns the shared 10 GB quota.) Consequence: a PR touching
+          # Rust source pays a partial rebuild every push — the cargo registry
+          # is a BuildKit type=cache mount that type=gha never exports — so the
+          # <10 min warm budget holds only for non-Rust-source PRs; the 50-min
+          # timeout is the real budget. Main pushes write the shared scope so
+          # later PRs and tag publishes start warm.
+          cache-from: type=gha,scope=buildkit-full
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=buildkit-full' || '' }}
+
+      - name: cos dry-run (credential-free)
+        run: |
+          set +e
+          docker run --rm -e DRY_RUN_ONLY=1 agentos:smoke cos >cos-dry.log 2>&1; rc=$?
+          set -e
+          if [ $rc -ne 0 ] || ! grep -q 'store_path = "/data/memory.redb"' cos-dry.log \
+             || grep -qE "[\"']\.\.?/" cos-dry.log; then
+            echo "::error title=cos dry-run failed::rc=$rc — problem: rewrite/guards broke; repro: docker run --rm -e DRY_RUN_ONLY=1 <image> cos; output below"
+            cat cos-dry.log
+            exit 1
+          fi
+          echo "cos dry-run OK"
+
+      - name: agent dry-run (dummy key)
+        run: |
+          set +e
+          docker run --rm -e DRY_RUN_ONLY=1 -e ANTHROPIC_API_KEY=x \
+            -e TEMPLATE_NAME=scout -e AGENT_TASK=x agentos:smoke agent >agent-dry.log 2>&1; rc=$?
+          set -e
+          # Positive assertion too (ship adversarial F5): rc==0 alone would
+          # false-green a lowering regression that renders the wrong agent.
+          if [ $rc -ne 0 ] || ! grep -q 'id = "scout"' agent-dry.log; then
+            echo "::error title=agent dry-run failed::rc=$rc — problem: template lowering or path rewrite broke; output below"
+            cat agent-dry.log
+            exit 1
+          fi
+          echo "agent dry-run OK"
+
+      - name: binary error probe
+        # agentd has no --help; a missing-config run proves the binary executes
+        # and errors coherently. Dummy key required — run) checks it before agentd.
+        # "loading config" is the anyhow context in agentd/src/main.rs — rewording
+        # it there must update this grep.
+        run: |
+          set +e
+          docker run --rm -e ANTHROPIC_API_KEY=x agentos:smoke run /nonexistent.toml >probe.log 2>&1; rc=$?
+          set -e
+          if [ $rc -eq 0 ] || ! grep -qi "loading config" probe.log; then
+            echo "::error title=binary probe failed::expected nonzero exit + config-load error; rc=$rc; output below"
+            cat probe.log
+            exit 1
+          fi
+          echo "binary probe OK"
+
+      - name: negative control — PR-#124 class fixture must refuse to boot
+        # The fixture carries the write_file(path='./output/ literal (so the
+        # pre-existing v0.86.2 prompt-vs-grant grep passes after rewrite) PLUS a
+        # planted relative path no sed rule knows. The boot guard must exit 1
+        # naming the surviving line.
+        run: |
+          set +e
+          docker run --rm -e DRY_RUN_ONLY=1 \
+            -v "$PWD/.github/fixtures/cos-broken-relative.toml":/etc/agentd/cos.agents.toml:ro \
+            agentos:smoke cos >fixture.log 2>&1; rc=$?
+          set -e
+          cat fixture.log
+          if [ $rc -eq 0 ]; then
+            echo "::error title=boot guard did not trip::the broken fixture booted — the PR-#124 guard class regressed"
+            exit 1
+          fi
+          # Message literal from docker/entrypoint.sh's boot guard (commented
+          # there too); the ^N: line-number form comes from its `grep -n` output.
+          if ! grep -q "relative path survived the boot rewrite" fixture.log \
+             || ! grep -qE "^[0-9]+:" fixture.log; then
+            echo "::error title=wrong failure::fixture failed but not via the path guard with a named line"
+            exit 1
+          fi
+          echo "negative control OK (guard tripped, line named)"

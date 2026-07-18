@@ -60,7 +60,7 @@ Both forms share `[model]`, `[tools]`, and `[scheduler]` sections. See `agent.to
 | `model.provider` | `"anthropic"` | Inference backend |
 | `model.model` | `"claude-sonnet-4-6"` | Model identifier passed to the provider |
 | `model.max_tokens` | `4096` | Max tokens per inference response |
-| `model.streaming` | `false` | Stream text chunks to stdout as they arrive (SSE). Applies to every agent and every inference turn. In multi-agent runs each chunk is prefixed with `[agent-id]`. Non-streaming path unchanged when `false`. |
+| `model.streaming` | `true` (h7.4+) | Stream text chunks to stdout as they arrive (SSE). Applies to every agent and every inference turn. In multi-agent runs each chunk is prefixed with `[agent-id]`. Non-streaming path unchanged when `false`. |
 | `tools.native` | `[]` | Native tools: `["all"]` or `["read_file", "write_file", "list_dir"]` |
 | `[[tools.mcp_servers]].capabilities` | absent (unsandboxed) | Kernel sandbox for this MCP server subprocess. Absent = no sandbox (warn + `SandboxSkipped` event); `[]` = deny spawn only; `[{FsRead={prefix="/data"}}]` = Landlock FS read grant. Variants mirror agent capabilities: `FsRead{prefix}`, `FsWrite{prefix}`, `Net{hosts}` (advisory), `Mcp{server,tools}`, `Spawn` (suppresses DenySpawn). Linux 5.13+ for Landlock; seccomp-bpf x86_64 only. |
 | `scheduler.global_token_budget` | `0` | Global token ceiling across all agents; `0` = unlimited |
@@ -89,9 +89,10 @@ cd agentd
 cargo build                      # debug
 cargo build --release            # size-optimized (~2 MB target)
 
-# Quality gate (run before committing)
-cargo clippy -- -D warnings
-cargo test
+# Quality gate (run before committing) — workspace-wide, from the REPO ROOT.
+# CI enforces exactly this across all five crates (ci.1); per-crate clippy/test
+# from agentd/ misses surfaces/sandbox/otel and goes red in CI.
+(cd .. && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace)
 
 # Run (single agent)
 cargo run -- agent.toml

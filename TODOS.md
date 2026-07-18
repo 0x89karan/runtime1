@@ -46,12 +46,12 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   reaches. Full-cloned into every checkpoint (interval 1 turn) and every snapshot tick ⇒
   unbounded RAM + linearly growing per-turn checkpoint writes. Fix: cap depth + threshold
   distillation for parked agents. → `run.1`.
-- **audit86-P1-4 (P1) [new] — CI tests only the agentd+agentctl packages.**
+- ~~**audit86-P1-4 (P1) [new] — CI tests only the agentd+agentctl packages.**~~ **[FIXED in ci.1 (v0.88.0): build-and-test is workspace-wide (build/clippy/test `--workspace --all-targets`); sandbox added to both aarch64 clippy lanes; verified by /qa (1430 tests).]**
   `ci.yml:44-61` pins `working-directory`; `surfaces` (96 tests incl. Linux-gated
   `agents_fs.rs`), `sandbox` (34), and `otel` (34) test suites are never executed in CI on
   any target, and their clippy is not reliably denied. The "1420 workspace tests" figure is
   a local-only guarantee. Fix: `cargo test/clippy --workspace --all-targets` from repo root. → `ci.1`.
-- **audit86-P1-5 (P1→ci.1 remainder) — entrypoint sed-rewrite pipeline has zero test coverage.** **[PARTIAL in audit.1 (v0.87.0): general negative-assertion guards (both quote styles, positive-form path-key, args-anchored), cos+agent DRY_RUN_ONLY hooks, escape hatch — verified live in Docker by /qa. Remaining for ci.1: the CI job invoking the dry-runs + the two unexercised guard branches (grep rc>=2 refusal, extra-pattern concat).]**
+- ~~**audit86-P1-5 (P1→ci.1 remainder) — entrypoint sed-rewrite pipeline has zero test coverage.**~~ **[audit.1: guards + dry-run hooks. ci.1 (v0.88.0): docker-smoke CI job runs cos/agent DRY_RUN_ONLY + binary probe + PR-#124-class negative fixture on every PR; the fixture exercises the extra-pattern concat branch (positive-form hit → `17:store_path` named). Still unexercised: the grep rc>=2 internal-error refusal branch (needs a grep malfunction to trigger — accepted residual). Known coverage limit (ship adversarial): the extra ERE only matches `*_path`/`*_dir` keys — a bare `path = "x"`/`dir = "x"` relative value without `./` escapes it; the class dies with the sed pipeline in par.2.]**
   `entrypoint.sh:242-247`'s `DRY_RUN_ONLY` hook (cred.2) is invoked by nothing; the v0.86.2
   guard (`:159`) covers 1 of 6 `cos)` rewrite rules and checks the *prompt* half of the
   v0.86.2 pair, not the *grant* half (`prefix = "./output"`), so the inverse desync passes.
@@ -59,7 +59,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   other rules. Fix: negative-assertion block after each rewrite (fail if `"../docker/`,
   `"memory.redb"`, `"evidence.jsonl"`, `"egress-key.pkcs8"`, `"./output` survive) + a CI job
   invoking `DRY_RUN_ONLY=1`. → `ci.1` / `audit.1`.
-- **audit86-P1-6 (P1) [new] — Any `v*` tag on a stale commit silently publishes `:latest`.**
+- ~~**audit86-P1-6 (P1) [new] — Any `v*` tag on a stale commit silently publishes `:latest`.**~~ **[FIXED in ci.1 (v0.88.0): `scripts/release-guard.sh` (ancestry, tag==Cargo, monotonicity, per-caller fail-closed reuse over all three version manifests) called by both ci.yml's release-guard job (`--check image`) and release.yml's (`--check release`); 24-scenario harness committed as `scripts/test-release-guard.sh` (self-counting: `EXPECTED=24`), run by the harness-tests CI job on every push.]**
   `publish-docker` (`ci.yml:193-254`) and `release.yml` fire on any `v*` tag, check out the
   tag ref, and push `:latest`/`:full`/`:core` + release binaries with no
   `merge-base --is-ancestor origin/main` check and no tag==Cargo-version check (image tags
@@ -98,6 +98,16 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 
 ### P2
 
+- **ci.2 (P2) [named deferral from ci.1] — Broker→oauth_mcp→provider fake-provider E2E.**
+  The nightly E2E (ci.1/3b) exercises agentd→mock-Anthropic only; the credential-broker
+  seam (CredentialGateway → oauth_mcp sidecar → provider token flow, cred.3–cred.7) has
+  no scheduled empirical signal. Scope: fake OAuth provider + fake API sidecar in the
+  harness, containerized broker round-trip, flight/receipt asserts. Also fold in
+  (ship adversarial F10): sidecar self-tests currently run against the git CHECKOUT's
+  python3, not the shipped image — a Dockerfile COPY omission or image-python
+  incompatibility ships undetected; run them inside `agentos:full` here. This named
+  entry replaces the ci.1 plan's "after smoke proves stable" never-trigger
+  (`docs/plans/ci.1-ci-tests-the-artifact.md` §NOT-in-scope).
 - **audit86-P2-1 (P2) [new] — Restart takes cfg/model/task/prompt from the checkpoint, overriding TOML.**
   `scheduler.rs:183-184,243-247`, `agent/mod.rs:206-221`. Since the CoS never terminates, a
   `docker compose pull && up` shipping a new prompt/budget/model silently changes nothing

@@ -18,3 +18,4 @@ output/
 # OS + tooling cruft
 .DS_Store
 .gstack/
+__pycache__/

@@ -85,6 +85,8 @@ guard_no_relative_paths() {
     fi
   fi
   if [ -n "$_guard_hits" ]; then
+    # CI's docker-smoke negative control greps this exact message (ci.yml) —
+    # rewording it must update that assertion in the same change.
     echo "ERROR: relative path survived the boot rewrite in $_guard_file:" >&2
     echo "$_guard_hits" | head -5 >&2
     echo "" >&2

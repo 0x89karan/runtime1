@@ -18,6 +18,33 @@ TOOLS = [{
     }
 }]
 
+if len(sys.argv) > 1 and sys.argv[1] == "--test":
+    # Self-test (ci.1): no network, no stdin. CI asserts the PASSED marker on
+    # stderr — exit codes alone are insufficient (an argv-less server EOFs on
+    # /dev/null stdin and exits 0, which is exactly the false-pass this closes).
+    import io
+    checks = 0
+    # T1: tool schema shape
+    assert len(TOOLS) == 1 and TOOLS[0]["name"] == "get_weather", "T1 tool name"
+    assert "city" in TOOLS[0]["inputSchema"]["properties"], "T1 schema city"
+    assert TOOLS[0]["inputSchema"]["required"] == ["city"], "T1 required"
+    checks += 1
+    # T2: TOOLS serializes to valid JSON and round-trips
+    assert json.loads(json.dumps(TOOLS)) == TOOLS, "T2 round-trip"
+    checks += 1
+    # T3: send() emits one valid JSONL line (finally: never leave stdout swapped)
+    _real_stdout = sys.stdout
+    try:
+        sys.stdout = io.StringIO()
+        send({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
+        _out = sys.stdout.getvalue()
+    finally:
+        sys.stdout = _real_stdout
+    assert _out.endswith("\n") and json.loads(_out)["result"]["ok"] is True, "T3 send"
+    checks += 1
+    print(f"weather_mcp.py: self-test PASSED ({checks}/3)", file=sys.stderr)
+    sys.exit(0)
+
 for line in sys.stdin:
     line = line.strip()
     if not line:

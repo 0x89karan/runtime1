@@ -11,7 +11,18 @@ use std::path::{Path, PathBuf};
 
 /// Directories holding checked-in agent-spec TOMLs, relative to CARGO_MANIFEST_DIR
 /// (= `agentd/`). Never CWD-relative — an integration test's CWD is cargo's choice.
-const SPEC_DIRS: &[&str] = &[".", "../docker", "../distro/overlay/etc/agentd"];
+///
+/// `.github/fixtures` (ci.1): the nightly-E2E and docker-smoke fixtures are real
+/// specs the workflows mount into the shipped image — schema drift there would
+/// otherwise surface only at 03:17 UTC in a non-required check (the dead-gauge
+/// pathology). A future fixture that must NOT parse belongs in
+/// `agentd/tests/fixtures/` (not swept), like `broken_model_id.toml`.
+const SPEC_DIRS: &[&str] = &[
+    ".",
+    "../docker",
+    "../distro/overlay/etc/agentd",
+    "../.github/fixtures",
+];
 
 /// Known non-spec TOMLs excluded by filename (crate/tool config, not agent specs).
 /// Everything else with a `.toml` extension in SPEC_DIRS is treated as a spec, so

@@ -1,0 +1,110 @@
+name: Nightly artifact E2E
+
+# ci.1 / UC1 (gate-approved 2026-07-18): the shipped image runs a REAL agent
+# loop against a mock provider — zero API cost. This is the only CI signal that
+# tests the artifact doing its job (audit S4) and the first scheduled empirical
+# signal for the always-on claim (audit S3). Non-required check by design.
+#
+# Own workflow file deliberately: a schedule: trigger inside ci.yml would run
+# every un-`if`-guarded job (build-and-test, audit, ...) nightly.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # nightly 03:17 UTC (off the top-of-hour thundering herd)
+  workflow_dispatch:
+
+# Least-privilege: this workflow only reads the repo (buildx GHA cache uses the
+# runtime token, not GITHUB_TOKEN permissions).
+permissions:
+  contents: read
+
+jobs:
+  nightly-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build runtime-full (amd64, loaded)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime-full
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: agentos:nightly
+          cache-from: type=gha,scope=buildkit-full
+          # Write only from main: schedule runs execute there anyway, but
+          # workflow_dispatch can target any ref — a feature-branch dispatch
+          # writing mode=max would churn the repo-wide 10 GB quota and evict
+          # main's warm entries (the exact churn docker-smoke's gate avoids).
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=buildkit-full' || '' }}
+
+      - name: Start mock provider
+        run: |
+          python3 .github/fixtures/mock_provider.py >mock.log 2>&1 &
+          echo $! > mock.pid
+          for i in $(seq 1 20); do
+            curl -sf -X POST http://127.0.0.1:8082/v1/messages -d '{}' >/dev/null && break
+            sleep 0.5
+          done
+          curl -sf -X POST http://127.0.0.1:8082/v1/messages -d '{}' >/dev/null \
+            || { echo "::error title=mock provider failed to start::see mock.log"; cat mock.log; exit 1; }
+
+      - name: Run the agent cycle against the mock
+        run: |
+          mkdir -p e2e-out
+          set +e
+          docker run --rm \
+            --add-host=host.docker.internal:host-gateway \
+            -e ANTHROPIC_API_KEY=mock \
+            -e ANTHROPIC_BASE_URL=http://host.docker.internal:8082 \
+            -v "$PWD/.github/fixtures/nightly.toml":/etc/agentd/nightly.toml:ro \
+            -v "$PWD/e2e-out":/workspace \
+            agentos:nightly run /etc/agentd/nightly.toml >run.log 2>&1
+          rc=$?
+          set -e
+          cat run.log
+          if [ $rc -ne 0 ]; then
+            echo "::error title=nightly E2E run failed::agentd exited rc=$rc — see run.log above and flight.jsonl artifact"
+            exit 1
+          fi
+
+      - name: Assert flight.jsonl health
+        run: |
+          FLIGHT=e2e-out/flight.jsonl
+          [ -f "$FLIGHT" ] || { echo "::error title=no flight.jsonl::agent ran but recorded nothing"; exit 1; }
+          # FlightRecorder wraps payloads under "data"; kind is top-level.
+          grep -q '"kind":"agent_completed"' "$FLIGHT" \
+            || { echo "::error title=no agent_completed event::cycle did not finish — flight log below"; cat "$FLIGHT"; exit 1; }
+          # The mock forces a list_dir tool_use on turn 1 — a completed run that
+          # never called a tool means the tool loop is broken, not exercised
+          # (adversarial-review: "reply done" alone tested only text-out).
+          grep -q '"kind":"tool_call"' "$FLIGHT" \
+            || { echo "::error title=no tool_call event::agent completed without exercising the tool loop — flight log below"; cat "$FLIGHT"; exit 1; }
+          if grep -q '"kind":"capability_denied"' "$FLIGHT"; then
+            echo "::error title=capability_denied in nightly run::the v0.86.2 failure class resurfaced"; cat "$FLIGHT"; exit 1
+          fi
+          echo "nightly E2E OK: agent completed, tool loop exercised, no capability denials"
+
+      - name: Upload diagnostics (flight.jsonl + run.log + mock.log)
+        # All three, not just flight.jsonl: if agentd dies at config stage the
+        # flight log never exists and run.log is the only evidence. `warn` (not
+        # `ignore`) so a no-files upload is visible in the run summary.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-e2e-diagnostics
+          path: |
+            e2e-out/flight.jsonl
+            run.log
+            mock.log
+          if-no-files-found: warn
+
+      - name: Stop mock
+        if: always()
+        run: kill "$(cat mock.pid)" 2>/dev/null || true

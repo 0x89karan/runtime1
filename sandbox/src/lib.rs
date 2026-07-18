@@ -258,7 +258,13 @@ mod linux {
 
     const LANDLOCK_RULE_PATH_BENEATH: libc::c_long = 1;
     // Landlock V4 rule type for TCP port restrictions (Linux 6.7+).
-    const LANDLOCK_RULE_NET_PORT: libc::c_long = 3;
+    // uapi enum landlock_rule_type: PATH_BENEATH = 1, NET_PORT = 2. This was
+    // wrongly 3 until ci.1 — every net-port landlock_add_rule EINVAL'd on any
+    // Landlock-ACTIVE kernel, so AllowNetConnect enforcement never worked
+    // outside the BestEffort-degrade environments (Docker/QEMU kernels without
+    // active Landlock). Caught by the first-ever CI run of this crate's tests
+    // on a real Linux runner (audit86-P1-4).
+    const LANDLOCK_RULE_NET_PORT: libc::c_long = 2;
 
     // Flag passed as `flags` to landlock_create_ruleset(NULL, 0, flags) to query
     // the kernel's supported ABI version. Returns version (1..N) or -1 on ENOSYS.
@@ -869,7 +875,10 @@ mod tests {
         assert!(bpf.0.len() >= 2, "BPF program too short: {} insns", bpf.0.len());
     }
 
-    #[cfg(target_os = "linux")]
+    // x86_64-gated like the field itself (deny_spawn_requested exists only on
+    // that arch) — target_os alone breaks the aarch64-linux test build (E0609,
+    // found by ci.1's workspace clippy sweep).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn deny_spawn_sets_deny_spawn_requested() {
         let rules = vec![SandboxRule::DenySpawn];
@@ -880,7 +889,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn no_deny_spawn_clears_deny_spawn_requested() {
         let rules = vec![SandboxRule::AllowFsRead { prefix: "/proc".to_string() }];
@@ -977,7 +986,11 @@ mod tests {
         assert!(compiled.inner.bpf.is_none(), "AllowFsWrite alone should not produce BPF");
     }
 
-    #[cfg(target_os = "linux")]
+    // x86_64-gated like the other DenySpawn tests: bpf is always None off
+    // x86_64, so the is_some() asserts fail at RUNTIME on aarch64-linux
+    // (found running this suite in an arm64 Linux container; the aarch64
+    // degradation contract is pinned by its own test above).
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn allow_fs_write_and_deny_spawn_produces_landlock_and_bpf() {
         let rules = vec![
@@ -989,7 +1002,7 @@ mod tests {
         assert!(compiled.inner.bpf.is_some(), "DenySpawn must produce BPF");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn combined_fs_read_write_and_deny_spawn() {
         let rules = vec![
@@ -1009,6 +1022,20 @@ mod tests {
         let s = compiled.enforcement_status();
         assert!(!s.landlock);
         assert!(!s.seccomp);
+        assert_eq!(s.spawn_enforcement, "none");
+    }
+
+    // The degraded-arch contract: DenySpawn on non-x86_64 must compile to NO
+    // seccomp filter and report spawn_enforcement "none" (ma.4 tier honesty —
+    // callers surface the degradation instead of assuming enforcement).
+    // Compile-checked today by the aarch64 clippy lane (ci.1); executes if a
+    // `cross test -p sandbox` lane is ever added.
+    #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+    #[test]
+    fn enforcement_status_deny_spawn_degrades_on_non_x86_64() {
+        let compiled = compile(&[SandboxRule::DenySpawn]).unwrap();
+        let s = compiled.enforcement_status();
+        assert!(!s.seccomp, "DenySpawn off x86_64 → no BPF program");
         assert_eq!(s.spawn_enforcement, "none");
     }
 
@@ -1033,7 +1060,7 @@ mod tests {
         let compiled = compile(&rules).unwrap();
         let s = compiled.enforcement_status();
         // landlock_fd may be -1 on old kernels; accept both
-        assert_eq!(s.seccomp, true, "DenySpawn on x86_64 always sets seccomp");
+        assert!(s.seccomp, "DenySpawn on x86_64 always sets seccomp");
         assert_eq!(s.spawn_enforcement, "fork_vfork_only");
     }
 
