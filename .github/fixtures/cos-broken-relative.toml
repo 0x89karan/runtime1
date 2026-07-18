@@ -1,0 +1,17 @@
+# CI negative-control fixture (ci.1): reproduces the PR-#124 bug class.
+# Mounted over /etc/agentd/cos.agents.toml in the docker-smoke job.
+#
+# Two load-bearing properties:
+#   1. It carries the write_file(path='./output/ literal, which the entrypoint
+#      sed DOES rewrite — so the pre-existing v0.86.2 prompt-vs-grant grep
+#      passes and the boot reaches the general path guard (asserting the RIGHT
+#      failure, not an unrelated one).
+#   2. store_path below uses a relative value NO sed rule knows about — it must
+#      survive the rewrite and trip guard_no_relative_paths with a named line.
+
+[agent]
+id   = "fixture"
+task = "Call write_file(path='./output/brief.md', content='x') and stop."
+
+[memory]
+store_path = "planted-relative.redb"

@@ -1,0 +1,27 @@
+# Nightly artifact-E2E fixture (ci.1 / UC1): a real single-agent loop against a
+# mock provider — zero API cost.
+#
+# streaming = false is LOAD-BEARING: the runtime default is true, which drives
+# infer_with_stream and requires a full SSE event sequence from the mock; with
+# false, the mock serves one plain Anthropic-JSON response (the SSE path keeps
+# its coverage in anthropic.rs's httpmock unit tests).
+
+[agent]
+id           = "nightly-e2e"
+# The mock scripts the actual turns (turn 1: tool_use list_dir → turn 2:
+# end_turn), so the cycle exercises the real tool loop + capability check —
+# the task text is context, not the driver.
+task         = "List the files in the current directory with list_dir, then reply with the single word: done."
+max_turns    = 3
+token_budget = 10_000
+
+[model]
+provider  = "anthropic"
+model     = "mock-model"
+streaming = false
+
+[tools]
+native = ["read_file", "list_dir"]
+
+[memory]
+enabled = false
