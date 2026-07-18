@@ -477,3 +477,57 @@ counted logical turns instead of wrapped visual rows. See CHANGELOG.md and TODOS
 the complete list, including further findings filed as TODOs rather than fixed under ship-time pressure.
 Full plan + dual-voice review trail: `docs/plans/ux.1-converse.md`; 1420 workspace tests (+52).
 
+**audit.1 complete (v0.87.0).** P0 hotfix + guard batch from the v0.86.2 full-system audit
+(`docs/plans/audit.1-p0-hotfix-guards.md`): the default QEMU boot config could never boot —
+`distro/overlay/etc/agentd/agent.toml` used `model_id`, a key that never existed on
+`ModelConfig` (`deny_unknown_fields`), so every non-CoS QEMU boot panicked PID-1 at config
+parse; renamed to `model`, and `agentd/tests/config_parse_all.rs` now parse+validate+
+lowering-proves every checked-in agent-spec TOML (docker/, agentd/, distro overlay) with
+negative-control fixtures. `agentd/tests/repo_consistency.rs` test-enforces CLAUDE.md's
+`**Current version:**` line against `agentd/Cargo.toml` (closes cred.3.2-ar-02 after three
+drift recurrences) and requires template `gated_requires` env vars to exist in product
+sources — closing the librarian-semantic class where the template's badge/spawn warning
+named `VOYAGE_API_KEY` while its sidecar reads `OPENAI_API_KEY`. Boot guards: the
+`cos)`/`agent)` sed pipeline gained line-anchored negative assertions (both quote styles,
+positive-form path-key check, args anchoring) that refuse to boot naming the surviving
+line, verified credential-free via `DRY_RUN_ONLY=1`, with an `AGENTOS_SKIP_PATH_GUARDS=1`
+escape hatch; adversarial hardening ensured guards never match over user task text, guard
+grep errors fail the boot instead of passing, and behavior flags can't be injected via the
+secrets file. CHANGELOG reordered newest-first; six long-fixed TODOS struck; ux.8 moved
+ahead of ux.10 at the review gate. 1428+ workspace tests.
+
+**ci.1 complete (v0.88.0).** CI tests the artifact, not just the source
+(`docs/plans/ci.1-ci-tests-the-artifact.md`). `build-and-test` goes workspace-wide
+(`cargo build/clippy/test --workspace --all-targets` from the repo root): `surfaces`
+(96 tests incl. Linux-gated FUSE glue), `sandbox` (35), and `otel` (34) build, lint, and
+test in CI for the first time, with FUSE headers preinstalled, root-workspace caches that
+actually hit, and the sandbox crate added to both aarch64 clippy lanes (`make
+clippy-aarch64` + CI) — closes audit86-P1-4. New `docker-smoke` job builds the real Docker
+image on every PR and boots it four ways: a credential-free CoS dry-run, an agent dry-run
+that must render the requested template, a binary error probe, and a negative-control
+fixture (`.github/fixtures/cos-broken-relative.toml`) that must *refuse* to boot with the
+offending line named (`17:store_path`) — the PR-#124 "relative path survives the boot
+rewrite" class can no longer land silently (closes the audit86-P1-5 remainder). Sidecar
+self-test contract: all nine `docker/*_mcp.py` servers must exit 0 AND print their
+`self-test PASSED` marker (either alone can lie); enforced by the `sidecar-tests` CI job
+and mirrored by `make test-harness`, both globbing the directory; `weather_mcp.py` gained
+its missing `--test` mode. Fail-closed release guards (`scripts/release-guard.sh`, closes
+audit86-P1-6): a tag must be on `main` (ancestry), match `agentd/Cargo.toml`, exceed every
+prior `v*` tag, and target an unpublished version — probed per-caller (`--check release`
+in release.yml, `--check image` in ci.yml) across all three version manifests, fail-closed
+(auth/network errors refuse rather than pass), with a serialized pre-push re-check closing
+the concurrent-publish race; a 24-scenario harness (`scripts/test-release-guard.sh`) runs
+in the `harness-tests` job on every push, and tag publishes now wait for the sidecar and
+harness jobs. Nightly artifact E2E (`.github/workflows/nightly-e2e.yml`, 03:17 UTC): a
+real agent cycle with a tool call against a stateful mock provider
+(`.github/fixtures/mock_provider.py` — dispatches on request content, self-tests in CI,
+refuses wrong endpoints) at zero API cost. The QEMU 2-boot continuity test moves from
+manual-only (red for months without anyone noticing) to a monthly cron with a preflight
+that names the missing secret and QEMU stderr capture. `distro/overlay/init` mirrors the
+entrypoint's env denylist (`GREP_OPTIONS`/`POSIXLY_CORRECT`/guard-bypass filtering).
+Broker→oauth_mcp→provider fake-provider E2E deferred as named `ci.2` (TODOS.md), replacing
+the plan's "after smoke proves stable" never-trigger. `docs/DEPLOYMENT.md` documents every
+guard refusal with remediation, the required-status-check setup (`build-and-test`,
+`docker-smoke`, `sidecar-tests`, `harness-tests`), and the release operating rules (linear
+versioning, tag spacing, safe re-run paths). 1430 workspace tests.
+

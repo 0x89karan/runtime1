@@ -59,7 +59,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   other rules. Fix: negative-assertion block after each rewrite (fail if `"../docker/`,
   `"memory.redb"`, `"evidence.jsonl"`, `"egress-key.pkcs8"`, `"./output` survive) + a CI job
   invoking `DRY_RUN_ONLY=1`. → `ci.1` / `audit.1`.
-- ~~**audit86-P1-6 (P1) [new] — Any `v*` tag on a stale commit silently publishes `:latest`.**~~ **[FIXED in ci.1 (v0.88.0): `scripts/release-guard.sh` (ancestry, tag==Cargo, monotonicity, per-caller fail-closed reuse over all three version manifests) called by both ci.yml's release-guard job (`--check image`) and release.yml's (`--check release`); 21-scenario harness committed as `scripts/test-release-guard.sh`, run by the harness-tests CI job on every push.]**
+- ~~**audit86-P1-6 (P1) [new] — Any `v*` tag on a stale commit silently publishes `:latest`.**~~ **[FIXED in ci.1 (v0.88.0): `scripts/release-guard.sh` (ancestry, tag==Cargo, monotonicity, per-caller fail-closed reuse over all three version manifests) called by both ci.yml's release-guard job (`--check image`) and release.yml's (`--check release`); 24-scenario harness committed as `scripts/test-release-guard.sh` (self-counting: `EXPECTED=24`), run by the harness-tests CI job on every push.]**
   `publish-docker` (`ci.yml:193-254`) and `release.yml` fire on any `v*` tag, check out the
   tag ref, and push `:latest`/`:full`/`:core` + release binaries with no
   `merge-base --is-ancestor origin/main` check and no tag==Cargo-version check (image tags

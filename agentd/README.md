@@ -89,9 +89,10 @@ cd agentd
 cargo build                      # debug
 cargo build --release            # size-optimized (~2 MB target)
 
-# Quality gate (run before committing)
-cargo clippy -- -D warnings
-cargo test
+# Quality gate (run before committing) — workspace-wide, from the REPO ROOT.
+# CI enforces exactly this across all five crates (ci.1); per-crate clippy/test
+# from agentd/ misses surfaces/sandbox/otel and goes red in CI.
+(cd .. && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace)
 
 # Run (single agent)
 cargo run -- agent.toml

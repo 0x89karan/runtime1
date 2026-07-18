@@ -171,6 +171,14 @@ To sandbox the server subprocess (p3.3+), add a `capabilities` array to the serv
 The `sandbox/` crate compiles Landlock FS rules + seccomp-bpf into a `CompiledSandbox`
 applied via `pre_exec`. Omitting `capabilities` runs the server unsandboxed (warn emitted).
 
+**Bundled sidecars carry a self-test contract (ci.1).** Every file matching
+`docker/*_mcp.py` MUST implement a `--test` mode that exits 0 **and** prints a
+`self-test PASSED` marker — either signal alone can lie (a sidecar can print
+PASSED then crash; a flagless server EOFing on `/dev/null` stdin can exit 0).
+CI's `sidecar-tests` job and `make test-harness` glob the directory, so a new
+sidecar without `--test` fails CI on the next push. No API key may be required;
+use a mock/offline path (see `MOCK_EMBEDDINGS=1` in `semantic_kb_mcp.py`).
+
 ### Add a memory namespace
 
 Memory namespaces use the `agent:<scope>` convention (e.g. `agent:scratch`, `agent:notes`).
