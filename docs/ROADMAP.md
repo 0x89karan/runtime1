@@ -62,7 +62,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. ~~**cred.7** (v0.84.0)~~ ✅ shipped — credential resilience (on top of broker mode).
 10. **Audit remediation** (from `docs/AUDIT-v0.86.md` §6/§9): ~~**audit.1** (v0.87.0)~~ ✅ shipped — P0 hotfix + guard batch (`docs/plans/audit.1-p0-hotfix-guards.md`) → ~~**ci.1** (v0.88.0)~~ ✅ shipped — CI tests the artifact (`docs/plans/ci.1-ci-tests-the-artifact.md`): workspace-wide CI, sidecar marker contract, docker-smoke + negative fixture, fail-closed release guards, nightly mock E2E, monthly qemu cron; broker E2E deferred as named `ci.2` (TODOS) → then cap.1/cap.2/run.1/par.1-2 interleave per the audit build order.
-11. **Track UX cockpit** (agentctl-client): ux.0 (async watch refactor — land solo before splitting) → ux.9 → ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → **ux.8 (budgets; ux.8′ scope — moved ahead of ux.10 at the audit.1 review gate 2026-07-17: budget truth before TUI polish)** → ux.10 (TUI polish) → ux.3 → ux.2b (idle/error).
+11. **Track UX cockpit** (agentctl-client): ux.0 → ux.9 → ux.2a → ux.1 (all ✅ shipped) → **reshaped 2026-07-18 (office-hours "trust after absence", `docs/plans/0x89karan-ux-control-panel-design-*.md`): ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram digest+approve/deny) → cap.1 → ux.13 (Cancel + live budget/caps)**, then the tail (ux.3, ux.2b, ux.10) and evidence-gated expansions (ux.6, ux.5, ux.7). Turns the cockpit from watch-and-chat into a control panel. A second identity — the governed-agent-microVM **mv track** — shares agentd core; see `docs/plans/0x89karan-mv-governed-agent-runtime-design-*.md`.
 12. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
@@ -1158,19 +1158,47 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   caps + tool/connector select); modal-over-live-dashboard; preview before launch; auto-drop into the
   new agent; `:` command palette.
 
-**Cathedral expansions (accepted 2026-07-10, CEO review — SCOPE EXPANSION):** the "CoS you live with."
-- **ux.4** — Proactive push: SSE sink → local notifier + *optional* signed webhook to one operator-owned
-  endpoint (approval/error/brief/skill events). New **outbound egress** → routes through the credential
-  broker (cred.3) + THREAT_MODEL note; deny-by-default. `/plan-eng-review` (security-sensitive).
+**The reshape (2026-07-18, office-hours — plan of record).** Framing: *trust after absence* — the
+operator wakes up, understands the night, unblocks from anywhere, and can stop a runaway. Four core
+increments, friction-ordered, each independently shippable. Full design + premises:
+`docs/plans/0x89karan-ux-control-panel-design-*.md` (APPROVED).
+- **ux.8′** — Budgets (FIRST): per-agent spend visible + settable, daily reset window re-basing
+  `tokens_spent` (audit D2), budget fail-fast at the top of `step_need_infer`. Closes audit86-P0-2
+  (always-on CoS self-brick) + P1-1 (budget only enforced under ToolUse). Also the data source ux.11's
+  digest needs. Supersedes the old ux.8 "live budget control" scope below. `/plan-eng-review` (live
+  config writes).
+- **ux.11** — Trust after absence: durable run records in redb derived from `flight.jsonl` (id,
+  start/end, status, last error, approvals, spend, stop reason); in-process digest timer (NOT cron_mcp);
+  native `runs_query` tool for the CoS; CoS-written morning brief into the chat rail; TUI "Runs" view
+  (last N → status, spend, failure reason, minimal event tail); records via API + FUSE. Dependency:
+  flight.jsonl rotation (audit86-P1-2 / run.1) — offset-track-and-survive-truncation or pull rotation
+  forward; decide at autoplan.
+- **ux.12** — Reach: one two-way Telegram sidecar (h7.x pattern, single chat-ID allowlist, token via
+  env): digest delivery + approval push + approve/deny replies through the existing approvals API. **No
+  inject** (cut on cross-model challenge — no lived friction; re-add only if dogfood shows it).
+  Degrades safe: sidecar down ⇒ approvals stay pending in the TUI. Subsumes the old ux.4 push (which was
+  push-only). `/plan-eng-review` (outbound egress via the credential broker + THREAT_MODEL note).
+- **ux.13** — Verbs (lands **after cap.1** — SetCaps wants its validation machinery): `ControlCommand::
+  {Cancel, SetBudget, SetCaps}` + management API + FUSE control + TUI keys. Cancel takes effect at the
+  next step boundary (one in-flight call may complete; stream-abort is stretch). SetBudget only unifies
+  ux.8′'s endpoint under ControlCommand (no new semantics). SetCaps is **revoke/narrow-only** in v1 (live
+  grant is a different posture, cf. audit86-P1-10). Pause/resume deferred. Closes the "no kill" + respawn-
+  tax frictions.
+
+**Cathedral expansions (accepted 2026-07-10, CEO review — re-scoped by the reshape):** the "CoS you live with."
+- ~~**ux.4** — Proactive push~~ **superseded by ux.12** (Telegram is push *and* reply; the old plan was
+  push-only). If a non-Telegram signed-webhook sink is still wanted, it re-enters as a ux.12 follow-on.
 - **ux.6** — Evidence view: surface the signed Ed25519 receipt chain (`evidence.jsonl`) + inline
-  `agentctl verify` + per-agent "chain verified" badge. Provable accountability.
+  `agentctl verify` + per-agent "chain verified" badge. Provable accountability. **Cross-track:** this is
+  also the governance artifact the mv product thesis rests on (EU AI Act Art.12) — build it once for both.
 - **ux.5** — Local web cockpit: self-contained host-loopback SPA over the management API/SSE (same
   converse/observe/spawn surface in a browser; still single-tenant, still loopback). ⚠ Browser ≠ FUSE
-  boundary — needs an Origin/Host allowlist (DNS-rebinding guard) to land first.
-- **ux.7** — Run replay: reconstruct + scrub an agent's run from `flight.jsonl` + checkpoints.
-- **ux.8** — Live budget control (added 2026-07-11): a cockpit panel to view + set per-agent and global
-  token budgets over a new management-API budget endpoint. Fixes the live-run "500k too small" finding.
-  `/plan-eng-review` (live config writes).
+  boundary — needs an Origin/Host allowlist (DNS-rebinding guard) to land first. **Now the "custom app"
+  question** — deferred until Telegram (ux.12) dogfood data shows what the phone actually needs.
+- **ux.7** — Run replay: reconstruct + scrub an agent's run from `flight.jsonl` + checkpoints. Deferred —
+  ux.11 ships the minimal drill-down; ux.7 returns only if the digest leaves deep-replay wanting.
+- ~~**ux.8** — Live budget control (added 2026-07-11)~~ **absorbed into ux.8′** (above): view + set
+  per-agent and global token budgets. Fixed the live-run "500k too small" finding.
 - **ux.10** — TUI polish: log streaming + input ergonomics (added 2026-07-16): (1) new `[g]` Logs view
   tailing `docker compose logs --follow` as a subprocess into a 2 000-line ring buffer with per-service
   filter + `/` search + follow mode; Docker-context-gated (absent on bare agentd); (2) replace all
@@ -1186,14 +1214,20 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   from `/data`, matching `cos)`/`agent)`), and terminal corruption on `docker stop` (agentctl
   gained its own SIGTERM/SIGINT handler). Full plan: `docs/plans/ux.9-cockpit-mode.md`.
 
-> **North star (2026-07-11):** the cockpit is **agentos's default operator surface** — an always-on
-> status/debug/control console (k9s/htop for agents), not an optional tool. ux.9 makes it the default;
-> ux.0/2/1/8 make it live, watchable, chattable, tunable.
+> **North star (2026-07-11, sharpened 2026-07-18):** the cockpit is **agentos's default operator
+> surface** — an always-on status/debug/**control** console (k9s/htop for agents), not an optional tool.
+> k9s's defining trait is that you can *act* on what you see; the reshape adds the missing verbs
+> (cancel, live budget/caps) and the missing memory (run history + digest) so the panel controls, not
+> just watches. ux.9 made it the default; ux.0/2a/1 made it live/watchable/chattable; ux.8′/11/12/13
+> make it accountable, rememberable, reachable, and controllable.
 
-Sequencing (updated 2026-07-13 — ux.1 shipped): core **ux.0 → ux.9 (boot into TUI) →
-ux.2a (attention, ✅ shipped) → ux.1 (chat, ✅ shipped) → ux.8 (budgets) → ux.3**, then expansions
-**ux.6 → ux.4 → ux.5 → ux.7 → ux.2b (idle/error, closes cos-ux-01 fully)**, then
-**skills (Phase 11) last**. One increment per branch, `main` shippable at each step. **Parallel, independent
+Sequencing (reshaped 2026-07-18): core **ux.0 → ux.9 → ux.2a → ux.1 (all ✅ shipped) →
+ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram) → cap.1 → ux.13 (verbs)**, then the tail
+**ux.3 (spawn-on-the-fly) · ux.2b (idle/error, closes cos-ux-01) · ux.10 (TUI polish)** and
+evidence-gated expansions **ux.6 (evidence, shared with mv track) · ux.5 (web/app, post-Telegram-dogfood)
+· ux.7 (replay)**, then **skills (Phase 11) last**. One increment per branch, `main` shippable at each
+step. ux.8′ ships first regardless — the P0 self-brick blocks every deployment shape and per-agent spend
+feeds both the digest and the mv track's per-VM budgets. **Parallel, independent
 of the cockpit — do first (makes the CoS usable today):** `cos-polish` (`docs/plans/cos-polish.md` — the
 8 bugs from live testing: brief-not-written, KB-unfindable, orchestrate errors, undersized budgets) and
 `memory-routing` (`docs/plans/memory-routing.md` — raw emails → harness Layer 2, also fixes the token
