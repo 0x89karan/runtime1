@@ -14,6 +14,8 @@
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/budget/reset                    → 200 {target,spent_before,reset_to,window_start} | 400 | 404 | 503 (ux.8′)
+//!   POST /api/v1/budget/set                       → 200 {target,old_limit,limit} | 400 (incl. global) | 404 | 503 (ux.11a)
+//!     (per-agent native-tier only; universal-tier agents are proxy-metered and return 404)
 //!   GET  /api/v1/credentials                     → 200 CredentialSnapshot JSON (cred.5)
 //!   POST /api/v1/credentials/:provider/reset-attention → 200 | 404 (cred.7)
 
@@ -383,6 +385,61 @@ async fn route(
             }
         }
 
+        (Method::POST, "/api/v1/budget/set") => {
+            // ux.11a SetBudget. Body: {"target":{"agent":"<id>"},"limit":50000}
+            // (limit:0 = unlimited). Per-agent only — the global ceiling is immutable
+            // config (400). Confirm-channel reports old→new; 404 for an unknown agent.
+            if body.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "request body required");
+            }
+            #[derive(serde::Deserialize)]
+            struct SetReq {
+                target: crate::control::BudgetTarget,
+                limit:  u64,
+            }
+            let req: SetReq = match serde_json::from_slice(body) {
+                Ok(r) => r,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+            };
+            let id = match &req.target {
+                crate::control::BudgetTarget::Global => {
+                    return error_response(StatusCode::BAD_REQUEST, "global budget is not runtime-settable; target a specific agent");
+                }
+                crate::control::BudgetTarget::Agent(id) => id.clone(),
+            };
+            // Validate the agent id here (400) rather than turning malformed ids into
+            // scheduler traffic that comes back as a misleading 404 (Codex ship review).
+            if id.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "agent id must not be empty");
+            }
+            if !id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-')) {
+                return error_response(StatusCode::BAD_REQUEST, "agent id must match [a-zA-Z0-9_-]");
+            }
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<Result<(u64, u64), String>>();
+            let cmd = ControlCommand::SetBudget { target: req.target, limit: req.limit, confirm_tx: Some(confirm_tx) };
+            match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running");
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(2), confirm_rx).await {
+                Ok(Ok(Ok((old_limit, new_limit)))) => json_response(
+                    StatusCode::OK,
+                    json!({ "target": id, "old_limit": old_limit, "limit": new_limit }),
+                ),
+                Ok(Ok(Err(e))) => error_response(StatusCode::NOT_FOUND, &e),
+                Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
+                Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for budget set"),
+            }
+        }
+
         (Method::POST, path) if path.starts_with("/api/v1/agents/") && path.ends_with("/inject") => {
             let agent_id = path
                 .strip_prefix("/api/v1/agents/")
@@ -617,6 +674,7 @@ mod tests {
             turn: 2,
             context_tokens: 100,
             token_budget: 50_000,
+            windowed_spent: 100,
             task_preview: "test task".to_string(),
             tools: vec![],
             short_term_previews: vec![],
@@ -649,6 +707,7 @@ mod tests {
             turn: 1,
             context_tokens: 0,
             token_budget: 0,
+            windowed_spent: 0,
             task_preview: String::new(),
             tools: vec![],
             short_term_previews: vec![],
@@ -880,6 +939,7 @@ mod tests {
             turn: 5,
             context_tokens: 0,
             token_budget: 0,
+            windowed_spent: 0,
             task_preview: String::new(),
             tools: vec![],
             short_term_previews: vec![],
@@ -1004,6 +1064,67 @@ mod tests {
         });
         let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
         let resp = route(state, Method::POST, "/api/v1/budget/reset", "", br#"{"target":{"agent":"ghost"}}"#).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn budget_set_empty_body_returns_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/budget/set", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn budget_set_global_returns_400() {
+        // F1: the global ceiling is not runtime-settable — reject before dispatch.
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/budget/set", "", br#"{"target":"global","limit":5000}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn budget_set_missing_limit_returns_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/budget/set", "", br#"{"target":{"agent":"cos"}}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn budget_set_without_control_tx_returns_503() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/budget/set", "", br#"{"target":{"agent":"cos"},"limit":5000}"#).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn budget_set_happy_path_reports_old_and_new() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        tokio::spawn(async move {
+            if let Some(ControlCommand::SetBudget { confirm_tx: Some(c), .. }) = rx.recv().await {
+                let _ = c.send(Ok((100_000, 500_000)));
+            }
+        });
+        let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/budget/set", "", br#"{"target":{"agent":"cos"},"limit":500000}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["old_limit"], 100_000);
+        assert_eq!(v["limit"], 500_000);
+    }
+
+    #[tokio::test]
+    async fn budget_set_unknown_agent_returns_404() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        tokio::spawn(async move {
+            if let Some(ControlCommand::SetBudget { confirm_tx: Some(c), .. }) = rx.recv().await {
+                let _ = c.send(Err("agent 'ghost' not found".into()));
+            }
+        });
+        let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/budget/set", "", br#"{"target":{"agent":"ghost"},"limit":5000}"#).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 

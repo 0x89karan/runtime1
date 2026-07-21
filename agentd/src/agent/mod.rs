@@ -191,6 +191,17 @@ impl AgentTask {
         self.cfg.token_budget
     }
 
+    /// Set the per-agent token budget at runtime (ux.11a SetBudget). Mutates the
+    /// **checkpointed** field (`cfg.token_budget`) so an operator's live change survives
+    /// a restart — a runtime-only override would be silently reverted to the config value
+    /// on restore (the audit86-P2-1 checkpoint-overrides-live-change class). `0` = unlimited.
+    /// Returns the previous budget so the caller can report old→new.
+    pub fn set_token_budget(&mut self, limit: u64) -> u64 {
+        let old = self.cfg.token_budget;
+        self.cfg.token_budget = limit;
+        old
+    }
+
     /// Clone of the model configuration. Used by the scheduler to seed child agents.
     pub fn model_cfg_cloned(&self) -> ModelConfig {
         self.model_cfg.clone()

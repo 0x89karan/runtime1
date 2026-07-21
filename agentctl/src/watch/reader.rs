@@ -159,6 +159,9 @@ pub struct AgentInfo {
     pub status_detail:    Option<String>,
     pub context_tokens:   u64,
     pub budget:           BudgetKind,
+    /// Spend within the current budget window (ux.11a). Equals lifetime spend under
+    /// legacy (interval=0) budgets. Rendered against `budget` in the agent list.
+    pub windowed_spent:   u64,
     pub tools:            Vec<String>,
     pub parent_id:        Option<String>,
     pub sandbox:          Option<AgentSandbox>,
@@ -247,8 +250,17 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
     let budget = match read_trimmed(&dir.join("budget")).as_deref() {
         Some(s) if s == BUDGET_UNLIMITED_SENTINEL => BudgetKind::Unlimited,
         None => BudgetKind::Unlimited,
-        Some(s) => s.parse::<u64>().map(BudgetKind::Tokens).unwrap_or(BudgetKind::Unlimited),
+        // u64::MAX is an unlimited sentinel too — mirror the HTTP source's mapping
+        // (source.rs) so the two reader paths don't disagree (Claude ship review).
+        Some(s) => match s.parse::<u64>() {
+            Ok(u64::MAX) | Ok(0) => BudgetKind::Unlimited,
+            Ok(n)                => BudgetKind::Tokens(n),
+            Err(_)               => BudgetKind::Unlimited,
+        },
     };
+    let windowed_spent = read_trimmed(&dir.join("windowed_spend"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(context_tokens);
     let tools = match read_trimmed(&dir.join("tools")).as_deref() {
         Some(s) if s == TOOLS_NONE_SENTINEL => vec![],
         None => vec![],
@@ -276,6 +288,7 @@ pub fn read_agent_info(agents_dir: &Path, id: &str) -> AgentInfo {
         status_detail: None,
         context_tokens,
         budget,
+        windowed_spent,
         tools,
         parent_id,
         sandbox,

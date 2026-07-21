@@ -265,6 +265,8 @@ fn agent_info_from_json(v: &Value) -> AgentInfo {
     let status = v["status"].as_str().unwrap_or("unknown").to_string();
     let status_detail = v["status_detail"].as_str().map(str::to_string);
     let context_tokens = v["context_tokens"].as_u64().unwrap_or(0);
+    // Older agentd (pre-ux.11a) omits windowed_spent — fall back to lifetime spend.
+    let windowed_spent = v["windowed_spent"].as_u64().unwrap_or(context_tokens);
 
     let budget = match v["token_budget"].as_u64() {
         Some(u64::MAX) | None => BudgetKind::Unlimited,
@@ -317,6 +319,7 @@ fn agent_info_from_json(v: &Value) -> AgentInfo {
         status_detail,
         context_tokens,
         budget,
+        windowed_spent,
         tools,
         parent_id,
         sandbox,

@@ -666,6 +666,7 @@ mod tests {
             status_detail:   None,
             context_tokens:  0,
             budget:          BudgetKind::Unlimited,
+            windowed_spent:  0,
             tools:           vec![],
             parent_id:       None,
             sandbox:         None,

@@ -57,6 +57,17 @@ pub enum ControlCommand {
         /// the fire-and-forget FUSE path. (ControlCommand is not a serde type.)
         confirm_tx: Option<tokio::sync::oneshot::Sender<Result<(u64, u64), String>>>,
     },
+    /// Set a per-agent token budget ceiling at runtime (ux.11a). `limit = 0` = unlimited.
+    /// `BudgetTarget::Global` is rejected (the global ceiling is immutable config); only
+    /// `Agent(id)` is honored. Raising a ceiling revives a deferred agent (drain).
+    SetBudget {
+        target:     BudgetTarget,
+        limit:      u64,
+        /// Confirmation channel. The scheduler sends `(old_budget, new_budget)` on success,
+        /// `Err` for an unknown agent (→ 404) or a Global target (→ 400 at the HTTP layer).
+        /// `None` on the fire-and-forget FUSE path.
+        confirm_tx: Option<tokio::sync::oneshot::Sender<Result<(u64, u64), String>>>,
+    },
 }
 
 /// Which budget a `ResetBudget` command targets. Typed (not a bare string) so
@@ -95,6 +106,11 @@ enum TaggedCommand {
     ResetBudget {
         target: BudgetTarget,
     },
+    #[serde(rename = "set_budget")]
+    SetBudget {
+        target: BudgetTarget,
+        limit:  u64,
+    },
 }
 
 /// Parse raw bytes from a FUSE write into a ControlCommand.
@@ -132,6 +148,13 @@ pub fn parse_control_command(bytes: &[u8]) -> anyhow::Result<ControlCommand> {
                 }
                 // FUSE path is fire-and-forget; the HTTP path supplies confirm_tx.
                 ControlCommand::ResetBudget { target, confirm_tx: None }
+            }
+            TaggedCommand::SetBudget { target, limit } => {
+                if let BudgetTarget::Agent(id) = &target {
+                    anyhow::ensure!(!id.is_empty(), "set_budget: agent id must not be empty");
+                }
+                // FUSE path is fire-and-forget; the HTTP path supplies confirm_tx.
+                ControlCommand::SetBudget { target, limit, confirm_tx: None }
             }
         });
     }
@@ -254,6 +277,32 @@ mod tests {
     fn parse_reject_empty_id_is_error() {
         let bytes = br#"{"reject":{"id":""}}"#;
         assert!(parse_control_command(bytes).is_err());
+    }
+
+    #[test]
+    fn parse_set_budget_tagged() {
+        let bytes = br#"{"set_budget":{"target":{"agent":"cos"},"limit":50000}}"#;
+        let cmd = parse_control_command(bytes).unwrap();
+        let ControlCommand::SetBudget { target, limit, confirm_tx } = cmd else {
+            panic!("expected SetBudget")
+        };
+        assert!(matches!(target, BudgetTarget::Agent(ref id) if id == "cos"));
+        assert_eq!(limit, 50_000);
+        assert!(confirm_tx.is_none(), "FUSE path is fire-and-forget");
+    }
+
+    #[test]
+    fn parse_set_budget_empty_agent_id_is_error() {
+        let bytes = br#"{"set_budget":{"target":{"agent":""},"limit":1}}"#;
+        assert!(parse_control_command(bytes).is_err());
+    }
+
+    #[test]
+    fn parse_set_budget_global_target_parses() {
+        // Global parses at the command layer; rejection happens in dispatch/HTTP (400).
+        let bytes = br#"{"set_budget":{"target":"global","limit":1000}}"#;
+        let cmd = parse_control_command(bytes).unwrap();
+        assert!(matches!(cmd, ControlCommand::SetBudget { target: BudgetTarget::Global, .. }));
     }
 
     #[test]

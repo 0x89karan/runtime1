@@ -476,6 +476,21 @@ Each reset emits a `budget_reset` event to `flight.jsonl`
 (`{target, spent_before, window_start, interval_secs, windows_advanced}`) so a
 spend drop reads as a scheduled rollover, not data loss.
 
+**Set a per-agent budget at runtime** (ux.11a — raise a ceiling without a respawn;
+raising revives a deferred agent immediately, and the change survives a restart):
+
+```bash
+curl -sX POST localhost:7999/api/v1/budget/set \
+  -d '{"target":{"agent":"cos-orchestrator"},"limit":50000000}'
+#   → {"target":"cos-orchestrator","old_limit":<N>,"limit":50000000}
+#   → 404 if the agent id is unknown; limit:0 = unlimited
+#   → 400 for {"target":"global"} — the global ceiling is immutable config, not runtime-settable
+```
+
+Per-agent **windowed** spend is visible without reading `flight.jsonl`: the agentctl
+TUI budget cell (`47k/100k`), the management snapshot (`windowed_spent` per agent), and
+the FUSE file `/agents/<id>/windowed_spend`. A `budget_set` event records each change.
+
 **Accepted tradeoff (early-burn blackout):** a fixed window means an agent that
 burns its budget early in the window goes idle until the next rollover, rather
 than degrading to a cheaper model. For a personal always-on assistant this is the

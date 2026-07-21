@@ -115,6 +115,23 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   (`scheduler.rs` drain_deferred admit loop). Low impact for the 3-agent CoS with a 50M window;
   becomes real as agent count grows or the window tightens. Fix: per-agent budget reservation or
   fair-aging on the drain. Deferred by user decision at the ux.8′ review gate.
+- **ux.11a-ar-01 (P3) [new, ux.11a /review] — SetBudget/ResetBudget 200 before the change is durable.**
+  `POST /api/v1/budget/set` (and the pre-existing `/budget/reset`) reply OK after scheduler
+  confirmation but before a checkpoint is written; checkpoints only fire at tool boundaries /
+  shutdown. A crash in that window loses the operator's live budget change. Accepted for ux.11a
+  (consistent with reset; forcing a checkpoint per mutation is heavier than the S scope). Fix
+  option: schedule an async checkpoint after a confirmed budget mutation. Both models flagged; low.
+- **ux.11a-ar-02 (P3) [new, ux.11a /review] — `/api/v1/budget/reset` skips agent-id validation.**
+  ux.11a added empty/charset validation to `/budget/set`; the pre-existing `/budget/reset` still
+  dispatches any `Agent(String)` (empty/malformed → scheduler traffic → misleading 404 not 400).
+  Mirror the set-path validation onto reset. Pre-existing (out of ux.11a scope); cheap. (Codex.)
+- **ux.11a-ar-03 (P3) [new, ux.11a /ship] — universal-tier `windowed_spent` always 0 in the snapshot.**
+  Universal-tier agents are proxy-metered, not AgentTask-metered, so `update_snapshot` hardcodes
+  `windowed_spent: 0` (mirroring the pre-existing `context_tokens: 0`). The TUI/FUSE can therefore show
+  `0/<budget>` for a universal agent whose proxy budget is actually depleted (Codex ship review). Not a
+  regression (consistent with the already-shipped context_tokens=0), but misleading. Fix: surface the
+  proxy `token_budget_remaining` atomic into the universal snapshot's windowed_spent, or omit the field
+  for universal agents. Needs proxy-spend plumbing → ux.11b/later scope.
 - **ux.8-ar-02 (P3) [new, ux.8′ /ship] — `MaxTokens` self-terminates regardless of `budget_resettable`.**
   The provider `MaxTokens` stop reason terminates the agent even under an active budget window, so a
   single over-long completion can end an otherwise-resumable agent (`agent/mod.rs`). Pre-existing
