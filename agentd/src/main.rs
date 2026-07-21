@@ -99,6 +99,27 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         toml::from_str(&raw).with_context(|| format!("parsing config from {path:?}"))?;
     cfg.management.apply_env_overrides();
 
+    // ux.8′: a global ceiling with no reset window permanently denies once
+    // exhausted (audit86-P0-2). Warn so the operator sets a window before the
+    // always-on agent self-bricks.
+    if cfg.scheduler.global_token_budget > 0 && cfg.scheduler.budget_reset_interval == 0 {
+        tracing::warn!(
+            global_token_budget = cfg.scheduler.global_token_budget,
+            "global_token_budget is set but budget_reset_interval is 0 — this is a \
+             LIFETIME ceiling and will permanently deny once exhausted. Set \
+             [scheduler] budget_reset_interval (e.g. 86400 for daily) to auto-reset."
+        );
+    }
+    // ux.8′ S3: an absurdly small window rebases so often it neuters the ceiling
+    // (each window is a fresh full budget), effectively unbounding lifetime spend.
+    if cfg.scheduler.budget_reset_interval > 0 && cfg.scheduler.budget_reset_interval < 3600 {
+        tracing::warn!(
+            budget_reset_interval = cfg.scheduler.budget_reset_interval,
+            "budget_reset_interval is under 1h — the window rebases so frequently the \
+             ceiling barely constrains cumulative spend. Use a longer window (e.g. 86400)."
+        );
+    }
+
     let run_id = uuid::Uuid::new_v4().to_string();
     let config_hash = {
         use std::hash::{Hash, Hasher};

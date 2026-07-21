@@ -65,7 +65,14 @@ streaming  = true
 # Scheduler
 # ---------------------------------------------------------------------------
 [scheduler]
-global_token_budget       = 0   # intentionally unlimited in production (always-on); dev mode uses 10_000_000
+# Rolling DAILY ceiling (ux.8′ / audit86-P0-2): a per-24h window that rebases
+# instead of self-bricking. Was `= 0` (unbounded) — the only way to keep the
+# always-on agent alive before the reset window existed, which violated the
+# "cognition is bounded" invariant. ~50M tokens/day is generous headroom for the
+# 3-agent CoS; raise if you legitimately hit it. Set budget_reset_interval = 0
+# to restore the old unbounded behavior (not recommended).
+global_token_budget       = 50_000_000
+budget_reset_interval     = 86400   # 24h rolling window
 max_concurrent_inferences = 3
 max_spawn_depth           = 2
 
@@ -142,6 +149,10 @@ name        = "Chief of Staff Orchestrator"
 description = "Cron-triggered coordinator: wakes daily, spawns Inbox + Curator, assembles and writes the Operating Brief."
 
 max_turns    = 200_000
+# Per-agent WINDOWED ceiling (ux.8′): with [scheduler] budget_reset_interval set,
+# this rebases every 24h rather than being lifetime-monotonic. Kept far above the
+# 50M global window so the orchestrator is bounded by the shared global ceiling
+# (which defers-and-revives) rather than its own per-agent cap.
 token_budget = 5_000_000_000
 priority     = 10
 

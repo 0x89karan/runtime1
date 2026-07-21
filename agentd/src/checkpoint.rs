@@ -13,6 +13,14 @@ use crate::{
     memory::MemItem,
 };
 
+// Stays 4 for ux.8′ (Codex P2): the ux.8′ budget fields (window_anchor,
+// budget_window_start, global_window_anchor) are purely additive #[serde(default)]
+// and no checkpoint struct uses deny_unknown_fields, so both directions are safe —
+// a new binary fills missing fields via defaults; an old binary ignores the extra
+// ones. Bumping to 5 would make the old (v0.88) loader refuse a new checkpoint
+// (`format_version > FORMAT_VERSION`), rename it as corrupt, and DISCARD CoS state
+// on rollback — the exact data loss this increment fights. Only bump for a
+// genuinely breaking (non-additive) schema change.
 pub const FORMAT_VERSION: u32 = 4;
 
 /// Serializable per-provider health state for checkpoint persistence.
@@ -91,6 +99,12 @@ pub struct AgentCheckpoint {
     /// `#[serde(default)]` makes v1 checkpoints (no field) load as empty vec.
     #[serde(default)]
     pub short_term:      Vec<MemItem>,
+    /// Budget-window anchor (ux.8′): lifetime spend (`total_input+total_output`)
+    /// at the start of the current budget window. Windowed spend = lifetime −
+    /// anchor. `#[serde(default)]` = 0 → pre-ux.8′ checkpoints load unanchored
+    /// and get a clean first window on restore (see scheduler init).
+    #[serde(default)]
+    pub window_anchor:   u64,
 }
 
 /// A serializable entry in the awaiting map (child → parent relationship).
@@ -146,6 +160,14 @@ pub struct SchedulerCheckpoint {
     /// Absent in v1–v4 → empty.
     #[serde(default)]
     pub credential_health: HashMap<String, ProviderHealthCheckpoint>,
+    /// Global budget-window start (ux.8′), wall-clock Unix seconds. 0 = unset →
+    /// the scheduler starts a fresh window at `now` on restore (clean migration).
+    #[serde(default)]
+    pub budget_window_start: u64,
+    /// Global lifetime `tokens_spent` at the current window's start (ux.8′).
+    /// Windowed global spend = `tokens_spent − global_window_anchor`.
+    #[serde(default)]
+    pub global_window_anchor: u64,
 }
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
@@ -277,6 +299,7 @@ mod tests {
             stored_response: None,
             terminal:        false,
             short_term:      vec![],
+            window_anchor:   0,
         }
     }
 
@@ -295,6 +318,8 @@ mod tests {
             waiting_agents:     vec![],
             orchestrated_agents: vec![],
             credential_health:  HashMap::new(),
+            budget_window_start: 0,
+            global_window_anchor: 0,
         }
     }
 
@@ -623,6 +648,29 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&json).unwrap()).unwrap();
         assert!(cp.waiting_agents.is_empty(), "missing waiting_agents must be empty vec");
         assert!(cp.orchestrated_agents.is_empty(), "missing orchestrated_agents must be empty vec");
+    }
+
+    #[test]
+    fn pre_ux8_checkpoint_defaults_budget_fields_to_zero() {
+        // Codex P2 / T6: FORMAT_VERSION stays 4 for ux.8′ (additive serde-default
+        // change). A checkpoint written WITHOUT the ux.8′ budget fields
+        // (window_anchor / budget_window_start / global_window_anchor) must load
+        // with them defaulting to 0 — the migration then opens a clean window.
+        // This is the forward-compat proof; keeping v4 also keeps ROLLBACK safe
+        // (an old binary won't refuse a new checkpoint as "too new").
+        let mut agent = serde_json::to_value(minimal_agent_checkpoint("a")).unwrap();
+        agent.as_object_mut().unwrap().remove("window_anchor");
+        let mut sched = serde_json::to_value(minimal_scheduler_checkpoint()).unwrap();
+        {
+            let o = sched.as_object_mut().unwrap();
+            o.remove("budget_window_start");
+            o.remove("global_window_anchor");
+            o["agents"] = serde_json::json!([agent]);
+        }
+        let cp: SchedulerCheckpoint = serde_json::from_value(sched).unwrap();
+        assert_eq!(cp.budget_window_start, 0, "absent budget_window_start defaults to 0");
+        assert_eq!(cp.global_window_anchor, 0, "absent global_window_anchor defaults to 0");
+        assert_eq!(cp.agents[0].window_anchor, 0, "absent per-agent window_anchor defaults to 0");
     }
 
     #[test]

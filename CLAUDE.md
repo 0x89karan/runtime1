@@ -24,17 +24,20 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.88.0 (shipped 2026-07-18)
+**Current version:** v0.89.0 (shipped 2026-07-21)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ci.1 (v0.88.0) — CI tests the artifact: workspace-wide CI
-(surfaces/sandbox/otel first-ever CI coverage), sidecar self-test contract
-(rc==0 AND marker), docker-smoke against the built image with a PR-#124-class
-negative fixture, fail-closed release guards (24-scenario committed harness),
-nightly mock-provider E2E exercising the real tool loop, monthly qemu cron.
-1430 workspace tests.
-**Next:** ux.8 (budgets; ux.8′ scope per `docs/AUDIT-v0.86.md` §9) → ux.10.
+**Latest shipped:** ux.8′ (v0.89.0) — budget-integrity hotfix (P0-2): a capped
+agent now **defers** under its budget window instead of self-bricking the
+process. Rolling window via `[scheduler] budget_reset_interval` (secs; 0 =
+legacy lifetime) with wall-clock rebase (loop-top + 60s idle tick,
+division-based catch-up), a monotonic meter that never zeroes (windowed =
+lifetime − anchor), a `POST /api/v1/budget/reset` manual escape hatch, and a
+`BudgetReset` flight event. Checkpoint FORMAT_VERSION stays 4 (additive
+serde-default, rollback-safe). CoS configs flipped to a 24h window (distro 50M/day,
+dev default 10M/day). 1455 workspace tests.
+**Next:** ux.11 (budget visibility + SetBudget + re-key) → ux.12 → ux.13.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

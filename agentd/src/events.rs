@@ -21,6 +21,7 @@ pub enum EventKind {
     AgentDeferred,
     AgentAdmissionDenied,
     BudgetExceeded,
+    BudgetReset,
     MaxTurnsReached,
     CapabilityDenied,
     AgentChildResultDelivered,

@@ -440,6 +440,51 @@ when `AGENTD_CREDENTIAL_GATEWAY_URL` is set — credential broker path, availabl
 
 ---
 
+## Budget windows (ux.8′)
+
+The always-on CoS is metered so token spend is always bounded. Two `[scheduler]`
+knobs govern it (shipped CoS configs set both):
+
+```toml
+[scheduler]
+global_token_budget   = 50_000_000   # ceiling across all agents
+budget_reset_interval = 86400        # rolling window in seconds (86400 = daily)
+```
+
+- **With `budget_reset_interval > 0`** (recommended, and the shipped default),
+  `global_token_budget` is a **per-window** ceiling: spend accrues, and every
+  `budget_reset_interval` seconds the window rolls over and the ceiling refreshes.
+  The agent never permanently self-bricks. Per-agent `token_budget` uses the same
+  window. `token_budget = 0` (or `global_token_budget = 0`) means **unlimited**.
+- **With `budget_reset_interval = 0`** (legacy), the ceiling is **lifetime** — once
+  exhausted the agent permanently denies until the checkpoint is reset. agentd logs
+  a startup warning if you set a ceiling with no window. Do **not** use `rm
+  checkpoint.json` to recover (it destroys conversation state); set a window instead.
+
+**Force a reset now** (the manual escape hatch — e.g. a burst blew the window early):
+
+```bash
+# Global window:
+curl -sX POST localhost:7999/api/v1/budget/reset -d '{"target":"global"}'
+#   → {"target":"global","spent_before":<N>,"reset_to":0}
+# A single agent's window:
+curl -sX POST localhost:7999/api/v1/budget/reset -d '{"target":{"agent":"cos-orchestrator"}}'
+#   → 404 if the agent id is unknown
+```
+
+Each reset emits a `budget_reset` event to `flight.jsonl`
+(`{target, spent_before, window_start, interval_secs, windows_advanced}`) so a
+spend drop reads as a scheduled rollover, not data loss.
+
+**Accepted tradeoff (early-burn blackout):** a fixed window means an agent that
+burns its budget early in the window goes idle until the next rollover, rather
+than degrading to a cheaper model. For a personal always-on assistant this is the
+v1 behavior; size `global_token_budget` for your peak day, or force a reset with
+the endpoint above. (Continuous refill / soft-cap degradation is possible future
+work, not shipped.)
+
+---
+
 ## Troubleshooting
 
 ### Verifying config changes (dry run — no credentials needed)

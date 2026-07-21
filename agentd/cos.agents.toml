@@ -49,9 +49,12 @@
 # LIFETIME LIMITS:
 #   Orchestrator max_turns = 200_000  (cron polling burns ~3456 turns/day — default 20 kills
 #                                      the agent in under 8 min before the first brief)
-#   Orchestrator token_budget = 5_000_000_000  (tokens_spent is lifetime-monotonic and never
-#                                               resets; 5B ≈ 50 k tokens/day × 365 days × 274×)
-#   → If you see budget_exceeded in flight.jsonl: rm checkpoint.json and restart agentd.
+#   Orchestrator token_budget = 5_000_000_000  (per-agent windowed ceiling; with the
+#                                               scheduler's budget_reset_interval it rebases
+#                                               every 24h — no longer lifetime-monotonic)
+#   → If you see budget_exceeded in flight.jsonl: the window will auto-reset at rollover, or
+#     force it now with `curl -X POST localhost:7999/api/v1/budget/reset -d '{"target":"global"}'`.
+#     (Do NOT rm checkpoint.json — that destroys conversation state and is no longer needed.)
 #
 # CHILD ID NOTE:
 #   The orchestrator spawns children with date-stamped IDs (inbox-YYYY-MM-DD, curator-YYYY-MM-DD).
@@ -106,8 +109,11 @@ allow_non_loopback = true
 # Scheduler
 # ---------------------------------------------------------------------------
 [scheduler]
-# Hard daily spend ceiling across all 3 CoS agents (~3 full cycles at 1.5M inbox + 500k curator).
+# Rolling DAILY spend ceiling across all 3 CoS agents (ux.8′): a per-24h window
+# that rebases at rollover instead of self-bricking. ~3 full cycles at 1.5M inbox
+# + 500k curator.
 global_token_budget       = 10_000_000
+budget_reset_interval     = 86400   # 24h rolling window (0 = lifetime, self-bricks)
 max_concurrent_inferences = 3
 max_spawn_depth           = 2
 
@@ -225,8 +231,8 @@ description = "Cron-triggered coordinator: wakes daily, spawns Inbox + Curator, 
 # CRITICAL: max_turns MUST be high. At 25 s/poll the orchestrator burns ~3456 turns/day
 # just waiting for the cron. Default (20) kills the agent before the first brief fires.
 max_turns    = 200_000
-# CRITICAL: tokens_spent is lifetime-monotonic (never resets across checkpoint restores).
-# 5 B tokens ≈ 50 k/day × 365 days × 274× headroom.
+# Per-agent WINDOWED ceiling (ux.8′): with [scheduler] budget_reset_interval set,
+# spend rebases every 24h — no longer lifetime-monotonic. Generous headroom.
 token_budget = 5_000_000_000
 priority     = 10
 

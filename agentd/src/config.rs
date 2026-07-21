@@ -367,8 +367,20 @@ impl Config {
 #[serde(deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// Global token ceiling across all agents. 0 = unlimited.
+    ///
+    /// When `budget_reset_interval` > 0 this is a *per-window* ceiling, not a
+    /// lifetime one: spend since the current window's start is compared against
+    /// it, and the window rolls over every `budget_reset_interval` seconds. When
+    /// the interval is 0 (default) this is a lifetime ceiling — which, on a 24/7
+    /// agent, permanently denies once exhausted (audit86-P0-2). See ux.8′.
     #[serde(default)]
     pub global_token_budget: u64,
+    /// Rolling budget-window length in seconds. 0 = no reset (lifetime ceiling,
+    /// the legacy behavior). Set to 86400 for a daily window on an always-on
+    /// deployment so the budget rebases instead of self-bricking (audit86-P0-2 /
+    /// D2). Applies to both the global ceiling and per-agent `token_budget`.
+    #[serde(default)]
+    pub budget_reset_interval: u64,
     /// Maximum number of in-flight inference calls at once. 0 = unlimited.
     #[serde(default)]
     pub max_concurrent_inferences: usize,
@@ -399,6 +411,7 @@ impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             global_token_budget:       0,
+            budget_reset_interval:     0,
             max_concurrent_inferences: 0,
             max_spawn_depth:           default_max_spawn_depth(),
             checkpoint_interval_turns: default_checkpoint_interval_turns(),

@@ -1162,12 +1162,18 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
 operator wakes up, understands the night, unblocks from anywhere, and can stop a runaway. Four core
 increments, friction-ordered, each independently shippable. Full design + premises:
 `docs/plans/0x89karan-ux-control-panel-design-*.md` (APPROVED).
-- **ux.8′** — Budgets (FIRST): per-agent spend visible + settable, daily reset window re-basing
-  `tokens_spent` (audit D2), budget fail-fast at the top of `step_need_infer`. Closes audit86-P0-2
-  (always-on CoS self-brick) + P1-1 (budget only enforced under ToolUse). Also the data source ux.11's
-  digest needs. Supersedes the old ux.8 "live budget control" scope below. `/plan-eng-review` (live
-  config writes).
-- **ux.11** — Trust after absence: durable run records in redb derived from `flight.jsonl` (id,
+- ✅ **ux.8′** — Budgets (P0-2 hotfix, **shipped v0.89.0**): rolling reset window
+  (`[scheduler] budget_reset_interval`, 0 = legacy lifetime) re-basing `tokens_spent` via a
+  monotonic anchor (audit D2), per-agent budget enforced at admission (**defers**, never bricks;
+  closes P1-1's ToolUse-only gap), `POST /api/v1/budget/reset` + `BudgetReset` event. Split at its
+  autoplan gate 2026-07-20 → the **visibility half** (per-agent spend on snapshot/FUSE/TUI +
+  `SetBudget` runtime mutation) moved to ux.11. Closes audit86-P0-2 + P1-1. Supersedes the old ux.8
+  "live budget control" scope below.
+- **ux.11** — Trust after absence (also inherits from the ux.8′ split 2026-07-20: **per-agent spend on
+  snapshot/FUSE/TUI, `SetBudget` runtime cap mutation, and the `BudgetRisk`→"spend risk" attention re-key**
+  — deferred here because ux.11 touches these surfaces anyway; Design review pre-flagged that spend/cap
+  rendering must special-case unlimited (`47k spent`, never `47k/0`) and abbreviate to k/M for the 12-col
+  column): durable run records in redb derived from `flight.jsonl` (id,
   start/end, status, last error, approvals, spend, stop reason); in-process digest timer (NOT cron_mcp);
   native `runs_query` tool for the CoS; CoS-written morning brief into the chat rail; TUI "Runs" view
   (last N → status, spend, failure reason, minimal event tail); records via API + FUSE. Dependency:
@@ -1226,8 +1232,12 @@ ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram) → cap.1 → 
 **ux.3 (spawn-on-the-fly) · ux.2b (idle/error, closes cos-ux-01) · ux.10 (TUI polish)** and
 evidence-gated expansions **ux.6 (evidence, shared with mv track) · ux.5 (web/app, post-Telegram-dogfood)
 · ux.7 (replay)**, then **skills (Phase 11) last**. One increment per branch, `main` shippable at each
-step. ux.8′ ships first regardless — the P0 self-brick blocks every deployment shape and per-agent spend
-feeds both the digest and the mv track's per-VM budgets. **Parallel, independent
+step. ux.8′ ships first regardless — the P0-2 self-brick (prod currently runs UNBOUNDED, violating the
+"bounded" invariant) blocks every deployment shape. (ux.8′ was split at its autoplan gate 2026-07-20 to
+the P0-2 integrity hotfix alone; per-agent spend visibility + SetBudget + the BudgetRisk re-key moved to
+ux.11.) Its **monotonic counter + window-delta** design — not the rolling reset itself — is the one part
+that helps the mv track later; per-VM billing needs calendar-aligned, per-unit windows over that meter, so
+do NOT treat ux.8′'s single shared rolling window as the billing substrate (`docs/PRODUCT-THESIS.md`). **Parallel, independent
 of the cockpit — do first (makes the CoS usable today):** `cos-polish` (`docs/plans/cos-polish.md` — the
 8 bugs from live testing: brief-not-written, KB-unfindable, orchestrate errors, undersized budgets) and
 `memory-routing` (`docs/plans/memory-routing.md` — raw emails → harness Layer 2, also fixes the token

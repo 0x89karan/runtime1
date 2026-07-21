@@ -59,6 +59,17 @@ pub struct AgentTask {
     tool_names:      Vec<String>,
     total_input:     u64,
     total_output:    u64,
+    /// Budget-window anchor (ux.8′): lifetime spend at the current window's start.
+    /// Windowed spend = `context_tokens() − window_anchor`. Kept separate from
+    /// `total_input/total_output` (which stay monotonic and feed context size,
+    /// snapshots, and paging) so a budget reset never corrupts those signals.
+    window_anchor:   u64,
+    /// True when a scheduler budget-reset window is active (ux.8′ / C1). When set,
+    /// per-agent budget exhaustion must NOT terminate the agent — the scheduler
+    /// defers it instead so the next window rollover revives it (park-not-terminate).
+    /// Runtime-only: derived from `SchedulerConfig.budget_reset_interval > 0` after
+    /// construction, not checkpointed (recomputed on restore).
+    budget_resettable: bool,
     turn:            u32,
     /// None = NeedInfer state; Some = ResponseStored state.
     stored_response: Option<InferenceResponse>,
@@ -97,6 +108,8 @@ impl AgentTask {
             tool_names,
             total_input: 0,
             total_output: 0,
+            window_anchor: 0,
+            budget_resettable: false,
             turn: 0,
             stored_response: None,
             terminal: false,
@@ -104,6 +117,21 @@ impl AgentTask {
             last_pressure: MemoryPressure::None,
             task_fp: task_fingerprint(task),
         }
+    }
+
+    /// Mark whether a scheduler budget-reset window is active (ux.8′ / C1). Set by
+    /// the scheduler right after construction/restore. When true, per-agent budget
+    /// exhaustion defers (scheduler-side) rather than terminating the agent.
+    pub fn set_budget_resettable(&mut self, resettable: bool) {
+        self.budget_resettable = resettable;
+    }
+
+    /// Test-only: seed lifetime spend so `windowed_spent()` reflects it, without
+    /// driving a full inference round. Used by scheduler budget tests (ux.8′).
+    #[cfg(test)]
+    pub(crate) fn test_set_spend(&mut self, tokens: u64) {
+        self.total_input = tokens;
+        self.total_output = 0;
     }
 
     /// Current turn index. The driver reads this when recording EventKind::Error
@@ -187,6 +215,7 @@ impl AgentTask {
             stored_response: self.stored_response.clone(),
             terminal:        self.terminal,
             short_term:      self.short_term.clone(),
+            window_anchor:   self.window_anchor,
         }
     }
 
@@ -212,6 +241,8 @@ impl AgentTask {
             tool_names,
             total_input:     cp.total_input,
             total_output:    cp.total_output,
+            window_anchor:   cp.window_anchor,
+            budget_resettable: false,
             turn:            cp.turn,
             stored_response: cp.stored_response,
             terminal:        cp.terminal,
@@ -224,6 +255,22 @@ impl AgentTask {
     /// Total tokens consumed so far (input + output). Used by the snapshot.
     pub fn context_tokens(&self) -> u64 {
         self.total_input + self.total_output
+    }
+
+    /// Spend within the current budget window (ux.8′): lifetime minus the window
+    /// anchor. This is what the per-agent budget is enforced against; a window
+    /// reset advances the anchor so the delta returns toward zero without
+    /// touching the monotonic lifetime counters.
+    pub fn windowed_spent(&self) -> u64 {
+        self.context_tokens().saturating_sub(self.window_anchor)
+    }
+
+    /// Rebase the budget window to the current spend (ux.8′ reset). Returns the
+    /// pre-reset windowed spend so the caller can report old→new / emit an event.
+    pub fn reset_budget_window(&mut self) -> u64 {
+        let old = self.windowed_spent();
+        self.window_anchor = self.context_tokens();
+        old
     }
 
     /// Number of turn pairs currently in the Tier-2 eviction buffer.
@@ -428,6 +475,38 @@ impl AgentTask {
             ));
         }
 
+        // Per-agent budget fail-fast (P1-1 / ux.8′). Checked BEFORE emitting the
+        // inference request — the ToolUse backstop below only fires *after* an
+        // overspending call, so a text-only orchestrated agent (EndTurn→park→
+        // inject cycle) could accrue unbounded spend without it. Enforced on
+        // WINDOWED spend so it re-arms after a budget-window reset. token_budget
+        // 0 = unlimited (matches the global convention). MaxTurns takes
+        // precedence (checked above) so a maxed-out agent reports "max turns".
+        //
+        // C1: only TERMINATE when no reset window is active (interval == 0). Under
+        // a window (`budget_resettable`) the scheduler's enqueue_or_defer DEFERS an
+        // over-per-agent-budget Infer instead, so the next rollover revives the
+        // agent (park-not-terminate). Terminating here would strip waiting/
+        // orchestrated and permanently brick a resident agent (audit86-P0-2 class).
+        let windowed = self.windowed_spent();
+        if !self.budget_resettable && self.cfg.token_budget != 0 && windowed >= self.cfg.token_budget {
+            recorder.record(
+                &self.agent_id,
+                Some(self.turn),
+                EventKind::BudgetExceeded,
+                json!({
+                    "windowed_tokens": windowed,
+                    "budget":          self.cfg.token_budget,
+                    "stage":           "pre_inference",
+                }),
+            );
+            self.terminal = true;
+            return AgentEffect::Failed(format!(
+                "token budget exceeded ({windowed} >= {})",
+                self.cfg.token_budget
+            ));
+        }
+
         // Memory pressure (p5.2; F-01 fix in p5.9). Two DISTINCT signals:
         //   - lifetime spend   → budget advisory + telemetry. Monotonic: never falls.
         //   - retained context → the PAGING decision. Falls after paging, so the
@@ -436,7 +515,9 @@ impl AgentTask {
         // Paging gives N+1 relief (the next inference request is smaller); it
         // cannot reduce already-spent tokens for the current turn.
         // Advisory events are edge-triggered (fire once on transition).
-        let total_spent = self.total_input + self.total_output;
+        // Windowed spend (ux.8′) so the advisory re-arms after a budget reset
+        // instead of staying stuck on a monotonic lifetime total.
+        let total_spent = self.windowed_spent();
         let tokens_spent_pct = if self.cfg.token_budget > 0 {
             total_spent as f64 / self.cfg.token_budget as f64
         } else {
@@ -621,16 +702,23 @@ impl AgentTask {
             }
 
             StopReason::ToolUse => {
-                if total > self.cfg.token_budget {
+                // Backstop to the pre-inference gate in step_need_infer: windowed
+                // spend, `>=`, 0 = unlimited — consistent with that gate (ux.8′).
+                // C1: like the pre-inference gate, only terminate when no reset
+                // window is active. Under a window the scheduler defers the next
+                // Infer instead (park-not-terminate); the agent finishes the
+                // current turn's tools and is deferred on its next inference.
+                let windowed = self.windowed_spent();
+                if !self.budget_resettable && self.cfg.token_budget != 0 && windowed >= self.cfg.token_budget {
                     recorder.record(
                         &self.agent_id,
                         Some(self.turn),
                         EventKind::BudgetExceeded,
-                        json!({ "total_tokens": total, "budget": self.cfg.token_budget }),
+                        json!({ "windowed_tokens": windowed, "budget": self.cfg.token_budget }),
                     );
                     self.terminal = true;
                     return AgentEffect::Failed(format!(
-                        "token budget exceeded ({total} > {})",
+                        "token budget exceeded ({windowed} >= {})",
                         self.cfg.token_budget
                     ));
                 }
@@ -1769,6 +1857,7 @@ mod tests {
             stored_response: None,
             terminal:        false,
             short_term:      vec![],
+            window_anchor:   0,
         };
         let task = AgentTask::from_checkpoint(cp, vec![fresh_spec]);
         assert_eq!(task.agent_id, "agent-42");
@@ -1797,6 +1886,7 @@ mod tests {
             stored_response: None,
             terminal:        true,
             short_term:      vec![],
+            window_anchor:   0,
         };
         let task = AgentTask::from_checkpoint(cp, vec![]);
         assert!(task.terminal, "orchestrated waiting agent must restore as terminal=true");
@@ -1989,5 +2079,97 @@ mod tests {
         assert_eq!(preview.chars().count(), 5);
         assert_eq!(preview, "こんにちは");
         assert_eq!(task.task_preview(100), "こんにちは世界");
+    }
+
+    // ── ux.8′ budget-window tests ─────────────────────────────────────────────
+
+    /// EndTurn response with the given input/output token counts.
+    fn end_turn_tokens(input: u32, output: u32) -> InferenceResponse {
+        InferenceResponse {
+            blocks:            vec![Block::Text { text: "answer".to_string() }],
+            stop_reason:       StopReason::EndTurn,
+            input_tokens:      input,
+            output_tokens:     output,
+            transport_retries: 0,
+        }
+    }
+
+    #[test]
+    fn windowed_spent_and_reset_keeps_lifetime_monotonic() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(50, 100), &model_cfg(), vec![]);
+        let _ = task.step(&rec); // Infer (turn 0)
+        task.provide_inference(end_turn_tokens(55, 55), &rec);
+        let _ = task.step(&rec); // Completed
+        assert_eq!(task.context_tokens(), 110);
+        assert_eq!(task.windowed_spent(), 110);
+
+        let old = task.reset_budget_window();
+        assert_eq!(old, 110, "reset returns pre-reset windowed spend");
+        assert_eq!(task.windowed_spent(), 0, "windowed spend rebases to 0");
+        assert_eq!(task.context_tokens(), 110, "reset must NOT touch the monotonic lifetime counter");
+    }
+
+    #[test]
+    fn pre_inference_gate_catches_text_only_overspend() {
+        // P1-1: a text-only orchestrated agent (EndTurn→park→inject) never hits
+        // the ToolUse backstop, so the pre-inference gate in step_need_infer must
+        // catch the overspend before the next inference.
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(50, 100), &model_cfg(), vec![]);
+        let _ = task.step(&rec); // Infer (turn 0)
+        task.provide_inference(end_turn_tokens(55, 55), &rec); // 110 > budget 100
+        let eff = task.step(&rec);
+        assert!(
+            matches!(eff, AgentEffect::Completed(_)),
+            "EndTurn completes even over budget — the P1-1 hole the gate closes"
+        );
+        assert_eq!(task.windowed_spent(), 110);
+
+        // Orchestration resume + inject → the NEXT step_need_infer must fail-fast.
+        task.resume_for_orchestration();
+        task.push_user_turn("again".to_string(), &rec);
+        let eff = task.step(&rec);
+        match eff {
+            AgentEffect::Failed(m) => assert!(
+                m.contains("budget exceeded"),
+                "expected pre-inference budget failure, got: {m}"
+            ),
+            _ => panic!("expected AgentEffect::Failed from the pre-inference gate"),
+        }
+    }
+
+    #[test]
+    fn zero_token_budget_is_unlimited() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(50, 0), &model_cfg(), vec![]);
+        let _ = task.step(&rec);
+        task.provide_inference(end_turn_tokens(10_000, 10_000), &rec);
+        let _ = task.step(&rec); // Completed
+        task.resume_for_orchestration();
+        task.push_user_turn("again".to_string(), &rec);
+        let eff = task.step(&rec);
+        assert!(
+            matches!(eff, AgentEffect::Infer(_)),
+            "token_budget = 0 means unlimited — must never brick on budget"
+        );
+    }
+
+    #[test]
+    fn reset_rearms_the_pre_inference_gate() {
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(50, 100), &model_cfg(), vec![]);
+        let _ = task.step(&rec);
+        task.provide_inference(end_turn_tokens(55, 55), &rec); // 110 > 100
+        let _ = task.step(&rec);
+        // Would fail the gate now; reset the window and it must proceed.
+        let _ = task.reset_budget_window();
+        task.resume_for_orchestration();
+        task.push_user_turn("again".to_string(), &rec);
+        let eff = task.step(&rec);
+        assert!(
+            matches!(eff, AgentEffect::Infer(_)),
+            "windowed budget must re-arm after a reset"
+        );
     }
 }
