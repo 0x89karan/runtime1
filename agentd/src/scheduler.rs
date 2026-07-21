@@ -1432,6 +1432,7 @@ fn drain_deferred(
     // still-over-cap entries aside and requeue them.
     let is_multi = state.agents.len() > 1;
     let mut holdback: Vec<DeferredInfer> = Vec::new();
+    let mut terminate_legacy: Vec<DeferredInfer> = Vec::new();
     while !state.deferred.is_empty() && slot_ok(state.in_flight) {
         let d = state.deferred.pop().expect("checked non-empty");
         let per_agent_over = state.agents.get(&d.agent_id).is_some_and(|a| {
@@ -1439,7 +1440,18 @@ fn drain_deferred(
             b != 0 && a.windowed_spent() >= b
         });
         if per_agent_over {
-            holdback.push(d);
+            // Under a reset window (interval>0) the over-cap agent is transiently over —
+            // hold it back so the next rollover revives it. Under legacy budgets
+            // (interval==0) it is PERMANENTLY over: holding back would strand the request
+            // forever (Codex ship review — reachable by a live SetBudget that lowers an
+            // agent below its current spend, or by a concurrent inflight completion pushing
+            // it over while this request sat slot-deferred). Terminate instead, matching
+            // enqueue_or_defer's legacy branch.
+            if sched.budget_reset_interval == 0 {
+                terminate_legacy.push(d);
+            } else {
+                holdback.push(d);
+            }
             continue;
         }
         state.in_flight += 1;
@@ -1460,6 +1472,26 @@ fn drain_deferred(
     }
     for d in holdback {
         state.deferred.push(d);
+    }
+    // Legacy (no-window) permanent over-budget: terminate the agent rather than leave its
+    // deferred work orphaned. Purge the agent's OTHER deferred entries first so the admit
+    // loop can never schedule an inference for an agent that is being removed.
+    for d in terminate_legacy {
+        let id = d.agent_id;
+        if state.agents.contains_key(&id) {
+            state.deferred.retain(|e| e.agent_id != id);
+            recorder.record(
+                &id,
+                Some(d.turn),
+                EventKind::AgentAdmissionDenied,
+                json!({ "reason": "agent_budget_exhausted", "remedy": BUDGET_REMEDY }),
+            );
+            handle_agent_terminal(
+                id,
+                Err(anyhow::anyhow!("admission denied: agent_budget_exhausted ({BUDGET_REMEDY})")),
+                state, sched, gateway, registry, recorder,
+            );
+        }
     }
 }
 
@@ -2164,6 +2196,56 @@ fn dispatch_control_command(
                 }
             }
         }
+        ControlCommand::SetBudget { target, limit, confirm_tx } => {
+            use crate::control::BudgetTarget;
+            // Result carries (old_budget, new_budget) on success (ux.11a F2/F3).
+            let result: Result<(u64, u64), String> = match &target {
+                // F1: the global ceiling lives in immutable SchedulerConfig; it is not
+                // runtime-settable in ux.11a. Reject (→ 400 at the HTTP layer).
+                BudgetTarget::Global => Err("global budget is not runtime-settable".to_string()),
+                BudgetTarget::Agent(id) => {
+                    // Scope the get_mut borrow so drain_deferred can take &mut state after.
+                    let outcome = state.agents.get_mut(id).map(|task| {
+                        let old = task.set_token_budget(limit);
+                        // Room = unlimited, or windowed spend is now under the new ceiling.
+                        let has_room = limit == 0 || task.windowed_spent() < limit;
+                        (old, has_room)
+                    });
+                    match outcome {
+                        Some((old, has_room)) => {
+                            recorder.record(
+                                id,
+                                None,
+                                EventKind::BudgetSet,
+                                json!({ "target": id, "old_budget": old, "new_budget": limit }),
+                            );
+                            // F2: raising a ceiling only revives a deferred agent when a
+                            // drain runs — nothing else triggers one until unrelated activity.
+                            if has_room {
+                                drain_deferred(state, sched, gateway, registry, recorder);
+                            }
+                            Ok((old, limit))
+                        }
+                        None => Err(format!("agent '{id}' not found")),
+                    }
+                }
+            };
+            match confirm_tx {
+                Some(tx) => {
+                    let _ = tx.send(result);
+                }
+                None => {
+                    if let Err(e) = result {
+                        recorder.record(
+                            "agentd",
+                            None,
+                            EventKind::FuseControlError,
+                            json!({ "error": e, "is_error": true }),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2403,7 +2485,10 @@ fn dispatch_send_message(
 /// (Maintainability review finding; ux.2b will add more `AgentTask`-derived inputs here).
 struct AttentionInputs<'a> {
     agent_id:             &'a str,
-    context_tokens:       u64,
+    /// Windowed spend (ux.11a): keys the BudgetRisk signal against the budget window,
+    /// so it clears/re-arms across resets (the lifetime counter never would). `assess`
+    /// returns None when `token_budget == 0`, so unlimited agents never fire.
+    windowed_spent:       u64,
     token_budget:         u64,
     credential_providers: &'a [String],
     pending_approvals:    &'a HashMap<String, ParkedApproval>,
@@ -2412,7 +2497,7 @@ struct AttentionInputs<'a> {
 
 fn derive_attention(inputs: AttentionInputs) -> Vec<surfaces::AttentionSignal> {
     let AttentionInputs {
-        agent_id, context_tokens, token_budget, credential_providers,
+        agent_id, windowed_spent, token_budget, credential_providers,
         pending_approvals, credential_snapshot,
     } = inputs;
     let now = std::time::SystemTime::now()
@@ -2477,11 +2562,11 @@ fn derive_attention(inputs: AttentionInputs) -> Vec<surfaces::AttentionSignal> {
         }
     }
 
-    if crate::memory::context::assess(context_tokens, token_budget)
+    if crate::memory::context::assess(windowed_spent, token_budget)
         == crate::memory::context::MemoryPressure::Hard
     {
         let pct = if token_budget > 0 {
-            (context_tokens as f64 / token_budget as f64 * 100.0).round() as u64
+            (windowed_spent as f64 / token_budget as f64 * 100.0).round() as u64
         } else {
             0
         };
@@ -2539,7 +2624,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                         .unwrap_or_default();
                 let attention = derive_attention(AttentionInputs {
                     agent_id:             id,
-                    context_tokens:       task.context_tokens(),
+                    windowed_spent:       task.windowed_spent(),
                     token_budget:         task.token_budget(),
                     credential_providers: &cred_providers,
                     pending_approvals:    &state.pending_approvals,
@@ -2551,6 +2636,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     turn:           task.turn(),
                     context_tokens: task.context_tokens(),
                     token_budget:   task.token_budget(),
+                    windowed_spent: task.windowed_spent(),
                     task_preview:   task.task_preview(80),
                     tools:          task.spec_names().to_vec(),
                     short_term_previews: task
@@ -2598,6 +2684,8 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 turn:           0,
                 context_tokens: 0,
                 token_budget:   ua.cfg.token_budget,
+                // Universal-tier spend is tracked via the proxy atomic, not AgentTask.
+                windowed_spent: 0,
                 task_preview:   ua.cfg.task.chars().take(80).collect(),
                 tools:          vec![],
                 short_term_previews: vec![],
@@ -5554,14 +5642,14 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn da(
         agent_id: &str,
-        context_tokens: u64,
+        windowed_spent: u64,
         token_budget: u64,
         credential_providers: &[String],
         pending_approvals: &HashMap<String, ParkedApproval>,
         credential_snapshot: Option<&surfaces::CredentialSnapshot>,
     ) -> Vec<surfaces::AttentionSignal> {
         derive_attention(AttentionInputs {
-            agent_id, context_tokens, token_budget, credential_providers,
+            agent_id, windowed_spent, token_budget, credential_providers,
             pending_approvals, credential_snapshot,
         })
     }
@@ -5818,6 +5906,7 @@ mod tests {
             turn: 0,
             context_tokens: 100,
             token_budget: 50_000,
+            windowed_spent: 100,
             task_preview: String::new(),
             tools: vec![],
             short_term_previews: vec![],
@@ -5836,5 +5925,139 @@ mod tests {
         let arr = json["attention"].as_array().expect("attention field must be present and be an array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["reason"], "approval_pending");
+        // ux.11a F4: the manual Serialize field_count bump + serialize_field call must keep
+        // windowed_spent in the JSON — the guard above only covers `attention`, so a missing
+        // windowed_spent would otherwise vanish silently from FUSE/HTTP JSON.
+        assert_eq!(json["windowed_spent"].as_u64(), Some(100),
+            "windowed_spent must serialize (field_count bump + serialize_field)");
+    }
+
+    #[test]
+    fn set_budget_agent_raise_revives_deferred_agent() {
+        // F2: SetBudget raising a per-agent ceiling above current windowed spend must
+        // drain_deferred so the parked agent is admitted immediately.
+        use crate::control::{BudgetTarget, ControlCommand};
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mdl = model_cfg();
+        let sched = SchedulerConfig { global_token_budget: 0, budget_reset_interval: 100, ..unlimited() };
+        let mut state = minimal_state("a");                         // per-agent budget 100_000
+        state.agents.get_mut("a").unwrap().test_set_spend(150_000);  // over the old ceiling
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0,
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::SetBudget { target: BudgetTarget::Agent("a".into()), limit: 500_000, confirm_tx: Some(tx) },
+            &mdl, &mut state, &sched, &gateway, &registry, &rec,
+        );
+        let (old, new) = rx.blocking_recv().unwrap().expect("set ok");
+        assert_eq!(old, 100_000);
+        assert_eq!(new, 500_000);
+        assert_eq!(state.agents.get("a").unwrap().token_budget(), 500_000, "budget mutated");
+        assert!(state.deferred.is_empty(), "raise revives the deferred agent");
+        assert_eq!(state.in_flight, 1);
+    }
+
+    #[test]
+    fn drain_terminates_legacy_over_budget_deferred_agent() {
+        // Ship-review P1: under legacy (interval=0) budgets, a deferred agent that is now
+        // over its per-agent cap (e.g. a live SetBudget lowered it below spend) must be
+        // TERMINATED by drain, not held back forever.
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mut state = minimal_state("a");                        // per-agent budget 100_000
+        state.tokens_spent = 0;                                     // global fine
+        state.agents.get_mut("a").unwrap().test_set_spend(150_000); // over its per-agent cap
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0,
+        });
+        // interval=0 → legacy: over-budget is permanent → terminate.
+        drain_deferred(&mut state, &budget_sched(0), &gateway, &registry, &rec);
+        assert!(state.deferred.is_empty(), "the stranded deferred entry is drained, not held forever");
+        assert_eq!(state.in_flight, 0, "not admitted (still over budget)");
+        assert!(state.outcomes.get("a").is_some_and(|r| r.is_err()), "legacy over-budget terminates the agent");
+    }
+
+    #[test]
+    fn drain_holds_back_windowed_over_budget_deferred_agent() {
+        // Contrast to the legacy case: under a reset window (interval>0) the same over-cap
+        // agent is HELD BACK (revived on the next rollover), never terminated.
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mut state = minimal_state("a");
+        state.tokens_spent = 0;
+        state.agents.get_mut("a").unwrap().test_set_spend(150_000);
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0,
+        });
+        drain_deferred(&mut state, &budget_sched(100), &gateway, &registry, &rec);
+        assert_eq!(state.deferred.len(), 1, "windowed over-cap agent stays deferred");
+        assert_eq!(state.in_flight, 0);
+        assert!(!state.outcomes.contains_key("a"), "not terminated under a window");
+    }
+
+    #[test]
+    fn set_budget_global_is_rejected() {
+        // F1: the global ceiling is immutable config; SetBudget must refuse Global.
+        use crate::control::{BudgetTarget, ControlCommand};
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mdl = model_cfg();
+        let mut state = minimal_state("a");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::SetBudget { target: BudgetTarget::Global, limit: 5_000, confirm_tx: Some(tx) },
+            &mdl, &mut state, &budget_sched(100), &gateway, &registry, &rec,
+        );
+        assert!(rx.blocking_recv().unwrap().is_err(), "global set is rejected");
+    }
+
+    #[test]
+    fn set_budget_unknown_agent_errors() {
+        // Unknown agent → Err → 404 at the HTTP layer.
+        use crate::control::{BudgetTarget, ControlCommand};
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mdl = model_cfg();
+        let mut state = minimal_state("a");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::SetBudget { target: BudgetTarget::Agent("ghost".into()), limit: 5_000, confirm_tx: Some(tx) },
+            &mdl, &mut state, &budget_sched(100), &gateway, &registry, &rec,
+        );
+        assert!(rx.blocking_recv().unwrap().is_err(), "unknown agent errors");
+    }
+
+    #[test]
+    fn set_token_budget_survives_checkpoint_round_trip() {
+        // F3: set_token_budget mutates the CHECKPOINTED cfg field, so an operator's live
+        // change persists across a restart (not the audit86-P2-1 revert class).
+        let mut state = minimal_state("a");
+        let old = state.agents.get_mut("a").unwrap().set_token_budget(777_000);
+        assert_eq!(old, 100_000);
+        let cp = state.agents.get("a").unwrap().to_checkpoint();
+        let restored = crate::agent::AgentTask::from_checkpoint(cp, vec![]);
+        assert_eq!(restored.token_budget(), 777_000, "live SetBudget survives restart");
+    }
+
+    #[test]
+    fn derive_attention_budget_risk_keys_on_windowed_not_lifetime() {
+        // B3: the re-key means a windowed spend under the hard threshold is clean even if
+        // lifetime spend would trip it; and windowed at the threshold fires.
+        let pending = HashMap::new();
+        // 95k windowed against a 100k budget → Hard → fires.
+        let hot = da("a1", 95_000, 100_000, &[], &pending, None);
+        assert!(hot.iter().any(|s| s.reason == surfaces::AttentionReason::BudgetRisk),
+            "windowed at hard threshold fires BudgetRisk");
+        // Unlimited (budget 0) never fires regardless of spend.
+        let unlimited = da("a1", 10_000_000, 0, &[], &pending, None);
+        assert!(!unlimited.iter().any(|s| s.reason == surfaces::AttentionReason::BudgetRisk),
+            "unlimited never fires BudgetRisk");
     }
 }

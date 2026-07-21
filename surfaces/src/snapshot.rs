@@ -234,6 +234,10 @@ pub struct AgentSnapshot {
     pub turn:          u32,
     pub context_tokens: u64,
     pub token_budget:  u64,
+    /// Spend within the current budget window (ux.11a): `context_tokens − window_anchor`.
+    /// This is what the per-agent budget is enforced against; equals lifetime spend under
+    /// legacy (interval=0) budgets. 0 for universal-tier agents (proxy-tracked spend).
+    pub windowed_spent: u64,
     pub task_preview:  String,
     /// Capability-filtered list of tool names available to this agent.
     pub tools:         Vec<String>,
@@ -283,7 +287,7 @@ impl Serialize for AgentSnapshot {
             AgentStatus::AwaitingChild(s) | AgentStatus::AwaitingApproval(s) => Some(s.as_str()),
             _ => None,
         };
-        let field_count = 18 + usize::from(detail.is_some());
+        let field_count = 19 + usize::from(detail.is_some());
         let mut s = ser.serialize_struct("AgentSnapshot", field_count)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("status", self.status.as_str())?;
@@ -293,6 +297,7 @@ impl Serialize for AgentSnapshot {
         s.serialize_field("turn", &self.turn)?;
         s.serialize_field("context_tokens", &self.context_tokens)?;
         s.serialize_field("token_budget", &self.token_budget)?;
+        s.serialize_field("windowed_spent", &self.windowed_spent)?;
         s.serialize_field("task_preview", &self.task_preview)?;
         s.serialize_field("tools", &self.tools)?;
         s.serialize_field("short_term_previews", &self.short_term_previews)?;

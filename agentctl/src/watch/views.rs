@@ -203,6 +203,42 @@ fn attention_counts(agents: &[reader::AgentInfo]) -> (usize, usize) {
     (needing, unavailable)
 }
 
+/// Abbreviate a token count for the 12-col Budget cell: `512`, `47k`, `1.2M`, `100M`, `5.0G`.
+/// Drops the decimal at ≥100M and switches to a G tier at ≥1B so an operator-set ceiling
+/// (ux.11a SetBudget accepts any u64) never blows past the fixed column (Codex ship review:
+/// `5000.0M/5000.0M` = 15 chars would clip). Extreme (>1e12) values still clip — never reached
+/// by realistic token budgets.
+fn abbrev_tokens(n: u64) -> String {
+    // Width is bounded per side so `spent/limit` fits the 12-col cell for every u64
+    // SetBudget accepts. One decimal ONLY where the integer part is a single digit
+    // (1.2M, 5.0G); integer form above that (47M, 999M, 100G) — so nothing rounds up
+    // into a 6-char `100.0M` (Codex ship review: `99_950_000` → `100.0M` overflowed).
+    if n < 1_000 {
+        format!("{n}")                                   // ≤ "999"
+    } else if n < 1_000_000 {
+        format!("{}k", n / 1_000)                        // ≤ "999k"
+    } else if n < 10_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)        // "1.0M".."9.9M"
+    } else if n < 1_000_000_000 {
+        format!("{}M", n / 1_000_000)                    // "10M".."999M"
+    } else if n < 10_000_000_000 {
+        format!("{:.1}G", n as f64 / 1_000_000_000.0)    // "1.0G".."9.9G"
+    } else {
+        format!("{}G", n / 1_000_000_000)                // "10G".."999G" (u64::MAX maps to Unlimited upstream)
+    }
+}
+
+/// Render the Budget cell (ux.11a): windowed spend against the ceiling.
+/// Unlimited → `47k spent` (NEVER `47k/0`); bounded → `47k/100k`, `1.2M/2.0M`.
+fn format_budget_cell(windowed_spent: u64, budget: &reader::BudgetKind) -> String {
+    match budget {
+        reader::BudgetKind::Unlimited     => format!("{} spent", abbrev_tokens(windowed_spent)),
+        reader::BudgetKind::Tokens(limit) => {
+            format!("{}/{}", abbrev_tokens(windowed_spent), abbrev_tokens(*limit))
+        }
+    }
+}
+
 fn render_dashboard(f: &mut Frame, app: &App) {
     let area = f.area();
 
@@ -327,7 +363,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
             Cell::from(a.status.clone()).style(status_style(&a.status)),
             Cell::from(glyph).style(glyph_style),
             Cell::from(format!("{}", a.context_tokens)),
-            Cell::from(a.budget.display()),
+            Cell::from(format_budget_cell(a.windowed_spent, &a.budget)),
             Cell::from(format!("{}", a.tools.len())),
         ]).style(Style::default().bg(bg)).height(height)
     }).collect();
@@ -1700,6 +1736,7 @@ mod tests {
             status_detail:   None,
             context_tokens:  ctx,
             budget:          BudgetKind::Unlimited,
+            windowed_spent:  ctx,
             tools,
             parent_id:       None,
             sandbox:         None,
@@ -1719,6 +1756,45 @@ mod tests {
     }
 
     // ── ux.1 chat rail: width/height floor + border-title truncation ─────────
+
+    #[test]
+    fn budget_cell_unlimited_shows_spent_never_slash_zero() {
+        use crate::watch::reader::BudgetKind;
+        assert_eq!(format_budget_cell(47_000, &BudgetKind::Unlimited), "47k spent");
+        assert_eq!(format_budget_cell(512, &BudgetKind::Unlimited), "512 spent");
+        // Never render "/0" for unlimited.
+        assert!(!format_budget_cell(47_000, &BudgetKind::Unlimited).contains("/0"));
+    }
+
+    #[test]
+    fn budget_cell_bounded_shows_spend_over_limit() {
+        use crate::watch::reader::BudgetKind;
+        assert_eq!(format_budget_cell(47_000, &BudgetKind::Tokens(100_000)), "47k/100k");
+        assert_eq!(format_budget_cell(1_200_000, &BudgetKind::Tokens(2_000_000)), "1.2M/2.0M");
+    }
+
+    #[test]
+    fn budget_cell_fits_twelve_col_column() {
+        use crate::watch::reader::BudgetKind;
+        let cases = [
+            format_budget_cell(0, &BudgetKind::Unlimited),
+            format_budget_cell(999_000, &BudgetKind::Unlimited),
+            format_budget_cell(50_000_000, &BudgetKind::Tokens(50_000_000)),
+            format_budget_cell(47_000, &BudgetKind::Tokens(100_000)),
+            format_budget_cell(1_200_000, &BudgetKind::Tokens(2_000_000)),
+            // Large operator-set ceilings (SetBudget accepts any u64) must still fit (Codex).
+            format_budget_cell(100_000_000, &BudgetKind::Tokens(200_000_000)),
+            format_budget_cell(5_000_000_000, &BudgetKind::Tokens(5_000_000_000)),
+            format_budget_cell(1_000_000_000, &BudgetKind::Unlimited),
+            // Codex ship-review boundaries: near-100M rounding, and huge G values.
+            format_budget_cell(99_950_000, &BudgetKind::Tokens(99_950_000)),
+            format_budget_cell(100_000_000_000, &BudgetKind::Tokens(100_000_000_000)),
+            format_budget_cell(9_999_999, &BudgetKind::Tokens(9_999_999)),
+        ];
+        for c in cases {
+            assert!(c.chars().count() <= 12, "budget cell '{c}' exceeds 12 cols");
+        }
+    }
 
     #[test]
     fn min_total_width_for_rail_115_hides_rail_below_floor() {

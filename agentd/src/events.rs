@@ -22,6 +22,8 @@ pub enum EventKind {
     AgentAdmissionDenied,
     BudgetExceeded,
     BudgetReset,
+    /// Operator set a per-agent token budget at runtime (ux.11a SetBudget).
+    BudgetSet,
     MaxTurnsReached,
     CapabilityDenied,
     AgentChildResultDelivered,

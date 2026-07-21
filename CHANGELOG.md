@@ -3,6 +3,36 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.90.0] - 2026-07-21
+
+### Added
+- **Per-agent spend is now visible** (ux.11a): each agent's **windowed** spend
+  (spend within the current budget window) is surfaced on the management-API
+  snapshot, as a new FUSE file `/agents/<id>/windowed_spend`, and rendered in the
+  agentctl TUI budget cell (`47k/100k`, `1.2M/2.0M`, or `47k spent` when
+  unlimited — width-bounded to the column).
+- **Runtime per-agent budget control** — `POST /api/v1/budget/set`
+  `{"target":{"agent":"<id>"},"limit":<u64>}` (`limit:0` = unlimited) sets an
+  agent's token ceiling live: reports `old_limit`→`limit`, revives the agent
+  immediately if the raise gives it room, and 404s an unknown agent. Also exposed
+  on the `/agents/control` FUSE surface as `{"set_budget":{...}}`. The change
+  mutates the checkpointed budget, so it survives a restart. **Per-agent only** —
+  the global ceiling is immutable config and returns 400.
+- **`BudgetSet` flight-recorder event** on every runtime budget change.
+
+### Changed
+- **The `BudgetRisk` attention signal now keys on windowed spend**, not lifetime
+  spend — so it clears and re-arms across budget-window resets instead of latching
+  on forever after the first window. Unlimited agents (`token_budget == 0`) never
+  fire it.
+
+### Notes
+- ux.11 was **split 2-way** at its autoplan CEO gate: this release is the
+  budget-visibility half (closes the ux.8′ P1 "visible + settable spend" debt).
+  Trust-after-absence (durable run store + digest + morning brief) is ux.11b,
+  landing on its own gate. No breaking changes — the new snapshot field is
+  additive and checkpoint `FORMAT_VERSION` is untouched.
+
 ## [v0.89.0] - 2026-07-21
 
 ### Fixed

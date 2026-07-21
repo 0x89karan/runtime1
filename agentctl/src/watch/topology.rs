@@ -254,6 +254,7 @@ mod tests {
             status_detail:   None,
             context_tokens:  0,
             budget:          BudgetKind::Unlimited,
+            windowed_spent:  0,
             tools:           vec![],
             parent_id:       parent.map(str::to_string),
             sandbox:         None,

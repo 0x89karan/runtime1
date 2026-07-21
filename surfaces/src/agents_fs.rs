@@ -59,6 +59,9 @@ pub(crate) const OFF_CREDENTIALS:   u64 = 13;
 /// /agents/<id>/attention — active attention signals JSON (ux.2a).
 #[cfg(any(test, target_os = "linux"))]
 pub(crate) const OFF_ATTENTION:     u64 = 14;
+/// /agents/<id>/windowed_spend — spend within the current budget window (ux.11a).
+#[cfg(any(test, target_os = "linux"))]
+pub(crate) const OFF_WINDOWED_SPEND: u64 = 15;
 
 /// System directory and file inodes (not in inode_to_id; handled explicitly).
 #[cfg(any(test, target_os = "linux"))]
@@ -103,6 +106,8 @@ const _: () = assert!(OFF_PID     < DIR_STEP - 1, "OFF_PID must be < DIR_STEP - 
 const _: () = assert!(OFF_CREDENTIALS < DIR_STEP - 1, "OFF_CREDENTIALS must be < DIR_STEP - 1");
 #[cfg(any(test, target_os = "linux"))]
 const _: () = assert!(OFF_ATTENTION < DIR_STEP - 1, "OFF_ATTENTION must be < DIR_STEP - 1");
+#[cfg(any(test, target_os = "linux"))]
+const _: () = assert!(OFF_WINDOWED_SPEND < DIR_STEP - 1, "OFF_WINDOWED_SPEND must be < DIR_STEP - 1");
 
 /// Last 64 KB of flight.jsonl to scan for per-agent events.
 #[cfg(any(test, target_os = "linux"))]
@@ -276,11 +281,12 @@ impl AgentsFs {
         let ino = self.next_dir_inode;
         self.next_dir_inode += DIR_STEP;
         self.dir_inodes.insert(agent_id.to_string(), ino);
-        // Register all 15 fixed inodes so inode_to_id lookups work.
+        // Register all fixed inodes so inode_to_id lookups work.
         for offset in [
             0, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
             OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
             OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS, OFF_ATTENTION,
+            OFF_WINDOWED_SPEND,
         ] {
             self.inode_to_id.insert(ino + offset, agent_id.to_string());
         }
@@ -387,6 +393,7 @@ impl AgentsFs {
                     format!("{}\n", agent.token_budget).into_bytes()
                 }
             }
+            OFF_WINDOWED_SPEND => format!("{}\n", agent.windowed_spent).into_bytes(),
             OFF_FLIGHT    => read_flight_tail(&agent.id),
             OFF_SHORT_TERM => {
                 if agent.short_term_previews.is_empty() {
@@ -606,11 +613,12 @@ impl AgentsFs {
     /// into a `Vec<String>` before calling this (Rust borrow checker requires it).
     fn prune_dead_agent(&mut self, agent_id: &str) {
         if let Some(base) = self.dir_inodes.remove(agent_id) {
-            // Remove all 15 fixed per-agent inodes (dir + offsets 1–14).
+            // Remove all fixed per-agent inodes (dir + offsets 1–15).
             for offset in [
                 0u64, OFF_STATUS, OFF_CONTEXT, OFF_BUDGET, OFF_FLIGHT,
                 OFF_MEMORY_DIR, OFF_SHORT_TERM, OFF_LONG_TERM_DIR, OFF_TOOLS, OFF_PARENT,
                 OFF_SANDBOX, OFF_TIER, OFF_PID, OFF_CREDENTIALS, OFF_ATTENTION,
+                OFF_WINDOWED_SPEND,
             ] {
                 self.inode_to_id.remove(&(base + offset));
             }
@@ -713,6 +721,7 @@ fn file_name_for_offset(offset: u64) -> Option<&'static str> {
         OFF_PID           => Some("pid"),
         OFF_CREDENTIALS   => Some("credentials"),
         OFF_ATTENTION     => Some("attention"),
+        OFF_WINDOWED_SPEND => Some("windowed_spend"),
         _ => None,
     }
 }
@@ -936,6 +945,14 @@ impl fuser::Filesystem for AgentsFs {
                     }
                     "attention" => {
                         let ino = dir_ino + OFF_ATTENTION;
+                        let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
+                        reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
+                    }
+                    // ux.11a: same readdir/lookup-sync class as credentials/attention above —
+                    // readdir lists windowed_spend, so lookup() MUST resolve it or a real FUSE
+                    // `cat /agents/<id>/windowed_spend` returns ENOENT (caught by Codex ship review).
+                    "windowed_spend" => {
+                        let ino = dir_ino + OFF_WINDOWED_SPEND;
                         let sz = self.file_content_for_ino(ino).map(|c| c.len() as u64).unwrap_or(0);
                         reply.entry(&TTL, &make_file_attr(ino, sz, fuser::FileType::RegularFile), 0);
                     }
@@ -1213,6 +1230,7 @@ impl fuser::Filesystem for AgentsFs {
                     (dir_ino + OFF_PID,         fuser::FileType::RegularFile, "pid".to_string()),
                     (dir_ino + OFF_CREDENTIALS, fuser::FileType::RegularFile, "credentials".to_string()),
                     (dir_ino + OFF_ATTENTION,   fuser::FileType::RegularFile, "attention".to_string()),
+                    (dir_ino + OFF_WINDOWED_SPEND, fuser::FileType::RegularFile, "windowed_spend".to_string()),
                 ];
                 if self.memory.is_some() {
                     v.push((dir_ino + OFF_MEMORY_DIR, fuser::FileType::Directory, "memory".to_string()));
@@ -1468,6 +1486,7 @@ mod tests {
             turn:                    0,
             context_tokens:          100,
             token_budget:            50_000,
+            windowed_spent:          100,
             task_preview:            "do something".to_string(),
             tools:                   vec![],
             short_term_previews:     vec![],
@@ -1750,6 +1769,9 @@ mod tests {
         assert_eq!(file_name_for_offset(OFF_LONG_TERM_DIR), Some("long_term"));
         assert_eq!(file_name_for_offset(OFF_TOOLS),         Some("tools"));
         assert_eq!(file_name_for_offset(OFF_PARENT),        Some("parent"));
+        assert_eq!(file_name_for_offset(OFF_CREDENTIALS),   Some("credentials"));
+        assert_eq!(file_name_for_offset(OFF_ATTENTION),     Some("attention"));
+        assert_eq!(file_name_for_offset(OFF_WINDOWED_SPEND), Some("windowed_spend"));
         assert_eq!(file_name_for_offset(99), None);
     }
 

@@ -1172,7 +1172,7 @@ increments, friction-ordered, each independently shippable. Full design + premis
 - **ux.11 — SPLIT 2-way at autoplan CEO gate (2026-07-21).** Both CEO voices converged that the bundled
   ux.11 (trust-after-absence + inherited budget-visibility) was the design-doc's rejected Approach B /
   a big-first-increment. Split (`docs/plans/ux.11-trust-after-absence.md`):
-  - **ux.11a — Budget visibility (ships first):** per-agent **windowed** spend on snapshot/FUSE/TUI;
+  - ✅ **ux.11a — Budget visibility (shipped v0.90.0):** per-agent **windowed** spend on snapshot/FUSE/TUI;
     `SetBudget` runtime mutation (`ControlCommand::SetBudget` + `POST /api/v1/budget/set` + FUSE, mirrors
     the ux.8′ ResetBudget path) + `AgentTask::set_token_budget`; `BudgetRisk`→windowed-spend re-key.
     Closes the ux.8′ P1 "visible + settable per-agent spend" debt. Small; all precedents shipped in ux.8′.
