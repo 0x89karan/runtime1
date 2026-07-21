@@ -19,7 +19,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   panic PID-1. Production CoS (passes `agentd.config=cos.agents.toml`) is unaffected.
   Invisible because `qemu-boot.yml` is `workflow_dispatch`-only and already red. Fix: rename
   to `model`; add the parse-all test (audit86-P1-7) so the class can't recur. → `audit.1`.
-- **audit86-P0-2 (P0) [new] — Always-on CoS self-bricks in ~1–2 days.**
+- ~~**audit86-P0-2 (P0) [new] — Always-on CoS self-bricks in ~1–2 days.**~~ **[FIXED in ux.8′ (v0.89.0): rolling window via `[scheduler] budget_reset_interval` (0 = legacy lifetime) with wall-clock rebase (loop-top + 60s idle tick, division-based catch-up); an over-budget agent now DEFERS at admission instead of terminating; monotonic meter never zeroes (windowed = lifetime − anchor); `POST /api/v1/budget/reset` escape hatch; `BudgetReset` event; prod flipped to 24h window. Proven live in /qa (exhaust→defer→survive→auto-revive). 1455 tests.]**
   `cos.agents.toml:109-110` documents `global_token_budget` as a "hard daily spend ceiling",
   but `tokens_spent` is lifetime-monotonic (`scheduler.rs:434,698`) and checkpoint-restored
   (`checkpoint.rs:125`) with no reset path anywhere. The 24/7 flagship hits permanent
@@ -30,7 +30,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 
 ### P1
 
-- **audit86-P1-1 (P1) [re-rate; = audit-C1 mechanism] — Per-agent budget only enforced under `ToolUse`.**
+- ~~**audit86-P1-1 (P1) [re-rate; = audit-C1 mechanism] — Per-agent budget only enforced under `ToolUse`.**~~ **[FIXED in ux.8′ (v0.89.0): per-agent windowed enforcement moved to admission (`enqueue_or_defer` defers, doesn't terminate) with a pre-inference gate + ToolUse backstop; text-only park/inject agents are now capped every turn. `drain_deferred` re-checks the per-agent cap on every completion (ship-adversarial F-A). Windowed, so it rolls over with the window.]**
   `agent/mod.rs:624-636` is the sole check site; `step_need_infer` (`:413-556`) checks
   `max_turns` but never the budget, so a text-only orchestrated agent accrues unbounded spend
   across the EndTurn→park→inject cycle. Fix: budget fail-fast at the top of `step_need_infer`. → `ux.8′`.
@@ -108,7 +108,19 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   incompatibility ships undetected; run them inside `agentos:full` here. This named
   entry replaces the ci.1 plan's "after smoke proves stable" never-trigger
   (`docs/plans/ci.1-ci-tests-the-artifact.md` §NOT-in-scope).
-- **audit86-P2-1 (P2) [new] — Restart takes cfg/model/task/prompt from the checkpoint, overriding TOML.**
+- **ux.8-ar-01 (P2) [new, ux.8′ /review] — Deferred-drain has no per-agent budget reservation / fair aging.**
+  On a window rollover `drain_deferred` admits by priority/slot count while the freshly-reset
+  window budget is shared — the first-admitted requests can consume the whole new window, so under
+  a tight window with many agents a lower-priority deferred agent can repeat-starve every window
+  (`scheduler.rs` drain_deferred admit loop). Low impact for the 3-agent CoS with a 50M window;
+  becomes real as agent count grows or the window tightens. Fix: per-agent budget reservation or
+  fair-aging on the drain. Deferred by user decision at the ux.8′ review gate.
+- **ux.8-ar-02 (P3) [new, ux.8′ /ship] — `MaxTokens` self-terminates regardless of `budget_resettable`.**
+  The provider `MaxTokens` stop reason terminates the agent even under an active budget window, so a
+  single over-long completion can end an otherwise-resumable agent (`agent/mod.rs`). Pre-existing
+  (predates ux.8′) and orthogonal to the budget-window mechanism, so left out of the P0-2 hotfix.
+  Fix: treat `MaxTokens` as a recoverable turn boundary (continue/retry with a lower cap) rather than
+  a terminal outcome. Low impact — surfaces only on pathological single-turn output.
   `scheduler.rs:183-184,243-247`, `agent/mod.rs:206-221`. Since the CoS never terminates, a
   `docker compose pull && up` shipping a new prompt/budget/model silently changes nothing
   until the checkpoint is deleted — image upgrades never reach the always-on agent. Fix:

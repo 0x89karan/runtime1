@@ -46,6 +46,26 @@ pub enum ControlCommand {
         agent_id: String,
         text:     String,
     },
+    /// Reset a budget window: rebase the target's window anchor to current spend
+    /// (the D2 manual escape hatch — clears the windowed ceiling without
+    /// destroying the lifetime meter). ux.8′.
+    ResetBudget {
+        target:     BudgetTarget,
+        /// Optional confirmation channel. The scheduler sends
+        /// `(spent_before, window_start)` so the HTTP API can report old→new and
+        /// the new window anchor; `Err` for an unknown agent (→ 404). `None` on
+        /// the fire-and-forget FUSE path. (ControlCommand is not a serde type.)
+        confirm_tx: Option<tokio::sync::oneshot::Sender<Result<(u64, u64), String>>>,
+    },
+}
+
+/// Which budget a `ResetBudget` command targets. Typed (not a bare string) so
+/// "global" can never collide with an agent literally named `global`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetTarget {
+    Global,
+    Agent(String),
 }
 
 /// Internal serde target for the tagged format. The public `ControlCommand` does
@@ -70,6 +90,10 @@ enum TaggedCommand {
     Inject {
         agent_id: String,
         text:     String,
+    },
+    #[serde(rename = "reset_budget")]
+    ResetBudget {
+        target: BudgetTarget,
     },
 }
 
@@ -101,6 +125,13 @@ pub fn parse_control_command(bytes: &[u8]) -> anyhow::Result<ControlCommand> {
                 anyhow::ensure!(!text.is_empty(), "inject: text must not be empty");
                 anyhow::ensure!(text.len() <= 65_536, "inject text too large (max 64 KiB)");
                 ControlCommand::Inject { agent_id, text }
+            }
+            TaggedCommand::ResetBudget { target } => {
+                if let BudgetTarget::Agent(id) = &target {
+                    anyhow::ensure!(!id.is_empty(), "reset_budget: agent id must not be empty");
+                }
+                // FUSE path is fire-and-forget; the HTTP path supplies confirm_tx.
+                ControlCommand::ResetBudget { target, confirm_tx: None }
             }
         });
     }

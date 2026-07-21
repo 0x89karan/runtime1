@@ -93,6 +93,11 @@ struct SchedulerState {
     deferred_seq:     u64,
     in_flight:        usize,
     tokens_spent:     u64,
+    /// Global budget-window start (ux.8′), wall-clock Unix seconds.
+    budget_window_start: u64,
+    /// Lifetime `tokens_spent` at the current window's start; windowed global
+    /// spend = `tokens_spent − global_window_anchor` (ux.8′, monotonic-counter).
+    global_window_anchor: u64,
     /// child_id → parent waiting info (parent is paused until child completes).
     awaiting:         HashMap<String, AwaitingParent>,
     /// Monotonically increasing counter for auto-generated child IDs.
@@ -134,11 +139,23 @@ struct SchedulerState {
     cred_gw: Option<Arc<crate::credential::CredentialGateway>>,
 }
 
+impl SchedulerState {
+    /// Global spend within the current budget window (ux.8′): lifetime − anchor.
+    /// The single source of truth for the windowed global ceiling comparison, so
+    /// the four call sites (admission, drain, rebase, reset) never drift on this
+    /// enforcement-path arithmetic. Mirrors `AgentTask::windowed_spent()`.
+    fn global_windowed_spent(&self) -> u64 {
+        self.tokens_spent.saturating_sub(self.global_window_anchor)
+    }
+}
+
 /// Scheduler-level state restored from a checkpoint (not exposed outside this module).
 struct SchedulerRestored {
     awaiting:           Vec<AwaitingEntry>,
     mailboxes:          HashMap<String, Vec<MailMessage>>,
     tokens_spent:       u64,
+    budget_window_start: u64,
+    global_window_anchor: u64,
     child_seq:          u64,
     spawn_depths:       HashMap<String, u32>,
     parent_map:         HashMap<String, String>,
@@ -214,6 +231,8 @@ impl Scheduler {
                 approval_seq:        cp_approval_seq,
                 waiting_agents:      cp_waiting_agents,
                 orchestrated_agents: cp_orchestrated_agents,
+                budget_window_start: cp_budget_window_start,
+                global_window_anchor: cp_global_window_anchor,
                 ..
             } = cp;
 
@@ -270,6 +289,8 @@ impl Scheduler {
                 approval_seq:        cp_approval_seq,
                 waiting_agents:      cp_waiting_agents,
                 orchestrated_agents: cp_orchestrated_agents,
+                budget_window_start: cp_budget_window_start,
+                global_window_anchor: cp_global_window_anchor,
             });
         } else {
             let mut universal_pending_local: Vec<AgentConfig> = Vec::new();
@@ -408,6 +429,8 @@ impl Scheduler {
             deferred_seq:       0,
             in_flight:          0,
             tokens_spent:       0,
+            budget_window_start: 0,
+            global_window_anchor: 0,
             awaiting:           HashMap::new(),
             child_seq:          0,
             spawn_depths:       HashMap::new(),
@@ -432,6 +455,8 @@ impl Scheduler {
         // Restore scheduler-level state from checkpoint when present.
         if let Some(r) = restored {
             state.tokens_spent = r.tokens_spent;
+            state.budget_window_start = r.budget_window_start;
+            state.global_window_anchor = r.global_window_anchor;
             state.child_seq    = r.child_seq;
             state.spawn_depths = r.spawn_depths;
             state.parent_map   = r.parent_map;
@@ -457,6 +482,8 @@ impl Scheduler {
             state.orchestrated.extend(r.orchestrated_agents);
             state.waiting.extend(r.waiting_agents);
         }
+
+        init_budget_window(&mut state, &sched, now_unix_secs());
 
         // Spawn universal-tier agents before the native seed loop.
         for cfg in universal_pending {
@@ -549,12 +576,25 @@ impl Scheduler {
         ).expect("failed to install SIGINT handler");
 
         'main: loop {
+            // Rebase budget windows first (ux.8′ / audit86-P0-2): wall-clock,
+            // independent of agent liveness, so an always-on agent parked on an
+            // exhausted budget is revived when its window rolls over. No-op when
+            // budget_reset_interval is 0 or no full window has elapsed.
+            maybe_rebase_windows(&mut state, &sched, &gateway, &registry, &recorder);
+
             // Poll universal agents for exit on each iteration (non-blocking).
             poll_universal_agents(&mut state, &recorder, &snapshot).await;
 
             // When all pending work is done, either wait for an operator command or exit.
             if state.pending.is_empty() && state.universal_agents.is_empty() {
                 match control_rx {
+                    // No control channel (ux.8′ F-B): if deferred work is waiting on a
+                    // budget-window rollover, keep looping so the tick-driven rebase can
+                    // revive it — breaking here would drop the deferred infer with no
+                    // outcome. Otherwise there is genuinely nothing left to do → exit.
+                    None if !state.deferred.is_empty() && sched.budget_reset_interval > 0 => {
+                        tokio::time::sleep(std::time::Duration::from_secs(BUDGET_TICK_SECS)).await;
+                    }
                     None => break 'main,
                     Some(ref mut rx) => {
                         tokio::select! {
@@ -563,6 +603,10 @@ impl Scheduler {
                                 dispatch_control_command(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
                                 update_snapshot(&snapshot, &state);
                             }
+                            // Periodic wake so a fully idle agentd still rebases its
+                            // budget window on schedule (ux.8′) — the loop-top
+                            // maybe_rebase_windows runs on the next iteration.
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(BUDGET_TICK_SECS)) => {}
                             _ = sigterm.recv() => {
                                 recorder.record(
                                     "agentd",
@@ -820,9 +864,12 @@ impl Scheduler {
 
                 for (agent_id, items) in candidates {
                     // Budget guard: require headroom for at least a small inference.
+                    // F3: compare WINDOWED spend, not lifetime — under a reset
+                    // window the lifetime total exceeds the per-window ceiling
+                    // within ~1 day, which would permanently skip distillation.
                     const MIN_DISTILL_TOKENS: u64 = 512;
                     let budget_ok = sched.global_token_budget == 0
-                        || state.tokens_spent + MIN_DISTILL_TOKENS <= sched.global_token_budget;
+                        || state.global_windowed_spent() + MIN_DISTILL_TOKENS <= sched.global_token_budget;
                     if !budget_ok {
                         break;
                     }
@@ -861,7 +908,9 @@ impl Scheduler {
                     let max_out_tokens = match sched.global_token_budget {
                         0 => req.max_tokens,
                         cap => {
-                            let remaining = cap.saturating_sub(state.tokens_spent) as u32;
+                            // F3: windowed remaining, not lifetime — else clamps to 0
+                            // ~1 day into a reset window and starves distillation.
+                            let remaining = cap.saturating_sub(state.global_windowed_spent()) as u32;
                             req.max_tokens.min(remaining)
                         }
                     };
@@ -1185,6 +1234,128 @@ fn make_infer_future(
 
 /// Drain the deferred queue, admitting agents until the cap or budget is hit.
 /// Agents that can never be admitted (budget exhausted) are denied immediately.
+/// How often a fully idle agentd wakes to check for a budget-window rollover.
+const BUDGET_TICK_SECS: u64 = 60;
+
+/// Wall-clock Unix seconds. Non-monotonic (NTP can step it); callers use
+/// `saturating_sub` so a backward step never underflows (ux.8′ / obs.1 pattern).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Advisory string appended to global-budget denials so a bricked operator sees
+/// the fix in the flight log instead of reaching for `rm checkpoint.json`.
+const BUDGET_REMEDY: &str =
+    "set [scheduler] budget_reset_interval (e.g. 86400) or POST /api/v1/budget/reset";
+
+/// One-time budget-window initialization at scheduler start (ux.8′ / audit86-P0-2).
+/// - A fresh start or a pre-ux.8′ checkpoint has `budget_window_start == 0` → open a
+///   clean window at `now`, anchoring all current spend (global + per-agent), so a
+///   migrated always-on agent doesn't inherit a spuriously-exhausted first window.
+/// - An already-anchored window in the FUTURE (dead RTC / forward clock spike captured
+///   in a prior rebase) is clamped to `now` (F2), else `now − start` saturates to 0 and
+///   resets stall for as long as the bogus future lasts.
+/// - Every agent is told whether a reset window is active (C1): when it is, per-agent
+///   budget exhaustion DEFERS scheduler-side instead of the agent self-terminating
+///   (which would strip waiting/orchestrated and permanently brick a resident agent).
+fn init_budget_window(state: &mut SchedulerState, sched: &SchedulerConfig, now: u64) {
+    // interval == 0 is legacy LIFETIME enforcement (ux.8′ Codex #3): leave the
+    // anchors at 0 so windowed_spent == lifetime spend, and leave every agent's
+    // budget_resettable at its `false` default (agents self-terminate on budget,
+    // the pre-ux.8′ behavior). Rebasing here would silently forgive prior spend
+    // once on a migrated checkpoint, breaking the documented "0 = lifetime".
+    if sched.budget_reset_interval == 0 {
+        return;
+    }
+    if state.budget_window_start == 0 {
+        state.budget_window_start = now;
+        state.global_window_anchor = state.tokens_spent;
+        for task in state.agents.values_mut() {
+            let _ = task.reset_budget_window();
+        }
+    } else if state.budget_window_start > now {
+        state.budget_window_start = now;
+    }
+    let budget_resettable = sched.budget_reset_interval > 0;
+    for task in state.agents.values_mut() {
+        task.set_budget_resettable(budget_resettable);
+    }
+}
+
+/// Whole budget-windows elapsed between `window_start` and `now` (ux.8′).
+/// Division, not a loop (a defaulted epoch anchor is ~1.8e9 s — a loop would spin
+/// ~20k times for a daily window). `saturating_sub` so an NTP step-back never
+/// underflows. `interval == 0` (no reset configured) → always 0.
+fn windows_elapsed(now_secs: u64, window_start: u64, interval: u64) -> u64 {
+    if interval == 0 {
+        return 0;
+    }
+    now_secs.saturating_sub(window_start) / interval
+}
+
+/// Rebase budget windows when whole intervals have elapsed (ux.8′ / audit86-P0-2).
+/// Wall-clock, division-based (never a loop), monotonic-counter (advances anchors,
+/// never zeroes the meters). No-op when the interval is 0 (legacy lifetime ceiling)
+/// or no full window has passed. On a real rollover it drains budget-deferred
+/// agents so an always-on agent parked on an exhausted budget resumes.
+fn maybe_rebase_windows(
+    state: &mut SchedulerState,
+    sched: &SchedulerConfig,
+    gateway: &Arc<dyn InferenceGateway + Send + Sync>,
+    registry: &Arc<ToolRegistry>,
+    recorder: &Arc<FlightRecorder>,
+) {
+    maybe_rebase_windows_at(state, sched, gateway, registry, recorder, now_unix_secs());
+}
+
+/// Testable core of `maybe_rebase_windows` with an injectable clock.
+fn maybe_rebase_windows_at(
+    state: &mut SchedulerState,
+    sched: &SchedulerConfig,
+    gateway: &Arc<dyn InferenceGateway + Send + Sync>,
+    registry: &Arc<ToolRegistry>,
+    recorder: &Arc<FlightRecorder>,
+    now_secs: u64,
+) {
+    // F2: if wall-clock stepped back below the window start (NTP correction after a
+    // rebase, RTC glitch), `windows_elapsed` would saturate to 0 and resets would
+    // stall until real time re-climbs past the stale start. Clamp the anchor to now
+    // so the window simply restarts from the corrected clock.
+    if sched.budget_reset_interval > 0 && state.budget_window_start > now_secs {
+        state.budget_window_start = now_secs;
+        return;
+    }
+    let n = windows_elapsed(now_secs, state.budget_window_start, sched.budget_reset_interval);
+    if n == 0 {
+        return;
+    }
+    let spent_before = state.global_windowed_spent();
+    state.global_window_anchor = state.tokens_spent;
+    state.budget_window_start = state
+        .budget_window_start
+        .saturating_add(n * sched.budget_reset_interval);
+    for task in state.agents.values_mut() {
+        let _ = task.reset_budget_window();
+    }
+    recorder.record(
+        "agentd",
+        None,
+        EventKind::BudgetReset,
+        json!({
+            "target":           "global",
+            "spent_before":     spent_before,
+            "window_start":     state.budget_window_start,
+            "interval_secs":    sched.budget_reset_interval,
+            "windows_advanced": n,
+        }),
+    );
+    // Admit agents that were deferred while the budget was exhausted.
+    drain_deferred(state, sched, gateway, registry, recorder);
+}
+
 fn drain_deferred(
     state: &mut SchedulerState,
     sched: &SchedulerConfig,
@@ -1192,7 +1363,13 @@ fn drain_deferred(
     registry: &Arc<ToolRegistry>,
     recorder: &Arc<FlightRecorder>,
 ) {
-    let budget_ok = |spent: u64| sched.global_token_budget == 0 || spent < sched.global_token_budget;
+    // Windowed global spend (ux.8′): capture the anchor by value so the closure
+    // does not borrow `state` (which is mutated in the admit loop below).
+    let anchor = state.global_window_anchor;
+    let budget_ok = |lifetime: u64| {
+        let w = lifetime.saturating_sub(anchor);
+        sched.global_token_budget == 0 || w < sched.global_token_budget
+    };
     let slot_ok   = |inf: usize| sched.max_concurrent_inferences == 0 || inf < sched.max_concurrent_inferences;
 
     // During shutdown, deny all queued agents immediately (no re-enqueue).
@@ -1217,18 +1394,24 @@ fn drain_deferred(
         return;
     }
 
-    // If budget is permanently exhausted, deny everything in the queue.
+    // Budget exhausted. With a reset window configured (ux.8′) this is TRANSIENT
+    // — leave deferred agents queued so the next window rollover (maybe_rebase_
+    // windows) drains them; terminating here is the old self-brick (audit86-P0-2).
+    // With no window (interval 0) it is permanent → legacy: deny everything.
     if !budget_ok(state.tokens_spent) {
+        if sched.budget_reset_interval > 0 {
+            return;
+        }
         while let Some(d) = state.deferred.pop() {
             recorder.record(
                 &d.agent_id,
                 None,
                 EventKind::AgentAdmissionDenied,
-                json!({ "reason": "global_budget_exhausted", "tokens_spent": state.tokens_spent }),
+                json!({ "reason": "global_budget_exhausted", "tokens_spent": state.tokens_spent, "remedy": BUDGET_REMEDY }),
             );
             handle_agent_terminal(
                 d.agent_id,
-                Err(anyhow::anyhow!("admission denied: global token budget exhausted")),
+                Err(anyhow::anyhow!("admission denied: global token budget exhausted ({BUDGET_REMEDY})")),
                 state,
                 sched,
                 gateway,
@@ -1239,10 +1422,26 @@ fn drain_deferred(
         return;
     }
 
-    // Admit as many as slots allow.
+    // Admit as many as slots allow. Re-check the PER-AGENT windowed cap here
+    // (ux.8′ F-A, cross-model review): drain_deferred runs on every inference
+    // completion, not just on rollover, so an agent deferred for exceeding its
+    // OWN windowed budget (enqueue_or_defer) must not be silently re-admitted
+    // just because a slot freed — that would leak the per-agent cap one
+    // inference at a time. Only a true rollover (which resets per-agent windows
+    // before draining) or a per-agent ResetBudget should revive it. Hold
+    // still-over-cap entries aside and requeue them.
     let is_multi = state.agents.len() > 1;
+    let mut holdback: Vec<DeferredInfer> = Vec::new();
     while !state.deferred.is_empty() && slot_ok(state.in_flight) {
         let d = state.deferred.pop().expect("checked non-empty");
+        let per_agent_over = state.agents.get(&d.agent_id).is_some_and(|a| {
+            let b = a.token_budget();
+            b != 0 && a.windowed_spent() >= b
+        });
+        if per_agent_over {
+            holdback.push(d);
+            continue;
+        }
         state.in_flight += 1;
         recorder.record(
             &d.agent_id,
@@ -1258,6 +1457,9 @@ fn drain_deferred(
         let id   = d.agent_id;
         let turn = d.turn;
         state.pending.push(make_infer_future(d.request, id, turn, is_multi, gw, rec, sa, sl, eg));
+    }
+    for d in holdback {
+        state.deferred.push(d);
     }
 }
 
@@ -1277,7 +1479,18 @@ fn enqueue_or_defer(
     recorder: &Arc<FlightRecorder>,
 ) {
     let slot_ok   = sched.max_concurrent_inferences == 0 || state.in_flight < sched.max_concurrent_inferences;
-    let budget_ok = sched.global_token_budget == 0 || state.tokens_spent < sched.global_token_budget;
+    // Windowed global spend (ux.8′): lifetime − anchor vs the (per-window) ceiling.
+    let global_windowed = state.global_windowed_spent();
+    let global_ok = sched.global_token_budget == 0 || global_windowed < sched.global_token_budget;
+    // Per-agent windowed budget (C1): the agent's own per-window cap. Enforced
+    // here (pre-dispatch) so per-agent exhaustion DEFERS under a window instead of
+    // the agent self-terminating in step_need_infer — that would strip
+    // waiting/orchestrated and permanently brick a resident agent (audit86-P0-2).
+    let per_agent_over = state.agents.get(&agent_id).is_some_and(|a| {
+        let b = a.token_budget();
+        b != 0 && a.windowed_spent() >= b
+    });
+    let budget_ok = global_ok && !per_agent_over;
 
     match effect {
         AgentEffect::Infer(req) => {
@@ -1298,21 +1511,34 @@ fn enqueue_or_defer(
                 let id       = agent_id;
                 state.pending.push(make_infer_future(req, id, turn, is_multi, gw, rec, sa, sl, eg));
             } else if !budget_ok {
+                let reason = if !global_ok { "global_budget_exhausted" } else { "agent_budget_exhausted" };
                 recorder.record(
                     &agent_id,
                     Some(turn),
                     EventKind::AgentAdmissionDenied,
-                    json!({ "reason": "global_budget_exhausted", "tokens_spent": state.tokens_spent }),
+                    json!({ "reason": reason, "tokens_spent": state.tokens_spent, "remedy": BUDGET_REMEDY }),
                 );
-                handle_agent_terminal(
-                    agent_id,
-                    Err(anyhow::anyhow!("admission denied: global token budget exhausted")),
-                    state,
-                    sched,
-                    gateway,
-                    registry,
-                    recorder,
-                );
+                if sched.budget_reset_interval > 0 {
+                    // Transient exhaustion (ux.8′/C1): with a reset window configured,
+                    // ANY agent over the global OR its per-agent windowed ceiling is
+                    // DEFERRED (not terminated) — the next window rollover drains the
+                    // queue. Applies to every agent, not just the always-on one. The
+                    // InferenceRequest is preserved intact.
+                    let seq = state.deferred_seq;
+                    state.deferred_seq += 1;
+                    state.deferred.push(DeferredInfer { priority, seq, agent_id, request: req, turn });
+                } else {
+                    // No window (legacy): permanent exhaustion → terminate.
+                    handle_agent_terminal(
+                        agent_id,
+                        Err(anyhow::anyhow!("admission denied: {reason} ({BUDGET_REMEDY})")),
+                        state,
+                        sched,
+                        gateway,
+                        registry,
+                        recorder,
+                    );
+                }
             } else {
                 // Slot full — defer.
                 let seq = state.deferred_seq;
@@ -1621,13 +1847,15 @@ fn dispatch_spawn(
         .map(|a| a.model_cfg_cloned())
         .unwrap_or_default();
 
-    let child_task = AgentTask::new(
+    let mut child_task = AgentTask::new(
         &child_id,
         &config.task,
         &child_agent_cfg,
         &child_model_cfg,
         child_specs,
     );
+    // C1: inherit the reset-window mode so per-agent exhaustion defers, not bricks.
+    child_task.set_budget_resettable(sched.budget_reset_interval > 0);
 
     // 6. Register child in scheduler state — guard for ID collision.
     if state.agents.contains_key(&child_id) || state.outcomes.contains_key(&child_id) {
@@ -1858,6 +2086,84 @@ fn dispatch_control_command(
                 );
             }
         }
+        ControlCommand::ResetBudget { target, confirm_tx } => {
+            use crate::control::BudgetTarget;
+            // Result carries (spent_before, window_start) on success (ux.8′ F4).
+            let result: Result<(u64, u64), String> = match &target {
+                BudgetTarget::Global => {
+                    let old = state.global_windowed_spent();
+                    state.global_window_anchor = state.tokens_spent;
+                    // F4: advance the window start to now, else the next loop-tick
+                    // maybe_rebase sees the old start and immediately rebases AGAIN
+                    // (a manual reset at T+interval-1 would double-reset 1s later).
+                    state.budget_window_start = now_unix_secs();
+                    // F4: also rebase every per-agent window — a manual global reset
+                    // that revives a deferred agent must not leave it instantly
+                    // re-tripped on its own stale per-agent window.
+                    for task in state.agents.values_mut() {
+                        let _ = task.reset_budget_window();
+                    }
+                    recorder.record(
+                        "agentd",
+                        None,
+                        EventKind::BudgetReset,
+                        json!({
+                            "target":           "global",
+                            "spent_before":     old,
+                            "window_start":     state.budget_window_start,
+                            "interval_secs":    sched.budget_reset_interval,
+                            "windows_advanced": 0,
+                        }),
+                    );
+                    // A manual global reset frees budget — admit any deferred agents.
+                    drain_deferred(state, sched, gateway, registry, recorder);
+                    Ok((old, state.budget_window_start))
+                }
+                BudgetTarget::Agent(id) => {
+                    let window_start = state.budget_window_start;
+                    let old_opt = state.agents.get_mut(id).map(|t| t.reset_budget_window());
+                    match old_opt {
+                        Some(old) => {
+                            recorder.record(
+                                id,
+                                None,
+                                EventKind::BudgetReset,
+                                json!({
+                                    "target":           id,
+                                    "spent_before":     old,
+                                    "window_start":     window_start,
+                                    "interval_secs":    sched.budget_reset_interval,
+                                    "windows_advanced": 0,
+                                }),
+                            );
+                            // Codex #2: a per-agent reset must also admit that agent if
+                            // it was deferred on its own cap — else the 200 reports a
+                            // reset while the agent stays parked until unrelated activity.
+                            drain_deferred(state, sched, gateway, registry, recorder);
+                            Ok((old, window_start))
+                        }
+                        None => Err(format!("agent '{id}' not found")),
+                    }
+                }
+            };
+            match confirm_tx {
+                // HTTP path: report old→new (or 404) synchronously.
+                Some(tx) => {
+                    let _ = tx.send(result);
+                }
+                // FUSE path: fire-and-forget; surface only the error case.
+                None => {
+                    if let Err(e) = result {
+                        recorder.record(
+                            "agentd",
+                            None,
+                            EventKind::FuseControlError,
+                            json!({ "error": e, "is_error": true }),
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1928,7 +2234,9 @@ fn dispatch_operator_spawn_inner(
     };
 
     let specs     = registry.filtered_specs(agent_cfg.capabilities.as_deref());
-    let task      = crate::agent::AgentTask::new(&agent_id, &req.task, &agent_cfg, default_model, specs);
+    let mut task  = crate::agent::AgentTask::new(&agent_id, &req.task, &agent_cfg, default_model, specs);
+    // C1: operator-spawned agents defer (not brick) on per-agent budget under a window.
+    task.set_budget_resettable(sched.budget_reset_interval > 0);
 
     state.agents.insert(agent_id.clone(), task);
     state.spawn_depths.insert(agent_id.clone(), 0);
@@ -2475,6 +2783,8 @@ fn build_scheduler_checkpoint(
         waiting_agents:      state.waiting.iter().cloned().collect(),
         orchestrated_agents: state.orchestrated.iter().cloned().collect(),
         credential_health,
+        budget_window_start:  state.budget_window_start,
+        global_window_anchor: state.global_window_anchor,
     }
 }
 
@@ -3534,6 +3844,8 @@ mod tests {
             deferred_seq:       0,
             in_flight:          0,
             tokens_spent:       0,
+            budget_window_start: 0,
+            global_window_anchor: 0,
             awaiting:           HashMap::new(),
             child_seq:          0,
             spawn_depths:       HashMap::new(),
@@ -3725,6 +4037,7 @@ mod tests {
             stored_response: None,
             terminal:    false,
             short_term:  vec![],
+            window_anchor: 0,
         }
     }
 
@@ -3743,6 +4056,8 @@ mod tests {
             waiting_agents:      vec![],
             orchestrated_agents: vec![],
             credential_health:   HashMap::new(),
+            budget_window_start: 0,
+            global_window_anchor: 0,
         }
     }
 
@@ -3847,6 +4162,8 @@ mod tests {
             waiting_agents:      vec![],
             orchestrated_agents: vec![],
             credential_health:   HashMap::new(),
+            budget_window_start: 0,
+            global_window_anchor: 0,
         };
         let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
         let (rec, _tmp) = recorder();
@@ -4570,6 +4887,342 @@ mod tests {
         update_snapshot(&snap, &state);
         let s = snap.read().unwrap();
         assert!(s.egress_addr.is_none());
+    }
+
+    // ── ux.8′ budget-window tests ─────────────────────────────────────────────
+
+    #[test]
+    fn windows_elapsed_math() {
+        // Division-based, saturating, interval 0 = never.
+        assert_eq!(windows_elapsed(1_250, 1_000, 100), 2);
+        assert_eq!(windows_elapsed(1_099, 1_000, 100), 0, "partial window does not count");
+        assert_eq!(windows_elapsed(1_000, 1_000, 100), 0);
+        assert_eq!(windows_elapsed(900, 1_000, 100), 0, "clock step-back saturates to 0");
+        assert_eq!(windows_elapsed(5_000, 5_000, 0), 0, "interval 0 never resets");
+        // Epoch-default anchor with a daily window: division, not a ~20k-iter loop.
+        assert_eq!(windows_elapsed(1_800_000_000, 0, 86_400), 20_833);
+    }
+
+    fn budget_sched(interval: u64) -> SchedulerConfig {
+        SchedulerConfig { global_token_budget: 1_000, budget_reset_interval: interval, ..unlimited() }
+    }
+
+    #[test]
+    fn rebase_advances_anchor_and_window_by_whole_intervals() {
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mut state = minimal_state("rebase");
+        state.tokens_spent = 500;
+        state.global_window_anchor = 0;
+        state.budget_window_start = 1_000;
+        let sched = budget_sched(100);
+
+        maybe_rebase_windows_at(&mut state, &sched, &gateway, &registry, &rec, 1_250);
+        assert_eq!(state.global_window_anchor, 500, "anchor advances to current lifetime spend");
+        assert_eq!(state.budget_window_start, 1_200, "window advances by whole intervals (2×100)");
+        assert_eq!(state.tokens_spent, 500, "lifetime meter is never zeroed");
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(log.contains("\"budget_reset\""), "a budget_reset event must be emitted");
+    }
+
+    #[test]
+    fn rebase_noop_when_interval_zero_or_partial() {
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let mut state = minimal_state("noop");
+        state.budget_window_start = 1_000;
+        // interval 0 → legacy lifetime ceiling, never rebases.
+        maybe_rebase_windows_at(&mut state, &budget_sched(0), &gateway, &registry, &rec, 9_999_999);
+        assert_eq!(state.budget_window_start, 1_000);
+        // partial window → no rebase.
+        maybe_rebase_windows_at(&mut state, &budget_sched(100), &gateway, &registry, &rec, 1_099);
+        assert_eq!(state.budget_window_start, 1_000);
+    }
+
+    #[test]
+    fn restarts_never_double_or_skip_resets() {
+        // Persisted window_start means elapsed accumulates across "restarts";
+        // the number of resets equals floor(total_elapsed / interval), never
+        // one-per-tick (double) nor zero (never-reset).
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mut state = minimal_state("restart");
+        state.budget_window_start = 1_000;
+        let sched = budget_sched(100);
+        // Ticks (as if from repeated short sessions) across 250s of wall time.
+        for now in [1_050, 1_099, 1_150, 1_199, 1_250] {
+            maybe_rebase_windows_at(&mut state, &sched, &gateway, &registry, &rec, now);
+        }
+        let resets = std::fs::read_to_string(tmp.path()).unwrap_or_default()
+            .matches("\"budget_reset\"").count();
+        assert_eq!(resets, 2, "250s / 100s window = exactly 2 resets");
+    }
+
+    #[test]
+    fn reset_budget_command_global_and_agent_and_unknown() {
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let mdl = model_cfg();
+        let sched = budget_sched(100);
+        let mut state = minimal_state("cos");
+        state.tokens_spent = 700;
+        state.global_window_anchor = 200; // windowed = 500
+
+        use crate::control::{BudgetTarget, ControlCommand};
+        // Global reset → anchor jumps to lifetime; confirm reports old windowed.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::ResetBudget { target: BudgetTarget::Global, confirm_tx: Some(tx) },
+            &mdl, &mut state, &sched, &gateway, &registry, &rec,
+        );
+        let (spent_before, _window_start) = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(spent_before, 500, "global reset reports pre-reset windowed spend");
+        assert_eq!(state.global_window_anchor, 700);
+
+        // Unknown agent → Err (the HTTP layer maps this to 404).
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::ResetBudget { target: BudgetTarget::Agent("ghost".into()), confirm_tx: Some(tx) },
+            &mdl, &mut state, &sched, &gateway, &registry, &rec,
+        );
+        assert!(rx.blocking_recv().unwrap().is_err(), "unknown agent must return an error");
+
+        // Known agent → Ok.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::ResetBudget { target: BudgetTarget::Agent("cos".into()), confirm_tx: Some(tx) },
+            &mdl, &mut state, &sched, &gateway, &registry, &rec,
+        );
+        assert!(rx.blocking_recv().unwrap().is_ok(), "known agent reset must succeed");
+    }
+
+    fn test_infer_req() -> InferenceRequest {
+        InferenceRequest { system: None, messages: vec![], tools: vec![], max_tokens: 1024, streaming: false }
+    }
+
+    #[test]
+    fn budget_deferred_agent_revived_on_rollover() {
+        // The P0-2 fix end-to-end: an agent deferred on an exhausted GLOBAL window
+        // is admitted (revived) — not terminated — when the window rolls over.
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let mut state = minimal_state("cos");
+        let sched = budget_sched(100); // global ceiling 1000, 100s window
+        state.tokens_spent = 1_500;          // windowed = 1500 − 0 ≥ 1000 → exhausted
+        state.global_window_anchor = 0;
+        state.budget_window_start = 1_000;
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "cos".into(), request: test_infer_req(), turn: 0,
+        });
+
+        maybe_rebase_windows_at(&mut state, &sched, &gateway, &registry, &rec, 1_250);
+
+        assert!(state.deferred.is_empty(), "rollover must drain the deferred agent");
+        assert_eq!(state.in_flight, 1, "the revived agent is admitted (in-flight), not terminated");
+        assert!(!state.outcomes.contains_key("cos"), "revived agent must NOT be terminated");
+        assert!(state.agents.contains_key("cos"), "revived agent stays live");
+    }
+
+    #[test]
+    fn drain_deferred_transient_under_window_permanent_without() {
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+
+        // interval > 0: exhausted global budget is TRANSIENT → queue preserved.
+        let (rec, _t1) = recorder();
+        let mut state = minimal_state("a");
+        state.tokens_spent = 5_000; // ≥ 1000
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0,
+        });
+        drain_deferred(&mut state, &budget_sched(100), &gateway, &registry, &rec);
+        assert_eq!(state.deferred.len(), 1, "under a window, exhausted agents stay deferred (not terminated)");
+        assert!(!state.outcomes.contains_key("a"));
+
+        // interval == 0: permanent → deny/terminate everything queued (legacy).
+        let (rec, _t2) = recorder();
+        let mut state = minimal_state("a");
+        state.tokens_spent = 5_000;
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0,
+        });
+        drain_deferred(&mut state, &budget_sched(0), &gateway, &registry, &rec);
+        assert!(state.deferred.is_empty(), "no window → deny everything queued");
+        assert!(state.outcomes.contains_key("a"), "no window → exhausted agent is terminated");
+    }
+
+    #[test]
+    fn enqueue_over_global_budget_defers_or_terminates() {
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+
+        // interval > 0 → defer, agent stays live.
+        let (rec, _t1) = recorder();
+        let mut state = minimal_state("a");
+        state.tokens_spent = 5_000;
+        enqueue_or_defer(AgentEffect::Infer(test_infer_req()), "a".into(), 0, 0, None,
+            &mut state, &budget_sched(100), &gateway, &registry, &rec);
+        assert_eq!(state.deferred.len(), 1, "over-budget Infer defers under a window");
+        assert!(!state.outcomes.contains_key("a"));
+
+        // interval == 0 → terminate.
+        let (rec, _t2) = recorder();
+        let mut state = minimal_state("a");
+        state.tokens_spent = 5_000;
+        enqueue_or_defer(AgentEffect::Infer(test_infer_req()), "a".into(), 0, 0, None,
+            &mut state, &budget_sched(0), &gateway, &registry, &rec);
+        assert!(state.outcomes.contains_key("a"), "no window → over-budget Infer terminates");
+    }
+
+    #[test]
+    fn per_agent_budget_defers_under_window_and_revives() {
+        // C1: per-agent (not just global) windowed exhaustion defers under a window,
+        // and the rollover revives it. Global budget is unlimited here so ONLY the
+        // per-agent cap is in play.
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let sched = SchedulerConfig { global_token_budget: 0, budget_reset_interval: 100, ..unlimited() };
+        let mut state = minimal_state("a"); // agent token_budget = 100_000
+        state.budget_window_start = 1_000;
+        state.agents.get_mut("a").unwrap().test_set_spend(150_000); // windowed ≥ 100_000
+
+        enqueue_or_defer(AgentEffect::Infer(test_infer_req()), "a".into(), 0, 0, None,
+            &mut state, &sched, &gateway, &registry, &rec);
+        assert_eq!(state.deferred.len(), 1, "per-agent over-budget defers under a window (not terminate)");
+        assert!(!state.outcomes.contains_key("a"), "must NOT terminate — that would brick a resident agent");
+
+        // Rollover resets the per-agent window → windowed drops to 0 → revived.
+        maybe_rebase_windows_at(&mut state, &sched, &gateway, &registry, &rec, 1_250);
+        assert!(state.deferred.is_empty(), "rollover revives the per-agent-deferred agent");
+        assert_eq!(state.in_flight, 1);
+    }
+
+    #[test]
+    fn drain_does_not_admit_per_agent_over_budget() {
+        // F-A (ship adversarial, cross-model): drain_deferred runs on EVERY inference
+        // completion, not just rollover. An agent over its own per-agent windowed cap
+        // must stay deferred even when the global window has room and a slot is free —
+        // otherwise the per-agent cap leaks one inference per slot-freed drain.
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mut state = minimal_state("a"); // per-agent token_budget = 100_000
+        state.tokens_spent = 0;             // global windowed 0 < 1000 → global has room
+        state.agents.get_mut("a").unwrap().test_set_spend(150_000); // per-agent windowed ≥ 100_000
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0,
+        });
+        drain_deferred(&mut state, &budget_sched(100), &gateway, &registry, &rec);
+        assert_eq!(state.deferred.len(), 1, "over-per-agent-cap agent must stay deferred, not admitted");
+        assert_eq!(state.in_flight, 0, "no admission");
+        assert!(!state.outcomes.contains_key("a"), "and not terminated either");
+    }
+
+    #[test]
+    fn agent_reset_drains_the_reset_agent() {
+        // Codex #2: a per-agent ResetBudget must admit the agent if it was deferred on
+        // its own cap — else the 200 reports a reset while the agent stays parked.
+        use crate::control::{BudgetTarget, ControlCommand};
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mdl = model_cfg();
+        let sched = SchedulerConfig { global_token_budget: 0, budget_reset_interval: 100, ..unlimited() };
+        let mut state = minimal_state("a");
+        state.agents.get_mut("a").unwrap().test_set_spend(150_000); // over per-agent 100_000
+        state.deferred.push(DeferredInfer {
+            priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0,
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::ResetBudget { target: BudgetTarget::Agent("a".into()), confirm_tx: Some(tx) },
+            &mdl, &mut state, &sched, &gateway, &registry, &rec,
+        );
+        assert!(rx.blocking_recv().unwrap().is_ok());
+        assert!(state.deferred.is_empty(), "per-agent reset must drain the deferred agent");
+        assert_eq!(state.in_flight, 1, "reset revives it, not just reports success");
+    }
+
+    #[test]
+    fn interval_zero_keeps_lifetime_no_rebase() {
+        // Codex #3: interval == 0 is legacy LIFETIME enforcement — init_budget_window
+        // must NOT rebase the anchor on a migrated checkpoint, or prior spend is
+        // forgiven once and "0 = lifetime" is a lie.
+        let mut state = minimal_state("a");
+        state.tokens_spent = 5_000;
+        state.budget_window_start = 0;   // migrated / fresh
+        state.global_window_anchor = 0;
+        init_budget_window(&mut state, &SchedulerConfig { budget_reset_interval: 0, ..unlimited() }, 9_999);
+        assert_eq!(state.global_window_anchor, 0, "interval=0 must not rebase — lifetime preserved");
+        assert_eq!(state.budget_window_start, 0, "interval=0 leaves the window unset");
+        assert_eq!(state.global_windowed_spent(), 5_000, "windowed == lifetime under interval=0");
+    }
+
+    #[test]
+    fn migration_opens_clean_window_and_sets_resettable() {
+        // T4: a pre-ux.8′ checkpoint (budget_window_start == 0) with accrued spend
+        // must open a clean window at `now`, anchoring all current spend, so the
+        // migrated agent's windowed spend is 0 (no spurious first-window brick).
+        let mut state = minimal_state("cos");
+        state.tokens_spent = 9_000_000;
+        state.global_window_anchor = 0;
+        state.budget_window_start = 0; // pre-ux.8′ / fresh
+        state.agents.get_mut("cos").unwrap().test_set_spend(1_500_000);
+
+        init_budget_window(&mut state, &budget_sched(86_400), 1_800_000_000);
+
+        assert_eq!(state.budget_window_start, 1_800_000_000, "window opens at now");
+        assert_eq!(state.global_window_anchor, state.tokens_spent, "global anchor = current lifetime spend");
+        assert_eq!(state.agents.get("cos").unwrap().windowed_spent(), 0, "per-agent windowed spend rebased to 0");
+    }
+
+    #[test]
+    fn future_window_start_is_clamped() {
+        // F2: a persisted window_start in the future (NTP/RTC glitch) must not stall
+        // resets forever — maybe_rebase clamps it back to now.
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let mut state = minimal_state("a");
+        state.budget_window_start = 9_000; // far ahead of `now`
+        maybe_rebase_windows_at(&mut state, &budget_sched(100), &gateway, &registry, &rec, 5_000);
+        assert_eq!(state.budget_window_start, 5_000, "future window_start clamps to now");
+    }
+
+    #[test]
+    fn manual_global_reset_advances_window_start_and_resets_agents() {
+        // F4: a manual global reset advances the window start (no double-rebase on the
+        // next tick) and rebases per-agent windows.
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let mdl = model_cfg();
+        let sched = budget_sched(100);
+        let mut state = minimal_state("cos");
+        state.budget_window_start = 1_000;
+        state.agents.get_mut("cos").unwrap().test_set_spend(500);
+
+        use crate::control::{BudgetTarget, ControlCommand};
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::ResetBudget { target: BudgetTarget::Global, confirm_tx: Some(tx) },
+            &mdl, &mut state, &sched, &gateway, &registry, &rec,
+        );
+        let (_spent, window_start) = rx.blocking_recv().unwrap().unwrap();
+        assert!(window_start > 1_000, "window_start advances to now (not left at the stale 1000)");
+        assert_eq!(state.budget_window_start, window_start);
+        assert_eq!(state.agents.get("cos").unwrap().windowed_spent(), 0, "per-agent window reset too");
+        // A tick just past the (new) window must NOT immediately double-reset.
+        let before = std::fs::read_to_string(_tmp.path()).unwrap_or_default().matches("\"budget_reset\"").count();
+        maybe_rebase_windows_at(&mut state, &sched, &gateway, &registry, &rec, window_start + 1);
+        let after = std::fs::read_to_string(_tmp.path()).unwrap_or_default().matches("\"budget_reset\"").count();
+        assert_eq!(before, after, "no double-reset one second after a manual reset");
     }
 
     // ── p7.6 universal-tier tests ─────────────────────────────────────────────

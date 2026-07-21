@@ -13,6 +13,7 @@
 //!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
+//!   POST /api/v1/budget/reset                    → 200 {target,spent_before,reset_to,window_start} | 400 | 404 | 503 (ux.8′)
 //!   GET  /api/v1/credentials                     → 200 CredentialSnapshot JSON (cred.5)
 //!   POST /api/v1/credentials/:provider/reset-attention → 200 | 404 (cred.7)
 
@@ -335,6 +336,50 @@ async fn route(
                 Ok(Ok(agent_id)) => json_response(StatusCode::CREATED, json!({"agent_id": agent_id})),
                 Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
                 Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for agent creation"),
+            }
+        }
+
+        (Method::POST, "/api/v1/budget/reset") => {
+            // ux.8′ D2 manual escape hatch. Body: {"target":"global"} or
+            // {"target":{"agent":"<id>"}}. Confirm-channel (like spawn) so we can
+            // report old→new and 404 an unknown agent — never fire-and-forget.
+            if body.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "request body required");
+            }
+            #[derive(serde::Deserialize)]
+            struct ResetReq {
+                target: crate::control::BudgetTarget,
+            }
+            let req: ResetReq = match serde_json::from_slice(body) {
+                Ok(r) => r,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+            };
+            let target_label = match &req.target {
+                crate::control::BudgetTarget::Global => "global".to_string(),
+                crate::control::BudgetTarget::Agent(id) => id.clone(),
+            };
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<Result<(u64, u64), String>>();
+            let cmd = ControlCommand::ResetBudget { target: req.target, confirm_tx: Some(confirm_tx) };
+            match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running");
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(2), confirm_rx).await {
+                Ok(Ok(Ok((spent_before, window_start)))) => json_response(
+                    StatusCode::OK,
+                    json!({ "target": target_label, "spent_before": spent_before, "reset_to": 0, "window_start": window_start }),
+                ),
+                Ok(Ok(Err(e))) => error_response(StatusCode::NOT_FOUND, &e),
+                Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
+                Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for budget reset"),
             }
         }
 
@@ -905,6 +950,61 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let ra = resp.headers().get("retry-after").map(|v| v.to_str().unwrap_or(""));
         assert_eq!(ra, Some("1"), "deny 503 must carry Retry-After: 1");
+    }
+
+    #[tokio::test]
+    async fn budget_reset_empty_body_returns_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/budget/reset", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn budget_reset_malformed_body_returns_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/budget/reset", "", b"{not json}").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn budget_reset_without_control_tx_returns_503() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/budget/reset", "", br#"{"target":"global"}"#).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn budget_reset_happy_path_reports_old_and_window() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        // Responder: reply Ok((spent_before, window_start)) as the scheduler would.
+        tokio::spawn(async move {
+            if let Some(ControlCommand::ResetBudget { confirm_tx: Some(c), .. }) = rx.recv().await {
+                let _ = c.send(Ok((500, 12_345)));
+            }
+        });
+        let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/budget/reset", "", br#"{"target":"global"}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["spent_before"], 500);
+        assert_eq!(v["reset_to"], 0);
+        assert_eq!(v["window_start"], 12_345);
+    }
+
+    #[tokio::test]
+    async fn budget_reset_unknown_agent_returns_404() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        tokio::spawn(async move {
+            if let Some(ControlCommand::ResetBudget { confirm_tx: Some(c), .. }) = rx.recv().await {
+                let _ = c.send(Err("agent 'ghost' not found".into()));
+            }
+        });
+        let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/budget/reset", "", br#"{"target":{"agent":"ghost"}}"#).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

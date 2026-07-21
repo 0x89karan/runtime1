@@ -3772,6 +3772,8 @@ max_requests_per_agent = 100
             waiting_agents:      vec![],
             orchestrated_agents: vec![],
             credential_health:   health,
+            budget_window_start: 0,
+            global_window_anchor: 0,
         };
         let json = serde_json::to_string(&cp).expect("serialize must succeed");
         let back: crate::checkpoint::SchedulerCheckpoint =

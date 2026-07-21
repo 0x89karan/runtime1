@@ -3,6 +3,44 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.89.0] - 2026-07-21
+
+### Fixed
+- **A budget-capped agent bricked the whole process instead of pausing**
+  (ux.8′, P0-2). When lifetime token spend hit `global_token_budget`, the
+  scheduler terminated the agent — under the long-lived CoS this meant the
+  assistant died on day 2 and never came back. Enforcement moved to admission:
+  an over-budget agent now **defers** (process stays alive, work is held) and
+  resumes automatically when its window rolls over. The self-brick is gone.
+
+### Added
+- **Rolling budget windows** (ux.8′): `[scheduler] budget_reset_interval`
+  (seconds; `0` = legacy lifetime enforcement, the default) caps spend per
+  window instead of over the process lifetime. The window rebases on wall-clock
+  — at the top of the scheduler loop and on a 60s idle tick — using
+  division-based catch-up so a long sleep advances the correct number of whole
+  windows in one step (no loop-spin). The token meter is monotonic and never
+  zeroes: windowed spend is `lifetime − window_anchor`, so the lifetime
+  accounting the flight recorder and receipts depend on stays intact across
+  every rollover.
+- **Manual budget reset** — `POST /api/v1/budget/reset` with
+  `{"target":"global"}` or `{"target":{"agent":"<id>"}}` rebases the window
+  anchor to current spend (clears the ceiling without destroying the lifetime
+  meter), reports `spent_before` → new `window_start`, and returns 404 for an
+  unknown agent. Also exposed on the `/agents/control` FUSE surface as
+  `{"reset_budget":{...}}` (fire-and-forget).
+- **`BudgetReset` flight-recorder event** — every automatic rollover and manual
+  reset is recorded with the window it opened and the spend it forgave.
+- CoS configs now run a 24h budget window (`budget_reset_interval = 86400`):
+  the shipped distro overlay caps at `global_token_budget = 50_000_000`/day, the
+  repo dev default at `10_000_000`/day.
+
+### Notes
+- Checkpoint `FORMAT_VERSION` stays **4** — the new fields
+  (`window_anchor`, `budget_window_start`, `global_window_anchor`) are additive
+  with serde defaults, so a v0.89.0 checkpoint still loads on v0.88.0 (the
+  window simply reads as unset). Rollback-safe.
+
 ## [v0.88.0] - 2026-07-18
 
 ### Fixed
