@@ -1169,16 +1169,23 @@ increments, friction-ordered, each independently shippable. Full design + premis
   autoplan gate 2026-07-20 → the **visibility half** (per-agent spend on snapshot/FUSE/TUI +
   `SetBudget` runtime mutation) moved to ux.11. Closes audit86-P0-2 + P1-1. Supersedes the old ux.8
   "live budget control" scope below.
-- **ux.11** — Trust after absence (also inherits from the ux.8′ split 2026-07-20: **per-agent spend on
-  snapshot/FUSE/TUI, `SetBudget` runtime cap mutation, and the `BudgetRisk`→"spend risk" attention re-key**
-  — deferred here because ux.11 touches these surfaces anyway; Design review pre-flagged that spend/cap
-  rendering must special-case unlimited (`47k spent`, never `47k/0`) and abbreviate to k/M for the 12-col
-  column): durable run records in redb derived from `flight.jsonl` (id,
-  start/end, status, last error, approvals, spend, stop reason); in-process digest timer (NOT cron_mcp);
-  native `runs_query` tool for the CoS; CoS-written morning brief into the chat rail; TUI "Runs" view
-  (last N → status, spend, failure reason, minimal event tail); records via API + FUSE. Dependency:
-  flight.jsonl rotation (audit86-P1-2 / run.1) — offset-track-and-survive-truncation or pull rotation
-  forward; decide at autoplan.
+- **ux.11 — SPLIT 2-way at autoplan CEO gate (2026-07-21).** Both CEO voices converged that the bundled
+  ux.11 (trust-after-absence + inherited budget-visibility) was the design-doc's rejected Approach B /
+  a big-first-increment. Split (`docs/plans/ux.11-trust-after-absence.md`):
+  - **ux.11a — Budget visibility (ships first):** per-agent **windowed** spend on snapshot/FUSE/TUI;
+    `SetBudget` runtime mutation (`ControlCommand::SetBudget` + `POST /api/v1/budget/set` + FUSE, mirrors
+    the ux.8′ ResetBudget path) + `AgentTask::set_token_budget`; `BudgetRisk`→windowed-spend re-key.
+    Closes the ux.8′ P1 "visible + settable per-agent spend" debt. Small; all precedents shipped in ux.8′.
+    Rendering special-cases unlimited (`47k spent`, never `47k/0`) and abbreviates k/M for the 12-col column.
+    ux.13 later only unifies SetBudget's write path (no new semantics — no double-claim).
+  - **ux.11b — Trust after absence (own gate, may split further):** durable run records in `runs.redb`
+    written from **authoritative scheduler state-machine transitions** (CEO C1 — NOT flight.jsonl-as-truth,
+    which violates the best-effort-log invariant), enriched by the **existing** `otel/src/tail.rs`
+    `FileTailer` (CEO C2 — copy-truncate-tested, do not reimplement); **catch-up** digest on a persisted
+    last-brief-timestamp (CEO C3 — a live in-process timer misses the overnight/restart absence it exists
+    for; use ux.8′'s division-based catch-up); per-run spend = Δ(lifetime) across segment flight events
+    (CEO C4 — not `windowed_spent`); native `runs_query` tool; CoS morning brief into the chat rail;
+    TUI "Runs" view **deferred** (CEO C5 — conversational drill-down via `runs_query` may subsume it).
 - **ux.12** — Reach: one two-way Telegram sidecar (h7.x pattern, single chat-ID allowlist, token via
   env): digest delivery + approval push + approve/deny replies through the existing approvals API. **No
   inject** (cut on cross-model challenge — no lived friction; re-add only if dogfood shows it).
