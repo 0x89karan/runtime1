@@ -1178,14 +1178,24 @@ increments, friction-ordered, each independently shippable. Full design + premis
     Closes the ux.8′ P1 "visible + settable per-agent spend" debt. Small; all precedents shipped in ux.8′.
     Rendering special-cases unlimited (`47k spent`, never `47k/0`) and abbreviates k/M for the 12-col column.
     ux.13 later only unifies SetBudget's write path (no new semantics — no double-claim).
-  - **ux.11b — Trust after absence (own gate, may split further):** durable run records in `runs.redb`
-    written from **authoritative scheduler state-machine transitions** (CEO C1 — NOT flight.jsonl-as-truth,
-    which violates the best-effort-log invariant), enriched by the **existing** `otel/src/tail.rs`
-    `FileTailer` (CEO C2 — copy-truncate-tested, do not reimplement); **catch-up** digest on a persisted
-    last-brief-timestamp (CEO C3 — a live in-process timer misses the overnight/restart absence it exists
-    for; use ux.8′'s division-based catch-up); per-run spend = Δ(lifetime) across segment flight events
-    (CEO C4 — not `windowed_spent`); native `runs_query` tool; CoS morning brief into the chat rail;
-    TUI "Runs" view **deferred** (CEO C5 — conversational drill-down via `runs_query` may subsume it).
+  - **ux.11b — Trust after absence — SPLIT again at its autoplan gate (2026-07-21)** into substrate + UX
+    (both CEO voices + Eng: two distinct correctness domains; plan `docs/plans/ux.11b-trust-after-absence.md`):
+    - **ux.11b-substrate (build first):** a scheduler-owned **`RunTracker`** writes versioned `runs.redb`
+      (separate file, **off-loop mpsc writer** — never fsync on the async loop) from **authoritative
+      lifecycle transitions at ALL sites** (config-seed CoS, `dispatch_spawn` children, operator spawn,
+      `handle_agent_terminal`, universal-agent exits, approval park/resume — CEO C1, Eng G1: spawn/terminal/park
+      alone is incomplete). **NO flight tailer** (Eng: every field is in-process; C2's otel-FileTailer reuse
+      belongs to a future Runs-view increment). Per-segment spend = Δ`context_tokens()` (C4/E3, NOT the
+      paging-shrinking estimator); restore **continues** the open segment, idempotent (E4/G3). Native
+      `runs_query` gated by new `Capability::RunsRead` (G5); read-only `GET /api/v1/runs` + `/agents/runs`
+      via a `RunsAccess` trait (G7). Runs the brief names are the **daily children** (the CoS itself is one
+      perpetual `config_seed` segment).
+    - **ux.11c-UX (own gate, after):** the CoS emits a `BriefWritten` rail event from its **existing cron
+      brief turn** (calling `runs_query`) — **NO scheduler catch-up trigger** (Eng G2: the scheduler can't
+      Inject the never-waiting CoS; the cron loop resuming after restart IS the catch-up). Advance on
+      successful write; bound long-gap briefs (E7). Brief is delivered to the chat rail = "understand
+      yesterday **at the terminal**"; terminal-free is ux.12 (E8).
+    - TUI "Runs" view **deferred** (C5). ux.2b idle/error fold-in **deferred** (OD5).
 - **ux.12** — Reach: one two-way Telegram sidecar (h7.x pattern, single chat-ID allowlist, token via
   env): digest delivery + approval push + approve/deny replies through the existing approvals API. **No
   inject** (cut on cross-model challenge — no lived friction; re-add only if dogfood shows it).
