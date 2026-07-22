@@ -393,7 +393,14 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // Keep clones for distillation wiring (p5.6) and management API (p7.7) before moving into registry.
     let memory_store_for_distillation = memory_store.clone();
     let memory_store_for_management = memory_store.clone();
-    register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store, runs_store.clone())?;
+    // ux.11c: publish_brief routes through the run-writer lane via a BriefPublisher on the
+    // same channel as lifecycle events (ordering fix); disabled when no run store opened.
+    let brief_publisher = if runs_store.is_some() {
+        Some(run_tracker.brief_publisher())
+    } else {
+        None
+    };
+    register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store, runs_store.clone(), brief_publisher)?;
 
     // Pass 1: validate capabilities and isolation settings before spawning any process.
 
@@ -1450,14 +1457,16 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
                     rules.push(SandboxRule::AllowNetConnect { port });
                 }
             }
-            // Mcp/KbRead/KbWrite/ShellExec/Credential/RunsRead are agent-level or broker-handled; no sandbox rule.
+            // Mcp/KbRead/KbWrite/ShellExec/Credential/RunsRead/BriefPublish are
+            // agent-level or broker-handled; no sandbox rule.
             Capability::Mcp { .. }
             | Capability::Spawn
             | Capability::ShellExec
             | Capability::KbRead { .. }
             | Capability::KbWrite { .. }
             | Capability::Credential { .. }
-            | Capability::RunsRead => {}
+            | Capability::RunsRead
+            | Capability::BriefPublish => {}
         }
     }
     rules

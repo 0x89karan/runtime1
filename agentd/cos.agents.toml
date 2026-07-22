@@ -256,6 +256,8 @@ capabilities = [
   { Credential = { provider = "Google" } },
   # ux.11b: read durable run history via the runs_query tool (for the morning brief).
   { RunsRead = {} },
+  # ux.11c: publish the morning brief to the operator's pull surface (agentctl brief).
+  { BriefPublish = {} },
   # request_approval is a native tool with no required capability; always available.
 ]
 
@@ -406,8 +408,16 @@ Brief format:
 - Brief generated: {ISO timestamp}
 ```
 
+STEP 6.5 — PUBLISH THE BRIEF TO THE OPERATOR (ux.11c)
+Call publish_brief() — optionally passing narrative='<one or two sentences>' with a
+plain-English summary of the night. Do NOT pass run counts, failures, or spend: agentd
+authors those facts itself from durable run history over the window since the last brief.
+This makes the brief readable by the operator via `agentctl brief` / GET /api/v1/brief
+whenever they next look, even after an overnight restart. Call it exactly once per cycle,
+after STEP 6.
+
 STEP 7 — LOOP BACK
-IMPORTANT: Do NOT emit a final answer. After writing the brief, IMMEDIATELY call
+IMPORTANT: Do NOT emit a final answer. After publishing the brief, IMMEDIATELY call
 cron_trigger.wait_for_trigger(timeout_s=20) to park until tomorrow's schedule.
 You are always-on. The loop never ends.
 
@@ -435,6 +445,7 @@ native = [
   "write_file",
   "request_approval",
   "runs_query",
+  "publish_brief",
 ]
 
 # ---------------------------------------------------------------------------

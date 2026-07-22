@@ -1190,12 +1190,20 @@ increments, friction-ordered, each independently shippable. Full design + premis
       `runs_query` gated by new `Capability::RunsRead` (G5); read-only `GET /api/v1/runs` + `/agents/runs`
       via a `RunsAccess` trait (G7). Runs the brief names are the **daily children** (the CoS itself is one
       perpetual `config_seed` segment).
-    - **ux.11c-UX (own gate, after):** the CoS emits a `BriefWritten` rail event from its **existing cron
-      brief turn** (calling `runs_query`) — **NO scheduler catch-up trigger** (Eng G2: the scheduler can't
-      Inject the never-waiting CoS; the cron loop resuming after restart IS the catch-up). Advance on
-      successful write; bound long-gap briefs (E7). Brief is delivered to the chat rail = "understand
-      yesterday **at the terminal**"; terminal-free is ux.12 (E8).
-    - TUI "Runs" view **deferred** (C5). ux.2b idle/error fold-in **deferred** (OD5).
+    - ✅ **ux.11c-UX — morning brief (shipped):** REFRAMED at its autoplan CEO gate from a live-rail push
+      to a **deterministic pull core** (both voices; Claude code-verified F1: the agentctl chat rail is a
+      lossy live SSE with no replay-on-attach, so a 6am brief is gone by the 9am attach — push and absence
+      are mutually exclusive). agentd authors the factual spine from `runs.redb` (new `BRIEFS` table +
+      `publish_brief` composer, windowed by **completion** not start_ts so overnight-completed failures are
+      never dropped — Eng G2); the CoS calls capability-gated `publish_brief` (`Capability::BriefPublish`,
+      narrative color only) from its cron loop (Eng G2: no scheduler trigger — the cron loop resuming after
+      restart IS the catch-up); operator reads via **`agentctl brief`** / **`GET /api/v1/brief`**
+      (attention-first: failed/approvals + run IDs before counts; quiet-night explicit; "N need approval"
+      overlaid **live** from the snapshot, Eng G1). `BriefWritten` flight event (informational). ux.12
+      (Telegram) is now a pure consumer of `GET /api/v1/brief`. This is "understand yesterday **at the
+      terminal (pull)**"; terminal-free is ux.12 (E8). Plan: `docs/plans/ux.11c-trust-after-absence.md`.
+    - TUI "Runs" view **deferred** (C5). Live-rail render **deferred to bonus** (A8; never the sole
+      surface). ux.2b idle/error fold-in **deferred** (OD5). FUSE `/agents/brief` → ux.11b-ar-02.
 - **ux.12** — Reach: one two-way Telegram sidecar (h7.x pattern, single chat-ID allowlist, token via
   env): digest delivery + approval push + approve/deny replies through the existing approvals API. **No
   inject** (cut on cross-model challenge — no lived friction; re-add only if dogfood shows it).

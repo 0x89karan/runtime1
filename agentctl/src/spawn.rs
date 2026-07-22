@@ -242,6 +242,9 @@ pub fn parse_cap_alias(s: &str) -> anyhow::Result<Capability> {
     if s == "runs-read" || s == "runsread" {
         return Ok(Capability::RunsRead);
     }
+    if s == "brief-publish" || s == "briefpublish" {
+        return Ok(Capability::BriefPublish);
+    }
     if s == "shell-exec" || s == "shellexec" {
         return Ok(Capability::ShellExec);
     }
@@ -268,7 +271,7 @@ pub fn parse_cap_alias(s: &str) -> anyhow::Result<Capability> {
     }
     let prefix = s.split(':').next().unwrap_or(s);
     anyhow::bail!(
-        "unknown capability alias '{prefix}'; valid: fs-read:<path>, fs-write:<path>, kb-read:<seg>, kb-write:<seg>, spawn, runs-read, net:<ports>"
+        "unknown capability alias '{prefix}'; valid: fs-read:<path>, fs-write:<path>, kb-read:<seg>, kb-write:<seg>, spawn, runs-read, brief-publish, net:<ports>"
     )
 }
 
@@ -327,6 +330,7 @@ pub fn cap_add_allowed_by_suggestion(cap: &Capability, suggested: &[Capability])
             (Capability::Spawn, Capability::Spawn) => return true,
             (Capability::ShellExec, Capability::ShellExec) => return true,
             (Capability::RunsRead, Capability::RunsRead) => return true,
+            (Capability::BriefPublish, Capability::BriefPublish) => return true,
             _ => {}
         }
     }
@@ -341,6 +345,7 @@ pub(crate) fn format_cap(cap: &Capability) -> String {
         Capability::KbRead { segment } => format!("kb-read:{segment}"),
         Capability::KbWrite { segment } => format!("kb-write:{segment}"),
         Capability::RunsRead => "runs-read".to_string(),
+        Capability::BriefPublish => "brief-publish".to_string(),
         Capability::Net { ports, .. } => {
             let p: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
             format!("net:{}", p.join(","))

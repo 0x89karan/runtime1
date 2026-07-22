@@ -56,6 +56,10 @@ pub enum EventKind {
     /// runs.redb could not be opened; run history unavailable this boot (ux.11b).
     /// data: { hint, error }
     RunsUnavailable,
+    /// CoS published a morning brief (ux.11c); authored deterministically from runs.redb.
+    /// Informational (no span). data: { agent_id, brief_id, window_from, window_to,
+    /// run_count, failed_count, spend_total }
+    BriefWritten,
     /// Token spend reached SOFT_THRESHOLD (75%); advisory only, no eviction.
     /// data: { agent, turn, tokens_spent_pct: f64, soft_threshold: f64 }
     MemoryPressureAdvisory,
@@ -281,6 +285,8 @@ mod tests {
         assert_eq!(kind_str(EventKind::IsolationProbed), "isolation_probed");
         assert_eq!(kind_str(EventKind::CredentialAttentionRequired), "credential_attention_required");
         assert_eq!(kind_str(EventKind::CredentialRecovered), "credential_recovered");
+        assert_eq!(kind_str(EventKind::RunsUnavailable), "runs_unavailable");
+        assert_eq!(kind_str(EventKind::BriefWritten), "brief_written");
         assert_eq!(kind_str(EventKind::Error), "error");
     }
 }

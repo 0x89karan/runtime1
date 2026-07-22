@@ -414,7 +414,13 @@ agentctl watch --url http://localhost:7999
 ssh -L 7999:localhost:7999 agentos@server   # in a terminal
 agentctl watch --url http://localhost:7999   # in another terminal
 
-# Brief output
+# Morning brief (ux.11c — durable pull; shows the latest even after an overnight restart)
+agentctl brief                                  # attention-first: failures/approvals + run IDs, then counts
+agentctl brief --url http://localhost:7999      # explicit endpoint (honors AGENTCTL_URL)
+agentctl brief --n 5                            # the last 5 briefs
+curl -s localhost:7999/api/v1/brief             # structured JSON: {brief, approvals_pending}
+
+# Full brief markdown (written by the CoS in addition to the pull surface)
 ls /home/agentos/.agentos-output/brief-*.md
 tail -f /home/agentos/.agentos-output/brief-$(date +%Y-%m-%d).md
 

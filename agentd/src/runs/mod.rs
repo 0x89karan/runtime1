@@ -61,6 +61,56 @@ pub struct RunRecord {
     pub tier:         String,
 }
 
+/// One attention line in a morning brief (ux.11c). Named by `run_id` (= segment_id)
+/// and `agent_id` so the operator can act on it today and ux.13 can attach verbs later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefItem {
+    /// The run segment id (`"{agent_id}:{seq}"`).
+    pub run_id:      String,
+    pub agent_id:    String,
+    /// "running" | "failed" | "interrupted" | "done" (attention items are the non-`done` ones).
+    pub status:      String,
+    #[serde(default)]
+    pub spend:       Option<u64>,
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    #[serde(default)]
+    pub last_error:  Option<String>,
+}
+
+/// A persisted morning brief (ux.11c) — the durable, pull-readable delivery record.
+/// agentd authors the factual spine deterministically from `runs.redb` (CEO F2); the
+/// model contributes only `narrative`. The "N need approval" headline is NOT stored
+/// here — it is live scheduler state, overlaid at `GET /api/v1/brief` time (Eng G1).
+/// All fields added after v1 must be `#[serde(default)]` (shares runs.redb's E5 rule).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefRecord {
+    /// `"brief:{seq}"`.
+    pub brief_id:       String,
+    pub created_at:     u64,
+    /// Window covered: `[window_from, window_to)`. First-ever brief floors at now−24h.
+    pub window_from:    u64,
+    pub window_to:      u64,
+    /// Total runs in the window (over the FULL window, not the clamped `items`).
+    pub run_count:      u64,
+    pub failed_count:   u64,
+    /// Sum of per-run `spend` (tokens) across the window; universal-tier (None spend) omitted.
+    pub spend_total:    u64,
+    /// Attention items (non-`done`), newest-first, capped at `MAX_BRIEF_ITEMS`.
+    pub items:          Vec<BriefItem>,
+    /// Count of genuinely-ok (`done`) runs not itemized — rendered as "✓ N ok".
+    /// (Renamed meaning post-review: it must NOT include truncated failures.)
+    pub overflow_count: u64,
+    /// Attention items beyond `MAX_BRIEF_ITEMS` that could not be shown (failures/blocked/
+    /// running). Rendered separately as "⚠ N more need attention" so truncated failures are
+    /// never mislabeled as "ok". Full detail remains in `runs_query`.
+    #[serde(default)]
+    pub attention_overflow: u64,
+    /// Optional model-authored narrative color (facts above cannot be faked by it).
+    #[serde(default)]
+    pub narrative:      Option<String>,
+}
+
 /// A lifecycle transition sent from the scheduler to the writer task.
 #[derive(Debug, Clone)]
 pub enum RunEvent {
@@ -85,16 +135,31 @@ pub enum RunEvent {
     IncrApproval { agent_id: String },
 }
 
+/// Messages on the single writer channel. Lifecycle events AND brief composition go
+/// through the ONE channel so FIFO ordering holds: any `Close` enqueued before a
+/// `PublishBrief` is applied to `runs.redb` first, so the brief can never miss a run
+/// whose close was still in flight (review: Codex critical — the own-txn design raced the
+/// channel drain and could drop a just-completed failure from every future window).
+pub enum WriterMsg {
+    Event(RunEvent),
+    /// Compose + persist a brief on the writer thread; reply with the persisted record.
+    PublishBrief {
+        narrative: Option<String>,
+        now:       u64,
+        reply:     tokio::sync::oneshot::Sender<anyhow::Result<BriefRecord>>,
+    },
+}
+
 /// Cheap, clonable handle the scheduler holds. Best-effort: a full/closed channel
 /// drops the event with a warn — recording a run must never stall or crash an agent.
 #[derive(Clone)]
 pub struct RunTracker {
-    tx: Option<tokio::sync::mpsc::UnboundedSender<RunEvent>>,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<WriterMsg>>,
 }
 
 impl RunTracker {
     /// A live tracker feeding `run_writer`.
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<RunEvent>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<WriterMsg>) -> Self {
         Self { tx: Some(tx) }
     }
 
@@ -103,9 +168,15 @@ impl RunTracker {
         Self { tx: None }
     }
 
+    /// A [`BriefPublisher`] on the SAME channel (ux.11c) — brief writes share the writer
+    /// lane with lifecycle events, guaranteeing ordering. Disabled when the tracker is.
+    pub fn brief_publisher(&self) -> BriefPublisher {
+        BriefPublisher { tx: self.tx.clone() }
+    }
+
     fn send(&self, ev: RunEvent) {
         if let Some(tx) = &self.tx {
-            if tx.send(ev).is_err() {
+            if tx.send(WriterMsg::Event(ev)).is_err() {
                 tracing::warn!("run-history writer channel closed; dropping run event (best-effort)");
             }
         }
@@ -156,22 +227,70 @@ impl RunTracker {
     }
 }
 
+/// Handle the `publish_brief` tool holds (ux.11c). Sends a `PublishBrief` command down
+/// the same channel the scheduler's lifecycle events use, so composition runs on the
+/// single writer AFTER every previously-enqueued event is applied, then awaits the reply.
+#[derive(Clone)]
+pub struct BriefPublisher {
+    tx: Option<tokio::sync::mpsc::UnboundedSender<WriterMsg>>,
+}
+
+impl BriefPublisher {
+    /// A no-op publisher (no run store configured) — `publish` returns an error.
+    pub fn disabled() -> Self {
+        Self { tx: None }
+    }
+
+    /// Compose + persist a brief on the writer thread and return the persisted record.
+    /// Errors (no store, channel closed, writer dropped, or a persist failure) propagate
+    /// so the tool returns `Err` and NO `BriefWritten` event fires (advance-on-success).
+    pub async fn publish(&self, narrative: Option<String>, now: u64) -> anyhow::Result<BriefRecord> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("run history not configured; cannot publish brief"))?;
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(WriterMsg::PublishBrief { narrative, now, reply })
+            .map_err(|_| anyhow::anyhow!("run-history writer channel closed"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("run-history writer dropped the brief reply"))?
+    }
+}
+
 /// Dedicated writer task: drains `rx` and applies each event to the single
 /// `RunsStore` writer. Runs off the scheduler loop (G4). A write failure is
 /// logged, never propagated — run history is best-effort like flight logging.
 pub async fn run_writer(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<RunEvent>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<WriterMsg>,
     store: std::sync::Arc<RunsStore>,
 ) {
-    while let Some(ev) = rx.recv().await {
-        let store = std::sync::Arc::clone(&store);
-        // redb writes are synchronous; do them on a blocking thread so this task's
-        // async worker isn't held on the commit fsync.
-        let res = tokio::task::spawn_blocking(move || store.apply(ev)).await;
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(error = %e, "run-history write failed (best-effort)"),
-            Err(e)     => tracing::warn!(error = %e, "run-history writer join failed"),
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            WriterMsg::Event(ev) => {
+                let store = std::sync::Arc::clone(&store);
+                // redb writes are synchronous; do them on a blocking thread so this task's
+                // async worker isn't held on the commit fsync.
+                let res = tokio::task::spawn_blocking(move || store.apply(ev)).await;
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(error = %e, "run-history write failed (best-effort)"),
+                    Err(e)     => tracing::warn!(error = %e, "run-history writer join failed"),
+                }
+            }
+            WriterMsg::PublishBrief { narrative, now, reply } => {
+                // Composition runs HERE, after all earlier events applied (FIFO). The full
+                // RUNS scan happening on this off-loop writer is fine — later events just
+                // queue behind it, which never stalls the scheduler (best-effort logging).
+                let store = std::sync::Arc::clone(&store);
+                let res = tokio::task::spawn_blocking(move || store.publish_brief(narrative, now)).await;
+                let flattened = match res {
+                    Ok(inner) => inner,
+                    Err(e)    => Err(anyhow::anyhow!("brief writer join failed: {e}")),
+                };
+                // Receiver may have gone away (tool cancelled) — dropping the reply is fine.
+                let _ = reply.send(flattened);
+            }
         }
     }
 }
@@ -211,5 +330,39 @@ mod tracker_tests {
         t.open("a", None, "config_seed", Some(0), "native");
         t.incr_approval("a");
         t.close("a", "done", None, None, Some(1)); // no channel → silently dropped
+    }
+
+    #[tokio::test]
+    async fn disabled_brief_publisher_errors() {
+        let bp = BriefPublisher::disabled();
+        assert!(bp.publish(None, 100_000).await.is_err(), "no store → error, not a false brief");
+    }
+
+    #[tokio::test]
+    async fn brief_sees_close_enqueued_before_it_fifo() {
+        // Review C1 (Codex critical): a Close enqueued BEFORE PublishBrief must be applied
+        // first (single writer, FIFO), so the brief never drops a just-completed failure.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _q) = RunsStore::open(&dir.path().join("runs.redb")).unwrap();
+        let store = Arc::new(store);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = tokio::spawn(run_writer(rx, Arc::clone(&store)));
+
+        let tracker = RunTracker::new(tx);
+        let publisher = tracker.brief_publisher();
+        // Enqueue open + a FAILED close, then immediately request a brief — all on one lane.
+        tracker.open("scout", Some("cos".into()), "child_spawn", Some(0), "native");
+        tracker.close("scout", "failed", Some("err".into()), Some("boom".into()), Some(9));
+        // `tracker.close` stamps end_ts with real wall-clock time, so the brief window
+        // must be anchored to real time too (a few seconds ahead covers the close).
+        let brief = publisher.publish(None, unix_now_secs() + 5).await.unwrap();
+        assert_eq!(brief.run_count, 1, "the close ahead in the FIFO queue was applied first");
+        assert_eq!(brief.failed_count, 1);
+        assert_eq!(brief.items[0].run_id, "scout:0");
+        assert_eq!(brief.items[0].last_error.as_deref(), Some("boom"));
+
+        drop(tracker);
+        drop(publisher);
+        writer.await.unwrap();
     }
 }
