@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod approve;
 mod auth;
+mod brief;
 mod inject;
 mod list;
 mod orchestrate;
@@ -32,6 +33,8 @@ enum Commands {
     Deny(approve::DenyArgs),
     /// Provision OAuth credentials for use by Docker agents
     Auth(auth::AuthCmd),
+    /// Show the Chief-of-Staff morning brief (durable pull; ux.11c)
+    Brief(brief::BriefArgs),
     /// Inject a new user turn into a waiting orchestrated agent
     Inject(inject::InjectArgs),
     ListTemplates(list::Args),
@@ -48,6 +51,7 @@ fn main() {
         Commands::Approve(args) => approve::run_approve(args),
         Commands::Deny(args) => approve::run_deny(args),
         Commands::Auth(cmd) => auth::run(cmd),
+        Commands::Brief(args) => brief::run(args),
         Commands::Inject(args) => inject::run(args),
         Commands::ListTemplates(args) => list::run(args),
         Commands::Orchestrate(args) => orchestrate::run(args),

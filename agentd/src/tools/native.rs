@@ -62,6 +62,14 @@ pub struct RunsQuery {
     pub store: Arc<crate::runs::RunsStore>,
 }
 
+/// Publish a morning brief (ux.11c). NOT in `"all"` — requires `BriefPublish` + explicit listing.
+/// agentd authors the factual spine from `runs.redb`; the caller passes only narrative color.
+/// Routes composition through the run-writer lane (`BriefPublisher`) so it runs after every
+/// prior lifecycle event is applied (ordering fix).
+pub struct PublishBrief {
+    pub publisher: crate::runs::BriefPublisher,
+}
+
 pub struct SpawnAgentTool;
 pub struct RequestApprovalTool;
 pub struct ListAgentsTool {
@@ -860,6 +868,49 @@ impl Tool for RunsQuery {
 }
 
 #[async_trait]
+impl Tool for PublishBrief {
+    fn name(&self) -> &str { "publish_brief" }
+
+    fn description(&self) -> &str {
+        "Publish the morning brief for the operator. agentd composes the facts (run count, \
+         failures, spend, and the failing/blocked run IDs) deterministically from durable run \
+         history over the window since the last brief — you do NOT pass any of those. Optionally \
+         pass `narrative`: a one- or two-sentence plain-English summary to accompany the facts. \
+         Call this once per cron cycle after writing the ops:briefs entry. The brief is then \
+         readable via `agentctl brief` / GET /api/v1/brief regardless of when the operator looks. \
+         Requires the BriefPublish capability."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "narrative": { "type": "string", "description": "Optional plain-English summary; facts are authored by agentd, not from this field" }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        Some(Capability::BriefPublish)
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
+        let narrative = input["narrative"].as_str().map(str::to_string);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Route through the writer lane: composes AFTER all prior lifecycle events are
+        // applied (FIFO), then persists in one txn. A failure returns Err → the central
+        // invoke hook fires no BriefWritten and the window does not advance (E7).
+        let brief = self.publisher.publish(narrative, now).await?;
+        // Return the structured spine so the ToolRegistry hook can emit BriefWritten.
+        Ok(serde_json::to_string(&brief)?)
+    }
+}
+
+#[async_trait]
 impl Tool for SpawnAgentTool {
     fn name(&self) -> &str {
         "spawn_agent"
@@ -1021,6 +1072,7 @@ pub fn register_native(
     cards: Option<Arc<Vec<AgentCard>>>,
     store: Option<Arc<dyn MemoryStore>>,
     runs: Option<Arc<crate::runs::RunsStore>>,
+    brief_publisher: Option<crate::runs::BriefPublisher>,
 ) -> anyhow::Result<()> {
     let all = names.iter().any(|n| n == "all");
     let want = |name: &str| all || names.iter().any(|n| n == name);
@@ -1088,6 +1140,12 @@ pub fn register_native(
     if names.iter().any(|n| n == "runs_query") {
         if let Some(r) = runs.clone() {
             reg.register(Box::new(RunsQuery { store: r }))?;
+        }
+    }
+    // publish_brief — NOT in "all"; requires BriefPublish + explicit opt-in (ux.11c).
+    if names.iter().any(|n| n == "publish_brief") {
+        if let Some(bp) = brief_publisher {
+            reg.register(Box::new(PublishBrief { publisher: bp }))?;
         }
     }
     Ok(())
@@ -1239,7 +1297,7 @@ mod tests {
     #[test]
     fn register_native_all_registers_six_base_tools_not_kv() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None, None).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
@@ -1276,7 +1334,7 @@ mod tests {
     #[test]
     fn register_native_subset() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["read_file".to_string()], None, None, None, None).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
@@ -1286,7 +1344,7 @@ mod tests {
     #[test]
     fn register_native_empty_registers_nothing() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &[], None, None, None).unwrap();
+        register_native(&mut reg, &[], None, None, None, None).unwrap();
         assert!(reg.tool_names().is_empty());
     }
 
@@ -1543,6 +1601,7 @@ mod tests {
             None,
             None,
         None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1695,6 +1754,7 @@ mod tests {
             None,
             None,
         None,
+            None,
         )
         .unwrap();
         assert!(
@@ -1710,7 +1770,7 @@ mod tests {
     #[test]
     fn register_native_all_does_not_include_mem_tools() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None, None).unwrap();
         let names = reg.tool_names();
         assert!(!names.contains(&"mem_remember".to_string()), "mem_remember must not be in 'all'");
         assert!(!names.contains(&"mem_recall".to_string()), "mem_recall must not be in 'all'");
@@ -1725,6 +1785,7 @@ mod tests {
             None,
             None,
         None,
+            None,
         )
         .unwrap();
         assert!(
@@ -2154,6 +2215,7 @@ mod tests {
             None,
             Some(store as Arc<dyn MemoryStore>),
         None,
+            None,
         ).unwrap();
 
         let tmp = NamedTempFile::new().unwrap();
@@ -2188,6 +2250,7 @@ mod tests {
             None,
             Some(store as Arc<dyn MemoryStore>),
         None,
+            None,
         ).unwrap();
 
         let tmp = NamedTempFile::new().unwrap();
@@ -2237,6 +2300,7 @@ mod tests {
             None,
             Some(store as Arc<dyn MemoryStore>),
         None,
+            None,
         ).unwrap();
 
         let tmp = NamedTempFile::new().unwrap();

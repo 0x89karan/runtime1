@@ -24,21 +24,24 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.91.0 (shipped 2026-07-22)
+**Current version:** v0.92.0 (shipped 2026-07-22)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.11b-substrate (v0.91.0) — durable run history (the run-store
-half of the ux.11b split; the digest/morning-brief is ux.11c). A scheduler-owned
-`RunTracker` authors per-segment run records into a separate `runs.redb` **from
-authoritative in-process lifecycle transitions** (config-seed/child/operator/universal
-spawn → terminal), NOT the best-effort flight log — off-loop mpsc writer that never
-stalls the scheduler and is drained at shutdown. Per-segment spend = Δ`context_tokens()`;
-idempotent open (restart continues); clean-shutdown closes open segments as
-`interrupted`. Read paths: native `runs_query` tool (new `Capability::RunsRead`, granted
-to the CoS) + `GET /api/v1/runs`. Checkpoint format untouched. 1488 workspace tests.
-Deferred: FUSE `/agents/runs` (ar-02), mid-run park boundary (ar-01), retention (ar-03).
-**Next:** ux.11c (catch-up digest + CoS morning brief) → ux.12 (Telegram) → cap.1 → ux.13 (verbs).
+**Latest shipped:** ux.11c (v0.92.0) — the **morning brief** (the UX half of ux.11b,
+reframed at its autoplan gate from a live-rail push to a durable **pull** surface after
+review found the agentctl chat rail is a lossy live stream with no replay-on-attach). The
+CoS calls a capability-gated `publish_brief` (`Capability::BriefPublish`) from its cron
+loop with optional narrative; **agentd authors the facts deterministically** from
+`runs.redb` (new `BRIEFS` table + composer), windowed by run **completion** not start_ts,
+and persists them. Brief composition routes through the **run_writer lane** (FIFO ordering,
+so a just-completed failure is never dropped). Operators read via **`agentctl brief`** and
+**`GET /api/v1/brief`** (attention-first: failed/approvals + run IDs before counts;
+quiet-night explicit; "N need approval" overlaid **live** from the snapshot). `BriefWritten`
+flight event. ux.12 (Telegram) becomes a pure consumer of `GET /api/v1/brief`.
+Deferred: live-rail render (bonus), approvals >100 undercount (ar-01), `runs_query`
+PROTECTED_TOOLS (ar-02).
+**Next:** ux.12 (Telegram digest + approve/deny) → cap.1 → ux.13 (verbs).
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

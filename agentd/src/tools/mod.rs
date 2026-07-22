@@ -77,7 +77,11 @@ impl ToolRegistry {
     /// primitives that must not be shadowed by MCP servers.
     /// Emits a warning when displacing a non-protected existing tool.
     pub fn register_override(&mut self, tool: Box<dyn Tool>) -> Result<()> {
-        const PROTECTED_TOOLS: &[&str] = &["request_approval", "spawn_agent", "send_message"];
+        // publish_brief (ux.11c) is protected: the central invoke hook emits BriefWritten
+        // purely by tool name, so an MCP override could emit the operator-trust event
+        // (and bypass BriefPublish) without ever persisting a brief. (review: Codex.)
+        const PROTECTED_TOOLS: &[&str] =
+            &["request_approval", "spawn_agent", "send_message", "publish_brief"];
         let name = tool.name().to_string();
         if PROTECTED_TOOLS.contains(&name.as_str()) {
             return Err(anyhow::anyhow!(
@@ -303,6 +307,27 @@ impl ToolRegistry {
                     }),
                 );
             }
+            "publish_brief" => {
+                // ux.11c: the tool returns the persisted BriefRecord spine; emit
+                // BriefWritten from it. Only reached on Ok(...) (a failed persist returns
+                // Err above via `?`), so a dropped brief fires no event — the pull surface
+                // and window advance stay consistent (E7/G3).
+                let v = serde_json::from_str::<serde_json::Value>(&result).unwrap_or_default();
+                recorder.record(
+                    &ctx.agent_id,
+                    None,
+                    EventKind::BriefWritten,
+                    serde_json::json!({
+                        "agent_id":     &ctx.agent_id,
+                        "brief_id":     v["brief_id"].as_str().unwrap_or(""),
+                        "window_from":  v["window_from"].as_u64().unwrap_or(0),
+                        "window_to":    v["window_to"].as_u64().unwrap_or(0),
+                        "run_count":    v["run_count"].as_u64().unwrap_or(0),
+                        "failed_count": v["failed_count"].as_u64().unwrap_or(0),
+                        "spend_total":  v["spend_total"].as_u64().unwrap_or(0),
+                    }),
+                );
+            }
             _ => {}
         }
 
@@ -346,8 +371,8 @@ mod tests {
     #[test]
     fn duplicate_registration_returns_error() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()], None, None, None).unwrap();
-        let err = register_native(&mut reg, &["read_file".to_string()], None, None, None).unwrap_err();
+        register_native(&mut reg, &["read_file".to_string()], None, None, None, None).unwrap();
+        let err = register_native(&mut reg, &["read_file".to_string()], None, None, None, None).unwrap_err();
         assert!(err.to_string().contains("read_file"));
         assert!(err.to_string().contains("already registered"));
     }
@@ -394,8 +419,8 @@ mod tests {
 
     #[test]
     fn tool_override_protected_tools_are_blocked() {
-        // Attempting to override request_approval, spawn_agent, or send_message must return an error.
-        for protected in &["request_approval", "spawn_agent", "send_message"] {
+        // Attempting to override a protected safety-critical native tool must return an error.
+        for protected in &["request_approval", "spawn_agent", "send_message", "publish_brief"] {
             let mut reg = ToolRegistry::new();
             let err = reg
                 .register_override(Box::new(StubTool { name: protected, desc: "malicious" }))
@@ -418,7 +443,7 @@ mod tests {
     #[tokio::test]
     async fn registry_specs_and_names_are_sorted() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None, None).unwrap();
         let names = reg.tool_names();
         let mut sorted = names.clone();
         sorted.sort();
@@ -433,14 +458,14 @@ mod tests {
     #[test]
     fn filtered_specs_none_cap_set_returns_all() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None, None).unwrap();
         assert_eq!(reg.filtered_specs(None).len(), reg.specs().len());
     }
 
     #[test]
     fn filtered_specs_empty_cap_set_returns_only_no_cap_tools() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None, None).unwrap();
         let specs = reg.filtered_specs(Some(&[]));
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         // list_agents and send_message require no capability; they remain visible.
@@ -456,7 +481,7 @@ mod tests {
     #[test]
     fn filtered_specs_fs_read_only_excludes_write() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None, None).unwrap();
         let caps = [Capability::FsRead { prefix: "/".to_string() }];
         let specs = reg.filtered_specs(Some(&caps));
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
@@ -468,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn capability_denied_event_emitted_and_error_returned() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None, None, None, None).unwrap();
         let (rec, tmp) = recorder();
 
         // Grant only FsRead — write_file requires FsWrite, so it should be denied.
@@ -501,7 +526,7 @@ mod tests {
         // An agent with the matching FsWrite cap MUST be able to invoke write_file.
         // This is the "granted agent succeeds" half of the p1.4 acceptance criterion.
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None, None, None, None).unwrap();
         let (rec, _tmp) = recorder();
         let tmp_dir = tempfile::TempDir::new_in("/tmp").unwrap();
         let path = tmp_dir.path().join("test.txt").to_string_lossy().to_string();
@@ -522,7 +547,7 @@ mod tests {
     #[test]
     fn filtered_specs_spawn_visible_with_cap_hidden_without() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None, None).unwrap();
 
         // With Spawn capability: spawn_agent should appear in specs.
         let caps_with_spawn = [Capability::Spawn];
@@ -676,6 +701,7 @@ mod tests {
             None,
             Some(SimpleStore::new_arc()),
         None,
+            None,
         )
         .unwrap();
 
@@ -706,6 +732,7 @@ mod tests {
             None,
             Some(SimpleStore::new_arc()),
         None,
+            None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -735,6 +762,7 @@ mod tests {
             None,
             Some(SimpleStore::new_arc()),
         None,
+            None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -767,6 +795,7 @@ mod tests {
             None,
             Some(store),
         None,
+            None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -809,6 +838,7 @@ mod tests {
             None,
             Some(store),
         None,
+            None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -843,6 +873,7 @@ mod tests {
             None,
             Some(store),
         None,
+            None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -884,6 +915,7 @@ mod tests {
             None,
             Some(store as Arc<dyn crate::memory::MemoryStore>),
         None,
+            None,
         ).unwrap();
         let (rec, tmp) = recorder();
         let caps = [Capability::KbRead { segment: "kb:research".to_string() }];
@@ -924,6 +956,7 @@ mod tests {
             None,
             Some(store as Arc<dyn crate::memory::MemoryStore>),
         None,
+            None,
         ).unwrap();
         let (rec, tmp) = recorder();
         let caps = [Capability::KbRead { segment: "kb:notes".to_string() }];
@@ -962,6 +995,7 @@ mod tests {
             None,
             Some(SimpleStore::new_arc()),
         None,
+            None,
         )
         .unwrap();
         let (rec, tmp) = recorder();

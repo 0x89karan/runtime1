@@ -131,6 +131,15 @@ impl HttpSource {
         Ok(resp.json()?)
     }
 
+    /// Fetch the morning brief (ux.11c). HTTP-only surface (no FUSE); `agentctl brief`
+    /// calls this on an `HttpSource` directly. `n` requests the last N briefs.
+    pub fn brief(&self, n: Option<usize>) -> anyhow::Result<Value> {
+        match n {
+            Some(k) => self.get_json(&format!("/api/v1/brief?n={k}")),
+            None => self.get_json("/api/v1/brief"),
+        }
+    }
+
     fn post_mutation(&self, path: &str, body: Option<&Value>) -> Result<(), String> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let mut req = self.mutation_client.post(&url);

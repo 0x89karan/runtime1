@@ -72,6 +72,10 @@ pub enum Capability {
     /// run history is a single dataset (errors/spend/parent), so it is NOT modeled
     /// as a KB segment (KbRead would be too loose).
     RunsRead,
+    /// Publish a morning brief via `publish_brief` (ux.11c). Unit grant — the brief
+    /// is an operator-facing trust surface, so writing one is gated (F8), even though
+    /// agentd (not the caller) authors the facts.
+    BriefPublish,
 }
 
 /// Normalize a path by resolving `.` and `..` components without filesystem
@@ -212,6 +216,7 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
             matches!(g, Capability::Credential { provider: gp } if gp == req_prov)
         }),
         Capability::RunsRead => granted.iter().any(|g| matches!(g, Capability::RunsRead)),
+        Capability::BriefPublish => granted.iter().any(|g| matches!(g, Capability::BriefPublish)),
     }
 }
 
@@ -418,6 +423,14 @@ mod tests {
         // Only non-Spawn caps → denied.
         let other = vec![Capability::FsRead { prefix: "/workspace".to_string() }];
         assert!(!satisfies(&other, &Capability::Spawn));
+    }
+
+    #[test]
+    fn satisfies_brief_publish_requires_grant() {
+        // ux.11c: publish_brief is gated (F8) — grant required, unit-matched like RunsRead.
+        assert!(satisfies(&[Capability::BriefPublish], &Capability::BriefPublish));
+        assert!(!satisfies(&[], &Capability::BriefPublish));
+        assert!(!satisfies(&[Capability::RunsRead], &Capability::BriefPublish));
     }
 
     #[test]

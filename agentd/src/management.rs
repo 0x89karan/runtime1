@@ -11,6 +11,7 @@
 //!   POST /api/v1/approvals/:id/deny              → 200 | 400 | 404 | 503
 //!   GET  /api/v1/memory/:ns?limit=&offset=       → 200 [{key, value}, ...] paginated
 //!   GET  /api/v1/runs?from=&to=&agent_id=&parent_id=&status=&limit=  → 200 [RunRecord, ...] (ux.11b)
+//!   GET  /api/v1/brief[?n=K]                      → 200 {brief|briefs, approvals_pending} | 503 (ux.11c)
 //!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
@@ -291,6 +292,40 @@ async fn route(
                 Ok(Ok(recs)) => json_response(StatusCode::OK, json!(recs)),
                 Ok(Err(e))   => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
                 Err(e)       => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("runs query join: {e}")),
+            }
+        }
+
+        (Method::GET, "/api/v1/brief") => {
+            // ux.11c: the durable morning brief (pull surface). Returns the latest brief
+            // (or ?n=K for the last K, newest-first) with a LIVE "approvals_pending"
+            // overlay — pending approvals are current scheduler state (Eng G1), not part
+            // of the persisted, at-compose-time record. `brief` is null when none exists yet.
+            let Some(store) = &state.runs_store else {
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "run history not configured");
+            };
+            // Live approvals count from the snapshot. Caveat: pending_actions is capped at
+            // ≤100 entries, so this undercounts past 100 (pathological for single-tenant).
+            let approvals_pending = match state.snapshot.read() {
+                Ok(g) => g.pending_actions.len(),
+                Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "snapshot lock poisoned"),
+            };
+            let n: Option<usize> = query
+                .split('&')
+                .filter_map(|p| p.split_once('='))
+                .find(|(k, _)| *k == "n")
+                .and_then(|(_, v)| v.parse().ok());
+            let store = Arc::clone(store);
+            match n {
+                Some(k) => match tokio::task::spawn_blocking(move || store.list_briefs(k)).await {
+                    Ok(Ok(briefs)) => json_response(StatusCode::OK, json!({ "briefs": briefs, "approvals_pending": approvals_pending })),
+                    Ok(Err(e))     => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                    Err(e)         => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("brief query join: {e}")),
+                },
+                None => match tokio::task::spawn_blocking(move || store.latest_brief()).await {
+                    Ok(Ok(brief)) => json_response(StatusCode::OK, json!({ "brief": brief, "approvals_pending": approvals_pending })),
+                    Ok(Err(e))    => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                    Err(e)        => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("brief query join: {e}")),
+                },
             }
         }
 
@@ -1147,6 +1182,86 @@ mod tests {
         assert_eq!(arr[0]["status"], "done");
         assert_eq!(arr[0]["spend"], 40);
         assert_eq!(arr[0]["parent_id"], "cos");
+    }
+
+    #[tokio::test]
+    async fn brief_unconfigured_returns_503() {
+        let state = make_state(SchedulerSnapshot::default()); // runs_store: None
+        let resp = route(state, Method::GET, "/api/v1/brief", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn brief_returns_latest_with_live_approvals_overlay() {
+        // ux.11c: GET /api/v1/brief returns the persisted brief + a LIVE approvals count
+        // from the snapshot (Eng G1) — the count is NOT part of the stored record.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _q) = crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap();
+        // One failed run in the window, then publish a brief over it.
+        store.apply(crate::runs::RunEvent::Open {
+            agent_id: "scout".into(), parent_id: Some("cos".into()), start_reason: "child_spawn".into(),
+            start_context_tokens: Some(0), tier: "native".into(), ts: 20_000,
+        }).unwrap();
+        store.apply(crate::runs::RunEvent::Close {
+            agent_id: "scout".into(), status: "failed".into(), stop_reason: Some("error".into()),
+            last_error: Some("boom".into()), end_context_tokens: Some(14), ts: 20_050,
+        }).unwrap();
+        store.publish_brief(Some("one failure overnight".into()), 100_000).unwrap();
+
+        // Snapshot carries two pending approvals → live overlay must report 2.
+        let mut snap = SchedulerSnapshot::default();
+        for i in 0..2 {
+            snap.pending_actions.push(surfaces::PendingActionView {
+                id: format!("act_{i}"), agent_id: "curator".into(), kind: "write_file".into(),
+                risk: "low".into(), summary: "s".into(), args_json: "{}".into(), age_secs: 1,
+            });
+        }
+
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap());
+        let state = Arc::new(ApiState {
+            snapshot: Arc::new(RwLock::new(snap)),
+            memory_store: None,
+            runs_store: Some(Arc::new(store)),
+            broadcast_tx: tx,
+            recorder,
+            control_tx: None,
+            credential_gateway: None,
+        });
+        let resp = route(state, Method::GET, "/api/v1/brief", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["approvals_pending"], 2, "live overlay from snapshot, not persisted");
+        assert_eq!(v["brief"]["run_count"], 1);
+        assert_eq!(v["brief"]["failed_count"], 1);
+        assert_eq!(v["brief"]["narrative"], "one failure overnight");
+        assert_eq!(v["brief"]["items"][0]["agent_id"], "scout");
+    }
+
+    #[tokio::test]
+    async fn brief_null_when_none_published_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _q) = crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap();
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap());
+        let state = Arc::new(ApiState {
+            snapshot: Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            memory_store: None,
+            runs_store: Some(Arc::new(store)),
+            broadcast_tx: tx,
+            recorder,
+            control_tx: None,
+            credential_gateway: None,
+        });
+        let resp = route(state, Method::GET, "/api/v1/brief", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["brief"].is_null(), "no brief yet → brief:null (200, not 404)");
+        assert_eq!(v["approvals_pending"], 0);
     }
 
     #[tokio::test]

@@ -143,6 +143,17 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   class). Low impact at v1 volume (~1k runs/year, list limit-capped at 100 results), but fix before it
   matters: age/count retention prune in the writer + a time-indexed table so from/to/limit avoid a full
   scan. (Companion to audit86-P1-2 flight rotation → run.1.)
+- **ux.11c-ar-01 (P3) [new, ux.11c /review] — `GET /api/v1/brief` "N need approval" undercounts past 100.**
+  The live overlay reports `snapshot.pending_actions.len()`, but the snapshot is built with `.take(100)`
+  (scheduler.rs), so with 100+ simultaneously-pending approvals the brief header shows "100 need approval"
+  when there are more (Codex + Claude review). Pathological for single-tenant (100+ parked approvals never
+  happens in practice), and documented at the call site. Fix if it ever matters: add an uncapped
+  `pending_actions_total` to `SchedulerSnapshot` and read that for the count only.
+- **ux.11c-ar-02 (P3) [pre-existing, flagged ux.11c /review] — `runs_query` is not in `PROTECTED_TOOLS`.**
+  ux.11c added `publish_brief` to `PROTECTED_TOOLS` (an MCP `tool_override` could otherwise shadow it and
+  make the central hook emit `BriefWritten` without persisting a brief). The sibling `runs_query` (ux.11b)
+  has the same shadowing exposure but lower impact (read-only; no trust event emitted), so it was left out
+  of ux.11c scope. Consider adding `runs_query` to `PROTECTED_TOOLS` too for consistency. (Codex review.)
 - **ux.11b-ar-02 (P3) [new, ux.11b-substrate] — FUSE `/agents/runs` not shipped.**
   ux.11b-substrate ships the read surfaces the CoS + operators use: the `runs_query` native tool and
   `GET /api/v1/runs`. The FUSE `/agents/runs` mirror (G7) needs a `RunsAccess` trait in `surfaces` +
