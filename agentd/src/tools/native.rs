@@ -57,6 +57,11 @@ pub struct KbSearch {
     pub store: Arc<dyn MemoryStore>,
 }
 
+/// Query durable run history (ux.11b). NOT in `"all"` — requires `RunsRead` + explicit listing.
+pub struct RunsQuery {
+    pub store: Arc<crate::runs::RunsStore>,
+}
+
 pub struct SpawnAgentTool;
 pub struct RequestApprovalTool;
 pub struct ListAgentsTool {
@@ -807,6 +812,54 @@ impl Tool for KbSearch {
 }
 
 #[async_trait]
+impl Tool for RunsQuery {
+    fn name(&self) -> &str { "runs_query" }
+
+    fn description(&self) -> &str {
+        "Query durable run history — one record per agent run segment (spawn/seed → terminal). \
+         Returns records newest-first with status, spend (tokens), stop reason, last error, \
+         parent, and approval count. Fields: agent_id (optional), parent_id (optional), status \
+         (optional: running|done|failed|interrupted), from/to (optional Unix-second bounds on \
+         start time), limit (optional, default 20, max 100). Requires RunsRead capability."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id":  { "type": "string", "description": "Filter to one agent id" },
+                "parent_id": { "type": "string", "description": "Filter to children of this agent id" },
+                "status":    { "type": "string", "description": "running | parked | done | failed" },
+                "from":      { "type": "integer", "description": "Only runs started at/after this Unix second" },
+                "to":        { "type": "integer", "description": "Only runs started at/before this Unix second" },
+                "limit":     { "type": "integer", "description": "Max records (default 20, max 100)" }
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        Some(Capability::RunsRead)
+    }
+
+    async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
+        let filter = crate::runs::RunFilter {
+            from:      input["from"].as_u64(),
+            to:        input["to"].as_u64(),
+            agent_id:  input["agent_id"].as_str().map(String::from),
+            parent_id: input["parent_id"].as_str().map(String::from),
+            status:    input["status"].as_str().map(String::from),
+            limit:     input["limit"].as_u64().unwrap_or(20).min(100) as usize,
+        };
+        let store = Arc::clone(&self.store);
+        let runs = tokio::task::spawn_blocking(move || store.list(&filter))
+            .await
+            .context("runs_query spawn_blocking join")??;
+        Ok(serde_json::to_string(&serde_json::json!({ "runs": runs, "count": runs.len() }))?)
+    }
+}
+
+#[async_trait]
 impl Tool for SpawnAgentTool {
     fn name(&self) -> &str {
         "spawn_agent"
@@ -967,6 +1020,7 @@ pub fn register_native(
     names: &[String],
     cards: Option<Arc<Vec<AgentCard>>>,
     store: Option<Arc<dyn MemoryStore>>,
+    runs: Option<Arc<crate::runs::RunsStore>>,
 ) -> anyhow::Result<()> {
     let all = names.iter().any(|n| n == "all");
     let want = |name: &str| all || names.iter().any(|n| n == name);
@@ -1028,6 +1082,12 @@ pub fn register_native(
     if names.iter().any(|n| n == "kb_search") {
         if let Some(s) = store.clone() {
             reg.register(Box::new(KbSearch { store: s }))?;
+        }
+    }
+    // runs_query — NOT in "all"; requires RunsRead + explicit opt-in (ux.11b).
+    if names.iter().any(|n| n == "runs_query") {
+        if let Some(r) = runs.clone() {
+            reg.register(Box::new(RunsQuery { store: r }))?;
         }
     }
     Ok(())
@@ -1179,7 +1239,7 @@ mod tests {
     #[test]
     fn register_native_all_registers_six_base_tools_not_kv() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
@@ -1216,7 +1276,7 @@ mod tests {
     #[test]
     fn register_native_subset() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["read_file".to_string()], None, None, None).unwrap();
         let names = reg.tool_names();
         assert!(names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"write_file".to_string()));
@@ -1226,7 +1286,7 @@ mod tests {
     #[test]
     fn register_native_empty_registers_nothing() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &[], None, None).unwrap();
+        register_native(&mut reg, &[], None, None, None).unwrap();
         assert!(reg.tool_names().is_empty());
     }
 
@@ -1482,6 +1542,7 @@ mod tests {
             &["kv_get".to_string(), "kv_set".to_string()],
             None,
             None,
+        None,
         )
         .unwrap();
         assert!(
@@ -1633,6 +1694,7 @@ mod tests {
             &["mem_remember".to_string(), "mem_recall".to_string()],
             None,
             None,
+        None,
         )
         .unwrap();
         assert!(
@@ -1648,7 +1710,7 @@ mod tests {
     #[test]
     fn register_native_all_does_not_include_mem_tools() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
         let names = reg.tool_names();
         assert!(!names.contains(&"mem_remember".to_string()), "mem_remember must not be in 'all'");
         assert!(!names.contains(&"mem_recall".to_string()), "mem_recall must not be in 'all'");
@@ -1662,6 +1724,7 @@ mod tests {
             &["kb_put".to_string(), "kb_get".to_string(), "kb_search".to_string()],
             None,
             None,
+        None,
         )
         .unwrap();
         assert!(
@@ -2090,6 +2153,7 @@ mod tests {
             &["kb_get".to_string()],
             None,
             Some(store as Arc<dyn MemoryStore>),
+        None,
         ).unwrap();
 
         let tmp = NamedTempFile::new().unwrap();
@@ -2123,6 +2187,7 @@ mod tests {
             &["kb_put".to_string()],
             None,
             Some(store as Arc<dyn MemoryStore>),
+        None,
         ).unwrap();
 
         let tmp = NamedTempFile::new().unwrap();
@@ -2171,6 +2236,7 @@ mod tests {
             &["kb_search".to_string()],
             None,
             Some(store as Arc<dyn MemoryStore>),
+        None,
         ).unwrap();
 
         let tmp = NamedTempFile::new().unwrap();

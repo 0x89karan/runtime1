@@ -166,6 +166,7 @@ capabilities = [
   { Mcp    = { server = "google_oauth",  tools = [] } },
   { FsWrite = { prefix = "/run/output" } },
   { Credential = { provider = "Google" } },
+  { RunsRead = {} },   # ux.11b: read durable run history via runs_query
 ]
 
 task = """
@@ -321,4 +322,5 @@ native = [
   "kb_search",
   "write_file",
   "request_approval",
+  "runs_query",
 ]

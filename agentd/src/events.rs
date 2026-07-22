@@ -53,6 +53,9 @@ pub enum EventKind {
     /// Corrupt store renamed to `.corrupt`; new empty store opened.
     /// data: { path }
     MemoryQuarantined,
+    /// runs.redb could not be opened; run history unavailable this boot (ux.11b).
+    /// data: { hint, error }
+    RunsUnavailable,
     /// Token spend reached SOFT_THRESHOLD (75%); advisory only, no eviction.
     /// data: { agent, turn, tokens_spent_pct: f64, soft_threshold: f64 }
     MemoryPressureAdvisory,

@@ -10,6 +10,7 @@
 //!   POST /api/v1/approvals/:id/approve           → 200 | 400 | 404 | 503
 //!   POST /api/v1/approvals/:id/deny              → 200 | 400 | 404 | 503
 //!   GET  /api/v1/memory/:ns?limit=&offset=       → 200 [{key, value}, ...] paginated
+//!   GET  /api/v1/runs?from=&to=&agent_id=&parent_id=&status=&limit=  → 200 [RunRecord, ...] (ux.11b)
 //!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
@@ -47,6 +48,8 @@ const MAX_MEMORY_LIMIT: usize = 100;
 struct ApiState {
     snapshot:           SharedSnapshot,
     memory_store:       Option<Arc<dyn MemoryStore>>,
+    /// Durable run-history store (ux.11b). None when the store failed to open.
+    runs_store:         Option<Arc<crate::runs::RunsStore>>,
     broadcast_tx:       broadcast::Sender<String>,
     recorder:           Arc<FlightRecorder>,
     /// Sender half of the scheduler control channel. None when not wired (non-Linux or test).
@@ -261,6 +264,33 @@ async fn route(
                     json_response(StatusCode::OK, json!(page))
                 }
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            }
+        }
+
+        (Method::GET, "/api/v1/runs") => {
+            // ux.11b: read-only durable run history. Filters via query params:
+            // ?from=&to=&agent_id=&parent_id=&status=&limit= (limit clamped to [1,100]).
+            let Some(store) = &state.runs_store else {
+                return error_response(StatusCode::SERVICE_UNAVAILABLE, "run history not configured");
+            };
+            let mut filter = crate::runs::RunFilter::default();
+            for pair in query.split('&').filter(|s| !s.is_empty()) {
+                let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                match k {
+                    "from"      => filter.from = v.parse().ok(),
+                    "to"        => filter.to = v.parse().ok(),
+                    "agent_id"  => filter.agent_id = Some(v.to_string()),
+                    "parent_id" => filter.parent_id = Some(v.to_string()),
+                    "status"    => filter.status = Some(v.to_string()),
+                    "limit"     => filter.limit = v.parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+            let store = Arc::clone(store);
+            match tokio::task::spawn_blocking(move || store.list(&filter)).await {
+                Ok(Ok(recs)) => json_response(StatusCode::OK, json!(recs)),
+                Ok(Err(e))   => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                Err(e)       => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("runs query join: {e}")),
             }
         }
 
@@ -555,6 +585,7 @@ pub async fn start(
     allow_non_loopback: bool,
     snapshot: SharedSnapshot,
     memory_store: Option<Arc<dyn MemoryStore>>,
+    runs_store: Option<Arc<crate::runs::RunsStore>>,
     broadcast_tx: broadcast::Sender<String>,
     recorder: Arc<FlightRecorder>,
     control_tx: Option<mpsc::Sender<ControlCommand>>,
@@ -591,6 +622,7 @@ pub async fn start(
     let state = Arc::new(ApiState {
         snapshot,
         memory_store,
+        runs_store,
         broadcast_tx,
         recorder,
         control_tx,
@@ -647,6 +679,7 @@ mod tests {
         Arc::new(ApiState {
             snapshot: Arc::new(RwLock::new(snap)),
             memory_store: None,
+            runs_store: None,
             broadcast_tx: tx,
             recorder,
             control_tx,
@@ -798,6 +831,7 @@ mod tests {
             false,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
             None,
+            None,
             tx,
             recorder,
             None,
@@ -824,6 +858,7 @@ mod tests {
             true,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
             None,
+            None,
             tx,
             recorder,
             None,
@@ -845,6 +880,7 @@ mod tests {
             0,
             true,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
             None,
             tx,
             recorder,
@@ -885,6 +921,7 @@ mod tests {
             false,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
             None,
+            None,
             tx,
             recorder,
             None,
@@ -906,6 +943,7 @@ mod tests {
             0,
             false,
             Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
             None,
             tx,
             recorder,
@@ -1065,6 +1103,50 @@ mod tests {
         let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
         let resp = route(state, Method::POST, "/api/v1/budget/reset", "", br#"{"target":{"agent":"ghost"}}"#).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn runs_unconfigured_returns_503() {
+        let state = make_state(SchedulerSnapshot::default()); // runs_store: None
+        let resp = route(state, Method::GET, "/api/v1/runs", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn runs_returns_records_with_store() {
+        // Populate a temp RunsStore, inject it into ApiState, assert GET /api/v1/runs 200 + shape.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _q) = crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap();
+        store.apply(crate::runs::RunEvent::Open {
+            agent_id: "inbox".into(), parent_id: Some("cos".into()), start_reason: "child_spawn".into(),
+            start_context_tokens: Some(10), tier: "native".into(), ts: 100,
+        }).unwrap();
+        store.apply(crate::runs::RunEvent::Close {
+            agent_id: "inbox".into(), status: "done".into(), stop_reason: Some("completed".into()),
+            last_error: None, end_context_tokens: Some(50), ts: 200,
+        }).unwrap();
+
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap());
+        let state = Arc::new(ApiState {
+            snapshot: Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            memory_store: None,
+            runs_store: Some(Arc::new(store)),
+            broadcast_tx: tx,
+            recorder,
+            control_tx: None,
+            credential_gateway: None,
+        });
+        let resp = route(state, Method::GET, "/api/v1/runs", "agent_id=inbox&limit=10", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["status"], "done");
+        assert_eq!(arr[0]["spend"], 40);
+        assert_eq!(arr[0]["parent_id"], "cos");
     }
 
     #[tokio::test]

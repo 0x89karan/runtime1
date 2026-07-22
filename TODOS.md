@@ -125,6 +125,28 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   ux.11a added empty/charset validation to `/budget/set`; the pre-existing `/budget/reset` still
   dispatches any `Agent(String)` (empty/malformed → scheduler traffic → misleading 404 not 400).
   Mirror the set-path validation onto reset. Pre-existing (out of ux.11a scope); cheap. (Codex.)
+- **ux.11b-ar-01 (P3) [new, ux.11b-substrate] — park/resume is not a run-segment boundary in v1.**
+  v1 models a segment as entry→terminal; an agent that parks (orchestrated `Waiting`, or `pending_approvals`
+  approval-park) stays in ONE open segment until it finally terminates (approval-park still increments
+  `approvals_count` on the open segment — G6). This is correct for the CoS daily children (spawn→terminal,
+  the runs that matter) but means an orchestrate-REPL agent shows one long segment, not one-per-turn. Fix
+  (deferred): close on park + reopen (`resume`) on inject/approval-resolve. Design-doc D3 wanted this;
+  descoped from the substrate to keep the wiring bounded. NOTE when implementing (ship review): once park
+  closes segments, the config-seed loop must SKIP agents restored into `waiting`/`pending_approvals` (else
+  restart mints phantom `running` segments for idle parked agents), and inject/approval-resolve must emit
+  the `resume` open. Shutdown already closes remaining native segments as `interrupted`, so nothing leaks
+  `running` across a clean stop.
+- **ux.11b-ar-03 (P2) [new, ux.11b-substrate /review] — `runs.redb` has no retention/prune; `list()` is O(n).**
+  `RunsStore::list` full-scans + deserializes every record per query, and nothing prunes old runs, so an
+  always-on CoS accreting inbox+curator child runs daily grows `runs.redb` monotonically and slows every
+  `runs_query` / `GET /api/v1/runs` over months (both models, ship review — the flight.jsonl-no-rotation
+  class). Low impact at v1 volume (~1k runs/year, list limit-capped at 100 results), but fix before it
+  matters: age/count retention prune in the writer + a time-indexed table so from/to/limit avoid a full
+  scan. (Companion to audit86-P1-2 flight rotation → run.1.)
+- **ux.11b-ar-02 (P3) [new, ux.11b-substrate] — FUSE `/agents/runs` not shipped.**
+  ux.11b-substrate ships the read surfaces the CoS + operators use: the `runs_query` native tool and
+  `GET /api/v1/runs`. The FUSE `/agents/runs` mirror (G7) needs a `RunsAccess` trait in `surfaces` +
+  threading through `AgentsFs::new`; deferred as additive. Add when a FUSE consumer needs it.
 - **ux.11a-ar-03 (P3) [new, ux.11a /ship] — universal-tier `windowed_spent` always 0 in the snapshot.**
   Universal-tier agents are proxy-metered, not AgentTask-metered, so `update_snapshot` hardcodes
   `windowed_spent: 0` (mirroring the pre-existing `context_tokens: 0`). The TUI/FUSE can therefore show

@@ -14,6 +14,7 @@ pub mod isolation_caps;
 pub mod loopback_proxy;
 pub mod management;
 pub mod memory;
+pub mod runs;
 pub mod scheduler;
 pub mod template;
 pub mod tools;

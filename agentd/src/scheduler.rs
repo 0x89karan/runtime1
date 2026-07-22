@@ -18,6 +18,7 @@ use crate::{
     flight_recorder::{EventKind, FlightRecorder},
     inference::{Block, InferenceGateway, InferenceRequest, InferenceResponse, Msg, Role},
     memory::MemoryStore,
+    runs::RunTracker,
     tools::ToolRegistry,
     universal::UniversalAgent,
 };
@@ -137,6 +138,8 @@ struct SchedulerState {
     waiting: HashSet<String>,
     /// Credential gateway for per-agent grant projection (cred.5). None when disabled.
     cred_gw: Option<Arc<crate::credential::CredentialGateway>>,
+    /// Run-history tracker (ux.11b): lifecycle transitions send RunEvents off-loop.
+    run_tracker: RunTracker,
 }
 
 impl SchedulerState {
@@ -193,6 +196,8 @@ pub struct Scheduler {
     universal_pending:   Vec<AgentConfig>,
     /// Credential gateway for per-agent grant projection into the snapshot (cred.5).
     cred_gw:             Option<Arc<crate::credential::CredentialGateway>>,
+    /// Run-history tracker (ux.11b). Disabled (no-op) unless set via with_run_tracker().
+    run_tracker:         RunTracker,
 }
 
 impl Scheduler {
@@ -329,6 +334,7 @@ impl Scheduler {
             snapshot,
             store,
             cred_gw: None,
+            run_tracker:         RunTracker::disabled(),
             restored,
             memory_store:        None,
             distill_on_complete: false,
@@ -390,6 +396,12 @@ impl Scheduler {
         self
     }
 
+    /// Attach the run-history tracker (ux.11b) so lifecycle transitions author `runs.redb`.
+    pub fn with_run_tracker(mut self, tracker: RunTracker) -> Self {
+        self.run_tracker = tracker;
+        self
+    }
+
     /// Return the bound egress proxy address, if configured.
     pub fn egress_addr(&self) -> Option<std::net::SocketAddr> {
         self.egress_addr
@@ -417,6 +429,7 @@ impl Scheduler {
             proxy_registry,
             universal_pending,
             cred_gw,
+            run_tracker,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
@@ -450,6 +463,7 @@ impl Scheduler {
             orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
             cred_gw,
+            run_tracker,
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -485,6 +499,18 @@ impl Scheduler {
 
         init_budget_window(&mut state, &sched, now_unix_secs());
 
+        // ux.11b: open a run segment for every seeded/restored native agent. Idempotent
+        // (G3) — on a restart the persisted open segment is continued, not duplicated.
+        // Collect first (borrows state.agents), then call the tracker (borrows state).
+        {
+            let seeds: Vec<(String, Option<String>, u64)> = state.agents.iter()
+                .map(|(id, task)| (id.clone(), state.parent_map.get(id).cloned(), task.context_tokens()))
+                .collect();
+            for (id, parent_id, spend) in seeds {
+                state.run_tracker.open(&id, parent_id, "config_seed", Some(spend), "native");
+            }
+        }
+
         // Spawn universal-tier agents before the native seed loop.
         for cfg in universal_pending {
             match egress_addr {
@@ -507,7 +533,12 @@ impl Scheduler {
                         }).await;
                     }
                     match UniversalAgent::spawn(&cfg, addr, &ephemeral_key, &recorder) {
-                        Ok(ua) => { state.universal_agents.insert(cfg.id.clone(), ua); }
+                        Ok(ua) => {
+                            state.universal_agents.insert(cfg.id.clone(), ua);
+                            // ux.11b: open a run segment; universal-tier is proxy-metered
+                            // (no context_tokens) → spend recorded as None.
+                            state.run_tracker.open(&cfg.id, None, "universal_spawn", None, "universal");
+                        }
                         Err(e) => {
                             // Deregister the key since the agent never started.
                             if let Some(reg) = &state.proxy_registry {
@@ -979,6 +1010,19 @@ impl Scheduler {
             state.outcomes.entry(id.clone()).or_insert_with(|| {
                 Err(anyhow::anyhow!("universal agent killed at shutdown"))
             });
+            state.run_tracker.close(&id, "interrupted", Some("shutdown".into()), None, None);
+        }
+
+        // ux.11b (ship review F2): close any native run segments still open at shutdown
+        // so they don't leak as "running". Agents that already terminated had close()
+        // called in handle_agent_terminal → this is a no-op double-close for them; it
+        // genuinely closes the perpetual orchestrator + agents parked in waiting/approval.
+        // Collect first (borrows state.agents), then call the tracker (borrows state).
+        let native_open: Vec<(String, u64)> = state.agents.iter()
+            .map(|(id, task)| (id.clone(), task.context_tokens()))
+            .collect();
+        for (id, tokens) in native_open {
+            state.run_tracker.close(&id, "interrupted", Some("shutdown".into()), None, Some(tokens));
         }
 
         state.outcomes
@@ -999,6 +1043,18 @@ fn handle_agent_terminal(
     // Always clear orchestration membership on termination — prevents phantom entries.
     state.waiting.remove(&agent_id);
     state.orchestrated.remove(&agent_id);
+
+    // ux.11b: close the run segment before the agent leaves state.agents. This funnels
+    // every native terminal (child, root, admission-denial). Spend = Δ context_tokens
+    // captured while the task still exists; status from the outcome.
+    {
+        let (status, stop_reason, last_error): (&str, Option<String>, Option<String>) = match &result {
+            Ok(_)  => ("done", Some("completed".to_string()), None),
+            Err(e) => ("failed", None, Some(e.to_string())),
+        };
+        let end_tokens = state.agents.get(&agent_id).map(|t| t.context_tokens());
+        state.run_tracker.close(&agent_id, status, stop_reason, last_error, end_tokens);
+    }
 
     if let Some(awaiting) = state.awaiting.remove(&agent_id) {
         // This agent is a child — inject its result into the waiting parent.
@@ -1660,6 +1716,8 @@ fn enqueue_or_defer(
                     "summary":     &action.summary,
                 }),
             );
+            // ux.11b (G6): count this approval against the agent's open run segment.
+            state.run_tracker.incr_approval(&agent_id);
             state.pending_approvals.insert(approval_id, ParkedApproval {
                 agent_id:   agent_id.clone(),
                 call_id,
@@ -1915,7 +1973,10 @@ fn dispatch_spawn(
         enqueue_or_defer(parent_effect, parent_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
         return;
     }
+    let child_open_tokens = child_task.context_tokens();
     state.agents.insert(child_id.clone(), child_task);
+    // ux.11b: open the child's run segment (parent linkage = the run tree).
+    state.run_tracker.open(&child_id, Some(parent_id.clone()), "child_spawn", Some(child_open_tokens), "native");
     state.awaiting.insert(
         child_id.clone(),
         AwaitingParent { parent_id: parent_id.clone(), call_id },
@@ -2320,7 +2381,10 @@ fn dispatch_operator_spawn_inner(
     // C1: operator-spawned agents defer (not brick) on per-agent budget under a window.
     task.set_budget_resettable(sched.budget_reset_interval > 0);
 
+    let op_open_tokens = task.context_tokens();
     state.agents.insert(agent_id.clone(), task);
+    // ux.11b: open the operator-spawned agent's run segment (top-level).
+    state.run_tracker.open(&agent_id, None, "operator_spawn", Some(op_open_tokens), "native");
     state.spawn_depths.insert(agent_id.clone(), 0);
     state.mailboxes.entry(agent_id.clone()).or_default();
     state.parent_map.insert(agent_id.clone(), "operator".to_string());
@@ -2762,6 +2826,7 @@ async fn poll_universal_agents(
             ua.kill().await;
             state.universal_agents.remove(&id);
             state.outcomes.insert(id.clone(), Err(anyhow::anyhow!("universal agent wall timeout exceeded")));
+            state.run_tracker.close(&id, "failed", Some("wall_timeout".into()), Some("universal agent wall timeout exceeded".into()), None);
             any_exited = true;
             continue;
         }
@@ -2785,6 +2850,12 @@ async fn poll_universal_agents(
                 if let Some(reg) = &state.proxy_registry {
                     reg.deregister_by_key(&ephemeral_key).await;
                 }
+                let (rt_status, rt_stop, rt_err) = match exit_code {
+                    Some(0) => ("done", Some("exit_0".to_string()), None),
+                    Some(n) => ("failed", Some(format!("exit_{n}")), Some(format!("universal agent exited with code {n}"))),
+                    None    => ("failed", Some("signal".to_string()), Some("universal agent killed by signal".to_string())),
+                };
+                state.run_tracker.close(&id, rt_status, rt_stop, rt_err, None);
                 state.outcomes.insert(id.clone(), outcome);
                 any_exited = true;
             }
@@ -2802,6 +2873,7 @@ async fn poll_universal_agents(
                 if let Some(reg) = &state.proxy_registry {
                     reg.deregister_by_key(&ephemeral_key).await;
                 }
+                state.run_tracker.close(&id, "failed", Some("poll_error".into()), Some(format!("universal agent poll error: {msg}")), None);
                 state.outcomes.insert(id.clone(), Err(anyhow::anyhow!("universal agent poll error: {msg}")));
                 any_exited = true;
             }
@@ -3121,6 +3193,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_authors_a_closed_run_record() {
+        // ux.11b F5 integration: a real agent lifecycle through run() must land an
+        // authoritative closed record in runs.redb — proves the RunTracker call-site
+        // placement (open at seed, close in handle_agent_terminal), not just the store.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _q) = crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap();
+        let store = Arc::new(store);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let writer = tokio::spawn(crate::runs::run_writer(rx, Arc::clone(&store)));
+
+        let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
+        let sched = make_scheduler(vec![agent_cfg("solo", "do something")], unlimited(), gw)
+            .with_run_tracker(crate::runs::RunTracker::new(tx));
+        let outcomes = sched.run().await; // drops the tracker (sender) → writer drains + ends
+        assert_eq!(outcomes["solo"].as_ref().unwrap(), "done");
+
+        writer.await.unwrap();
+        let recs = store.list(&crate::runs::RunFilter::default()).unwrap();
+        assert_eq!(recs.len(), 1, "exactly one segment for the solo agent");
+        assert_eq!(recs[0].agent_id, "solo");
+        assert_eq!(recs[0].status, "done", "root completion closes via handle_agent_terminal");
+        assert_eq!(recs[0].start_reason, "config_seed");
+        assert!(recs[0].end_ts.is_some(), "segment is closed");
+        assert!(recs[0].spend.is_some(), "native segment has a spend delta");
+    }
+
+    #[tokio::test]
     async fn scheduler_one_agent_fails_other_completes() {
         struct PartialFailGateway {
             calls: Arc<Mutex<u32>>,
@@ -3318,7 +3417,7 @@ mod tests {
         };
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["write_file".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["write_file".to_string()], None, None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             InferenceResponse {
@@ -3372,7 +3471,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         let responses = vec![
             // Parent turn 0: spawns child
@@ -3441,7 +3540,7 @@ mod tests {
         }
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         let parent = AgentConfig {
             capabilities: Some(vec![Capability::Spawn]),
@@ -3472,7 +3571,7 @@ mod tests {
         use crate::tools::native::register_native;
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent turn 0: tries to spawn (will be denied)
@@ -3509,7 +3608,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent turn 0: spawn (will be denied — already at max depth 0, limit 0)
@@ -3558,7 +3657,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Parent turn 0 (10+5=15 tokens): spawn
@@ -3610,7 +3709,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         // Build a spawn response that carries an explicit child_id.
         let spawn_response = InferenceResponse {
@@ -3674,7 +3773,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         let spawn_response = InferenceResponse {
             blocks: vec![Block::ToolUse {
@@ -3725,7 +3824,7 @@ mod tests {
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["spawn_agent".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None).unwrap();
 
         let spawn_response = InferenceResponse {
             blocks: vec![Block::ToolUse {
@@ -3777,11 +3876,11 @@ mod tests {
         use crate::tools::native::register_native;
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["send_message".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["send_message".to_string()], None, None, None).unwrap();
 
         // Run both agents via a single MockGateway (interleaved responses).
         let mut registry2 = ToolRegistry::new();
-        register_native(&mut registry2, &["send_message".to_string()], None, None).unwrap();
+        register_native(&mut registry2, &["send_message".to_string()], None, None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent alpha: send_message to beta
@@ -3827,7 +3926,7 @@ mod tests {
         use crate::tools::native::register_native;
 
         let mut registry = ToolRegistry::new();
-        register_native(&mut registry, &["send_message".to_string()], None, None).unwrap();
+        register_native(&mut registry, &["send_message".to_string()], None, None, None).unwrap();
 
         let gw = MockGateway::new(vec![
             // Agent sends to unknown recipient
@@ -3953,6 +4052,7 @@ mod tests {
             orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
             cred_gw:            None,
+            run_tracker:        RunTracker::disabled(),
         }
     }
 

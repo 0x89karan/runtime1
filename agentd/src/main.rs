@@ -314,6 +314,53 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         None
     };
 
+    // ── ux.11b-substrate: durable run history ──────────────────────────────
+    // Separate `runs.redb` beside the memory store (E6 — no shared write-lock with
+    // KB traffic). Best-effort: an open failure emits RunsUnavailable and boot
+    // continues with a disabled tracker (run history is best-effort, like the
+    // flight recorder — it must never block boot).
+    let runs_path = {
+        let base = PathBuf::from(&cfg.memory.store_path);
+        base.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join("runs.redb"))
+            .unwrap_or_else(|| PathBuf::from("runs.redb"))
+    };
+    #[allow(clippy::type_complexity)]
+    let (run_tracker, runs_store, run_writer_handle): (
+        agentd::runs::RunTracker,
+        Option<Arc<agentd::runs::RunsStore>>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) =
+        match agentd::runs::RunsStore::open(&runs_path) {
+            Ok((store, quarantined)) => {
+                if let Some(ref corrupt_path) = quarantined {
+                    tracing::warn!(path = %corrupt_path.display(), "corrupt runs store quarantined; starting fresh");
+                }
+                let store = Arc::new(store);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                // Keep the JoinHandle so we can drain queued run events at shutdown —
+                // otherwise the runtime can cancel the writer before the final Close
+                // events land, leaving terminal runs stuck "running" (ship review).
+                let handle = tokio::spawn(agentd::runs::run_writer(rx, Arc::clone(&store)));
+                (agentd::runs::RunTracker::new(tx), Some(store), Some(handle))
+            }
+            Err(e) => {
+                recorder.record(
+                    "agentd",
+                    None,
+                    EventKind::RunsUnavailable,
+                    serde_json::json!({
+                        "hint": "runs_query / GET /api/v1/runs / /agents/runs will be empty",
+                        "error": format!("{e:#}"),
+                    }),
+                );
+                tracing::warn!(error = %e, "runs store unavailable; run history disabled this boot");
+                (agentd::runs::RunTracker::disabled(), None, None)
+            }
+        };
+    let runs_store_for_management = runs_store.clone();
+
     // Initialise declared KB segment classes (p5.4). Done before registering tools so
     // that `kb_put` enforces the correct class from the first invocation.
     if let Some(ref store) = memory_store {
@@ -346,7 +393,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // Keep clones for distillation wiring (p5.6) and management API (p7.7) before moving into registry.
     let memory_store_for_distillation = memory_store.clone();
     let memory_store_for_management = memory_store.clone();
-    register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store)?;
+    register_native(&mut registry, &cfg.tools.native, Some(Arc::clone(&cards)), memory_store, runs_store.clone())?;
 
     // Pass 1: validate capabilities and isolation settings before spawning any process.
 
@@ -1114,6 +1161,7 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             cfg.management.allow_non_loopback,
             Arc::clone(&snapshot),
             memory_store_for_management,
+            runs_store_for_management,
             broadcast_tx.clone(),
             Arc::clone(&recorder),
             mgmt_control_tx,
@@ -1210,6 +1258,9 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         scheduler
     };
 
+    // ux.11b: wire the run-history tracker so lifecycle transitions author runs.redb.
+    let scheduler = scheduler.with_run_tracker(run_tracker);
+
     let streamed_agents = scheduler.streamed_agents();
     recorder.record(
         "agentd",
@@ -1224,6 +1275,13 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         EventKind::SchedulerStopped,
         serde_json::json!({ "run_id": run_id, "agent_count": outcomes.len() }),
     );
+
+    // Drain queued run-history writes before exit (ship review): scheduler.run()
+    // dropped the RunTracker (sender), so the writer finishes once it applies the
+    // remaining events. Bounded wait so a wedged writer can't hang shutdown.
+    if let Some(handle) = run_writer_handle {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    }
 
     #[cfg(target_os = "linux")]
     if let Some(session) = maybe_session {
@@ -1392,13 +1450,14 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
                     rules.push(SandboxRule::AllowNetConnect { port });
                 }
             }
-            // Mcp/KbRead/KbWrite/ShellExec/Credential are agent-level or broker-handled; no sandbox rule.
+            // Mcp/KbRead/KbWrite/ShellExec/Credential/RunsRead are agent-level or broker-handled; no sandbox rule.
             Capability::Mcp { .. }
             | Capability::Spawn
             | Capability::ShellExec
             | Capability::KbRead { .. }
             | Capability::KbWrite { .. }
-            | Capability::Credential { .. } => {}
+            | Capability::Credential { .. }
+            | Capability::RunsRead => {}
         }
     }
     rules

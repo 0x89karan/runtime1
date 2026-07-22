@@ -68,6 +68,10 @@ pub enum Capability {
     /// Grants an agent (or MCP server) access to a specific credential provider
     /// via the credential broker. Audited; enforcement (deny-without-cap) deferred to cred.4+.
     Credential { provider: CredentialProvider },
+    /// Read access to durable run history via `runs_query` (ux.11b). Unit grant —
+    /// run history is a single dataset (errors/spend/parent), so it is NOT modeled
+    /// as a KB segment (KbRead would be too loose).
+    RunsRead,
 }
 
 /// Normalize a path by resolving `.` and `..` components without filesystem
@@ -207,6 +211,7 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
         Capability::Credential { provider: req_prov } => granted.iter().any(|g| {
             matches!(g, Capability::Credential { provider: gp } if gp == req_prov)
         }),
+        Capability::RunsRead => granted.iter().any(|g| matches!(g, Capability::RunsRead)),
     }
 }
 

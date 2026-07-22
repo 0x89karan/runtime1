@@ -39,6 +39,7 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::BudgetExceeded => false,
         EventKind::BudgetReset => false,
         EventKind::BudgetSet => false,
+        EventKind::RunsUnavailable => false,
         EventKind::MaxTurnsReached => false,
         EventKind::CapabilityDenied => false,
         EventKind::AgentChildResultDelivered => false,
