@@ -241,6 +241,94 @@ pub fn kb_segment_satisfies(granted: &str, required: &str) -> bool {
     }
 }
 
+/// The broker-registry key for a credential provider. This MUST match the runtime broker's
+/// key derivation (`credential_allowed_providers` in main.rs) so the cap.1 linter's wiring
+/// cross-check and the runtime broker never disagree — a second key derivation is exactly
+/// the drift this increment exists to prevent (review: both voices).
+pub fn credential_provider_key(p: &CredentialProvider) -> String {
+    match p {
+        CredentialProvider::Google => "google".to_string(),
+        CredentialProvider::BraveSearch => "brave-search".to_string(),
+        CredentialProvider::Custom(s) => s.clone(),
+    }
+}
+
+/// A bare `agent` KB-segment grant (cap.1 A5 / audit-C2 / P1-11).
+///
+/// `kb_segment_satisfies` matches on a `granted` prefix followed by a delimiter, so ONLY the
+/// bare `agent` namespace (no trailing delimiter) satisfies every per-agent Tier-3
+/// self-namespace (`agent/<id>` AND `agent:<id>`), defeating memory isolation. `"agent/"` and
+/// `"agent:"` match only their literal selves (review F2: `kb_segment_satisfies("agent/",
+/// "agent/inbox")` is false — the stripped remainder has no leading delimiter), so they are
+/// harmless and are NOT flagged. A legitimate grant names the full `agent/<id>`; the per-agent
+/// self-namespace used by `remember`/`recall` is never a config grant.
+pub fn is_bare_agent_segment(segment: &str) -> bool {
+    segment == "agent"
+}
+
+/// The tier a capability is declared at. A single `Capability` variant means different
+/// things (or nothing) depending on where it is declared, and the enforcement paths differ —
+/// this is the "declaration surface" the cap.1 audit targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapContext {
+    /// Granted to an agent (`[[agents]].capabilities`).
+    Agent,
+    /// Declared on a stdio MCP server (`[[mcp_servers]].capabilities`) → Landlock/seccomp.
+    StdioMcp,
+    /// Declared on an HTTP MCP server — the transport discards all sandbox fields.
+    HttpMcp,
+}
+
+/// Whether a capability is actually enforced when declared in a given context, or inert
+/// (present in config but a silent no-op — the fail-closed-with-no-signal class).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Legality {
+    /// The grant is honored by some enforcement path in this context.
+    Enforced,
+    /// The grant is a silent no-op here; the `&'static str` explains why (for diagnostics).
+    Inert(&'static str),
+}
+
+/// The ONE shared effective-capability resolver (cap.1 F3). `agentd check` (the linter) and
+/// the `CapabilitiesResolved` boot event both call this — there must be exactly one place
+/// that decides which (capability × context) pairs are enforced vs inert, or the linter
+/// becomes a third interpreter that drifts from enforcement as the enum grows.
+///
+/// NO wildcard arm on `Capability`: adding a variant MUST fail to compile here until its
+/// tier legality is declared for every context (the drift guard — do not "fix the build"
+/// with a `_ =>` arm). `Credential { Agent }` is `Inert` here, but whether that is an ERROR
+/// is decided by the config-level *wiring* cross-check in `check.rs` (it depends on whether
+/// a matching stdio MCP server provides the provider), not by this per-pair function.
+pub fn tier_legality(cap: &Capability, ctx: CapContext) -> Legality {
+    use Capability::*;
+    match ctx {
+        // HTTP transport reads only url/headers_env; every sandbox/grant field is discarded.
+        CapContext::HttpMcp => Legality::Inert("HTTP MCP transport discards capabilities/isolation"),
+        CapContext::Agent => match cap {
+            FsRead { .. } | FsWrite { .. } => Legality::Enforced,
+            Mcp { .. } | Spawn | KbRead { .. } | KbWrite { .. } | RunsRead | BriefPublish => {
+                Legality::Enforced
+            }
+            Net { .. } => Legality::Inert("agent-level Net is advisory; native agents have no sandbox"),
+            ShellExec => Legality::Inert("agent-level ShellExec is not gated; use Mcp { server }"),
+            Credential { .. } => {
+                Legality::Inert("agent-level Credential is not enforced; the broker token is per stdio-server")
+            }
+        },
+        // A stdio server's own sandbox: FS/Net/Spawn/ShellExec/Credential compile to
+        // Landlock/seccomp/broker rules; agent-facing caps have no server-sandbox meaning.
+        CapContext::StdioMcp => match cap {
+            FsRead { .. } | FsWrite { .. } | Net { .. } | Spawn | ShellExec | Credential { .. } => {
+                Legality::Enforced
+            }
+            Mcp { .. } => Legality::Inert("Mcp grant has no meaning on a server's own sandbox"),
+            KbRead { .. } | KbWrite { .. } | RunsRead | BriefPublish => {
+                Legality::Inert("agent-facing capability has no server-sandbox rule")
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +519,52 @@ mod tests {
         assert!(satisfies(&[Capability::BriefPublish], &Capability::BriefPublish));
         assert!(!satisfies(&[], &Capability::BriefPublish));
         assert!(!satisfies(&[Capability::RunsRead], &Capability::BriefPublish));
+    }
+
+    // ─────────────────────────── cap.1: tier_legality + bare-agent ───────────────────────────
+
+    #[test]
+    fn tier_legality_pins_the_matrix() {
+        use Capability::*;
+        // NOTE: the real drift guard is the COMPILE-TIME non-wildcard match in `tier_legality`
+        // (a new variant fails to compile until declared). This test only pins known values.
+        let fsr = FsRead { prefix: "/x".into() };
+        let net = Net { hosts: vec![], ports: vec![] };
+        let cred = Credential { provider: CredentialProvider::Google };
+
+        // Agent context: FS enforced; Net/ShellExec/Credential inert.
+        assert_eq!(tier_legality(&fsr, CapContext::Agent), Legality::Enforced);
+        assert!(matches!(tier_legality(&net, CapContext::Agent), Legality::Inert(_)));
+        assert!(matches!(tier_legality(&ShellExec, CapContext::Agent), Legality::Inert(_)));
+        assert!(matches!(tier_legality(&cred, CapContext::Agent), Legality::Inert(_)));
+        assert_eq!(tier_legality(&Spawn, CapContext::Agent), Legality::Enforced);
+        assert_eq!(tier_legality(&RunsRead, CapContext::Agent), Legality::Enforced);
+
+        // Stdio-MCP context: FS/Net/ShellExec/Credential enforced; agent-facing caps inert.
+        assert_eq!(tier_legality(&net, CapContext::StdioMcp), Legality::Enforced);
+        assert_eq!(tier_legality(&cred, CapContext::StdioMcp), Legality::Enforced);
+        assert_eq!(tier_legality(&ShellExec, CapContext::StdioMcp), Legality::Enforced);
+        assert!(matches!(tier_legality(&RunsRead, CapContext::StdioMcp), Legality::Inert(_)));
+
+        // HTTP-MCP context: everything inert (transport discards all sandbox fields).
+        assert!(matches!(tier_legality(&fsr, CapContext::HttpMcp), Legality::Inert(_)));
+        assert!(matches!(tier_legality(&cred, CapContext::HttpMcp), Legality::Inert(_)));
+    }
+
+    #[test]
+    fn bare_agent_segment_detection() {
+        // Only bare "agent" (no delimiter) prefixes both agent/<id> and agent:<id> → dangerous.
+        assert!(is_bare_agent_segment("agent"));
+        // "agent/" and "agent:" match only themselves (review F2) → harmless, not flagged.
+        assert!(!is_bare_agent_segment("agent/"));
+        assert!(!is_bare_agent_segment("agent:"));
+        assert!(!is_bare_agent_segment("agent/inbox"));
+        assert!(!is_bare_agent_segment("agent:inbox"));
+        assert!(!is_bare_agent_segment("ops:briefs"));
+        // The fact the narrowing relies on:
+        assert!(kb_segment_satisfies("agent", "agent/x")); // bare agent IS dangerous
+        assert!(kb_segment_satisfies("agent", "agent:x"));
+        assert!(!kb_segment_satisfies("agent/", "agent/x")); // "agent/" is NOT
     }
 
     #[test]

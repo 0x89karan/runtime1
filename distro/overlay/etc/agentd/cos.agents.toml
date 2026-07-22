@@ -165,6 +165,9 @@ capabilities = [
   { Mcp    = { server = "cron_trigger", tools = [] } },
   { Mcp    = { server = "google_oauth",  tools = [] } },
   { FsWrite = { prefix = "/run/output" } },
+  # cap.1: agent-level Credential is a declaration/attention signal, NOT enforced — the
+  # broker token is built from the google_oauth stdio server's own Credential cap. `agentd
+  # check` cross-checks that wiring.
   { Credential = { provider = "Google" } },
   { RunsRead = {} },   # ux.11b: read durable run history via runs_query
   { BriefPublish = {} },   # ux.11c: publish the morning brief to the operator pull surface

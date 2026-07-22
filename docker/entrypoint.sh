@@ -267,6 +267,16 @@ case "${1:-shell}" in
       "[\"']\.\.?/" \
       "^[[:space:]]*[a-z_]*_(path|dir)[[:space:]]*=[[:space:]]*[\"'][^/]" \
       "docker run --rm -e DRY_RUN_ONLY=1 <image> cos"
+    # cap.1: real capability-declaration linter on the REWRITTEN config (replaces the grep
+    # guards' partial coverage with actual parsing + the shared tier_legality resolver).
+    # Runs on /data (post-rewrite), fail-closed on any error finding — a mis-wired grant
+    # (wrong-tier credential, relative FS prefix, unknown MCP server, bare agent/ segment)
+    # never reaches a silent runtime denial. Runs in the dry-run path too.
+    agentd check --strict /data/cos.agents.toml || {
+      echo "ERROR: agentd check --strict failed on the rewritten config (see above)." >&2
+      echo "       The config would fail closed at runtime — fix the capability declarations." >&2
+      exit 1
+    }
     if [ -n "$_COS_DRY_RUN" ]; then
       cat /data/cos.agents.toml
       exit 0

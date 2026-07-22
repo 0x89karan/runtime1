@@ -251,8 +251,11 @@ capabilities = [
   # Without this, filtered_specs omits google_oauth from the child's tool list.
   { Mcp    = { server = "google_oauth",  tools = [] } },
   { FsWrite = { prefix = "./output" } },
-  # Credential broker access — spawned children inherit this grant, which lets
-  # the inbox agent's google_oauth calls route through the broker gateway.
+  # Credential declaration for Google. NOTE (cap.1): agent-level Credential is NOT
+  # enforced — the broker token's allowed_providers is built solely from the google_oauth
+  # *stdio server's* own Credential capability (main.rs credential_allowed_providers). This
+  # grant is a declaration/attention signal only; `agentd check` cross-checks that some
+  # stdio MCP server actually carries this provider (the wiring that makes it work).
   { Credential = { provider = "Google" } },
   # ux.11b: read durable run history via the runs_query tool (for the morning brief).
   { RunsRead = {} },
