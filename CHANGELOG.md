@@ -3,6 +3,28 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.92.0] - 2026-07-22
+
+### Added
+- **Morning brief** (ux.11c): the Chief of Staff now publishes a durable daily brief the
+  operator can pull at any time — `agentctl brief` and `GET /api/v1/brief` — so waking up
+  and reading "what happened overnight" needs no `runs_query` typing and no flight-log
+  reading. Reframed at plan review from a live chat-rail push to a **pull** surface after
+  both review voices found the rail is a lossy live stream with no replay-on-attach (a 6am
+  brief would be gone by the 9am attach — push and absence are mutually exclusive).
+- agentd **authors the brief's facts deterministically** from `runs.redb` (a new `BRIEFS`
+  table + `publish_brief` composer): run count, failures, spend, and the failing/blocked
+  run IDs — windowed by run **completion** (not start time), so a run that started before
+  the window but failed inside it is never silently dropped. The model contributes only
+  optional narrative color and cannot fake the facts.
+- **`agentctl brief`** renders attention-first: `📋 1 failed · 2 need approval · 12 runs`,
+  then the failing/blocked lines with run + agent IDs, then `✓ N others ok`; a quiet night
+  states `Quiet night — 0 runs` explicitly (a present brief is the liveness signal). "N need
+  approval" is overlaid **live** from the scheduler snapshot, not the at-compose-time record.
+- **`publish_brief` native tool** behind a new **`Capability::BriefPublish`** (granted to the
+  CoS) — the brief is an operator trust surface. `BriefWritten` flight event (informational).
+- ux.12 (Telegram) is now a pure consumer of `GET /api/v1/brief`.
+
 ## [v0.91.0] - 2026-07-22
 
 ### Added
