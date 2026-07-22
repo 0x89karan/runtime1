@@ -3,6 +3,33 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.93.0] - 2026-07-23
+
+### Added
+- **`agentd check` — capability declaration-surface linter** (cap.1, from the v0.86 audit).
+  Catches config that *looks* granted but is inert or wrong — the silent-fail-closed /
+  Gmail-outage class — at test, CI, and container-boot time, instead of a mysterious runtime
+  no-op. Checks MCP-server-name existence, KB-segment existence, tier-legality, relative FS
+  prefixes, and a **credential wiring cross-check** (a `Credential{provider}` granted to an
+  agent but carried by no stdio MCP server → the broker token is empty → every call fails
+  silently — the actual historical Gmail bug). `--strict` (used at container boot) elevates
+  relative FS prefixes to hard errors; default mode warns.
+- One shared **`tier_legality`** resolver (in `capability.rs`) decides which
+  (capability × context: agent / stdio-MCP / HTTP-MCP) pairs are enforced vs inert — used by
+  both the linter and the new **`CapabilitiesResolved`** boot event (logs each agent's +
+  server's effective set). A no-wildcard match makes a new `Capability` variant fail to
+  compile until its tier legality is declared (drift guard).
+- Reject bare `agent` / `agent/` / `agent:` KB-segment grants (they defeat per-agent memory
+  isolation — audit-C2 / P1-11).
+
+### Changed
+- The container entrypoint (`cos)` mode) now runs `agentd check --strict` on the rewritten
+  config instead of `grep` guards — real parsing, fail-closed on a mis-wired grant.
+- Framing (reviewed): under the single-tenant, mutually-trusting constitution this is
+  **misconfiguration ergonomics**, not defense against a malicious agent; it unblocks cap.2
+  (spawn attenuation). Fixed two misleading `cos.agents.toml` comments that claimed the inert
+  agent-level `Credential` grant was load-bearing.
+
 ## [v0.92.0] - 2026-07-22
 
 ### Added

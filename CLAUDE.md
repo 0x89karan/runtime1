@@ -24,24 +24,27 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.92.0 (shipped 2026-07-22)
+**Current version:** v0.93.0 (shipped 2026-07-23)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.11c (v0.92.0) — the **morning brief** (the UX half of ux.11b,
-reframed at its autoplan gate from a live-rail push to a durable **pull** surface after
-review found the agentctl chat rail is a lossy live stream with no replay-on-attach). The
-CoS calls a capability-gated `publish_brief` (`Capability::BriefPublish`) from its cron
-loop with optional narrative; **agentd authors the facts deterministically** from
-`runs.redb` (new `BRIEFS` table + composer), windowed by run **completion** not start_ts,
-and persists them. Brief composition routes through the **run_writer lane** (FIFO ordering,
-so a just-completed failure is never dropped). Operators read via **`agentctl brief`** and
-**`GET /api/v1/brief`** (attention-first: failed/approvals + run IDs before counts;
-quiet-night explicit; "N need approval" overlaid **live** from the snapshot). `BriefWritten`
-flight event. ux.12 (Telegram) becomes a pure consumer of `GET /api/v1/brief`.
-Deferred: live-rail render (bonus), approvals >100 undercount (ar-01), `runs_query`
-PROTECTED_TOOLS (ar-02).
-**Next:** ux.12 (Telegram digest + approve/deny) → cap.1 → ux.13 (verbs).
+**Latest shipped:** cap.1 (v0.93.0) — the **capability declaration surface** (from the v0.86
+audit). A new **`agentd check`** config linter catches grants that *look* granted but are
+inert or wrong — the silent-fail-closed / Gmail-outage class — at test/CI/boot time. One
+shared **`tier_legality(cap, ctx)`** resolver (in `capability.rs`, no-wildcard match =
+compile-time drift guard) classifies enforced-vs-inert; the linter also runs a **credential
+wiring cross-check** (a `Credential{provider}` granted to an agent but carried by no stdio
+MCP server → empty broker token → silent denial — the real Gmail bug), MCP-server / KB-segment
+existence, HTTP-server-carrying-sandbox-fields (P1-9), relative FS prefixes (warn default /
+error `--strict`), and bare-`agent` KB grants. New **`CapabilitiesResolved`** boot event logs
+each agent's + server's effective set via the same resolver. The container entrypoint
+(`cos)` mode) now runs `agentd check --strict` on the rewritten config (grep → real parsing,
+fail-closed). A shared `credential_provider_key` de-duplicates the broker's provider-key logic
+(review catch). Reframed (single-tenant): this is misconfiguration ergonomics, not
+defense-against-malice; it unblocks cap.2. Deferred: runtime denial-surfacing ATTN column
+(cap.1b), per-server credential binding (cap.1-ar-01), `mcp_require_capabilities` mirror
+(ar-02), distro `/init` parity (ar-03).
+**Next:** cap.2 (spawn attenuation — cap.1 unblocks it) → ux.13 (verbs) or ux.12 (Telegram).
 
 Full per-increment completion notes: `docs/STATUS.md`.
 
