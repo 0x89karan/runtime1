@@ -2,7 +2,7 @@ use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
 use agentd::{agent::{truncate, PREVIEW_CHARS}, checkpoint::CheckpointStore, config, scheduler::Scheduler};
-use agentd::capability::{normalize_path, Capability, CredentialProvider};
+use agentd::capability::{normalize_path, Capability};
 use agentd::credential::CredentialGateway;
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
@@ -80,6 +80,15 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--probe requires a prompt argument"))?;
             run_probe(prompt, resolve_log_path(log_path_override, None)).await
         }
+        // `agentd check [--strict] <config>` — capability declaration-surface linter (cap.1).
+        // Static, synchronous, no boot side-effects; fail-closed on any error finding.
+        Some("check") => {
+            let strict = raw_args.iter().any(|a| a == "--strict");
+            match filtered.get(1).copied() {
+                Some(path) => agentd::check::run_check(std::path::Path::new(path), strict),
+                None => Err(anyhow::anyhow!("agentd check requires a config path: agentd check [--strict] <config.toml>")),
+            }
+        }
         Some(path) => run_agent(PathBuf::from(path), no_fuse, log_path_override).await,
         None => run_agent(PathBuf::from("agent.toml"), no_fuse, log_path_override).await,
     };
@@ -136,6 +145,12 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     let recorder = Arc::new(
         FlightRecorder::new(&log_path)?.with_broadcast(broadcast_tx.clone()),
     );
+
+    // cap.1: log each agent's + MCP server's EFFECTIVE capability set once at boot, computed
+    // by the same shared resolver `agentd check` uses (enforced vs inert). Descriptive only.
+    for payload in agentd::check::capabilities_resolved_events(&cfg) {
+        recorder.record("agentd", None, EventKind::CapabilitiesResolved, payload);
+    }
 
     let mut agent_cfgs = cfg.agent_configs()?;
 
@@ -1357,6 +1372,7 @@ fn filter_positional_args(args: &[String]) -> Vec<String> {
         .filter_map(|a| {
             if skip_next { skip_next = false; return None; }
             if a == "--no-fuse" { return None; }
+            if a == "--strict" { return None; } // cap.1: `agentd check --strict` flag, not a positional
             if a == "--log-path" { skip_next = true; return None; }
             Some(a.clone())
         })
@@ -1580,11 +1596,9 @@ fn credential_allowed_providers(caps: &Option<Vec<Capability>>) -> Vec<String> {
             .iter()
             .filter_map(|cap| {
                 if let Capability::Credential { provider } = cap {
-                    Some(match provider {
-                        CredentialProvider::Google      => "google".to_string(),
-                        CredentialProvider::BraveSearch => "brave-search".to_string(),
-                        CredentialProvider::Custom(s)   => s.clone(),
-                    })
+                    // Shared key derivation (cap.1) — `agentd check`'s wiring cross-check calls
+                    // the same function, so linter and broker can never disagree.
+                    Some(agentd::capability::credential_provider_key(provider))
                 } else {
                     None
                 }

@@ -1,0 +1,9 @@
+# cap.1 regression fixture (the v0.86.2 class): a relative FsWrite prefix. CWD-blind — it
+# matches textually only and breaks when the container's working dir is unpredictable.
+# PARSES cleanly; WARNS in default mode, ERRORS under `--strict` (the boot profile).
+[[agents]]
+id   = "worker"
+task = "write output"
+capabilities = [
+  { FsWrite = { prefix = "./output" } },
+]

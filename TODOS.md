@@ -85,6 +85,32 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   validation in `Config::validate()` (hard error for HTTP servers carrying security fields —
   see open question D4; warn for inert agent-level grants) + a `CapabilitiesResolved` boot
   event logging each agent's and server's effective set. → `cap.1`.
+- **cap.1b (P2) [new, cap.1 /autoplan split] — runtime capability-denial surfacing.**
+  cap.1 shipped the config/boot-time declaration surface (`agentd check` + `CapabilitiesResolved`).
+  The runtime half — a per-agent `capability_denied` counter on the snapshot + a Dashboard ATTN
+  column — was split out (different surface: `surfaces`/`agentctl`; cap.2 does not depend on it).
+  When built: the first denial of a **novel (agent, capability) pair surfaces (N=1)** — dedup only
+  the repeats (the one-shot-give-up Gmail case) — and it rides the **shared attention channel**
+  (audit §direction 4), not a distinct one. Prompt-path-literal ↔ FsWrite consistency was demoted
+  to a `agentd check` warning (brittle free-text heuristic); revisit only if dogfood wants it.
+- **cap.1-ar-01 (P2) [new, cap.1 /review] — credential wiring cross-check is config-global, not per-server.**
+  `agentd check` errors only when NO stdio MCP server anywhere carries a referenced `Credential{provider}`,
+  but the runtime broker token is built **per-server** (each stdio server's token = its OWN Credential caps,
+  main.rs `credential_allowed_providers`). So a config with a stray server carrying `Credential{Google}`
+  while the `google_oauth` server the agent actually calls carries none PASSES `check --strict` but fails
+  silently at runtime — the exact Gmail-outage class the linter advertises. Does NOT fire on the shipped
+  single-credential-server config. Precise detection needs a provider→server binding the config doesn't
+  express today (the honesty-boundary line now states the limitation). Tighten in a follow-up (may fold into
+  cap.2's per-child attenuation). (Both review voices.)
+- **cap.1-ar-02 (P3) [new, cap.1 /review] — `agentd check` doesn't mirror the `mcp_require_capabilities` boot check.**
+  When `mcp_require_capabilities = true`, the runtime fails boot if a stdio server's effective sandbox rules
+  are empty (`caps_to_rules` empty, main.rs). `agentd check` only warns about the HTTP exemption; it doesn't
+  reproduce the stdio empty-rules test, so `check` can pass a config that then fails boot. Loud-fail (clear
+  boot error), not the silent class cap.1 targets, so lower priority. Fix = move the effective-rule predicate
+  to lib and apply it in `check_config`. (Codex review.)
+- **cap.1-ar-03 (P3) [new, cap.1 /review] — distro/QEMU init doesn't run `agentd check`.**
+  Only the Docker `entrypoint.sh cos)` path is gated with `agentd check --strict`; the distro/QEMU `/init`
+  boot path is not. The distro config is already clean, so informational — add the check to `/init` for parity.
 - **audit86-P1-10 (P1) [re-rate; = cos-dev-02, was P2] — Spawn inheritance is all-or-nothing; Curator inherits live Gmail.**
   `SpawnConfig` (`config.rs:412-422`) has no capabilities field; `dispatch_spawn`
   (`scheduler.rs:1586`) does `parent_cap_set.clone()`. The Curator (processes

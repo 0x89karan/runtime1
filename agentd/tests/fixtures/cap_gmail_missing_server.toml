@@ -1,0 +1,17 @@
+# cap.1 regression fixture (the historical Gmail-outage class): an agent is granted
+# Credential{Google}, but NO stdio MCP server carries a matching Credential capability, so
+# the broker token's allowed_providers is empty → every Gmail call fails silently.
+# This PARSES cleanly but must FAIL `agentd check` (both modes).
+[[tools.mcp_servers]]
+name    = "google_oauth"
+command = "python3"
+args    = ["oauth_mcp.py"]
+# BUG: no `capabilities = [{ Credential = { provider = "Google" } }]` here.
+
+[[agents]]
+id   = "cos"
+task = "produce the daily brief"
+capabilities = [
+  { Mcp = { server = "google_oauth", tools = [] } },
+  { Credential = { provider = "Google" } },
+]
