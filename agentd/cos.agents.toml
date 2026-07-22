@@ -254,6 +254,8 @@ capabilities = [
   # Credential broker access — spawned children inherit this grant, which lets
   # the inbox agent's google_oauth calls route through the broker gateway.
   { Credential = { provider = "Google" } },
+  # ux.11b: read durable run history via the runs_query tool (for the morning brief).
+  { RunsRead = {} },
   # request_approval is a native tool with no required capability; always available.
 ]
 
@@ -432,6 +434,7 @@ native = [
   "kb_search",
   "write_file",
   "request_approval",
+  "runs_query",
 ]
 
 # ---------------------------------------------------------------------------

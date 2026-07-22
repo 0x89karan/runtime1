@@ -17,6 +17,7 @@ fn registry_with_store(store: Arc<dyn agentd::memory::MemoryStore>) -> ToolRegis
         &["kv_get".to_string(), "kv_set".to_string()],
         None,
         Some(store),
+        None,
     )
     .unwrap();
     reg
@@ -29,6 +30,7 @@ fn kb_registry(store: Arc<dyn agentd::memory::MemoryStore>) -> ToolRegistry {
         &["kb_put".to_string(), "kb_get".to_string(), "kb_search".to_string()],
         None,
         Some(store),
+        None,
     )
     .unwrap();
     reg

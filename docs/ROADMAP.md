@@ -1180,7 +1180,7 @@ increments, friction-ordered, each independently shippable. Full design + premis
     ux.13 later only unifies SetBudget's write path (no new semantics — no double-claim).
   - **ux.11b — Trust after absence — SPLIT again at its autoplan gate (2026-07-21)** into substrate + UX
     (both CEO voices + Eng: two distinct correctness domains; plan `docs/plans/ux.11b-trust-after-absence.md`):
-    - **ux.11b-substrate (build first):** a scheduler-owned **`RunTracker`** writes versioned `runs.redb`
+    - ✅ **ux.11b-substrate (shipped v0.91.0):** a scheduler-owned **`RunTracker`** writes versioned `runs.redb`
       (separate file, **off-loop mpsc writer** — never fsync on the async loop) from **authoritative
       lifecycle transitions at ALL sites** (config-seed CoS, `dispatch_spawn` children, operator spawn,
       `handle_agent_terminal`, universal-agent exits, approval park/resume — CEO C1, Eng G1: spawn/terminal/park

@@ -3,6 +3,34 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.91.0] - 2026-07-22
+
+### Added
+- **Durable run history** (ux.11b-substrate): agentd now records a per-segment run
+  record for every agent lifecycle in a new `runs.redb` — `{agent_id, segment_seq,
+  parent_id, start_reason, start/end, status, stop_reason, last_error, approvals_count,
+  spend}`. Records are authored from **authoritative in-process scheduler transitions**
+  (config-seed / child / operator / universal spawn → terminal), never derived from the
+  best-effort flight log, so a dropped event can't drop a run. Per-segment spend is
+  Δ`context_tokens()` (native tier; `null` for proxy-metered universal agents).
+- **`runs_query` native tool** (new `Capability::RunsRead`, granted to the CoS) lets an
+  agent ask "what happened overnight?" over the run store — filter by
+  `agent_id`/`parent_id`/`status`/time window, newest-first.
+- **`GET /api/v1/runs`** — read-only run history for `agentctl`/operators, same filters.
+
+### Changed
+- Run writes go through an off-loop `mpsc` writer task (a single writer, `spawn_blocking`)
+  so recording never stalls or crashes the scheduler — best-effort, like the flight
+  recorder. The writer is drained at shutdown so terminal runs never leak as `running`;
+  a clean shutdown closes any still-open segment as `interrupted`.
+
+### Notes
+- ux.11b was **split** at its autoplan gate into this substrate (run store + query) and
+  ux.11c (the catch-up digest + CoS-written morning brief). Checkpoint `FORMAT_VERSION`
+  untouched; `runs.redb` is a new, separate, versioned store — additive and rollback-safe.
+- Deferred (see TODOS): FUSE `/agents/runs` (`ux.11b-ar-02`), mid-run park/resume segment
+  boundaries (`ux.11b-ar-01`), `runs.redb` retention/prune (`ux.11b-ar-03`).
+
 ## [v0.90.0] - 2026-07-21
 
 ### Added

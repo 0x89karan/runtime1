@@ -24,22 +24,21 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.90.0 (shipped 2026-07-21)
+**Current version:** v0.91.0 (shipped 2026-07-22)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.11a (v0.90.0) — budget visibility (ux.11 split 2-way at
-its autoplan gate; this is the budget-visibility half, ships first): per-agent
-**windowed** spend surfaced on the snapshot → FUSE (`/agents/<id>/windowed_spend`)
-→ agentctl TUI budget cell; per-agent `SetBudget` runtime mutation
-(`POST /api/v1/budget/set` + `ControlCommand::SetBudget` + FUSE `set_budget` +
-`AgentTask::set_token_budget` mutating the checkpointed field; per-agent only —
-global ceiling is immutable config → 400; drains a deferred agent on a raise);
-the `BudgetRisk` attention signal re-keyed from lifetime to windowed spend so it
-clears/re-arms across resets; new `BudgetSet` event. Closes the ux.8′ P1
-"visible + settable spend" debt. 1474 workspace tests.
-**Next:** ux.11b (trust-after-absence: run store + digest + brief) → ux.12
-(Telegram) → cap.1 → ux.13 (verbs).
+**Latest shipped:** ux.11b-substrate (v0.91.0) — durable run history (the run-store
+half of the ux.11b split; the digest/morning-brief is ux.11c). A scheduler-owned
+`RunTracker` authors per-segment run records into a separate `runs.redb` **from
+authoritative in-process lifecycle transitions** (config-seed/child/operator/universal
+spawn → terminal), NOT the best-effort flight log — off-loop mpsc writer that never
+stalls the scheduler and is drained at shutdown. Per-segment spend = Δ`context_tokens()`;
+idempotent open (restart continues); clean-shutdown closes open segments as
+`interrupted`. Read paths: native `runs_query` tool (new `Capability::RunsRead`, granted
+to the CoS) + `GET /api/v1/runs`. Checkpoint format untouched. 1488 workspace tests.
+Deferred: FUSE `/agents/runs` (ar-02), mid-run park boundary (ar-01), retention (ar-03).
+**Next:** ux.11c (catch-up digest + CoS morning brief) → ux.12 (Telegram) → cap.1 → ux.13 (verbs).
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

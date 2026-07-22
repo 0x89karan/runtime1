@@ -346,8 +346,8 @@ mod tests {
     #[test]
     fn duplicate_registration_returns_error() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["read_file".to_string()], None, None).unwrap();
-        let err = register_native(&mut reg, &["read_file".to_string()], None, None).unwrap_err();
+        register_native(&mut reg, &["read_file".to_string()], None, None, None).unwrap();
+        let err = register_native(&mut reg, &["read_file".to_string()], None, None, None).unwrap_err();
         assert!(err.to_string().contains("read_file"));
         assert!(err.to_string().contains("already registered"));
     }
@@ -418,7 +418,7 @@ mod tests {
     #[tokio::test]
     async fn registry_specs_and_names_are_sorted() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
         let names = reg.tool_names();
         let mut sorted = names.clone();
         sorted.sort();
@@ -433,14 +433,14 @@ mod tests {
     #[test]
     fn filtered_specs_none_cap_set_returns_all() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
         assert_eq!(reg.filtered_specs(None).len(), reg.specs().len());
     }
 
     #[test]
     fn filtered_specs_empty_cap_set_returns_only_no_cap_tools() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
         let specs = reg.filtered_specs(Some(&[]));
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         // list_agents and send_message require no capability; they remain visible.
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn filtered_specs_fs_read_only_excludes_write() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
         let caps = [Capability::FsRead { prefix: "/".to_string() }];
         let specs = reg.filtered_specs(Some(&caps));
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
@@ -468,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn capability_denied_event_emitted_and_error_returned() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None, None, None).unwrap();
         let (rec, tmp) = recorder();
 
         // Grant only FsRead — write_file requires FsWrite, so it should be denied.
@@ -501,7 +501,7 @@ mod tests {
         // An agent with the matching FsWrite cap MUST be able to invoke write_file.
         // This is the "granted agent succeeds" half of the p1.4 acceptance criterion.
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["write_file".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["write_file".to_string()], None, None, None).unwrap();
         let (rec, _tmp) = recorder();
         let tmp_dir = tempfile::TempDir::new_in("/tmp").unwrap();
         let path = tmp_dir.path().join("test.txt").to_string_lossy().to_string();
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn filtered_specs_spawn_visible_with_cap_hidden_without() {
         let mut reg = ToolRegistry::new();
-        register_native(&mut reg, &["all".to_string()], None, None).unwrap();
+        register_native(&mut reg, &["all".to_string()], None, None, None).unwrap();
 
         // With Spawn capability: spawn_agent should appear in specs.
         let caps_with_spawn = [Capability::Spawn];
@@ -675,6 +675,7 @@ mod tests {
             &["kv_get".to_string(), "kv_set".to_string()],
             None,
             Some(SimpleStore::new_arc()),
+        None,
         )
         .unwrap();
 
@@ -704,6 +705,7 @@ mod tests {
             &["kv_get".to_string()],
             None,
             Some(SimpleStore::new_arc()),
+        None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -732,6 +734,7 @@ mod tests {
             &["kv_set".to_string()],
             None,
             Some(SimpleStore::new_arc()),
+        None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -763,6 +766,7 @@ mod tests {
             &["kb_put".to_string()],
             None,
             Some(store),
+        None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -804,6 +808,7 @@ mod tests {
             &["kb_get".to_string()],
             None,
             Some(store),
+        None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -837,6 +842,7 @@ mod tests {
             &["kb_get".to_string()],
             None,
             Some(store),
+        None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
@@ -877,6 +883,7 @@ mod tests {
             &["kb_search".to_string()],
             None,
             Some(store as Arc<dyn crate::memory::MemoryStore>),
+        None,
         ).unwrap();
         let (rec, tmp) = recorder();
         let caps = [Capability::KbRead { segment: "kb:research".to_string() }];
@@ -916,6 +923,7 @@ mod tests {
             &["kb_search".to_string()],
             None,
             Some(store as Arc<dyn crate::memory::MemoryStore>),
+        None,
         ).unwrap();
         let (rec, tmp) = recorder();
         let caps = [Capability::KbRead { segment: "kb:notes".to_string() }];
@@ -953,6 +961,7 @@ mod tests {
             &["mem_remember".to_string()],
             None,
             Some(SimpleStore::new_arc()),
+        None,
         )
         .unwrap();
         let (rec, tmp) = recorder();
