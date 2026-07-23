@@ -146,6 +146,17 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   sanitizes the collection name (colons → `_`), applied in the ONE mapping used by
   create/put/get/search so reads/writes align. No data migration needed (all prior writes 422'd).
   Follow-up: add a `_collection_name` unit test + consider a non-mock Qdrant smoke in CI.
+- ~~**cap.2b-ar-02 (P2) [found in cap.2b live test] — cos-inbox job balloons context/spend via `format=full`.**~~ **[FIXED — inbox now fetches `format=metadata` (From/Subject/Date + Gmail `snippet`, no base64 body) in both cos configs; triage is snippet-based, context stays ~50×≤1 KB, budget reverted 5M→1.5M. Tradeoff: brief detail is snippet-level, not full-body. Deeper option (bound ALL oauth_call_api output in the oauth_mcp sidecar) left as a future hardening.]**
+  The inbox job's task fetches each message with `oauth_call_api(...messages/{id}?format=full)`, which
+  returns the entire raw payload incl. base64 body parts. Those huge tool results accumulate in the
+  agent's context, and re-sending the growing context every turn balloons cumulative spend — observed
+  **~1.8M tokens by turn 6**, tripping the (old 1.5M) budget → `deferred`, so the pipeline stalled and
+  no brief landed. Temporary unblock: bumped `cos-inbox` `token_budget` to 5M (both configs). Real fix:
+  lighten what enters context — fetch `format=metadata` for triage and/or extract only the plaintext
+  body part with a hard per-message cap BEFORE it becomes a tool result (the current "truncate to 8 KB"
+  is applied by the model to `kb_put` AFTER it has already seen the full response, so it doesn't bound
+  context). Watch for a context-WINDOW overflow too (budget can't fix that). Pre-existing (the pre-cap.2b
+  spawned inbox did the same fetch at the same 1.5M budget); cap.2b surfaced it in a clean run.
 - **cap.2b-ar-01 (P3) [new; found in cap.2b /review] — sealed-job pipeline date can skew across UTC midnight.**
   `dispatch_run_job` server-stamps `{date}` = `Utc::now()` independently for each `run_job` call
   (`scheduler.rs`). The CoS pipeline is two calls (cos-inbox then cos-curator); if they straddle
