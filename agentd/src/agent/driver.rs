@@ -59,6 +59,13 @@ pub(crate) async fn run(
                 ));
             }
 
+            AgentEffect::RunJob { .. } => {
+                // Sealed jobs (cap.2b) require the Scheduler's job registry + await machinery.
+                return Err(anyhow::anyhow!(
+                    "run_job is not supported in the single-agent driver; use the Scheduler"
+                ));
+            }
+
             AgentEffect::SendMessage { .. } => {
                 // The single-agent driver does not support inter-agent messaging.
                 // Use the Scheduler for multi-agent workloads.

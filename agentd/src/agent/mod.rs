@@ -38,6 +38,10 @@ pub enum AgentEffect {
     /// Emitted when the model calls `spawn_agent` as its sole tool in a turn.
     /// The scheduler intercepts this before any tool `invoke()` is called.
     SpawnAgent { call_id: String, config: SpawnConfig },
+    /// Emitted when the model calls `run_job` as its sole tool in a turn (cap.2b).
+    /// The scheduler materializes the config-declared job (fixed caps + task) and delivers
+    /// only a completion signal back (never the child's output). `job_id` is the only input.
+    RunJob { call_id: String, job_id: String },
     /// Emitted when the model calls `send_message` as its sole tool in a turn.
     /// The scheduler delivers the message and synthesizes a ToolResult.
     SendMessage { call_id: String, to: String, content: String },
@@ -783,6 +787,37 @@ impl AgentTask {
                         call_id: call_id.clone(),
                         config,
                     };
+                }
+
+                // Intercept run_job before tool dispatch — sole call, like spawn_agent
+                // (cap.2b). The ONLY input is `job_id`; caps + task come from config, so
+                // there is deliberately no `capabilities`/`task`/`params` field to parse.
+                let run_job_idx = call_blocks.iter().position(|b| {
+                    matches!(b, Block::ToolUse { name, .. } if name == "run_job")
+                });
+
+                if let Some(idx) = run_job_idx {
+                    if call_blocks.len() > 1 {
+                        return self.reject_batched_sole_tool("run_job", &call_blocks, recorder);
+                    }
+                    let Block::ToolUse { id: call_id, input, .. } = &call_blocks[idx] else {
+                        unreachable!("filtered to ToolUse above")
+                    };
+                    let job_id = match input.get("job_id").and_then(|v| v.as_str()) {
+                        Some(j) => j.to_string(),
+                        None => {
+                            self.provide_tool_results(
+                                vec![Block::ToolResult {
+                                    tool_use_id: call_id.clone(),
+                                    content: "run_job requires a string `job_id`".to_string(),
+                                    is_error: true,
+                                }],
+                                recorder,
+                            );
+                            return self.step_need_infer(recorder);
+                        }
+                    };
+                    return AgentEffect::RunJob { call_id: call_id.clone(), job_id };
                 }
 
                 // Intercept send_message before tool dispatch — must be sole call.

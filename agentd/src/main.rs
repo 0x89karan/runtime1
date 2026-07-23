@@ -1283,6 +1283,9 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // ux.11b: wire the run-history tracker so lifecycle transitions author runs.redb.
     let scheduler = scheduler.with_run_tracker(run_tracker);
 
+    // cap.2b: register config-declared sealed jobs so run_job(job_id) can materialize them.
+    let scheduler = scheduler.with_jobs(cfg.jobs.clone());
+
     let streamed_agents = scheduler.streamed_agents();
     recorder.record(
         "agentd",
@@ -1482,7 +1485,8 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
             | Capability::KbWrite { .. }
             | Capability::Credential { .. }
             | Capability::RunsRead
-            | Capability::BriefPublish => {}
+            | Capability::BriefPublish
+            | Capability::RunJob => {}
         }
     }
     rules

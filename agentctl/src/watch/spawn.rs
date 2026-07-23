@@ -60,6 +60,7 @@ pub fn display_cap(cap: &Capability) -> String {
         Capability::KbWrite { segment }  => format!("KbWrite {{{segment}}}"),
         Capability::RunsRead             => "RunsRead".to_string(),
         Capability::BriefPublish         => "BriefPublish".to_string(),
+        Capability::RunJob               => "RunJob".to_string(),
         Capability::Net { ports, .. } => {
             let p: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
             if p.is_empty() { "Net".to_string() } else { format!("Net     {{ports: {}}}", p.join(",")) }
