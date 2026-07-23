@@ -39,7 +39,10 @@ token_path    = "/run/secrets/google.json"
 # /run/state does NOT exist in the QEMU initramfs; /run/secrets is read-only.
 state_path    = "/run/memory/oauth/google.json"
 # Gmail query params forwarded to upstream (D3 allowlist — all others dropped).
-passthrough_query_params = ["maxResults", "q", "format", "pageToken", "includeSpamTrash"]
+# `metadataHeaders` is required so the inbox job's format=metadata fetch (cap.2b-ar-02)
+# can filter to From/Subject/Date; without it the broker strips the filter and Gmail
+# returns ALL headers, re-inflating the response.
+passthrough_query_params = ["maxResults", "q", "format", "metadataHeaders", "pageToken", "includeSpamTrash"]
 
 # ---------------------------------------------------------------------------
 # Management HTTP API — exposed at :7999 inside the VM, hostfwd'd to the host.

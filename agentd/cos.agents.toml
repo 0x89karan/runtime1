@@ -92,7 +92,11 @@ token_path    = "/run/secrets/google.json"
 # QEMU: 9p memory0 → /run/memory; /run/state does NOT exist in the initramfs).
 state_path    = "/run/memory/oauth/google.json"
 # Gmail query params forwarded to upstream (D3 allowlist — all others dropped).
-passthrough_query_params = ["maxResults", "q", "format", "pageToken", "includeSpamTrash"]
+# `metadataHeaders` is required so the inbox job's format=metadata fetch (cap.2b-ar-02)
+# can actually filter to From/Subject/Date; without it the broker strips the filter and
+# Gmail returns ALL headers (Received/DKIM/ARC chains), re-inflating the response. The
+# broker forwards each repeated `metadataHeaders=` pair independently (credential/mod.rs).
+passthrough_query_params = ["maxResults", "q", "format", "metadataHeaders", "pageToken", "includeSpamTrash"]
 
 # ---------------------------------------------------------------------------
 # Management HTTP API — bound 0.0.0.0 so the compose `127.0.0.1:7999:7999`
@@ -154,8 +158,9 @@ class = "scratch"
 [[memory.segments]]
 name  = "mail:raw"
 class = "scratch"
-# Raw email bodies indexed via L2 semantic KB (Qdrant + OpenAI embeddings).
-# Keyed by Gmail message ID; content is plain-text body (up to 8 KB per message).
+# Message metadata indexed via L2 semantic KB (Qdrant + OpenAI embeddings).
+# Keyed by Gmail message ID; content is a ≤1 KB `From | Subject | Date | snippet`
+# line (cap.2b-ar-02 — no full bodies), used for dedup and snippet-level triage.
 # Evicted after SEMANTIC_MAX_AGE_DAYS (default 30 days).
 
 # ---------------------------------------------------------------------------
