@@ -1,129 +1,108 @@
-//! Guards the cap.2 CRITICAL /review finding: the CoS orchestrator spawns its
-//! inbox/curator children with an explicit `capabilities` set (in the task prompt),
-//! and cap.2's `dispatch_spawn` REJECTS the whole spawn if any requested cap is not
-//! covered by the parent (`capability_covered_by`). A dev/distro config drift — where
-//! the orchestrator's declared caps no longer cover what the prompt tells it to request
-//! — would brick the daily brief at the first inbox spawn, and no other test would catch
-//! it (the child caps live in prompt TEXT, invisible to `agentd check`).
+//! Guards the cap.2b CoS topology: the orchestrator is a DE-PRIVILEGED cron trigger, and the
+//! Gmail/KB/file-write authority lives on config-declared `[[jobs]]` (the trust root), NOT on
+//! the schedule-exposed trigger. Runtime enforcement is `run_job` (config caps, deliver_content
+//! =false) + `agentd check`; this test pins the CONFIG so a future edit that re-privileges the
+//! trigger (or leaks Gmail into the curator job) fails here rather than shipping a reopened P1-10.
 //!
-//! This test reads each config's REAL orchestrator capabilities via the boot loader and
-//! asserts every documented child-profile cap is covered. If someone removes a cap from
-//! an orchestrator (the exact distro-drift that shipped semantic-kb/mail:raw child caps
-//! against a parent that lacked them), this fails.
+//! Loads each real config via the boot loader and asserts, per config:
+//!   - the cos-orchestrator holds ONLY {cron_trigger, RunJob} — no Gmail, Credential, KB,
+//!     FsWrite, BriefPublish, or Spawn (it can trigger predeclared work, nothing else);
+//!   - the cos-inbox job holds Gmail (`Mcp{google_oauth}`) — the one node that touches email;
+//!   - the cos-curator job is Gmail-FREE (no `Mcp{google_oauth}`, no Credential, no Spawn) yet
+//!     owns the brief (`FsWrite` + `BriefPublish`).
 
-use agentd::capability::{capability_covered_by, Capability, CredentialProvider};
-use agentd::config::Config;
+use agentd::capability::Capability;
+use agentd::config::{Config, Job};
 use std::path::Path;
 
-fn mcp(server: &str) -> Capability {
-    Capability::Mcp { server: server.to_string(), tools: vec![] }
-}
-fn kb_read(seg: &str) -> Capability {
-    Capability::KbRead { segment: seg.to_string() }
-}
-fn kb_write(seg: &str) -> Capability {
-    Capability::KbWrite { segment: seg.to_string() }
-}
-fn cred_google() -> Capability {
-    Capability::Credential { provider: CredentialProvider::Google }
-}
-
-/// Load a cos config (path relative to `agentd/` = CARGO_MANIFEST_DIR) and return the
-/// cos-orchestrator's declared capability set.
-fn orchestrator_caps(rel_path: &str) -> Vec<Capability> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let path = root.join(rel_path);
+fn load(rel_path: &str) -> Config {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_path);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    let cfg: Config = toml::from_str(&text)
-        .unwrap_or_else(|e| panic!("cannot parse {}: {e}", path.display()));
-    let orch = cfg
-        .agents
-        .iter()
-        .find(|a| a.id == "cos-orchestrator")
-        .unwrap_or_else(|| panic!("no cos-orchestrator agent in {}", path.display()));
-    orch.capabilities
-        .clone()
-        .unwrap_or_else(|| panic!("cos-orchestrator in {} has no capabilities", path.display()))
+    toml::from_str(&text).unwrap_or_else(|e| panic!("cannot parse {}: {e}", path.display()))
 }
 
-fn assert_child_covered(parent: &[Capability], child: &[Capability], label: &str) {
-    for cap in child {
+fn orchestrator_caps(cfg: &Config) -> Vec<Capability> {
+    let orch = cfg.agents.iter().find(|a| a.id == "cos-orchestrator").expect("no cos-orchestrator");
+    orch.capabilities.clone().expect("cos-orchestrator has no capabilities")
+}
+
+fn job<'a>(cfg: &'a Config, id: &str) -> &'a Job {
+    cfg.jobs.iter().find(|j| j.id == id).unwrap_or_else(|| panic!("no [[jobs]] with id '{id}'"))
+}
+
+fn has_mcp(caps: &[Capability], server: &str) -> bool {
+    caps.iter().any(|c| matches!(c, Capability::Mcp { server: s, .. } if s == server))
+}
+
+/// Assert the shared cap.2b invariants for a given config (dev or distro).
+fn assert_cos2b_topology(rel_path: &str) {
+    let cfg = load(rel_path);
+    let orch = orchestrator_caps(&cfg);
+
+    // 1. The trigger is de-privileged: RunJob + cron_trigger, and NOTHING dangerous.
+    assert!(
+        orch.iter().any(|c| matches!(c, Capability::RunJob)),
+        "{rel_path}: cos-orchestrator must hold RunJob (it triggers the sealed jobs)"
+    );
+    assert!(has_mcp(&orch, "cron_trigger"), "{rel_path}: cos-orchestrator must hold Mcp{{cron_trigger}}");
+    for cap in &orch {
+        match cap {
+            Capability::RunJob | Capability::Mcp { .. } => {} // RunJob + cron_trigger only
+            other => panic!(
+                "{rel_path}: cos-orchestrator holds {other:?} — the cap.2b trigger must be \
+                 de-privileged to only {{cron_trigger, RunJob}}. Gmail/KB/FsWrite/BriefPublish/\
+                 Spawn/Credential authority belongs on the [[jobs]], not the schedule-exposed node."
+            ),
+        }
+    }
+    assert!(!has_mcp(&orch, "google_oauth"), "{rel_path}: trigger must NOT hold Mcp{{google_oauth}}");
+
+    // 2. The inbox job is the ONE node with Gmail.
+    let inbox = &job(&cfg, "cos-inbox").capabilities;
+    assert!(has_mcp(inbox, "google_oauth"), "{rel_path}: cos-inbox job must hold Mcp{{google_oauth}}");
+    assert!(
+        !inbox.iter().any(|c| matches!(c, Capability::Spawn | Capability::RunJob)),
+        "{rel_path}: cos-inbox job must not hold Spawn/RunJob (leaf, cannot fan out)"
+    );
+
+    // 3. The curator job is Gmail-FREE but owns the brief. This is the acceptance criterion:
+    //    an injected curator (it reads the email-derived summary) has NO path to live Gmail.
+    let curator = &job(&cfg, "cos-curator").capabilities;
+    assert!(
+        !has_mcp(curator, "google_oauth"),
+        "{rel_path}: cos-curator job must NOT hold Mcp{{google_oauth}} — filtered_specs must show \
+         no Gmail tools in the curator's flight log (the P1-10 acceptance criterion)"
+    );
+    assert!(
+        !curator.iter().any(|c| matches!(c, Capability::Credential { .. } | Capability::Spawn | Capability::RunJob)),
+        "{rel_path}: cos-curator job must hold no Credential/Spawn/RunJob"
+    );
+    assert!(
+        curator.iter().any(|c| matches!(c, Capability::FsWrite { .. })),
+        "{rel_path}: cos-curator job owns the brief — must hold FsWrite"
+    );
+    assert!(
+        curator.iter().any(|c| matches!(c, Capability::BriefPublish)),
+        "{rel_path}: cos-curator job must hold BriefPublish (it publishes the brief)"
+    );
+}
+
+#[test]
+fn dev_cos2b_topology() {
+    assert_cos2b_topology("cos.agents.toml");
+}
+
+#[test]
+fn distro_cos2b_topology() {
+    assert_cos2b_topology("../distro/overlay/etc/agentd/cos.agents.toml");
+    // The QEMU/production config runs no semantic-kb sidecar — neither job may reference it.
+    let cfg = load("../distro/overlay/etc/agentd/cos.agents.toml");
+    for id in ["cos-inbox", "cos-curator"] {
         assert!(
-            capability_covered_by(parent, cap),
-            "{label}: child cap {cap:?} is NOT covered by the orchestrator's set — the spawn \
-             would be rejected with AgentSpawnDenied and the daily brief would break. \
-             Either grant this cap on the orchestrator or drop it from the child profile."
+            !has_mcp(&job(&cfg, id).capabilities, "semantic-kb"),
+            "distro job '{id}' references semantic-kb, but the QEMU image runs no such sidecar \
+             (it would be an inert/mis-wired grant)"
         );
     }
-}
-
-#[test]
-fn dev_cos_child_profiles_are_subset_of_orchestrator() {
-    let parent = orchestrator_caps("cos.agents.toml");
-    // Inbox profile (STEP 3 of the orchestrator prompt).
-    assert_child_covered(
-        &parent,
-        &[
-            mcp("google_oauth"),
-            mcp("semantic-kb"),
-            kb_read("mail:raw"),
-            kb_write("mail:raw"),
-            cred_google(),
-        ],
-        "dev inbox",
-    );
-    // Curator profile (STEP 4).
-    assert_child_covered(
-        &parent,
-        &[
-            mcp("semantic-kb"),
-            kb_read("ops:entities"),
-            kb_write("ops:briefs"),
-            kb_write("ops:entities"),
-        ],
-        "dev curator",
-    );
-    // Acceptance criterion: the curator profile is Gmail-free — google_oauth is NOT in it,
-    // so filtered_specs omits every Gmail tool from the curator's flight log. (The parent
-    // HOLDS google_oauth, so this is attenuation, not an accident of the parent lacking it.)
-    let curator = [
-        mcp("semantic-kb"),
-        kb_read("ops:entities"),
-        kb_write("ops:briefs"),
-        kb_write("ops:entities"),
-    ];
-    assert!(
-        !curator.iter().any(|c| matches!(c, Capability::Mcp { server, .. } if server == "google_oauth")),
-        "curator profile must not include google_oauth (the acceptance criterion)"
-    );
-    assert!(
-        parent.iter().any(|c| matches!(c, Capability::Mcp { server, .. } if server == "google_oauth")),
-        "dev orchestrator should hold google_oauth so the curator's omission is real attenuation"
-    );
-}
-
-#[test]
-fn distro_cos_child_profiles_are_subset_of_orchestrator() {
-    let parent = orchestrator_caps("../distro/overlay/etc/agentd/cos.agents.toml");
-    // The distro (QEMU prod) runs NO semantic-kb sidecar, so its inbox profile is
-    // narrower than dev's — this is the exact drift the /review CRITICAL finding caught.
-    assert_child_covered(&parent, &[mcp("google_oauth"), cred_google()], "distro inbox");
-    assert_child_covered(
-        &parent,
-        &[
-            kb_read("ops:entities"),
-            kb_write("ops:briefs"),
-            kb_write("ops:entities"),
-        ],
-        "distro curator",
-    );
-    // Guard the drift directly: the distro orchestrator must NOT declare semantic-kb
-    // (no sidecar). If a future edit adds it here without adding the server, cap.1's
-    // `agentd check` wiring cross-check is the backstop; this documents the expectation.
-    assert!(
-        !parent.iter().any(|c| matches!(c, Capability::Mcp { server, .. } if server == "semantic-kb")),
-        "distro orchestrator unexpectedly declares Mcp{{semantic-kb}} — if the QEMU image now \
-         runs the sidecar, update the child profiles + this guard together"
-    );
 }

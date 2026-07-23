@@ -234,6 +234,7 @@ impl TemplateConfig {
             egress: Default::default(),
             management: Default::default(),
             credential_gateway: Default::default(),
+            jobs: vec![],
         })
     }
 }

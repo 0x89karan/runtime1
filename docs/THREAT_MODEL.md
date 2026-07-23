@@ -684,6 +684,37 @@ gap, not a code change.
 
 ---
 
+## 9.5 Injected-trigger lateral movement & brief integrity (cap.2b)
+
+The CoS pipeline ingests attacker-authored content by design: the daily brief is built from the
+operator's Gmail, so a crafted email is a normal input, not an edge case. Single-tenant does not
+make prompt injection irrelevant — it changes the *victim model* (the attacker is anyone who can
+get text into the inbox), so reducing the authority co-located with untrusted-data ingestion is
+least-privilege between agents (in scope), not multi-tenant isolation (out of scope).
+
+**Closed (cap.2b — the machine-credential path).** The node exposed to the schedule (the CoS
+orchestrator) is de-privileged to a summary-free cron TRIGGER holding only `{Mcp{cron_trigger},
+RunJob}`. Gmail lives on the `cos-inbox` sealed job; brief authoring on the KB-only `cos-curator`
+job. Sealed-job caps + task templates are owned by config, not the (injectable) trigger, and the
+trigger receives only an agentd-authored completion signal — never a job's output (`AwaitingParent.
+deliver_content=false`). So an injected trigger can neither mint caps, nor supply task text, nor
+read email-derived content back into a spawn-capable context. **No child obtains live Gmail via
+injection, and no untrusted-data-reading node holds spawn or credential authority.**
+
+**Residual (NOT closed — capability envelopes bound actions, not intent).** The curator reads the
+email-derived summary and authors the operator-facing brief. An injected curator can therefore write
+a *misleading* brief (e.g. "URGENT: wire funds to X") — a social-engineering channel that no
+capability system closes, because writing the brief is the curator's legitimate job. Its blast radius
+is bounded to *integrity/manipulation* (a bad brief, poisoned KB), NOT credential exfiltration or
+RCE: Gmail is read-only (no send scope), `oauth_call_api` is provider-host-pinned + SSRF/IP-hardened
+(§8.3), and single-tenant means a stolen token has no lateral value. Mitigation is detective, not
+preventive: the flight recorder, signed egress receipts (§8), and the operator's own judgment reading
+a brief they know is machine-assembled. **North star (not built):** data-taint — a node that has read
+untrusted data may not exercise irreversible authority — which would generalize this to future ingest
+flows (Telegram, webhooks) without hand-decomposing each pipeline.
+
+---
+
 ## 10. Summary table
 
 | Threat | Control | Gaps |
@@ -707,3 +738,5 @@ gap, not a code change.
 | Universal-tier credential access | See §8.6 | Not implemented; deferred to cred.4/5 |
 | Egress content scan | See §8.7 | NOT IMPLEMENTED; no credential-shaped token scanning in tool output |
 | Management API unauthenticated access (ux.0b+) | See §9 | Loopback guard defaults on; `cos`/`agent` network-segmented (ux.0b-ar-01, fixed); `allow_non_loopback` opt-in still unscoped rather than Docker-bridge-limited (ux.0b-ar-02, open); no auth until ux.5 |
+| Injected trigger grants live Gmail to a child (cap.2b) | See §9.5 | CLOSED: de-privileged cron trigger + sealed `run_job` (config-owned caps/task, completion-only delivery); no injection path to live credentials |
+| Injected curator writes a misleading brief (cap.2b) | See §9.5 | OPEN by design: brief authoring is the curator's job; social-engineering channel, detective controls only (flight log, receipts, operator judgment); north star = data-taint |

@@ -72,8 +72,21 @@ impl PartialOrd for DeferredInfer {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AwaitingParent {
     parent_id: String,
-    /// tool_use_id from the parent's spawn_agent call — injected back as ToolResult.
+    /// tool_use_id from the parent's spawn_agent / run_job call — injected back as ToolResult.
     call_id:   String,
+    /// Whether the child's answer is delivered into the parent's context on completion.
+    /// `true` for `spawn_agent` (trusted delegation — the parent authored the task and wants
+    /// the result). `false` for `run_job` (cap.2b): the parent (an injectable cron trigger)
+    /// receives ONLY an agentd-authored completion signal, never the child's email-derived
+    /// output — the content leak that made the injected-orchestrator bypass possible.
+    #[serde(default = "default_deliver_content")]
+    deliver_content: bool,
+}
+
+/// Serde default so pre-cap.2b checkpoints (which only ever held spawn_agent awaits) restore
+/// as content-delivering — the correct behavior for the trusted-delegation path.
+fn default_deliver_content() -> bool {
+    true
 }
 
 /// An agent parked waiting for operator approval via /agents/control.
@@ -140,6 +153,10 @@ struct SchedulerState {
     cred_gw: Option<Arc<crate::credential::CredentialGateway>>,
     /// Run-history tracker (ux.11b): lifecycle transitions send RunEvents off-loop.
     run_tracker: RunTracker,
+    /// Config-declared sealed jobs (cap.2b), keyed by job id. A `run_job(job_id)` call
+    /// materializes a child from THIS declaration's fixed caps + rendered task — the trust
+    /// root is config, not the (injectable) caller.
+    jobs: HashMap<String, crate::config::Job>,
 }
 
 impl SchedulerState {
@@ -198,6 +215,9 @@ pub struct Scheduler {
     cred_gw:             Option<Arc<crate::credential::CredentialGateway>>,
     /// Run-history tracker (ux.11b). Disabled (no-op) unless set via with_run_tracker().
     run_tracker:         RunTracker,
+    /// Config-declared sealed jobs (cap.2b), set via with_jobs(). Converted to a
+    /// by-id map when the run-loop `SchedulerState` is built.
+    jobs:                Vec<crate::config::Job>,
 }
 
 impl Scheduler {
@@ -335,6 +355,7 @@ impl Scheduler {
             store,
             cred_gw: None,
             run_tracker:         RunTracker::disabled(),
+            jobs:                Vec::new(),
             restored,
             memory_store:        None,
             distill_on_complete: false,
@@ -369,6 +390,13 @@ impl Scheduler {
     /// initial agents complete as long as this channel remains open.
     pub fn with_control(mut self, rx: tokio::sync::mpsc::Receiver<crate::control::ControlCommand>) -> Self {
         self.control_rx = Some(rx);
+        self
+    }
+
+    /// Register config-declared sealed jobs (cap.2b). Callers of `run_job(job_id)` get a
+    /// child materialized from the matching declaration's fixed caps + rendered task.
+    pub fn with_jobs(mut self, jobs: Vec<crate::config::Job>) -> Self {
+        self.jobs = jobs;
         self
     }
 
@@ -430,6 +458,7 @@ impl Scheduler {
             universal_pending,
             cred_gw,
             run_tracker,
+            jobs,
         } = self;
         let max_spawn_depth = sched.max_spawn_depth;
         let interval = sched.checkpoint_interval_turns;
@@ -464,6 +493,7 @@ impl Scheduler {
             waiting:            HashSet::new(),
             cred_gw,
             run_tracker,
+            jobs:               jobs.into_iter().map(|j| (j.id.clone(), j)).collect(),
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -479,6 +509,7 @@ impl Scheduler {
                 state.awaiting.insert(entry.child_id, AwaitingParent {
                     parent_id: entry.parent_id,
                     call_id:   entry.call_id,
+                    deliver_content: entry.deliver_content,
                 });
             }
             for (id, msgs) in r.mailboxes {
@@ -1063,9 +1094,27 @@ fn handle_agent_terminal(
         state.spawn_depths.remove(&agent_id);
         state.agents.remove(&agent_id);
 
+        // cap.2b: for a sealed job (`deliver_content=false`) the parent is an injectable
+        // trigger — deliver ONLY an agentd-authored signal, never the child's output. Both
+        // the success and failure branches are agentd-authored: a raw error string could
+        // echo a child tool's untrusted text (e.g. an email subject) back into the trigger's
+        // context, which would reopen the very leak this closes. Trusted delegation
+        // (`spawn_agent`, `deliver_content=true`) still gets the child's real answer.
         let (content, is_error) = match &result {
-            Ok(answer) => (answer.clone(), false),
-            Err(e) => (e.to_string(), true),
+            Ok(answer) => {
+                if awaiting.deliver_content {
+                    (answer.clone(), false)
+                } else {
+                    (format!("job '{agent_id}' completed"), false)
+                }
+            }
+            Err(e) => {
+                if awaiting.deliver_content {
+                    (e.to_string(), true)
+                } else {
+                    (format!("job '{agent_id}' failed"), true)
+                }
+            }
         };
 
         recorder.record(
@@ -1661,6 +1710,12 @@ fn enqueue_or_defer(
                 state, sched, gateway, registry, recorder,
             );
         }
+        AgentEffect::RunJob { call_id, job_id } => {
+            dispatch_run_job(
+                agent_id, call_id, job_id, cap_set, turn,
+                state, sched, gateway, registry, recorder,
+            );
+        }
         AgentEffect::SendMessage { call_id, to, content } => {
             dispatch_send_message(
                 agent_id, call_id, to, content, turn,
@@ -2020,7 +2075,7 @@ fn dispatch_spawn(
     state.run_tracker.open(&child_id, Some(parent_id.clone()), "child_spawn", Some(child_open_tokens), "native");
     state.awaiting.insert(
         child_id.clone(),
-        AwaitingParent { parent_id: parent_id.clone(), call_id },
+        AwaitingParent { parent_id: parent_id.clone(), call_id, deliver_content: true },
     );
     state.spawn_depths.insert(child_id.clone(), parent_depth + 1);
     state.parent_map.insert(child_id.clone(), parent_id.clone());
@@ -2058,6 +2113,170 @@ fn dispatch_spawn(
         registry,
         recorder,
     );
+}
+
+/// Handle an AgentEffect::RunJob (cap.2b): materialize a config-declared sealed job.
+///
+/// Unlike `dispatch_spawn`, the child's capabilities and task come from the operator-authored
+/// `[[jobs]]` declaration — NOT from the caller — so:
+///   - there is NO `capability_covered_by` parent-subset check (the caller need not, and for
+///     the de-privileged CoS trigger must not, hold the job's caps);
+///   - the task is the fixed template with only the server-stamped `{date}` substituted, so an
+///     injected caller cannot redirect the work; and
+///   - the parent await is `deliver_content=false` — the caller gets only a completion signal,
+///     never the child's (email-derived) output.
+///
+/// The caller must hold `RunJob`. This is the hardened primitive for the injection-exposed
+/// data pipeline; `spawn_agent` remains the trusted-delegation path.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_run_job(
+    parent_id: String,
+    call_id: String,
+    job_id: String,
+    parent_cap_set: Option<Vec<Capability>>,
+    parent_turn: u32,
+    state: &mut SchedulerState,
+    sched: &SchedulerConfig,
+    gateway: &Arc<dyn InferenceGateway + Send + Sync>,
+    registry: &Arc<ToolRegistry>,
+    recorder: &Arc<FlightRecorder>,
+) {
+    // Local helper: reject the run_job call, hand an is_error ToolResult back to the caller,
+    // and re-step it. Mirrors the dispatch_spawn reject blocks.
+    fn reject(
+        parent_id: String,
+        call_id: String,
+        message: String,
+        state: &mut SchedulerState,
+        sched: &SchedulerConfig,
+        gateway: &Arc<dyn InferenceGateway + Send + Sync>,
+        registry: &Arc<ToolRegistry>,
+        recorder: &Arc<FlightRecorder>,
+    ) {
+        let priority = state.agents[&parent_id].priority();
+        let caps = state.agents[&parent_id].cap_set_cloned();
+        let (parent_effect, next_turn) = {
+            let parent = state.agents.get_mut(&parent_id).unwrap();
+            parent.provide_tool_results(
+                vec![Block::ToolResult { tool_use_id: call_id, content: message, is_error: true }],
+                recorder,
+            );
+            let t = parent.turn();
+            (parent.step(recorder), t)
+        };
+        enqueue_or_defer(parent_effect, parent_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
+    }
+
+    // 1. Capability check — caller must hold RunJob.
+    if let Some(caps) = &parent_cap_set {
+        if !caps.iter().any(|c| matches!(c, Capability::RunJob)) {
+            recorder.record(&parent_id, Some(parent_turn), EventKind::CapabilityDenied,
+                json!({ "tool": "run_job", "required": "RunJob" }));
+            reject(parent_id, call_id, "capability denied: RunJob capability required to call run_job".to_string(),
+                state, sched, gateway, registry, recorder);
+            return;
+        }
+    }
+
+    // 2. Look up the config-declared job. Unknown id → reject (never a silent no-op).
+    let job = match state.jobs.get(&job_id) {
+        Some(j) => j.clone(),
+        None => {
+            recorder.record(&parent_id, Some(parent_turn), EventKind::AgentSpawnDenied,
+                json!({ "tool": "run_job", "job_id": &job_id, "reason": "unknown job id" }));
+            reject(parent_id, call_id, format!("run_job denied: no job declared with id '{job_id}'"),
+                state, sched, gateway, registry, recorder);
+            return;
+        }
+    };
+
+    // 3. Depth limit (mirror dispatch_spawn — jobs count against nesting depth too).
+    let parent_depth = state.spawn_depths.get(&parent_id).copied().unwrap_or(0);
+    if parent_depth >= state.max_spawn_depth {
+        recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
+            json!({ "stage": "run_job", "error": "max spawn depth exceeded", "depth": parent_depth, "limit": state.max_spawn_depth }));
+        reject(parent_id, call_id, format!("run_job denied: max nesting depth {} reached", state.max_spawn_depth),
+            state, sched, gateway, registry, recorder);
+        return;
+    }
+
+    // 4. Server-stamp the date and derive the child id. The caller supplies NO date (zero
+    // params) — the only value is agentd's wall-clock, so there is no injectable slot.
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let child_id = format!("{job_id}-{date}");
+    if let Err(reason) = validate_child_id(&child_id) {
+        recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
+            json!({ "stage": "run_job", "error": "invalid derived child_id", "child_id": &child_id, "reason": reason.to_string() }));
+        reject(parent_id, call_id, format!("run_job denied: derived child id {child_id:?} invalid: {reason}"),
+            state, sched, gateway, registry, recorder);
+        return;
+    }
+
+    // 5. Collision guard: reject if a child with this id is still LIVE (in state.agents) or
+    // retained in outcomes. A job that already COMPLETED and delivered to its parent is in
+    // neither map, so a same-day re-trigger re-runs (harmless — brief is log-append/LWW; cron
+    // fires once daily). Same-day idempotency is intentionally not enforced (matches dispatch_spawn).
+    if state.agents.contains_key(&child_id) || state.outcomes.contains_key(&child_id) {
+        recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
+            json!({ "stage": "run_job", "error": "child ID collision", "child_id": &child_id }));
+        reject(parent_id, call_id, format!("run_job denied: job child '{child_id}' is already in use"),
+            state, sched, gateway, registry, recorder);
+        return;
+    }
+
+    // 6. Build the child from the CONFIG-TRUSTED declaration — fixed caps (no subset check),
+    // fixed task template with only the server-stamped {date} substituted.
+    let child_caps = Some(job.capabilities.clone());
+    let task = job.render(&date);
+    let child_agent_cfg = crate::config::AgentConfig {
+        id:              child_id.clone(),
+        task:            task.clone(),
+        max_turns:       job.max_turns,
+        token_budget:    job.token_budget,
+        priority:        0,
+        capabilities:    child_caps.clone(),
+        name:            None,
+        description:     String::new(),
+        skills:          vec![],
+        tier:            crate::config::AgentTier::Native,
+        command:         None,
+        args:            vec![],
+        isolation:       crate::config::IsolationMode::None,
+        max_wall_seconds: 0,
+    };
+    let child_specs = registry.filtered_specs(child_caps.as_deref());
+    let child_model_cfg = state
+        .agents
+        .get(&parent_id)
+        .map(|a| a.model_cfg_cloned())
+        .unwrap_or_default();
+    let mut child_task = AgentTask::new(&child_id, &task, &child_agent_cfg, &child_model_cfg, child_specs);
+    child_task.set_budget_resettable(sched.budget_reset_interval > 0);
+
+    // 7. Register the child. `deliver_content=false` is the crux: the caller (an injectable
+    // trigger) receives only an agentd-authored completion signal, never the child's output.
+    let child_open_tokens = child_task.context_tokens();
+    state.agents.insert(child_id.clone(), child_task);
+    state.run_tracker.open(&child_id, Some(parent_id.clone()), "run_job", Some(child_open_tokens), "native");
+    state.awaiting.insert(
+        child_id.clone(),
+        AwaitingParent { parent_id: parent_id.clone(), call_id, deliver_content: false },
+    );
+    state.spawn_depths.insert(child_id.clone(), parent_depth + 1);
+    state.parent_map.insert(child_id.clone(), parent_id.clone());
+    state.mailboxes.entry(child_id.clone()).or_default();
+
+    recorder.record(&child_id, None, EventKind::AgentSpawned,
+        json!({ "parent_id": &parent_id, "job_id": &job_id, "task_preview": truncate(&task, PREVIEW_CHARS), "depth": parent_depth + 1 }));
+
+    // 8. Seed the child.
+    let child_cap_set = state.agents[&child_id].cap_set_cloned();
+    let (child_effect, child_turn) = {
+        let child_sm = state.agents.get_mut(&child_id).unwrap();
+        let t = child_sm.turn();
+        (child_sm.step(recorder), t)
+    };
+    enqueue_or_defer(child_effect, child_id, child_turn, 0, child_cap_set, state, sched, gateway, registry, recorder);
 }
 
 /// Dispatch a ControlCommand from the /agents/control FUSE surface.
@@ -2949,6 +3168,7 @@ fn build_scheduler_checkpoint(
             child_id:  child_id.clone(),
             parent_id: ap.parent_id.clone(),
             call_id:   ap.call_id.clone(),
+            deliver_content: ap.deliver_content,
         })
         .collect();
 
@@ -4024,13 +4244,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_attenuation_documents_injection_bypass() {
-        // KNOWN LIMIT (cap.2 is a FLOOR, not injection defense): an orchestrator that
-        // HOLDS Mcp{google_oauth} can spawn a child WITH Mcp{google_oauth} — it is ⊆ the
-        // parent's own set, so the subset check passes. This is exactly the injected-
-        // orchestrator gap the CEO gate accepted; cap.2b (orchestrator de-privilege)
-        // closes it. If this test ever starts FAILING, cap.2b has changed the model —
-        // update this test deliberately, do not paper over it.
+    async fn spawn_agent_floor_is_not_injection_defense() {
+        // spawn_agent (cap.2 FLOOR) is trusted-delegation: a parent that HOLDS Mcp{google_oauth}
+        // can spawn a child WITH it — ⊆ its own set, so the subset check passes. This is
+        // CORRECT for trusted delegation and remains unchanged by cap.2b. The injection-exposed
+        // CoS path no longer uses spawn_agent at all — it uses the sealed `run_job` (config-owned
+        // caps + task, deliver_content=false), tested below. This test pins that the spawn_agent
+        // floor still behaves as the documented trusted-delegation primitive.
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
@@ -4078,7 +4298,217 @@ mod tests {
         let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
         assert!(
             !content.contains("\"agent_spawn_denied\""),
-            "the bypass is NOT denied — that is the documented limit cap.2b must close"
+            "spawn_agent trusted delegation is not denied (the sealed run_job path is what closes injection)"
+        );
+    }
+
+    // ── cap.2b: sealed run_job ────────────────────────────────────────────────
+
+    fn cos_like_job(id: &str, caps: Vec<Capability>) -> crate::config::Job {
+        crate::config::Job {
+            id: id.to_string(),
+            token_budget: crate::config::default_token_budget(),
+            max_turns: crate::config::default_job_max_turns(),
+            capabilities: caps,
+            task: "sealed job for {date}".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_job_materializes_sealed_child_with_config_caps() {
+        // A DE-PRIVILEGED trigger (only RunJob) fires a job whose caps live in config. The
+        // child runs with the CONFIG caps (no parent-subset check, because the trigger holds
+        // none of them), and there is no denial. This is the cap.2b inversion: cap authority
+        // moved off the injectable trigger onto config.
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj1".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-curator" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = MockGateway::new(vec![
+            run,
+            end_turn("child ok", 5, 3),   // the job child terminates
+            end_turn("trigger ok", 10, 5), // the trigger continues after the completion signal
+        ]);
+
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        // Curator job: KB-only, NO google_oauth — the trigger holds none of these caps.
+        let sched = sched.with_jobs(vec![cos_like_job(
+            "cos-curator",
+            vec![Capability::KbWrite { segment: "ops:briefs".into() }],
+        )]);
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["cos-orchestrator"].is_ok(), "trigger must complete: {:?}", outcomes["cos-orchestrator"]);
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(!content.contains("\"agent_spawn_denied\""), "a valid run_job must not be denied");
+        // The child materialized under the server-stamped id and ran (agent_spawned recorded).
+        assert!(content.contains("cos-curator-"), "job child should be id-stamped cos-curator-<date>");
+    }
+
+    #[tokio::test]
+    async fn run_job_rejects_unknown_job_id() {
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj_bad".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "no-such-job" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = MockGateway::new(vec![run, end_turn("trigger recovered", 10, 5)]);
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        let sched = sched.with_jobs(vec![cos_like_job("cos-inbox", vec![Capability::RunsRead])]);
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["cos-orchestrator"].is_ok(), "trigger recovers from a bad job id");
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"agent_spawn_denied\""), "unknown job id must be recorded as denied");
+        assert!(!outcomes.keys().any(|k| k.starts_with("no-such-job")), "no child for an unknown job");
+    }
+
+    #[tokio::test]
+    async fn run_job_requires_run_job_capability() {
+        // A trigger WITHOUT RunJob cannot fire jobs — capability-gated like spawn_agent/Spawn.
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj_nocap".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-inbox" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = MockGateway::new(vec![run, end_turn("recovered", 10, 5)]);
+        // Trigger holds some other cap but NOT RunJob.
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunsRead]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        let sched = sched.with_jobs(vec![cos_like_job("cos-inbox", vec![Capability::RunsRead])]);
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["cos-orchestrator"].is_ok(), "trigger recovers from the denial");
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"capability_denied\""), "run_job without RunJob must be capability-denied");
+    }
+
+    // Captures every InferenceRequest it serves, so a test can inspect exactly what reached an
+    // agent's context — used to PROVE the sealed-job no-read property (deliver_content=false).
+    struct CapturingGateway {
+        responses: Arc<Mutex<Vec<InferenceResponse>>>,
+        seen:      Arc<Mutex<Vec<InferenceRequest>>>,
+    }
+    #[async_trait::async_trait]
+    impl InferenceGateway for CapturingGateway {
+        async fn infer(&self, req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+            self.seen.lock().unwrap().push(req);
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                return Err(anyhow::anyhow!("CapturingGateway: no more responses queued"));
+            }
+            Ok(q.remove(0))
+        }
+        fn model_id(&self) -> &str { "capturing" }
+    }
+
+    #[tokio::test]
+    async fn run_job_delivers_completion_signal_not_child_output() {
+        // The crux of cap.2b: a sealed job's (email-derived) OUTPUT must never reach the
+        // injectable trigger's context — only an agentd-authored completion signal. Drive a job
+        // whose child answer is a distinctive sentinel and assert the sentinel appears in NO
+        // inference request (i.e. was never fed back to any agent), while the trigger's follow-up
+        // request DOES carry the "completed" signal as its ToolResult.
+        use crate::inference::Block as IBlock;
+        use crate::tools::native::register_native;
+        const SENTINEL: &str = "SENTINEL_LEAK_9F3A_wire_funds_now";
+
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj_seal".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-inbox" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = CapturingGateway {
+            responses: Arc::new(Mutex::new(vec![
+                run,                                   // trigger req #1 → run_job
+                end_turn(SENTINEL, 5, 3),              // the JOB child's answer (hostile output)
+                end_turn("trigger done", 10, 5),       // trigger req #2 (carries the delivered ToolResult)
+            ])),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let seen = Arc::clone(&gw.seen); // keep a handle after run() consumes the scheduler
+
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        let sched = sched.with_jobs(vec![cos_like_job(
+            "cos-inbox",
+            vec![Capability::KbWrite { segment: "ops:entities".into() }],
+        )]);
+        let outcomes = sched.run().await;
+        assert!(outcomes["cos-orchestrator"].is_ok());
+
+        // Inspect every request served. Collect all ToolResult contents that reached any agent.
+        let reqs = seen.lock().unwrap();
+        let tool_result_contents: Vec<String> = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                IBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // No-read: the child's hostile answer must NEVER appear in any request context.
+        assert!(
+            !reqs.iter().any(|r| format!("{:?}", r.messages).contains(SENTINEL)),
+            "LEAK: the sealed job's output reached an agent's context — deliver_content is broken"
+        );
+        // Positive: the trigger DID receive the agentd-authored completion signal instead.
+        assert!(
+            tool_result_contents.iter().any(|c| c.contains("completed") && c.contains("cos-inbox-")),
+            "the trigger must receive the 'job cos-inbox-<date> completed' signal as its ToolResult; \
+             got: {tool_result_contents:?}"
         );
     }
 
@@ -4268,6 +4698,7 @@ mod tests {
             waiting:            HashSet::new(),
             cred_gw:            None,
             run_tracker:        RunTracker::disabled(),
+            jobs:               HashMap::new(),
         }
     }
 
@@ -4299,7 +4730,7 @@ mod tests {
         let mut state = minimal_state("parent");
         state.awaiting.insert(
             "child-1".to_string(),
-            AwaitingParent { parent_id: "parent".to_string(), call_id: "call-1".to_string() },
+            AwaitingParent { parent_id: "parent".to_string(), call_id: "call-1".to_string(), deliver_content: true },
         );
         update_snapshot(&snap, &state);
         let s = snap.read().unwrap();

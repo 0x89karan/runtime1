@@ -71,6 +71,7 @@ pub struct PublishBrief {
 }
 
 pub struct SpawnAgentTool;
+pub struct RunJobTool;
 pub struct RequestApprovalTool;
 pub struct ListAgentsTool {
     pub cards: Arc<Vec<AgentCard>>,
@@ -955,6 +956,43 @@ impl Tool for SpawnAgentTool {
 }
 
 #[async_trait]
+impl Tool for RunJobTool {
+    fn name(&self) -> &str {
+        "run_job"
+    }
+
+    fn description(&self) -> &str {
+        "Trigger a config-declared sealed job by id. Must be the sole tool call in a turn. \
+         Requires the RunJob capability. The job's capabilities and task are fixed in config \
+         (you cannot choose them); you pass ONLY the job id. Use this for the daily pipeline; \
+         it returns a completion signal, not the job's output."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string", "description": "The id of a configured [[jobs]] entry to run (e.g. \"cos-inbox\", \"cos-curator\")." }
+            },
+            "required": ["job_id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn required_capability_for(&self, _input: &Value) -> Option<Capability> {
+        Some(Capability::RunJob)
+    }
+
+    async fn invoke(&self, _input: Value, _ctx: &ToolContext) -> Result<String> {
+        // run_job is intercepted by step_with_response() before reaching invoke(), exactly
+        // like spawn_agent. Reaching here means the effect dispatch path was bypassed.
+        Err(anyhow::anyhow!(
+            "run_job must be intercepted by the scheduler; invoke() should never be called"
+        ))
+    }
+}
+
+#[async_trait]
 impl Tool for ListAgentsTool {
     fn name(&self) -> &str {
         "list_agents"
@@ -1092,6 +1130,9 @@ pub fn register_native(
     }
     if want("spawn_agent") {
         reg.register(Box::new(SpawnAgentTool))?;
+    }
+    if want("run_job") {
+        reg.register(Box::new(RunJobTool))?;
     }
     if want("list_agents") {
         let c = cards.clone().unwrap_or_else(|| Arc::new(vec![]));

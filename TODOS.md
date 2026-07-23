@@ -126,16 +126,25 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   child's caps while reading untrusted email, so an injected orchestrator grants the curator
   Gmail *from its own set* and the subset check passes. That gap is **encoded as a passing test**
   (`spawn_attenuation_documents_injection_bypass`) so it can't be mistaken for closed. → `cap.2b`.
-- **cap.2b (P1) [new; = the real P1-10 closure] — De-privilege the CoS orchestrator / keep it out of the untrusted-data path.**
+- ~~**cap.2b (P1) [= the real P1-10 closure] — De-privilege the CoS orchestrator.**~~ **[DONE — sealed `run_job` + `[[jobs]]` + de-privileged cron trigger; `deliver_content=false` completion-only delivery; brief authoring moved to the KB-only curator job; both cos configs migrated + `agentd check` clean; P1-10 CLOSED against the pinned claim (no live Gmail via injection), brief social-engineering residual documented in THREAT_MODEL §9.5; north-star data-taint recorded. Shipped in the cap.2b increment (see docs/plans/cap.2b-orchestrator-deprivilege.md).]**
   The subset check (cap.2) only becomes load-bearing once the GRANTING node is itself attenuated.
-  Close P1-10 by restructuring the CoS so the node that ingests untrusted email holds no
-  `Mcp{google_oauth}`/`Credential` and no `Spawn` authority — a statically-wired inbox→curator
-  pipeline with fixed caps, or an orchestrator that never reads raw email/the inbox summary back
-  into a spawn-capable context. Largely a `cos.agents.toml` topology change (+ possibly scheduler
-  support for static child pipelines); touches the load-bearing daily-brief flow, so it deserves
-  its own design pass. North star (cap.3+): taint — caps unavailable to any agent downstream of an
-  untrusted-data read. Turns `spawn_attenuation_documents_injection_bypass` from a documentation
-  test into a red test to make green.
+  cap.2b moved cap + task authority off the injectable trigger onto config-owned sealed jobs, so an
+  injected trigger can neither mint caps nor redirect work nor read job output. North star (still
+  open): data-taint — caps unavailable to any agent downstream of an untrusted-data read (generalizes
+  to Telegram/webhook ingest). The former `spawn_attenuation_documents_injection_bypass` test was
+  renamed `spawn_agent_floor_is_not_injection_defense` (the spawn_agent floor is unchanged; the
+  sealed run_job path is what closes injection).
+- **cap.2b-ar-01 (P3) [new; found in cap.2b /review] — sealed-job pipeline date can skew across UTC midnight.**
+  `dispatch_run_job` server-stamps `{date}` = `Utc::now()` independently for each `run_job` call
+  (`scheduler.rs`). The CoS pipeline is two calls (cos-inbox then cos-curator); if they straddle
+  UTC midnight (a cron near 00:00 UTC, or a first-run OAuth delay), inbox writes
+  `ops:entities/inbox-<old-date>` but the curator renders its task to read `inbox-<new-date>` and
+  finds nothing → the brief fails (cleanly — curator's "missing → error, stop"). NOT a security
+  issue and the default `TRIGGER_CRON="0 8 * * *"` never hits it; fails SAFE (no stale/wrong data).
+  Fix: carry ONE pipeline date across both jobs — e.g. a strictly-validated (`^\d{4}-\d{2}-\d{2}$`,
+  no injection surface) optional `date` param on `run_job` that the trigger sets once from the cron
+  `fired_utc`, or a scheduler-held per-cron pipeline date. Chose docs-over-fix at /review: a fixed
+  handoff key would remove the skew but introduce a worse SILENT stale-brief failure mode.
 - **cap.2-ar-01 (P3) [new] — spawn `max_turns` passthrough (split out of cap.2).**
   `SpawnConfig` has no `max_turns`; children get `default_max_turns()` (`scheduler.rs` step 4).
   `cos-polish-adv-F5` (curator hits `MaxTurnsReached` at the default) wanted this merged into

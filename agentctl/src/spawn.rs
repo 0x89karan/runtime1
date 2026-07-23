@@ -346,6 +346,7 @@ pub(crate) fn format_cap(cap: &Capability) -> String {
         Capability::KbWrite { segment } => format!("kb-write:{segment}"),
         Capability::RunsRead => "runs-read".to_string(),
         Capability::BriefPublish => "brief-publish".to_string(),
+        Capability::RunJob => "run-job".to_string(),
         Capability::Net { ports, .. } => {
             let p: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
             format!("net:{}", p.join(","))

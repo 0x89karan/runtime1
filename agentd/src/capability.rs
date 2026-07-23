@@ -76,6 +76,13 @@ pub enum Capability {
     /// is an operator-facing trust surface, so writing one is gated (F8), even though
     /// agentd (not the caller) authors the facts.
     BriefPublish,
+    /// Trigger a config-declared sealed job via `run_job` (cap.2b). Unit grant. The job's
+    /// caps + task template are owned by config (`[[jobs]]`), NOT chosen by the caller — so
+    /// an injected, untrusted-data-reading agent (the CoS cron trigger) can trigger predeclared
+    /// work but cannot author privileged work or mint caps. `spawn_agent` (Spawn) stays the
+    /// trusted-delegation path where the caller authors the child; `run_job` is the hardened
+    /// path for the injection-exposed data pipeline. See docs/plans/cap.2b-*.
+    RunJob,
 }
 
 /// Normalize a path by resolving `.` and `..` components without filesystem
@@ -217,6 +224,7 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
         }),
         Capability::RunsRead => granted.iter().any(|g| matches!(g, Capability::RunsRead)),
         Capability::BriefPublish => granted.iter().any(|g| matches!(g, Capability::BriefPublish)),
+        Capability::RunJob => granted.iter().any(|g| matches!(g, Capability::RunJob)),
     }
 }
 
@@ -278,7 +286,8 @@ pub fn capability_covered_by(parent: &[Capability], child: &Capability) -> bool 
         | Capability::ShellExec
         | Capability::Credential { .. }
         | Capability::RunsRead
-        | Capability::BriefPublish => satisfies(parent, child),
+        | Capability::BriefPublish
+        | Capability::RunJob => satisfies(parent, child),
     }
 }
 
@@ -378,7 +387,7 @@ pub fn tier_legality(cap: &Capability, ctx: CapContext) -> Legality {
         CapContext::HttpMcp => Legality::Inert("HTTP MCP transport discards capabilities/isolation"),
         CapContext::Agent => match cap {
             FsRead { .. } | FsWrite { .. } => Legality::Enforced,
-            Mcp { .. } | Spawn | KbRead { .. } | KbWrite { .. } | RunsRead | BriefPublish => {
+            Mcp { .. } | Spawn | KbRead { .. } | KbWrite { .. } | RunsRead | BriefPublish | RunJob => {
                 Legality::Enforced
             }
             Net { .. } => Legality::Inert("agent-level Net is advisory; native agents have no sandbox"),
@@ -394,7 +403,7 @@ pub fn tier_legality(cap: &Capability, ctx: CapContext) -> Legality {
                 Legality::Enforced
             }
             Mcp { .. } => Legality::Inert("Mcp grant has no meaning on a server's own sandbox"),
-            KbRead { .. } | KbWrite { .. } | RunsRead | BriefPublish => {
+            KbRead { .. } | KbWrite { .. } | RunsRead | BriefPublish | RunJob => {
                 Legality::Inert("agent-facing capability has no server-sandbox rule")
             }
         },

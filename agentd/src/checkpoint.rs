@@ -113,6 +113,15 @@ pub struct AwaitingEntry {
     pub child_id:  String,
     pub parent_id: String,
     pub call_id:   String,
+    /// Whether the child's answer is delivered to the parent on completion (cap.2b).
+    /// Default `true` so pre-cap.2b checkpoints (spawn_agent awaits only) restore correctly.
+    #[serde(default = "crate::checkpoint::default_true")]
+    pub deliver_content: bool,
+}
+
+/// Serde default for `AwaitingEntry.deliver_content` — see the field doc.
+pub fn default_true() -> bool {
+    true
 }
 
 /// A serializable snapshot of a parked approval (written to checkpoint so
@@ -363,6 +372,7 @@ mod tests {
             child_id:  "child-1".to_string(),
             parent_id: "agent-a".to_string(),
             call_id:   "call-xyz".to_string(),
+            deliver_content: true,
         });
         cp.mailboxes.insert(
             "agent-a".to_string(),

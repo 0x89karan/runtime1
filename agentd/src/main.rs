@@ -1283,6 +1283,9 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // ux.11b: wire the run-history tracker so lifecycle transitions author runs.redb.
     let scheduler = scheduler.with_run_tracker(run_tracker);
 
+    // cap.2b: register config-declared sealed jobs so run_job(job_id) can materialize them.
+    let scheduler = scheduler.with_jobs(cfg.jobs.clone());
+
     let streamed_agents = scheduler.streamed_agents();
     recorder.record(
         "agentd",
@@ -1482,7 +1485,8 @@ fn caps_to_rules_inner(caps: &[Capability], v4_available: bool) -> Vec<SandboxRu
             | Capability::KbWrite { .. }
             | Capability::Credential { .. }
             | Capability::RunsRead
-            | Capability::BriefPublish => {}
+            | Capability::BriefPublish
+            | Capability::RunJob => {}
         }
     }
     rules
@@ -2267,12 +2271,16 @@ mod tests {
                 "{label}: google_oauth must NOT have FsRead{{prefix=\"/run/secrets\"}} \
                  in broker mode — the sidecar holds no raw credential (cred.6)"
             );
-            // 2. Orchestrator must have Credential{Google} so children inherit broker access.
+            // 2. Credential{Google} must be declared somewhere agent-facing so the Gmail-fetching
+            //    node can call through the broker gateway (cred.6). cap.2b moved it OFF the
+            //    de-privileged orchestrator trigger and ONTO the cos-inbox [[jobs]] declaration —
+            //    check agents AND jobs (union) so the wiring is verified wherever it lives.
             let agent_caps = cfg
                 .agent_configs()
                 .unwrap_or_default()
                 .into_iter()
                 .flat_map(|a| a.capabilities.unwrap_or_default())
+                .chain(cfg.jobs.iter().flat_map(|j| j.capabilities.clone()))
                 .collect::<Vec<_>>();
             let has_credential_google = agent_caps.iter().any(|c| {
                 matches!(c, Capability::Credential { provider }
@@ -2280,8 +2288,8 @@ mod tests {
             });
             assert!(
                 has_credential_google,
-                "{label}: orchestrator capabilities must include Credential{{provider=Google}} \
-                 so spawned inbox agents can call through the broker gateway (cred.6)"
+                "{label}: an agent or job must declare Credential{{provider=Google}} \
+                 so the Gmail node can call through the broker gateway (cred.6)"
             );
             // 3. google provider must have non-empty passthrough_query_params so Gmail
             //    query params (maxResults, q, format, pageToken) reach the upstream API.
