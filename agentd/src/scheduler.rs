@@ -4422,6 +4422,96 @@ mod tests {
         assert!(content.contains("\"capability_denied\""), "run_job without RunJob must be capability-denied");
     }
 
+    // Captures every InferenceRequest it serves, so a test can inspect exactly what reached an
+    // agent's context — used to PROVE the sealed-job no-read property (deliver_content=false).
+    struct CapturingGateway {
+        responses: Arc<Mutex<Vec<InferenceResponse>>>,
+        seen:      Arc<Mutex<Vec<InferenceRequest>>>,
+    }
+    #[async_trait::async_trait]
+    impl InferenceGateway for CapturingGateway {
+        async fn infer(&self, req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+            self.seen.lock().unwrap().push(req);
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                return Err(anyhow::anyhow!("CapturingGateway: no more responses queued"));
+            }
+            Ok(q.remove(0))
+        }
+        fn model_id(&self) -> &str { "capturing" }
+    }
+
+    #[tokio::test]
+    async fn run_job_delivers_completion_signal_not_child_output() {
+        // The crux of cap.2b: a sealed job's (email-derived) OUTPUT must never reach the
+        // injectable trigger's context — only an agentd-authored completion signal. Drive a job
+        // whose child answer is a distinctive sentinel and assert the sentinel appears in NO
+        // inference request (i.e. was never fed back to any agent), while the trigger's follow-up
+        // request DOES carry the "completed" signal as its ToolResult.
+        use crate::inference::Block as IBlock;
+        use crate::tools::native::register_native;
+        const SENTINEL: &str = "SENTINEL_LEAK_9F3A_wire_funds_now";
+
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj_seal".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-inbox" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = CapturingGateway {
+            responses: Arc::new(Mutex::new(vec![
+                run,                                   // trigger req #1 → run_job
+                end_turn(SENTINEL, 5, 3),              // the JOB child's answer (hostile output)
+                end_turn("trigger done", 10, 5),       // trigger req #2 (carries the delivered ToolResult)
+            ])),
+            seen: Arc::new(Mutex::new(Vec::new())),
+        };
+        let seen = Arc::clone(&gw.seen); // keep a handle after run() consumes the scheduler
+
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        let sched = sched.with_jobs(vec![cos_like_job(
+            "cos-inbox",
+            vec![Capability::KbWrite { segment: "ops:entities".into() }],
+        )]);
+        let outcomes = sched.run().await;
+        assert!(outcomes["cos-orchestrator"].is_ok());
+
+        // Inspect every request served. Collect all ToolResult contents that reached any agent.
+        let reqs = seen.lock().unwrap();
+        let tool_result_contents: Vec<String> = reqs
+            .iter()
+            .flat_map(|r| r.messages.iter())
+            .flat_map(|m| m.blocks.iter())
+            .filter_map(|b| match b {
+                IBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // No-read: the child's hostile answer must NEVER appear in any request context.
+        assert!(
+            !reqs.iter().any(|r| format!("{:?}", r.messages).contains(SENTINEL)),
+            "LEAK: the sealed job's output reached an agent's context — deliver_content is broken"
+        );
+        // Positive: the trigger DID receive the agentd-authored completion signal instead.
+        assert!(
+            tool_result_contents.iter().any(|c| c.contains("completed") && c.contains("cos-inbox-")),
+            "the trigger must receive the 'job cos-inbox-<date> completed' signal as its ToolResult; \
+             got: {tool_result_contents:?}"
+        );
+    }
+
     // ── p1.6: send_message tests ─────────────────────────────────────────────
 
     #[tokio::test]
