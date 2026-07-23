@@ -28,6 +28,9 @@
 #   export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
 #   export OAUTH_PROVIDER_NAME="google"
 #   export TRIGGER_CRON="0 8 * * *"           # daily 08:00 UTC; change to taste
+#   # Keep the fire time away from 00:00 UTC: the inbox→curator handoff is date-keyed and
+#   # server-stamped per job, so a pipeline that straddles UTC midnight fails the brief
+#   # (cleanly) — see cap.2b-ar-01. 08:00 is safe.
 #   # After first run (skip the browser dance):
 #   export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
 #
@@ -60,8 +63,10 @@
 #
 # JOB CHILD ID NOTE (cap.2b):
 #   run_job stamps the child id as "<job-id>-<YYYY-MM-DD>" (UTC, server-side) — the trigger
-#   passes NO date. Date-stamping prevents collisions across cron cycles; the scheduler
-#   rejects a same-day duplicate cleanly.
+#   passes NO date. The scheduler rejects a duplicate id only while the prior run is still
+#   LIVE (in-flight); a job that already COMPLETED can re-run the same day (harmless — the
+#   brief is log-append/last-writer-wins, and cron normally fires once daily). Same-day
+#   idempotency is not enforced (matching the pre-cap.2b model, which relied on cron cadence).
 
 # ---------------------------------------------------------------------------
 # Shared model config (applies to all agents unless overridden per-agent)
@@ -303,6 +308,7 @@ native = [
 [[jobs]]
 id           = "cos-inbox"
 token_budget = 1_500_000
+max_turns    = 600   # OAuth + list + fetch/analyze ~20 messages + KB writes (default 20 would trip mid-run)
 capabilities = [
   { Mcp    = { server = "google_oauth", tools = [] } },
   { Mcp    = { server = "semantic-kb",  tools = [] } },
@@ -355,6 +361,7 @@ id           = "cos-curator"
 # Larger than inbox: brief assembly + kb_search + runs_query all run here (cap.2b F7d — the
 # old 200k curator would brick mid-brief now that assembly moved off the trigger).
 token_budget = 500_000
+max_turns    = 300   # read inbox JSON + entity writes + kb_search + write_file + publish
 capabilities = [
   { Mcp    = { server = "semantic-kb",  tools = [] } },
   { KbRead  = { segment = "ops:entities" } },

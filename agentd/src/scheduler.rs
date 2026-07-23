@@ -2212,7 +2212,10 @@ fn dispatch_run_job(
         return;
     }
 
-    // 5. Collision guard (same-day re-trigger, or an id already live). Reject cleanly.
+    // 5. Collision guard: reject if a child with this id is still LIVE (in state.agents) or
+    // retained in outcomes. A job that already COMPLETED and delivered to its parent is in
+    // neither map, so a same-day re-trigger re-runs (harmless — brief is log-append/LWW; cron
+    // fires once daily). Same-day idempotency is intentionally not enforced (matches dispatch_spawn).
     if state.agents.contains_key(&child_id) || state.outcomes.contains_key(&child_id) {
         recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
             json!({ "stage": "run_job", "error": "child ID collision", "child_id": &child_id }));
@@ -2228,7 +2231,7 @@ fn dispatch_run_job(
     let child_agent_cfg = crate::config::AgentConfig {
         id:              child_id.clone(),
         task:            task.clone(),
-        max_turns:       crate::config::default_max_turns(),
+        max_turns:       job.max_turns,
         token_budget:    job.token_budget,
         priority:        0,
         capabilities:    child_caps.clone(),
@@ -4305,6 +4308,7 @@ mod tests {
         crate::config::Job {
             id: id.to_string(),
             token_budget: crate::config::default_token_budget(),
+            max_turns: crate::config::default_job_max_turns(),
             capabilities: caps,
             task: "sealed job for {date}".to_string(),
         }

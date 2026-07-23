@@ -217,6 +217,7 @@ native = [
 [[jobs]]
 id           = "cos-inbox"
 token_budget = 1_500_000
+max_turns    = 600   # OAuth + list + fetch/analyze ~20 messages + KB write (default 20 would trip mid-run)
 capabilities = [
   { Mcp    = { server = "google_oauth", tools = [] } },
   { KbWrite = { segment = "ops:entities" } },
@@ -258,6 +259,7 @@ STEP 4 — Persist the OperatingBrief for the curator:
 [[jobs]]
 id           = "cos-curator"
 token_budget = 500_000
+max_turns    = 300   # read inbox JSON + entity writes + kb_search + write_file + publish
 capabilities = [
   { KbRead  = { segment = "ops:entities" } },
   { KbRead  = { segment = "ops:briefs"   } },

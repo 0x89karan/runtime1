@@ -72,6 +72,12 @@ pub struct Job {
     /// Per-child token ceiling.
     #[serde(default = "default_token_budget")]
     pub token_budget: u64,
+    /// Per-child turn ceiling. Jobs do BOUNDED work (fetch mail, write a brief), unlike the
+    /// always-on cron trigger, so this defaults generously rather than to the tiny agent
+    /// default (`default_max_turns` = 20, which would trip `MaxTurnsReached` mid-pipeline —
+    /// the cos-polish-adv-F5 class). `token_budget` remains the real spend bound.
+    #[serde(default = "default_job_max_turns")]
+    pub max_turns: u32,
     /// Fixed capability set attached to the spawned child. Config-trusted: the `run_job`
     /// path does NOT run the `capability_covered_by` parent-subset check (the caller need
     /// not — and for the de-privileged CoS trigger, must not — hold these).
@@ -559,6 +565,13 @@ pub struct AgentConfig {
 
 pub fn default_max_turns() -> u32 {
     20
+}
+
+/// Default turn ceiling for a sealed [[jobs]] child (cap.2b). Generous because a job runs a
+/// bounded pipeline (OAuth + fetch ~20 messages + KB writes, or read + assemble + publish) that
+/// needs far more than the 20-turn agent default; `token_budget` is the real spend bound.
+pub fn default_job_max_turns() -> u32 {
+    1000
 }
 
 pub fn default_token_budget() -> u64 {

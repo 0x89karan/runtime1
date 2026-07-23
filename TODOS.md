@@ -134,6 +134,17 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   to Telegram/webhook ingest). The former `spawn_attenuation_documents_injection_bypass` test was
   renamed `spawn_agent_floor_is_not_injection_defense` (the spawn_agent floor is unchanged; the
   sealed run_job path is what closes injection).
+- **cap.2b-ar-01 (P3) [new; found in cap.2b /review] — sealed-job pipeline date can skew across UTC midnight.**
+  `dispatch_run_job` server-stamps `{date}` = `Utc::now()` independently for each `run_job` call
+  (`scheduler.rs`). The CoS pipeline is two calls (cos-inbox then cos-curator); if they straddle
+  UTC midnight (a cron near 00:00 UTC, or a first-run OAuth delay), inbox writes
+  `ops:entities/inbox-<old-date>` but the curator renders its task to read `inbox-<new-date>` and
+  finds nothing → the brief fails (cleanly — curator's "missing → error, stop"). NOT a security
+  issue and the default `TRIGGER_CRON="0 8 * * *"` never hits it; fails SAFE (no stale/wrong data).
+  Fix: carry ONE pipeline date across both jobs — e.g. a strictly-validated (`^\d{4}-\d{2}-\d{2}$`,
+  no injection surface) optional `date` param on `run_job` that the trigger sets once from the cron
+  `fired_utc`, or a scheduler-held per-cron pipeline date. Chose docs-over-fix at /review: a fixed
+  handoff key would remove the skew but introduce a worse SILENT stale-brief failure mode.
 - **cap.2-ar-01 (P3) [new] — spawn `max_turns` passthrough (split out of cap.2).**
   `SpawnConfig` has no `max_turns`; children get `default_max_turns()` (`scheduler.rs` step 4).
   `cos-polish-adv-F5` (curator hits `MaxTurnsReached` at the default) wanted this merged into
