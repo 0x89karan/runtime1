@@ -39,7 +39,10 @@ token_path    = "/run/secrets/google.json"
 # /run/state does NOT exist in the QEMU initramfs; /run/secrets is read-only.
 state_path    = "/run/memory/oauth/google.json"
 # Gmail query params forwarded to upstream (D3 allowlist — all others dropped).
-passthrough_query_params = ["maxResults", "q", "format", "pageToken", "includeSpamTrash"]
+# `metadataHeaders` is required so the inbox job's format=metadata fetch (cap.2b-ar-02)
+# can filter to From/Subject/Date; without it the broker strips the filter and Gmail
+# returns ALL headers, re-inflating the response.
+passthrough_query_params = ["maxResults", "q", "format", "metadataHeaders", "pageToken", "includeSpamTrash"]
 
 # ---------------------------------------------------------------------------
 # Management HTTP API — exposed at :7999 inside the VM, hostfwd'd to the host.
@@ -216,8 +219,10 @@ native = [
 
 [[jobs]]
 id           = "cos-inbox"
+# Budget bounded by the metadata-only fetch (cap.2b-ar-02): STEP 2 pulls headers + snippet,
+# never full base64 bodies, so context stays small and 1.5M is ample.
 token_budget = 1_500_000
-max_turns    = 600   # OAuth + list + fetch/analyze ~20 messages + KB write (default 20 would trip mid-run)
+max_turns    = 600   # OAuth + list + per-message metadata fetch (~50)
 capabilities = [
   { Mcp    = { server = "google_oauth", tools = [] } },
   { KbWrite = { segment = "ops:entities" } },
@@ -233,11 +238,15 @@ STEP 1 — Check Gmail auth: oauth_check_auth(). If not ready:
        summary='Gmail OAuth required — visit the URL to authorize', args={'url': <the URL>}).
   c. oauth_check_auth() again; if still not ready, wait 30s and retry.
 
-STEP 2 — Fetch recent emails:
+STEP 2 — Fetch recent-message METADATA only (bounded — NEVER pull full bodies into context):
   oauth_call_api(method='GET',
     url='https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=newer_than:1d')
-  For each important message (up to 20), fetch full content:
-    oauth_call_api(method='GET', url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
+  For each message id (up to 50), fetch METADATA ONLY — do NOT use format=full:
+    oauth_call_api(method='GET',
+      url='.../messages/{id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date')
+  This returns From/Subject/Date + Gmail's `snippet` (~200 chars), NO base64 body — keeping context small.
+  ⚠ NEVER request format=full: one message can be 50–100 KB of base64 and will blow your budget +
+    context window. Triage entirely from subject + snippet.
 
 STEP 3 — Build the OperatingBrief JSON (compact; KB entry limit 8 KB):
   summaries/asks ≤120 chars; subjects ≤80; important ≤12; response_needed ≤8; open_items ≤10.

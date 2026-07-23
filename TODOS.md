@@ -134,6 +134,46 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   to Telegram/webhook ingest). The former `spawn_attenuation_documents_injection_bypass` test was
   renamed `spawn_agent_floor_is_not_injection_defense` (the spawn_agent floor is unchanged; the
   sealed run_job path is what closes injection).
+- ~~**semantic-kb-colon (P1) [found in cap.2b live test] — L2 semantic KB never persisted colon segments (Qdrant 422).**~~ **[FIXED — `docker/semantic_kb_mcp.py` `_collection_name` now sanitizes `[^A-Za-z0-9_]`→`_` before the `kb_` prefix.]**
+  `_collection_name(segment)` returned `f"kb_{segment}"`, so `ops:entities`/`ops:briefs`/`mail:raw`
+  mapped to Qdrant collections `kb_ops:entities` etc. — and **Qdrant rejects `:` in collection
+  names** (`HTTP 422: collection name cannot contain ':' char`). So EVERY `kb_put` to a colon
+  segment through the semantic-kb sidecar (tool_override) has silently failed since memory-routing
+  (v0.81) — the L2 "semantic email dedup / brief persistence" never actually wrote to Qdrant for
+  these segments. Latent because the sidecar's own `_validate_segment` allows colons and the unit
+  tests use MOCK_EMBED (never hit real Qdrant collection creation). cap.2b surfaced it: the
+  inbox→curator handoff MUST go through the KB, so the curator found `ops:entities` empty. Fix
+  sanitizes the collection name (colons → `_`), applied in the ONE mapping used by
+  create/put/get/search so reads/writes align. No data migration needed (all prior writes 422'd).
+  Regression fence added (`test_t20` — direct assertion on the mapping, since the MOCK_EMBED
+  suite uses colon-free segments and would pass even if the sanitizer regressed). Follow-up:
+  consider a non-mock Qdrant smoke in CI.
+- **semantic-kb-injective (P3) [/review, cross-model Claude+Codex] — `_collection_name` is non-injective and `_point_id` is segment-blind.**
+  Any char outside `[A-Za-z0-9_]` maps to `_`, so segments differing only by a sanitized char
+  (`ops:entities` vs `ops.entities`/`ops-entities`/`ops entities`) collapse to one Qdrant
+  collection; combined with `_point_id(key)` (no segment component), a collision would let
+  same-key writes across the two logical segments silently overwrite each other and reads cross
+  the boundary. NOT triggerable with the current 5 segments (all map distinct — `test_t20`
+  asserts this), so P3. Real fix when a colliding segment is ever needed: fold the segment into
+  `_point_id`, or hash the raw segment into the collection name.
+- **cos-kbwrite-override-cap (P3) [/review, Claude adversarial] — verify agentd enforces the KbWrite segment cap on the `tool_override` path.**
+  `cos-inbox` routes `kb_put` to the semantic-kb sidecar via `tool_override=true`. The sidecar's
+  `_validate_segment` accepts any colon segment; segment-scoping is agentd's KbWrite cap, not the
+  sidecar's. Pre-existing since h8.1, but the colon fix above WIDENS the blast radius (colon
+  segments now actually persist to Qdrant instead of 422-ing), so a cap-bypass write would now
+  land real data. Confirm agentd re-checks the KbWrite segment on overridden MCP tool calls;
+  if it doesn't, an injected inbox agent could write to the curator-owned `ops:briefs`.
+- ~~**cap.2b-ar-02 (P2) [found in cap.2b live test] — cos-inbox job balloons context/spend via `format=full`.**~~ **[FIXED — inbox now fetches `format=metadata` (From/Subject/Date + Gmail `snippet`, no base64 body) in both cos configs; triage is snippet-based, context stays ~50×≤1 KB, budget reverted 5M→1.5M. Also added `metadataHeaders` to the broker `passthrough_query_params` allowlist in both configs — /review (Codex) caught that the broker was silently stripping the header filter, so Gmail returned ALL headers (still no base64 body, which is why the live test stayed bounded, but larger than intended). Tradeoff: brief detail is snippet-level, not full-body. Deeper option (bound ALL oauth_call_api output in the oauth_mcp sidecar) left as a future hardening.]**
+  The inbox job's task fetches each message with `oauth_call_api(...messages/{id}?format=full)`, which
+  returns the entire raw payload incl. base64 body parts. Those huge tool results accumulate in the
+  agent's context, and re-sending the growing context every turn balloons cumulative spend — observed
+  **~1.8M tokens by turn 6**, tripping the (old 1.5M) budget → `deferred`, so the pipeline stalled and
+  no brief landed. Temporary unblock: bumped `cos-inbox` `token_budget` to 5M (both configs). Real fix:
+  lighten what enters context — fetch `format=metadata` for triage and/or extract only the plaintext
+  body part with a hard per-message cap BEFORE it becomes a tool result (the current "truncate to 8 KB"
+  is applied by the model to `kb_put` AFTER it has already seen the full response, so it doesn't bound
+  context). Watch for a context-WINDOW overflow too (budget can't fix that). Pre-existing (the pre-cap.2b
+  spawned inbox did the same fetch at the same 1.5M budget); cap.2b surfaced it in a clean run.
 - **cap.2b-ar-01 (P3) [new; found in cap.2b /review] — sealed-job pipeline date can skew across UTC midnight.**
   `dispatch_run_job` server-stamps `{date}` = `Utc::now()` independently for each `run_job` call
   (`scheduler.rs`). The CoS pipeline is two calls (cos-inbox then cos-curator); if they straddle

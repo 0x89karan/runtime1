@@ -221,8 +221,25 @@ def _qdrant(path: str, method: str = "GET", body: dict | None = None) -> dict:
 
 
 def _collection_name(segment: str) -> str:
-    """Map a KB segment name to a Qdrant collection name."""
-    return f"kb_{segment}"
+    """Map a KB segment name to a Qdrant collection name.
+
+    Qdrant rejects several characters in collection names — notably ':' (HTTP 422:
+    "collection name cannot contain ':' char"). KB segments routinely use colons
+    (ops:entities, ops:briefs, mail:raw), so map any char outside [A-Za-z0-9_] to '_'
+    before prefixing. Applied here (the ONE mapping used by create/put/get/search), so
+    writes and reads always resolve to the same collection.
+
+    NOTE: this map is non-injective — segments that differ only by a sanitized char
+    collapse to one collection (e.g. 'ops:x', 'ops.x', 'ops-x', 'ops x' all → 'kb_ops_x';
+    NOT 'ops/x', which `_validate_segment` rejects outright). Because `_point_id` keys on
+    `key` alone (no segment component), a collision would let same-key writes across the
+    two logical segments overwrite each other and reads cross the boundary silently. The
+    current segment set (mail:raw, ops:entities, ops:briefs, project:meta, project:research)
+    sanitizes to five distinct names — see test_t20 for the injectivity fence. Revisit
+    (fold the segment into `_point_id`, or hash the raw segment) before adding a segment
+    that differs from an existing one only by a sanitized character."""
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", segment)
+    return f"kb_{safe}"
 
 
 def _ensure_collection(segment: str) -> None:
@@ -949,7 +966,7 @@ class SelfTests(unittest.TestCase):
             # /collections (list all)
             if path == "/collections" and method == "GET":
                 return {"result": {"collections": [{"name": cname}]}}
-            # /collections/kb_evict-test-seg/points/scroll
+            # /collections/kb_evict_test_seg/points/scroll (hyphens sanitize to '_')
             if _re.match(r".*/points/scroll$", path) and method == "POST":
                 return {
                     "result": {
@@ -976,6 +993,29 @@ class SelfTests(unittest.TestCase):
         finally:
             globals()["_qdrant"] = orig_qdrant
             globals()["SEMANTIC_MAX_AGE_DAYS"] = orig_age
+
+    # T20: colon (and other invalid) chars are sanitized out of collection names,
+    # and the live CoS segment set maps to distinct collections. This is the
+    # regression fence for the Qdrant "cannot contain ':'" bug — the MOCK_EMBED
+    # tests above use colon-free segments and would still pass if _collection_name
+    # regressed to f"kb_{segment}", so assert the mapping directly here.
+    def test_t20_collection_name_sanitizes_and_is_injective(self):
+        # Colons (and dots/hyphens/spaces) never survive into a collection name.
+        self.assertEqual(_collection_name("ops:entities"), "kb_ops_entities")
+        self.assertEqual(_collection_name("mail:raw"), "kb_mail_raw")
+        for seg in ("ops:entities", "ops.x", "ops-x", "weird seg:v2"):
+            cname = _collection_name(seg)
+            self.assertRegex(cname, r"^kb_[A-Za-z0-9_]+$",
+                             f"{seg!r} produced an invalid Qdrant collection name {cname!r}")
+        # The real segment set the CoS uses must map to DISTINCT collections;
+        # a collision would silently mix data (see _collection_name docstring).
+        live_segments = [
+            "mail:raw", "ops:entities", "ops:briefs",
+            "project:meta", "project:research",
+        ]
+        names = [_collection_name(s) for s in live_segments]
+        self.assertEqual(len(set(names)), len(names),
+                         f"live segments collide under sanitization: {names}")
 
 
 def _run_self_tests():
