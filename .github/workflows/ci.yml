@@ -303,7 +303,11 @@ jobs:
             ghcr.io/0x89karan/runtime1:core
             ghcr.io/0x89karan/runtime1:v${{ steps.version.outputs.version }}-core
           cache-from: type=gha,scope=buildkit-core
-          cache-to: type=gha,mode=max,scope=buildkit-core
+          # ignore-error: GitHub retired the legacy Actions Cache service (2025); the gha
+          # cache backend now returns `not_found` on export and buildx treats that as fatal,
+          # reddening the RELEASE despite a successful image push (broke v0.93.0 + v0.94.0).
+          # Cache export is a build-speed optimization, never a release gate — make it best-effort.
+          cache-to: type=gha,mode=max,scope=buildkit-core,ignore-error=true
 
       - name: Build and push agentos:full (and :latest)
         uses: docker/build-push-action@v6
@@ -319,7 +323,7 @@ jobs:
             ghcr.io/0x89karan/runtime1:v${{ steps.version.outputs.version }}-full
             ghcr.io/0x89karan/runtime1:v${{ steps.version.outputs.version }}
           cache-from: type=gha,scope=buildkit-full
-          cache-to: type=gha,mode=max,scope=buildkit-full
+          cache-to: type=gha,mode=max,scope=buildkit-full,ignore-error=true
 
   distro-aarch64:
     runs-on: ubuntu-latest
@@ -475,7 +479,7 @@ jobs:
           # timeout is the real budget. Main pushes write the shared scope so
           # later PRs and tag publishes start warm.
           cache-from: type=gha,scope=buildkit-full
-          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=buildkit-full' || '' }}
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=buildkit-full,ignore-error=true' || '' }}
 
       - name: cos dry-run (credential-free)
         run: |

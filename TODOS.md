@@ -154,6 +154,16 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 
 ### P2
 
+- **ci-cache-01 (P3) [new; found post-cap.2 /land] — Docker build cache (`type=gha`) is dead → cold 80-min release builds.**
+  GitHub retired the legacy Actions Cache service (2025); buildx `cache-to/cache-from: type=gha`
+  now returns `not_found` on export. The `hotfix-publish-docker-cache` branch added
+  `ignore-error=true` so the RED release is fixed (image push already succeeded; only the
+  cache export was fatal — broke v0.93.0 + v0.94.0 CI-on-tag). But caching is still effectively
+  OFF: `cache-from` misses too, so multi-arch release builds run cold (~1h23m observed on
+  v0.94.0). Restore build-cache speed: bump `docker/setup-buildx-action` to a version bundling
+  BuildKit ≥0.16 that speaks the gha cache v2 API, OR switch to `type=registry` cache
+  (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
+  releases publish fine after the hotfix.
 - **test-flake-01 (P2) [new; found in cap.2 /ship] — Full-suite `cargo test --workspace` is flaky under high parallelism.**
   On a high-core machine (many `--test-threads`), `cargo test --workspace` intermittently fails a
   *varying* set of async scheduler/egress tests (`streaming_*`, `stream_delta_*`,
