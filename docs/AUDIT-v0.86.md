@@ -380,12 +380,19 @@ bare `agent/` KB grants).
 both fail `agentd check` in a regression fixture; repeated identical denials surface in
 the Dashboard ATTN column.
 
-**cap.2 — spawn attenuation** *(depends: cap.1; closes cos-dev-02 + adv-F2/F5)*
-`SpawnConfig.capabilities` validated ⊆ parent; `max_turns` passthrough; cos orchestrator
-prompt updated to pass per-child caps (inbox: `Mcp{google_oauth}` +`Credential{Google}`
-only; curator: KB-only — make `cos.agents.toml:438-446`'s comment true).
-*Acceptance:* curator's flight log shows no Gmail tool specs; a child requesting a
-capability outside the parent set is rejected with a recorded error.
+**cap.2 — spawn attenuation FLOOR** *(depends: cap.1; SHIPPED v0.94.0; P1-10 PARTIAL — see cap.2b)*
+`SpawnConfig.capabilities` validated ⊆ parent via `capability_covered_by` (Net & Mcp given real
+containment — raw `satisfies` was unsound for both; no-wildcard-arm drift guard); out-of-parent →
+`AgentSpawnDenied` (reject, not clamp); cos orchestrator prompt scopes children (curator KB-only,
+no `Mcp{google_oauth}`). **Reframed at the autoplan CEO gate (both models, USER decision
+2026-07-23):** this closes ACCIDENTAL over-grant only — NOT the injected-orchestrator threat P1-10
+names (the orchestrator holds Gmail + chooses child caps while reading untrusted email, so an
+injected orchestrator grants Gmail from its own set and the subset check passes). So **P1-10 stays
+OPEN**; the real closure is **cap.2b** (de-privilege the orchestrator / static untrusted-data
+pipeline). `max_turns` passthrough was CUT (resource limit, not a capability → cap.2-ar-01).
+*Acceptance (met):* curator's flight log shows no Gmail tool specs; an out-of-parent child request
+is rejected with `AgentSpawnDenied`; the injected-orchestrator bypass is encoded as a passing test
+(`spawn_attenuation_documents_injection_bypass`) so the floor is never mistaken for the ceiling.
 
 **run.1 — residency hardening** *(depends: ux.8′; medium)*
 flight.jsonl self-rotation (P1-2); `short_term` cap + threshold distillation for parked
