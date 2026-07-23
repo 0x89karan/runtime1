@@ -11,7 +11,7 @@ use serde_json::json;
 use crate::{
     agent::{run_tools_sequential, truncate, AgentEffect, AgentTask, PREVIEW_CHARS},
     bus::{MailMessage, Mailboxes},
-    capability::Capability,
+    capability::{capability_covered_by, Capability},
     checkpoint::{AgentCheckpoint, AwaitingEntry, CheckpointStore, ParkedApprovalEntry, SchedulerCheckpoint},
     config::{AgentConfig, AgentTier, ModelConfig, PendingActionRequest, SchedulerConfig, SpawnConfig},
     egress::EgressProxy,
@@ -1898,8 +1898,49 @@ fn dispatch_spawn(
         }
     };
 
-    // 4. Build child AgentConfig (inherit caps + budget from parent).
-    let child_caps = parent_cap_set.clone();
+    // 4. Resolve the child's capability set (cap.2 spawn attenuation).
+    // `config.capabilities` absent → inherit the parent's full set (backward compat).
+    // Present → each requested cap must be covered by the parent (`capability_covered_by`);
+    // any cap outside the parent rejects the WHOLE spawn (fail-closed, reject not clamp).
+    // An unrestricted parent (`parent_cap_set == None`) covers everything, so a child may
+    // still scope itself down. This bounds accidental over-grant / an honest orchestrator;
+    // it is NOT injection defense (the orchestrator picks these and reads untrusted data).
+    let child_caps = match &config.capabilities {
+        Some(requested) => {
+            if let Some(parent_caps) = &parent_cap_set {
+                if let Some(denied) = requested.iter().find(|req| !capability_covered_by(parent_caps, req)) {
+                    let denied_str = format!("{denied:?}");
+                    recorder.record(
+                        &parent_id,
+                        Some(parent_turn),
+                        EventKind::AgentSpawnDenied,
+                        json!({ "child_id": &child_id, "denied": &denied_str }),
+                    );
+                    let priority = state.agents[&parent_id].priority();
+                    let caps = state.agents[&parent_id].cap_set_cloned();
+                    let (parent_effect, next_turn) = {
+                        let parent = state.agents.get_mut(&parent_id).unwrap();
+                        parent.provide_tool_results(
+                            vec![Block::ToolResult {
+                                tool_use_id: call_id,
+                                content: format!(
+                                    "spawn denied: requested capability {denied_str} is not covered by the parent's capability set"
+                                ),
+                                is_error: true,
+                            }],
+                            recorder,
+                        );
+                        let t = parent.turn();
+                        (parent.step(recorder), t)
+                    };
+                    enqueue_or_defer(parent_effect, parent_id, next_turn, priority, caps, state, sched, gateway, registry, recorder);
+                    return;
+                }
+            }
+            Some(requested.clone())
+        }
+        None => parent_cap_set.clone(),
+    };
     let parent_token_budget = state
         .agents
         .get(&parent_id)
@@ -3864,6 +3905,180 @@ mod tests {
         assert!(
             outcomes["parent-budget"].is_ok(),
             "parent must complete with explicit child budget: {:?}", outcomes["parent-budget"]
+        );
+    }
+
+    // ── cap.2: spawn attenuation ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn spawn_attenuation_rejects_cap_outside_parent() {
+        // A child requesting a capability the parent does NOT hold rejects the WHOLE
+        // spawn (fail-closed, reject not clamp) with an AgentSpawnDenied event. The
+        // parent recovers and completes; no child is created.
+        use crate::{capability::Capability, tools::native::register_native};
+
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None, None).unwrap();
+
+        let spawn_response = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id:    "spawn_esc".to_string(),
+                name:  "spawn_agent".to_string(),
+                input: serde_json::json!({
+                    "task":         "over-reaching child",
+                    "child_id":     "greedy",
+                    // Parent holds only Spawn; requesting Credential{Google} is an escalation.
+                    "capabilities": ["Spawn", {"Credential": {"provider": "Google"}}]
+                }),
+            }],
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
+        };
+
+        let gw = MockGateway::new(vec![
+            spawn_response,
+            end_turn("parent recovered", 10, 5),
+        ]);
+
+        let parent = AgentConfig {
+            capabilities: Some(vec![Capability::Spawn]),
+            ..agent_cfg("parent-esc", "spawn a greedy child")
+        };
+
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![parent], unlimited(), gw, registry);
+        let outcomes = sched.run().await;
+
+        assert_eq!(outcomes.len(), 1, "rejected child must not be spawned");
+        assert!(
+            !outcomes.keys().any(|k| k.contains("greedy")),
+            "no over-reaching child may appear in outcomes"
+        );
+        assert!(
+            outcomes["parent-esc"].is_ok(),
+            "parent must recover and complete: {:?}", outcomes["parent-esc"]
+        );
+
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(
+            content.contains("\"agent_spawn_denied\""),
+            "AgentSpawnDenied flight event must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_attenuation_allows_covered_subset() {
+        // A child requesting a strict subset of the parent's caps spawns normally.
+        use crate::{capability::Capability, tools::native::register_native};
+
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None, None).unwrap();
+
+        let spawn_response = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id:    "spawn_sub".to_string(),
+                name:  "spawn_agent".to_string(),
+                input: serde_json::json!({
+                    "task":         "scoped-down child",
+                    "child_id":     "scoped",
+                    // Parent holds Spawn + Mcp{google_oauth}; child asks for only Spawn.
+                    "capabilities": ["Spawn"]
+                }),
+            }],
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
+        };
+
+        let gw = MockGateway::new(vec![
+            spawn_response,
+            end_turn("child ok", 5, 3),
+            end_turn("parent ok", 10, 5),
+        ]);
+
+        let parent = AgentConfig {
+            capabilities: Some(vec![
+                Capability::Spawn,
+                Capability::Mcp { server: "google_oauth".into(), tools: vec![] },
+            ]),
+            ..agent_cfg("parent-sub", "spawn a scoped child")
+        };
+
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![parent], unlimited(), gw, registry);
+        let outcomes = sched.run().await;
+
+        assert_eq!(outcomes.len(), 1, "child is internal; only parent in outcomes");
+        assert!(
+            outcomes["parent-sub"].is_ok(),
+            "parent must complete after a covered-subset spawn: {:?}", outcomes["parent-sub"]
+        );
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(
+            !content.contains("\"agent_spawn_denied\""),
+            "a covered subset must NOT be denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_attenuation_documents_injection_bypass() {
+        // KNOWN LIMIT (cap.2 is a FLOOR, not injection defense): an orchestrator that
+        // HOLDS Mcp{google_oauth} can spawn a child WITH Mcp{google_oauth} — it is ⊆ the
+        // parent's own set, so the subset check passes. This is exactly the injected-
+        // orchestrator gap the CEO gate accepted; cap.2b (orchestrator de-privilege)
+        // closes it. If this test ever starts FAILING, cap.2b has changed the model —
+        // update this test deliberately, do not paper over it.
+        use crate::{capability::Capability, tools::native::register_native};
+
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["spawn_agent".to_string()], None, None, None, None).unwrap();
+
+        let spawn_response = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id:    "spawn_byp".to_string(),
+                name:  "spawn_agent".to_string(),
+                input: serde_json::json!({
+                    "task":         "curator (but handed Gmail)",
+                    "child_id":     "curator-with-gmail",
+                    "capabilities": ["Spawn", {"Mcp": {"server": "google_oauth", "tools": []}}]
+                }),
+            }],
+            stop_reason:       StopReason::ToolUse,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
+        };
+
+        let gw = MockGateway::new(vec![
+            spawn_response,
+            end_turn("child ok", 5, 3),
+            end_turn("parent ok", 10, 5),
+        ]);
+
+        // The orchestrator itself holds Gmail (the over-privileged injectable root).
+        let parent = AgentConfig {
+            capabilities: Some(vec![
+                Capability::Spawn,
+                Capability::Mcp { server: "google_oauth".into(), tools: vec![] },
+            ]),
+            ..agent_cfg("orchestrator", "injected: spawn curator with Gmail")
+        };
+
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![parent], unlimited(), gw, registry);
+        let outcomes = sched.run().await;
+
+        assert!(
+            outcomes["orchestrator"].is_ok(),
+            "spawn must SUCCEED — the floor does not stop an orchestrator granting from its OWN set"
+        );
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(
+            !content.contains("\"agent_spawn_denied\""),
+            "the bypass is NOT denied — that is the documented limit cap.2b must close"
         );
     }
 

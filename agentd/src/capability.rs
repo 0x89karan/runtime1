@@ -220,6 +220,78 @@ pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
     }
 }
 
+/// Attenuation subset check: is `child` covered by the `parent` capability set?
+///
+/// This answers "is the requested child grant ⊆ the parent's grant" for **spawn
+/// attenuation** (cap.2). It is deliberately NOT `satisfies`: `satisfies` is a
+/// runtime *invocation* check where `required` is always a concrete access, so it
+/// takes two shortcuts that are unsound as a subset test: `Net` returns `true`
+/// unconditionally (advisory at this layer), and `Mcp` with an empty *required* tool
+/// list passes vacuously (`all()` over `[]`). A child could exploit either to request
+/// MORE than the parent holds. So `Net` and `Mcp` get real containment here; every
+/// other variant IS a correct child-⊆-parent test under `satisfies` and is delegated.
+///
+/// The match is EXHAUSTIVE with no wildcard arm: a new `Capability` variant will not
+/// compile until its containment rule is decided here (the same drift guard as
+/// `tier_legality`).
+pub fn capability_covered_by(parent: &[Capability], child: &Capability) -> bool {
+    match child {
+        // Net is checked PER PARENT ENTRY (not unioned across entries): a single grant
+        // pairs its hosts with its ports, so `Net{[a],[443]}` + `Net{[b],[22]}` does NOT
+        // grant `[a]:22`. Unioning hosts and ports independently would over-grant across
+        // that cross-product. Per-entry `any()` can over-DENY a child covered only by the
+        // union (safe direction, fail-closed) but never over-grants.
+        Capability::Net { hosts, ports } => parent.iter().any(|p| {
+            if let Capability::Net { hosts: ph, ports: pp } = p {
+                list_covers(ph, hosts) && list_covers(pp, ports)
+            } else {
+                false
+            }
+        }),
+        // Mcp tools on a server have no host×port-style pairing, so a child is covered by
+        // the UNION of all same-server parent grants (review: both voices — per-entry `any()`
+        // would over-deny a legitimate split grant). An empty parent tool list on any
+        // matching entry is a wildcard (covers all, including a wildcard child).
+        Capability::Mcp { server, tools } => {
+            let same_server: Vec<&[String]> = parent
+                .iter()
+                .filter_map(|p| match p {
+                    Capability::Mcp { server: ps, tools: pt } if ps == server => Some(pt.as_slice()),
+                    _ => None,
+                })
+                .collect();
+            if same_server.is_empty() {
+                false
+            } else if same_server.iter().any(|pt| pt.is_empty()) {
+                true // a wildcard parent entry covers every child request on this server
+            } else if tools.is_empty() {
+                false // child requests ALL tools but no wildcard parent entry exists
+            } else {
+                tools.iter().all(|t| same_server.iter().any(|pt| pt.contains(t)))
+            }
+        }
+        Capability::FsRead { .. }
+        | Capability::FsWrite { .. }
+        | Capability::Spawn
+        | Capability::KbRead { .. }
+        | Capability::KbWrite { .. }
+        | Capability::ShellExec
+        | Capability::Credential { .. }
+        | Capability::RunsRead
+        | Capability::BriefPublish => satisfies(parent, child),
+    }
+}
+
+/// Wildcard-aware list containment for the `Net`/`Mcp` attenuation checks.
+///
+/// An empty `parent` list is a wildcard: it covers everything, including an empty
+/// (also-wildcard) child request. A non-empty `parent` covers a child only when the
+/// child is a non-empty subset — an empty child ("give me all of them") is NOT
+/// covered by an explicit parent. Fail-closed: containment must be provable.
+fn list_covers<T: PartialEq>(parent: &[T], child: &[T]) -> bool {
+    parent.is_empty() || (!child.is_empty() && child.iter().all(|c| parent.contains(c)))
+}
+
 /// Return true if `granted_prefix` covers `required_segment`.
 ///
 /// An empty granted segment is NEVER a valid grant (fail-safe to deny, mirrors
@@ -758,5 +830,168 @@ mod tests {
         // Re-parse to confirm full round-trip.
         let w2: Wrapper = toml::from_str(&ser).expect("re-parse must succeed");
         assert_eq!(w2, w, "round-trip must be identical");
+    }
+
+    // ---- capability_covered_by: spawn attenuation subset check (cap.2) ----
+
+    #[test]
+    fn covered_net_wildcard_parent_covers_explicit_and_empty_child() {
+        let parent = vec![Capability::Net { hosts: vec![], ports: vec![] }];
+        // explicit child
+        assert!(capability_covered_by(
+            &parent,
+            &Capability::Net { hosts: vec!["api.example.com".into()], ports: vec![443] }
+        ));
+        // empty (wildcard) child — only a wildcard parent covers this
+        assert!(capability_covered_by(&parent, &Capability::Net { hosts: vec![], ports: vec![] }));
+    }
+
+    #[test]
+    fn covered_net_explicit_parent_rejects_wildcard_child() {
+        // The unsoundness `satisfies` had: an explicit parent must NOT cover a child
+        // asking for everything.
+        let parent = vec![Capability::Net { hosts: vec!["a.com".into()], ports: vec![443] }];
+        assert!(!capability_covered_by(&parent, &Capability::Net { hosts: vec![], ports: vec![] }));
+        // and `satisfies` would have (wrongly) returned true here:
+        assert!(satisfies(&parent, &Capability::Net { hosts: vec![], ports: vec![] }));
+    }
+
+    #[test]
+    fn covered_net_subset_ok_superset_denied() {
+        let parent = vec![Capability::Net {
+            hosts: vec!["a.com".into(), "b.com".into()],
+            ports: vec![443, 8443],
+        }];
+        // subset host + port
+        assert!(capability_covered_by(
+            &parent,
+            &Capability::Net { hosts: vec!["a.com".into()], ports: vec![443] }
+        ));
+        // extra host → denied
+        assert!(!capability_covered_by(
+            &parent,
+            &Capability::Net { hosts: vec!["c.com".into()], ports: vec![443] }
+        ));
+        // extra port → denied
+        assert!(!capability_covered_by(
+            &parent,
+            &Capability::Net { hosts: vec!["a.com".into()], ports: vec![22] }
+        ));
+    }
+
+    #[test]
+    fn covered_mcp_explicit_parent_rejects_wildcard_child() {
+        // The Codex catch: satisfies is vacuously true for an empty child tool list.
+        let parent = vec![Capability::Mcp {
+            server: "google_oauth".into(),
+            tools: vec!["gmail_read".into()],
+        }];
+        let child_all = Capability::Mcp { server: "google_oauth".into(), tools: vec![] };
+        assert!(!capability_covered_by(&parent, &child_all), "explicit parent must not cover wildcard child");
+        // `satisfies` would have wrongly allowed it:
+        assert!(satisfies(&parent, &child_all));
+    }
+
+    #[test]
+    fn covered_mcp_wildcard_parent_covers_explicit_and_wildcard_child() {
+        let parent = vec![Capability::Mcp { server: "google_oauth".into(), tools: vec![] }];
+        assert!(capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "google_oauth".into(), tools: vec!["gmail_read".into()] }
+        ));
+        assert!(capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "google_oauth".into(), tools: vec![] }
+        ));
+        // wrong server never covered
+        assert!(!capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "github".into(), tools: vec![] }
+        ));
+    }
+
+    #[test]
+    fn covered_mcp_explicit_subset_ok() {
+        let parent = vec![Capability::Mcp {
+            server: "google_oauth".into(),
+            tools: vec!["gmail_read".into(), "gmail_send".into()],
+        }];
+        assert!(capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "google_oauth".into(), tools: vec!["gmail_read".into()] }
+        ));
+        assert!(!capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "google_oauth".into(), tools: vec!["gmail_delete".into()] }
+        ));
+    }
+
+    #[test]
+    fn covered_mcp_unions_split_parent_grants() {
+        // A child covered only by the UNION of same-server parent grants is allowed
+        // (review: per-entry any() would over-deny this legitimate split).
+        let parent = vec![
+            Capability::Mcp { server: "gmail".into(), tools: vec!["read".into()] },
+            Capability::Mcp { server: "gmail".into(), tools: vec!["send".into()] },
+        ];
+        assert!(capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "gmail".into(), tools: vec!["read".into(), "send".into()] }
+        ));
+        // a tool in neither entry is still denied
+        assert!(!capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "gmail".into(), tools: vec!["read".into(), "delete".into()] }
+        ));
+        // child wildcard still needs a wildcard parent entry (split explicit grants don't imply all)
+        assert!(!capability_covered_by(
+            &parent,
+            &Capability::Mcp { server: "gmail".into(), tools: vec![] }
+        ));
+    }
+
+    #[test]
+    fn covered_fs_narrow_ok_widen_denied() {
+        let parent = vec![Capability::FsRead { prefix: "/data".into() }];
+        assert!(capability_covered_by(&parent, &Capability::FsRead { prefix: "/data/sub".into() }));
+        assert!(!capability_covered_by(&parent, &Capability::FsRead { prefix: "/".into() }));
+        assert!(!capability_covered_by(&parent, &Capability::FsRead { prefix: "/etc".into() }));
+    }
+
+    #[test]
+    fn covered_kb_narrow_ok_widen_denied() {
+        let parent = vec![Capability::KbRead { segment: "ops".into() }];
+        assert!(capability_covered_by(&parent, &Capability::KbRead { segment: "ops:briefs".into() }));
+        assert!(!capability_covered_by(&parent, &Capability::KbRead { segment: "agent".into() }));
+    }
+
+    #[test]
+    fn covered_credential_exact_ok_wrong_denied() {
+        let parent = vec![Capability::Credential { provider: CredentialProvider::Google }];
+        assert!(capability_covered_by(
+            &parent,
+            &Capability::Credential { provider: CredentialProvider::Google }
+        ));
+        assert!(!capability_covered_by(
+            &parent,
+            &Capability::Credential { provider: CredentialProvider::BraveSearch }
+        ));
+    }
+
+    #[test]
+    fn covered_unit_caps_present_ok_missing_denied() {
+        let parent = vec![Capability::Spawn, Capability::RunsRead];
+        assert!(capability_covered_by(&parent, &Capability::Spawn));
+        assert!(capability_covered_by(&parent, &Capability::RunsRead));
+        assert!(!capability_covered_by(&parent, &Capability::BriefPublish));
+        assert!(!capability_covered_by(&parent, &Capability::ShellExec));
+    }
+
+    #[test]
+    fn covered_empty_parent_covers_nothing_except_wildcards() {
+        // An empty parent set (deny-all) covers no concrete grant.
+        assert!(!capability_covered_by(&[], &Capability::Spawn));
+        assert!(!capability_covered_by(&[], &Capability::Mcp { server: "x".into(), tools: vec![] }));
+        assert!(!capability_covered_by(&[], &Capability::Credential { provider: CredentialProvider::Google }));
     }
 }

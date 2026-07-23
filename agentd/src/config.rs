@@ -433,6 +433,20 @@ pub struct SpawnConfig {
     pub priority: u32,
     /// Per-agent token ceiling. Inherits parent's remaining budget if absent.
     pub token_budget: Option<u64>,
+    /// Capabilities requested for the child (cap.2 spawn attenuation).
+    /// `None` — the field is absent OR explicitly `null` (serde treats them identically) —
+    /// = inherit the parent's full set (backward compat). Note: `null` never *exceeds* the
+    /// parent, it just declines to attenuate, same as omitting the field.
+    /// `Some(set)` = the child's requested set, validated ⊆ parent at spawn time
+    /// (`capability_covered_by`); any cap outside the parent rejects the whole spawn.
+    /// `Some([])` = no capability-GATED tools. Capability-free convenience tools
+    /// (`send_message`, `request_approval`, `list_agents`, memory tools) whose
+    /// `required_capability_for` is `None` are still visible — see `filtered_specs`.
+    /// This bounds an *honest* orchestrator / accidental over-grant — it is a
+    /// least-privilege FLOOR, not injection defense (the orchestrator chooses these and
+    /// is itself downstream of untrusted data).
+    #[serde(default)]
+    pub capabilities: Option<Vec<Capability>>,
 }
 
 /// The action an agent is requesting approval for. Passed by the agent as the

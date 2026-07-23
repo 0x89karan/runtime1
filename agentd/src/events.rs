@@ -26,6 +26,9 @@ pub enum EventKind {
     BudgetSet,
     MaxTurnsReached,
     CapabilityDenied,
+    /// A spawn was rejected because the child requested a capability not covered by
+    /// the parent's set (cap.2 spawn attenuation, fail-closed — reject, not clamp).
+    AgentSpawnDenied,
     AgentChildResultDelivered,
     AgentCardRegistered,
     AgentCheckpointed,
@@ -232,6 +235,7 @@ mod tests {
         assert_eq!(kind_str(EventKind::BudgetExceeded), "budget_exceeded");
         assert_eq!(kind_str(EventKind::MaxTurnsReached), "max_turns_reached");
         assert_eq!(kind_str(EventKind::CapabilityDenied), "capability_denied");
+        assert_eq!(kind_str(EventKind::AgentSpawnDenied), "agent_spawn_denied");
         assert_eq!(kind_str(EventKind::AgentChildResultDelivered), "agent_child_result_delivered");
         assert_eq!(kind_str(EventKind::AgentCardRegistered), "agent_card_registered");
         assert_eq!(kind_str(EventKind::AgentCheckpointed), "agent_checkpointed");
