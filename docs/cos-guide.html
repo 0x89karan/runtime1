@@ -683,14 +683,14 @@
 
     <div class="step">
       <div class="step-num">04</div>
-      <div class="step-title">Create local directories <span class="step-tag">once</span></div>
-      <p>Two host directories are mounted into the container: one for runtime state (checkpoint, memory DB, evidence log), one for the brief output.</p>
+      <div class="step-title">Create the output directory <span class="step-tag">once</span></div>
+      <p>Runtime state (checkpoint, memory DB, flight log, evidence log) lives in a Docker <strong>named volume</strong> (<code>cos-data</code>, mounted at <code>/data</code> in the container) that Compose creates automatically — you don't manage it on the host. The one host directory you create is where the daily brief is written; secrets land in <code>~/.agentos-secrets</code> when you run <code>agentctl auth google</code>.</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
           <div class="code-lang">bash</div>
         </div>
-        <pre><code><span class="cmd">mkdir -p</span> <span class="path">~/.agentos-output ~/.agentos-data</span></code></pre>
+        <pre><code><span class="cmd">mkdir -p</span> <span class="path">~/.agentos-output</span></code></pre>
       </div>
     </div>
 
@@ -811,7 +811,7 @@
       <li><strong>Ctrl+C</strong> in the terminal running <code>docker compose up cos</code> stops the <code>cos</code> container with a graceful checkpoint. <code>qdrant</code> and <code>semantic-kb-mcp</code> keep running in the background (cheap to leave up between sessions).</li>
       <li><strong>Stop everything</strong> (cos + qdrant + semantic-kb-mcp): <code>docker compose down</code> — removes the containers + network, but keeps named volumes (your data).</li>
       <li><strong>Not sure what's running?</strong> <code>docker ps -a --filter name=agentos</code> lists every AgentOS container; remove leftovers with <code>docker rm -f &lt;name&gt;</code>.</li>
-      <li><strong>Your data is safe.</strong> State lives in the host mounts <code>~/.agentos-data</code> and <code>~/.agentos-output</code> — removing a container never touches them. The only destructive command is <code>docker compose down -v</code>, which also deletes named volumes (including Qdrant's index — re-embeds from scratch on next run).</li>
+      <li><strong>Your data is safe.</strong> Runtime state lives in the <code>cos-data</code> named volume (<code>/data</code> in the container) and briefs on the host at <code>~/.agentos-output</code> — removing a container never touches either. The only destructive command is <code>docker compose down -v</code>, which also deletes named volumes (<code>cos-data</code> plus Qdrant's index — re-embeds from scratch on next run).</li>
     </ul>
   </div>
 
@@ -845,18 +845,17 @@
         <div class="code-dots"><span></span><span></span><span></span></div>
         <div class="code-lang">bash</div>
       </div>
-      <pre><code><span class="c"># 1. Stop the old containers</span>
-<span class="cmd">docker compose down</span>
+      <pre><code><span class="c"># 1. Stop the containers AND drop the cos-data volume so no stale</span>
+<span class="c">#    (or failed) agents reload from the checkpoint. -v also clears</span>
+<span class="c">#    Qdrant's index (re-embeds on next run).</span>
+<span class="cmd">docker compose down</span> <span class="flag">-v</span>
 
-<span class="c"># 2. Drop the checkpoint so no stale agents reload</span>
-<span class="cmd">rm -f</span> <span class="path">~/.agentos-data/checkpoint.json</span> <span class="p">2&gt;/dev/null || true</span>
-
-<span class="c"># 3. Pull the fixed image</span>
+<span class="c"># 2. Pull the fixed image</span>
 <span class="cmd">docker pull</span> ghcr.io/0x89karan/runtime1:full
 
-<span class="c"># 4. Re-run step 6</span></code></pre>
+<span class="c"># 3. Re-run step 6</span></code></pre>
     </div>
-    <p><strong>Full reset</strong> (only if stale state persists): <code>rm -rf ~/.agentos-data/*</code> regenerates the memory store, flight log, and signing keys. Google credentials in <code>~/.agentos-secrets</code> are <strong>not</strong> touched.</p>
+    <p><strong>Why <code>-v</code>:</strong> the checkpoint, memory store, flight log, and signing keys all live in the <code>cos-data</code> named volume — there is no <code>~/.agentos-data</code> on the host to <code>rm</code>. <code>docker compose down -v</code> is the clean-slate reset. Google credentials in <code>~/.agentos-secrets</code> (a separate host mount) are <strong>not</strong> touched.</p>
   </div>
 
   <div class="note">
@@ -871,8 +870,8 @@
       <li><strong><code>agentctl watch</code> can't connect:</strong> confirm the container is running with <code>-p 127.0.0.1:7999:7999</code> — older invocations without this flag won't expose the port. Verify with <code>curl -s http://localhost:7999/healthz</code>.</li>
       <li><strong>Chat rail sends a message but the reply never appears:</strong> you're likely connected via <code>--agents-dir /agents</code> (FUSE) instead of <code>--url http://localhost:7999</code> — the chat rail needs the management API's streaming connection, which FUSE mode doesn't provide. After ~30s you'll see an inline "No response after 30s" hint; reconnect with <code>--url</code> as shown in step 07.</li>
       <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> port <code>8585</code> was already in use. Re-run with <code>--port &lt;free-port&gt;</code> — Desktop app clients accept any loopback port automatically.</li>
-      <li><strong>No brief after a few minutes:</strong> check the cron fired — <code>jq 'select(.kind=="mcp_tool_called")' ~/.agentos-data/flight.jsonl | tail</code>.</li>
-      <li><strong>Logs &amp; receipts:</strong> inspect <code>~/.agentos-data/flight.jsonl</code> with <code>jq</code>; verify the signed action-receipt chain with <code>agentctl verify ~/.agentos-data/evidence.jsonl</code>.</li>
+      <li><strong>No brief after a few minutes:</strong> check the cron fired — <code>docker compose exec cos jq 'select(.kind=="mcp_tool_called")' /data/flight.jsonl | tail</code>.</li>
+      <li><strong>Logs &amp; receipts:</strong> the flight log and evidence chain live in the container at <code>/data</code> (the <code>cos-data</code> volume). Inspect with <code>docker compose exec cos jq . /data/flight.jsonl</code>; verify the signed action-receipt chain with <code>docker compose exec cos agentctl verify /data/evidence.jsonl</code>.</li>
     </ul>
   </div>
 
@@ -882,7 +881,7 @@
       <li><strong>Schedule:</strong> <code>TRIGGER_INTERVAL="every 2m"</code> (used above) only accepts <code>every N(s|m|h)</code>. For a daily brief use <code>-e "TRIGGER_CRON=0 8 * * *"</code> (08:00 UTC). A cron expression in <code>TRIGGER_INTERVAL</code> will not parse.</li>
       <li><strong>API key across shells:</strong> Compose's bare <code>- ANTHROPIC_API_KEY</code> (no <code>=value</code>) forwards it from the shell you <code>export</code>ed in — run <code>docker compose up cos</code> in that same terminal.</li>
       <li><strong>Talk to it interactively:</strong> instead of the autonomous cron brief, run the orchestrator REPL — <code>docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate</code>.</li>
-      <li><strong>Stopping:</strong> Ctrl+C triggers a graceful checkpoint. State is preserved in <code>~/.agentos-data</code> — the next run resumes from where it left off.</li>
+      <li><strong>Stopping:</strong> Ctrl+C triggers a graceful checkpoint. State is preserved in the <code>cos-data</code> volume (<code>/data</code> in the container) — the next run resumes from where it left off.</li>
       <li><strong>Google auth on subsequent runs:</strong> The refresh token in <code>google.json</code> is read by the credential broker; no browser re-auth needed. If the token expires, re-run <code>agentctl auth google</code> with the same flags.</li>
       <li><strong>Privacy — email embeddings:</strong> The CoS sends email body content (up to 8 KB per message) to OpenAI's Embeddings API for vectorisation. Review OpenAI's data usage policies before enabling on inboxes with sensitive content. To run without OpenAI (BM25 only), omit <code>OPENAI_API_KEY</code> and remove the semantic-kb block from <code>cos.agents.toml</code>.</li>
     </ul>
