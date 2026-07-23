@@ -3,6 +3,43 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.95.0] - 2026-07-23
+
+### Added
+- **Orchestrator de-privilege via sealed jobs** (cap.2b) — the REAL closure of audit P1-10 (cap.2
+  shipped only the accidental-over-grant floor). New `Capability::RunJob` + `run_job(job_id)` native
+  tool (job_id is the only input) + `[[jobs]]` config (`Job { id, capabilities, task, max_turns,
+  token_budget }`) + `dispatch_run_job`. A sealed job's capabilities and task template are owned by
+  config, NOT the caller: `dispatch_run_job` attaches the job's caps directly (the `capability_covered_by`
+  subset check is bypassed soundly — the trust root moved from the injectable parent to config), the
+  `{date}` slot is server-stamped (no caller-supplied param), and the child's output is never
+  delivered to the caller.
+- **`AwaitingParent.deliver_content` delivery gate** — `spawn_agent` (trusted delegation) still
+  delivers the child's answer; `run_job` (`deliver_content=false`) delivers only an agentd-authored
+  `"job X completed"` / `"job X failed"` signal, never the child's (email-derived) output or a raw
+  error string. Checkpoint-safe (`AwaitingEntry.deliver_content`, serde default true so pre-cap.2b
+  spawn awaits restore correctly).
+- `agentd check` lints `[[jobs]]` capabilities (MCP-server / KB-segment existence, credential wiring,
+  FS prefix) and includes them in the `CapabilitiesResolved` boot event.
+
+### Changed
+- **CoS pipeline restructured** (dev + distro `cos.agents.toml`): the orchestrator is de-privileged to
+  a summary-free cron TRIGGER holding only `{Mcp{cron_trigger}, RunJob}` — no Gmail, Credential, KB,
+  FsWrite, BriefPublish, or Spawn. Gmail fetch is the `cos-inbox` job; brief assembly + `FsWrite` +
+  `publish_brief` moved into the KB-only `cos-curator` job. `spawn_agent` (cap.2 floor) is unchanged
+  for trusted operator-driven delegation.
+- The `spawn_attenuation_documents_injection_bypass` test was renamed
+  `spawn_agent_floor_is_not_injection_defense` (the floor is unchanged; the sealed `run_job` path is
+  what closes injection).
+
+### Notes
+- **Audit P1-10 CLOSED** against the pinned claim: *no child obtains live Gmail via injection, and no
+  untrusted-data-reading node holds spawn/credential authority.* NOT "injection defeated" — an
+  injected curator can still write a misleading brief (integrity, not credential exfil; detective
+  controls only). See THREAT_MODEL §9.5; north star is data-taint (recorded, not built).
+- Follow-ups: `cap.2b-ar-01` (P3 — sealed-job pipeline date can skew across UTC midnight; fails safe;
+  default 08:00 cron unaffected).
+
 ## [v0.94.0] - 2026-07-23
 
 ### Added
