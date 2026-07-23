@@ -111,7 +111,7 @@ overlapping discoveries merged into one row.
 | P1-7 | 5 parity | no test globs `docker/*.toml`, `agentd/*.toml`, `distro/overlay/etc/agentd/*.toml` | No parse check for any checked-in TOML outside `templates/` — P0-1's enabler → `agentd/tests/config_parse_all.rs` (~1 h). **[NEW]** |
 | P1-8 | 3 capability | `capability.rs:27-29` (doc), `:76-94` (`normalize_path` strips `CurDir`); `cos.agents.toml:247,375` | "Relative fails closed" is false: relative-vs-relative matches textually, CWD-blind; production dev-mode depends on the undocumented behavior — the v0.86.2 root cause → `AbsPathPrefix` newtype absolutizing at deserialization + at `required_capability_for` (`native.rs:88/128/169`, `main.rs:1345-1349`). **[NEW]** |
 | P1-9 | 2/3 capability | `capability.rs:69` (agent-level `Credential` "deferred"), `:162` (agent-level `Net` unconditionally true); `main.rs:361` (`mcp_require_capabilities` filters out HTTP), `:468-513` (HTTP path never reads `capabilities`/`isolation`); `config.rs:604-628` | Wrong-tier grants are silent no-ops — 6 of 9 variant×tier combos inert; HTTP MCP servers exempt from the mandatory-sandbox switch with no warning. The Gmail outage class → tier-legality validation in `Config::validate()` (hard error for HTTP servers with security fields; warn for inert agent-level grants) + `CapabilitiesResolved` boot event logging each agent's and server's *effective* set. **[NEW]** |
-| P1-10 | 2/6 security | `config.rs:412-422` (`SpawnConfig` has no capabilities field); `scheduler.rs:1586` (`parent_cap_set.clone()`); `cos.agents.toml:244-250,284,438-446` (the "inbox caps: Mcp{google_oauth} only" comment is fiction) | Spawn inheritance all-or-nothing; Curator (daily attacker-influenceable input) inherits live Gmail access via broker → `capabilities: Option<Vec<Capability>>` on `SpawnConfig`, validated ⊆ parent (subset check is mandatory or the field becomes an escalation vector); merge cos-polish-adv-F2 + F5 (`max_turns` passthrough, `scheduler.rs:1597`). **[TRACKED↑ cos-dev-02 P2→P1]** |
+| P1-10 | 2/6 security | `config.rs:412-422` (`SpawnConfig` has no capabilities field); `scheduler.rs:1586` (`parent_cap_set.clone()`); `cos.agents.toml:244-250,284,438-446` (the "inbox caps: Mcp{google_oauth} only" comment is fiction) | Spawn inheritance all-or-nothing; Curator (daily attacker-influenceable input) inherits live Gmail access via broker → `capabilities: Option<Vec<Capability>>` on `SpawnConfig`, validated ⊆ parent (subset check is mandatory or the field becomes an escalation vector); merge cos-polish-adv-F2 + F5 (`max_turns` passthrough, `scheduler.rs:1597`). **[TRACKED↑ cos-dev-02 P2→P1]** **[FLOOR in cap.2 (v0.94.0); CLOSED in cap.2b — sealed `run_job` + de-privileged trigger; residual = the operator-facing brief is a social-engineering channel, THREAT_MODEL §9.5]** |
 | P1-11 | 3 capability | `capability.rs:513-514` (test asserts `agent/sub` satisfied by `agent/` grant) | audit-C2 confirmed still open: `KbRead{segment:"agent"}` defeats per-agent Tier-3 memory isolation — breaks a locked memory rule; small fix, already P1 in TODOS → reject bare `agent`/`agent/` prefix grants (or require full `agent/<id>`). **[TRACKED, confirmed]** |
 
 ### P2 (grouped)
@@ -393,6 +393,29 @@ pipeline). `max_turns` passthrough was CUT (resource limit, not a capability →
 *Acceptance (met):* curator's flight log shows no Gmail tool specs; an out-of-parent child request
 is rejected with `AgentSpawnDenied`; the injected-orchestrator bypass is encoded as a passing test
 (`spawn_attenuation_documents_injection_bypass`) so the floor is never mistaken for the ceiling.
+
+**cap.2b — orchestrator de-privilege (real P1-10 closure)** *(depends: cap.2; SHIPPED)*
+Sealed jobs: new `Capability::RunJob` + `run_job(job_id)` tool + `[[jobs]]` config + `dispatch_run_job`.
+A job's caps + task template are owned by CONFIG, not the caller — so the `capability_covered_by`
+subset check is bypassed *soundly* (the trust root moved from the injectable parent to config), and
+there is no caller-supplied task text or param to carry an injection. `run_job` stamps the date
+server-side (zero params). The crux: `AwaitingParent.deliver_content=false` — a sealed job returns an
+agentd-authored `"job X completed"` signal to the trigger, never its (email-derived) output (both
+success and failure branches authored by agentd, so no raw error can echo child text back). The CoS
+orchestrator is de-privileged to a summary-free cron TRIGGER (`{Mcp{cron_trigger}, RunJob}` only —
+no Gmail/Credential/KB/FsWrite/BriefPublish/Spawn); the Gmail fetch is the `cos-inbox` job and the
+brief authoring (FsWrite + BriefPublish) is the KB-only `cos-curator` job. `agentd check` lints
+`[[jobs]]`; `spawn_agent` (cap.2 floor) is untouched for trusted operator-driven delegation
+(task-provenance rule: operator-typed = trusted, data-derived = untrusted).
+**P1-10 CLOSED** against the pinned claim: *no child obtains live Gmail via injection, and no
+untrusted-data-reading node holds spawn/credential authority.* NOT claimed: injection defeated — an
+injected curator can still write a misleading brief; the operator-facing brief remains a
+social-engineering channel mitigated only by detective controls (flight recorder, receipts, operator
+judgment) — see THREAT_MODEL §9.5. North star for the class: data-taint (a node that read untrusted
+data may not exercise irreversible authority) — recorded, not built. `max_turns` follow-up = cap.2-ar-01.
+*Acceptance (met):* de-privileged trigger cannot grant Gmail to any child (config-owned job caps);
+daily brief still runs end-to-end; `run_job` rejects unknown jobs + requires `RunJob`; config guard
+pins the trigger holds nothing dangerous and the curator is Gmail-free.
 
 **run.1 — residency hardening** *(depends: ux.8′; medium)*
 flight.jsonl self-rotation (P1-2); `short_term` cap + threshold distillation for parked
