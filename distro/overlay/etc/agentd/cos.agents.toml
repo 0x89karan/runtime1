@@ -203,8 +203,18 @@ Call spawn_agent with:
   child_id     = "inbox-{TODAY}"          (replace {TODAY} with the actual date)
   task         = (see Inbox Agent task below)
   token_budget = 1_500_000
-Note: spawned agents inherit the parent's full capability set. The inbox agent will
-have access to all registered MCP servers and tools; its task prompt constrains usage.
+  capabilities = [
+    { "Mcp": { "server": "google_oauth", "tools": [] } },
+    { "Credential": { "provider": "Google" } }
+  ]
+Note (cap.2 spawn attenuation): the `capabilities` you pass scope the child to LEAST
+PRIVILEGE — each must be within YOUR own set (a request outside it rejects the whole
+spawn). The inbox agent needs Gmail (Mcp google_oauth); it does NOT get Spawn, so it
+cannot spawn further agents. It reaches Gmail because it holds `Mcp{google_oauth}` —
+that (not the decorative agent-level Credential) is the tool-visibility boundary. This
+QEMU/production config does not run the semantic-kb sidecar, so no semantic-kb/mail:raw
+caps are granted here (they would be inert). This is a least-privilege floor, not
+injection defense.
 
 Inbox Agent task prompt:
 "You are a read-only Gmail analyst. Your job is to produce a structured OperatingBrief
@@ -258,6 +268,20 @@ Call spawn_agent with:
   child_id     = "curator-{TODAY}"
   task         = (see Curator Agent task below)
   token_budget = 200_000
+  capabilities = [
+    { "KbRead":  { "segment": "ops:entities" } },
+    { "KbWrite": { "segment": "ops:briefs"   } },
+    { "KbWrite": { "segment": "ops:entities" } }
+  ]
+Note (cap.2 spawn attenuation): the curator is KB-ONLY. It is NOT granted
+`Mcp{google_oauth}`, so `filtered_specs` omits every Gmail tool from its context — the
+curator's flight log shows NO Gmail tool specs. This is the point of attenuation: the
+curator processes the inbox summary (email-derived, attacker-influenceable text) but
+cannot reach live Gmail. It also gets no Spawn and no Credential.
+KNOWN LIMIT (honest): this bounds an accidental over-grant. It does NOT stop an injected
+orchestrator, because YOU (the orchestrator) hold Gmail and choose these caps — an
+attacker who controls your reasoning could grant the curator Gmail from your own set and
+the subset check would pass. Closing that is cap.2b (de-privilege this orchestrator).
 
 Curator Agent task prompt:
 "You are a KB curator. Persist today's Daily Operating Brief to the ops KB.

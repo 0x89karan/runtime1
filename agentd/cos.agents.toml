@@ -294,8 +294,19 @@ Call spawn_agent with:
   child_id     = "inbox-{TODAY}"          (replace {TODAY} with the actual date)
   task         = (see Inbox Agent task below)
   token_budget = 1_500_000
-Note: spawned agents inherit the parent's full capability set. The inbox agent will
-have access to all registered MCP servers and tools; its task prompt constrains usage.
+  capabilities = [
+    { "Mcp": { "server": "google_oauth", "tools": [] } },
+    { "Mcp": { "server": "semantic-kb",  "tools": [] } },
+    { "KbRead":  { "segment": "mail:raw" } },
+    { "KbWrite": { "segment": "mail:raw" } },
+    { "Credential": { "provider": "Google" } }
+  ]
+Note (cap.2 spawn attenuation): the `capabilities` you pass scope the child to LEAST
+PRIVILEGE — each must be within YOUR own set (a request outside it rejects the whole
+spawn). The inbox agent needs Gmail (Mcp google_oauth) and the mail:raw KB; it does NOT
+get Spawn, so it cannot spawn further agents. It reaches Gmail because it holds
+`Mcp{google_oauth}` — that (not the decorative agent-level Credential) is the tool-visibility
+boundary. This is a least-privilege floor, not injection defense.
 
 Inbox Agent task prompt:
 "You are a read-only Gmail analyst. Your job is to produce a structured OperatingBrief
@@ -357,6 +368,21 @@ Call spawn_agent with:
   child_id     = "curator-{TODAY}"
   task         = (see Curator Agent task below)
   token_budget = 200_000
+  capabilities = [
+    { "Mcp": { "server": "semantic-kb", "tools": [] } },
+    { "KbRead":  { "segment": "ops:entities" } },
+    { "KbWrite": { "segment": "ops:briefs"   } },
+    { "KbWrite": { "segment": "ops:entities" } }
+  ]
+Note (cap.2 spawn attenuation): the curator is KB-ONLY. It is NOT granted
+`Mcp{google_oauth}`, so `filtered_specs` omits every Gmail tool from its context — the
+curator's flight log shows NO Gmail tool specs. This is the point of attenuation: the
+curator processes the inbox summary (email-derived, attacker-influenceable text) but
+cannot reach live Gmail. It also gets no Spawn and no Credential.
+KNOWN LIMIT (honest): this bounds an accidental over-grant. It does NOT stop an injected
+orchestrator, because YOU (the orchestrator) hold Gmail and choose these caps — an
+attacker who controls your reasoning could grant the curator Gmail from your own set and
+the subset check would pass. Closing that is cap.2b (de-privilege this orchestrator).
 
 Curator Agent task prompt:
 "You are a KB curator. Persist today's Daily Operating Brief to the ops KB.
@@ -455,16 +481,19 @@ native = [
 # Agents 2 & 3: Inbox and Curator are spawned dynamically by the orchestrator.
 # They do not appear as [[agents]] entries — the orchestrator creates them at
 # runtime with spawn_agent, passing capabilities and task prompts inline.
-# The MCP servers above (cron_trigger, google_oauth) are available to all
-# children whose capabilities grant access.
+# The children are attenuated (cap.2): each is spawned with an explicit `capabilities`
+# set that MUST be ⊆ the orchestrator's own set (validated by capability_covered_by; an
+# out-of-parent request rejects the spawn with an AgentSpawnDenied event). Absent =
+# inherit the full parent set (the pre-cap.2 all-or-nothing behavior).
 #
-# Inbox agent profile (for reference — spawned by orchestrator):
-#   caps:   Mcp{google_oauth}  (read-only Gmail; no Spawn, no FsWrite, no KB)
-#   model:  inherits orchestrator default (claude-sonnet-4-6)
+# Inbox agent profile (spawned by orchestrator, STEP 3):
+#   caps:   Mcp{google_oauth}, Mcp{semantic-kb}, KbRead/KbWrite{mail:raw}, Credential{Google}
+#           (Gmail + dedup cache; NO Spawn)
 #   budget: 1_500_000 tokens
 #
-# Curator agent profile (for reference — spawned by orchestrator):
-#   caps:   KbWrite{ops:briefs}, KbWrite{ops:entities}
-#   model:  inherits orchestrator default (claude-sonnet-4-6)
+# Curator agent profile (spawned by orchestrator, STEP 4):
+#   caps:   Mcp{semantic-kb}, KbRead{ops:entities}, KbWrite{ops:briefs}, KbWrite{ops:entities}
+#           (KB-ONLY — deliberately NO Mcp{google_oauth}, so filtered_specs shows no Gmail
+#           tool specs in the curator's flight log; NO Spawn, NO Credential)
 #   budget: 200_000 tokens
 # ---------------------------------------------------------------------------

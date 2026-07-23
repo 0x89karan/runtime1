@@ -24,27 +24,29 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.93.0 (shipped 2026-07-23)
+**Current version:** v0.94.0 (shipped 2026-07-23)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** cap.1 (v0.93.0) — the **capability declaration surface** (from the v0.86
-audit). A new **`agentd check`** config linter catches grants that *look* granted but are
-inert or wrong — the silent-fail-closed / Gmail-outage class — at test/CI/boot time. One
-shared **`tier_legality(cap, ctx)`** resolver (in `capability.rs`, no-wildcard match =
-compile-time drift guard) classifies enforced-vs-inert; the linter also runs a **credential
-wiring cross-check** (a `Credential{provider}` granted to an agent but carried by no stdio
-MCP server → empty broker token → silent denial — the real Gmail bug), MCP-server / KB-segment
-existence, HTTP-server-carrying-sandbox-fields (P1-9), relative FS prefixes (warn default /
-error `--strict`), and bare-`agent` KB grants. New **`CapabilitiesResolved`** boot event logs
-each agent's + server's effective set via the same resolver. The container entrypoint
-(`cos)` mode) now runs `agentd check --strict` on the rewritten config (grep → real parsing,
-fail-closed). A shared `credential_provider_key` de-duplicates the broker's provider-key logic
-(review catch). Reframed (single-tenant): this is misconfiguration ergonomics, not
-defense-against-malice; it unblocks cap.2. Deferred: runtime denial-surfacing ATTN column
-(cap.1b), per-server credential binding (cap.1-ar-01), `mcp_require_capabilities` mirror
-(ar-02), distro `/init` parity (ar-03).
-**Next:** cap.2 (spawn attenuation — cap.1 unblocks it) → ux.13 (verbs) or ux.12 (Telegram).
+**Latest shipped:** cap.2 (v0.94.0) — the **spawn attenuation FLOOR** (audit P1-10, from the
+v0.86 audit). `SpawnConfig` gains a `capabilities` field + a `spawn_agent` tool-schema field, so
+the CoS orchestrator spawns each child (inbox, curator) with a **least-privilege** set instead of
+the old all-or-nothing `parent_cap_set.clone()`. A new **`capability_covered_by(parent, child)`**
+subset check (in `capability.rs`) validates every requested cap ⊆ parent; an out-of-parent request
+**rejects the whole spawn** with a new `AgentSpawnDenied` event (reject, not clamp). The check is
+sound where `satisfies` was not: `Net` and `Mcp` get real containment (`satisfies` returned true
+unconditionally for `Net` and vacuously for an empty child `Mcp` tool list), multi-entry `Mcp`
+grants union per-server, and the exhaustive no-wildcard match is a compile-time drift guard.
+The curator ships **KB-only, no `Mcp{google_oauth}`** → its flight log shows no Gmail tool specs.
+**Reframed at the autoplan CEO gate (both models + USER, 2026-07-23):** this is an *accidental-
+over-grant* floor, **NOT** injection defense — the orchestrator holds Gmail and chooses child caps
+while reading untrusted email, so an injected orchestrator can grant Gmail from its own set and the
+subset check passes. That bypass is **encoded as a passing test** so the floor is never mistaken for
+the ceiling. **Audit P1-10 stays OPEN**; real closure = cap.2b (de-privilege the orchestrator).
+A regression guard (`cos_spawn_caps_subset.rs`) pins each CoS config's child profiles ⊆ its
+orchestrator (caught a dev/distro drift where distro children requested a `semantic-kb` sidecar the
+QEMU config doesn't run). Cut from scope: `max_turns` passthrough → cap.2-ar-01.
+**Next:** cap.2b (orchestrator de-privilege — real P1-10 closure) → ux.13 (verbs) or ux.12 (Telegram).
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

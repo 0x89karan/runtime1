@@ -929,7 +929,12 @@ impl Tool for SpawnAgentTool {
                 "task":         { "type": "string",  "description": "The sub-task for the child agent to complete" },
                 "child_id":     { "type": "string",  "description": "Optional stable ID for the child (auto-generated if absent)" },
                 "priority":     { "type": "integer", "description": "Scheduling priority (higher runs first). Default 0." },
-                "token_budget": { "type": "integer", "description": "Token ceiling for the child. Inherits parent budget if absent." }
+                "token_budget": { "type": "integer", "description": "Token ceiling for the child. Inherits parent budget if absent." },
+                "capabilities": {
+                    "type": "array",
+                    "description": "Optional least-privilege capability set for the child. Absent = inherit ALL of the parent's capabilities. Each entry is validated to be within the parent's set (a request outside it rejects the whole spawn). Use to scope a child down to only what it needs. Format matches the config capability shape: unit caps are strings (e.g. \"Spawn\", \"RunsRead\"); parameterized caps are single-key objects, e.g. {\"Mcp\":{\"server\":\"google_oauth\",\"tools\":[]}}, {\"KbRead\":{\"segment\":\"ops:briefs\"}}, {\"KbWrite\":{\"segment\":\"ops\"}}, {\"Credential\":{\"provider\":\"Google\"}}. An empty array grants no capability-gated tools (capability-free tools like send_message and request_approval remain).",
+                    "items": {}
+                }
             },
             "required": ["task"],
             "additionalProperties": false

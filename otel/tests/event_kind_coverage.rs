@@ -44,6 +44,7 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::CapabilitiesResolved => false,
         EventKind::MaxTurnsReached => false,
         EventKind::CapabilityDenied => false,
+        EventKind::AgentSpawnDenied => false,
         EventKind::AgentChildResultDelivered => false,
         EventKind::AgentCardRegistered => false,
         EventKind::AgentCheckpointed => false,

@@ -111,19 +111,50 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 - **cap.1-ar-03 (P3) [new, cap.1 /review] — distro/QEMU init doesn't run `agentd check`.**
   Only the Docker `entrypoint.sh cos)` path is gated with `agentd check --strict`; the distro/QEMU `/init`
   boot path is not. The distro config is already clean, so informational — add the check to `/init` for parity.
-- **audit86-P1-10 (P1) [re-rate; = cos-dev-02, was P2] — Spawn inheritance is all-or-nothing; Curator inherits live Gmail.**
+- **audit86-P1-10 (P1) [re-rate; = cos-dev-02, was P2] — Spawn inheritance is all-or-nothing; Curator inherits live Gmail. [PARTIAL — floor shipped in cap.2 (v0.94.0); STILL OPEN for the injected-orchestrator threat → cap.2b.]**
   `SpawnConfig` (`config.rs:412-422`) has no capabilities field; `dispatch_spawn`
   (`scheduler.rs:1586`) does `parent_cap_set.clone()`. The Curator (processes
   attacker-influenceable email text daily) inherits `Credential{Google}`, so a prompt-injection
   payload surviving into curation can call live Gmail through the broker with every hardening
   layer cooperating. Post-cred.6 the broker made capability scoping load-bearing; this makes
-  it decorative for children. The `cos.agents.toml:438-446` "inbox caps: Mcp{google_oauth}
-  only" comment is fiction. Fix: `capabilities: Option<Vec<Capability>>` on `SpawnConfig`,
-  validated ⊆ parent (subset check mandatory or the field becomes an escalation vector); merge
-  cos-polish-adv-F2 + F5 (`max_turns` passthrough, `scheduler.rs:1597`). → `cap.2`.
+  it decorative for children. **cap.2 (v0.94.0)** shipped the attenuation FLOOR:
+  `SpawnConfig.capabilities` + a sound subset check (`capability_covered_by` — Net & Mcp given
+  real containment, no-wildcard-arm drift guard) + `AgentSpawnDenied` (reject not clamp) + CoS
+  prompt scoping the curator KB-only (no `Mcp{google_oauth}`). **This closes accidental
+  over-grant only.** The CEO gate (both models) established that tool-input caps CANNOT close the
+  injected-orchestrator threat this item names: the orchestrator holds Gmail and chooses the
+  child's caps while reading untrusted email, so an injected orchestrator grants the curator
+  Gmail *from its own set* and the subset check passes. That gap is **encoded as a passing test**
+  (`spawn_attenuation_documents_injection_bypass`) so it can't be mistaken for closed. → `cap.2b`.
+- **cap.2b (P1) [new; = the real P1-10 closure] — De-privilege the CoS orchestrator / keep it out of the untrusted-data path.**
+  The subset check (cap.2) only becomes load-bearing once the GRANTING node is itself attenuated.
+  Close P1-10 by restructuring the CoS so the node that ingests untrusted email holds no
+  `Mcp{google_oauth}`/`Credential` and no `Spawn` authority — a statically-wired inbox→curator
+  pipeline with fixed caps, or an orchestrator that never reads raw email/the inbox summary back
+  into a spawn-capable context. Largely a `cos.agents.toml` topology change (+ possibly scheduler
+  support for static child pipelines); touches the load-bearing daily-brief flow, so it deserves
+  its own design pass. North star (cap.3+): taint — caps unavailable to any agent downstream of an
+  untrusted-data read. Turns `spawn_attenuation_documents_injection_bypass` from a documentation
+  test into a red test to make green.
+- **cap.2-ar-01 (P3) [new] — spawn `max_turns` passthrough (split out of cap.2).**
+  `SpawnConfig` has no `max_turns`; children get `default_max_turns()` (`scheduler.rs` step 4).
+  `cos-polish-adv-F5` (curator hits `MaxTurnsReached` at the default) wanted this merged into
+  cap.2, but the CEO gate cut it: `max_turns` is a resource limit, not a capability, and bundling
+  it dilutes a security review (one-increment-per-branch). Add `max_turns: Option<u32>` to
+  `SpawnConfig` + tool schema; `dispatch_spawn` uses it. Small cos-polish-class follow-up.
 
 ### P2
 
+- **test-flake-01 (P2) [new; found in cap.2 /ship] — Full-suite `cargo test --workspace` is flaky under high parallelism.**
+  On a high-core machine (many `--test-threads`), `cargo test --workspace` intermittently fails a
+  *varying* set of async scheduler/egress tests (`streaming_*`, `stream_delta_*`,
+  `spawn_attenuation_documents_injection_bypass`, `egress::proxy_large_request_body_returns_413`) —
+  the failure is a `sched.run().await` not completing → `outcomes["id"]` index panic, or a port/proxy
+  race. All pass in isolation and `--test-threads=1` is 100% green (1535/0). Pre-existing (spans tests
+  far older than cap.2); NOT a logic bug. Low CI risk today (GitHub runners are 2-4 core → little
+  contention, hence green history), but latent. Fix: give the contended async tests their own
+  resources (unique ports, per-test tokio runtime, or `serial_test` on the streaming/egress group);
+  optionally pin CI to `--test-threads` or adopt `cargo-nextest` with retries. Not cap.2 scope.
 - **ci.2 (P2) [named deferral from ci.1] — Broker→oauth_mcp→provider fake-provider E2E.**
   The nightly E2E (ci.1/3b) exercises agentd→mock-Anthropic only; the credential-broker
   seam (CredentialGateway → oauth_mcp sidecar → provider token flow, cred.3–cred.7) has

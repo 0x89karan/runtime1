@@ -3,6 +3,33 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.94.0] - 2026-07-23
+
+### Added
+- **Spawn attenuation floor** (cap.2, audit P1-10). `SpawnConfig.capabilities:
+  Option<Vec<Capability>>` + a `capabilities` property on the `spawn_agent` tool schema let the
+  orchestrator spawn each child with a least-privilege set. Absent = inherit the parent's full set
+  (backward compat). `dispatch_spawn` validates every requested cap is covered by the parent and
+  **rejects the whole spawn** (reject, not clamp) with a new `AgentSpawnDenied` flight event when it
+  is not. The CoS orchestrator now scopes its children — the curator is KB-only (no
+  `Mcp{google_oauth}`), so its flight log shows no Gmail tool specs.
+- **`capability_covered_by(parent, child)`** — a sound subset predicate in `capability.rs`, distinct
+  from `satisfies` (which is a runtime *invocation* check). `Net` and `Mcp` get real containment
+  (`satisfies` returned `true` unconditionally for `Net` and vacuously for an empty child `Mcp` tool
+  list — both unsound as subset tests); multi-entry `Mcp` grants union per-server. Exhaustive
+  no-wildcard match = compile-time drift guard for new `Capability` variants.
+- Regression guard `cos_spawn_caps_subset.rs`: pins each CoS config's documented child profiles ⊆
+  its orchestrator's capabilities (caught a dev/distro drift where distro children requested a
+  `semantic-kb` sidecar the QEMU config does not run).
+
+### Notes
+- **Scope (CEO-gated, both models + user):** cap.2 closes *accidental over-grant*, NOT the
+  injected-orchestrator prompt-injection threat P1-10 names — the orchestrator holds Gmail and picks
+  child caps while reading untrusted email, so an injected orchestrator can grant Gmail from its own
+  set and the subset check passes. That bypass is encoded as a passing test
+  (`spawn_attenuation_documents_injection_bypass`). **Audit P1-10 stays OPEN**; real closure is
+  cap.2b (orchestrator de-privilege). `max_turns` passthrough was cut → cap.2-ar-01.
+
 ## [v0.93.0] - 2026-07-23
 
 ### Added
