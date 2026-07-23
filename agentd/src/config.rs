@@ -2065,14 +2065,17 @@ allow_insecure_local = true
     }
 
     #[test]
-    fn cos_agents_toml_step6_requires_markdown_content() {
+    fn cos_agents_toml_curator_requires_markdown_content() {
+        // cap.2b moved brief assembly from the orchestrator prompt into the cos-curator [[jobs]]
+        // task. The instruction that write_file content be formatted markdown (not raw JSON)
+        // must survive that move — a JSON blob written as the brief is the classic regression.
         let dev_raw = include_str!("../cos.agents.toml");
         let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
         for (label, raw) in [("dev", dev_raw), ("overlay", overlay_raw)] {
             assert!(
-                raw.contains("MUST be a formatted markdown string"),
-                "{} cos.agents.toml STEP 6 must contain an explicit instruction that \
-                 write_file content must be a formatted markdown string, not JSON",
+                raw.contains("MUST be formatted markdown"),
+                "{} cos.agents.toml cos-curator job must instruct that write_file content is \
+                 formatted markdown, not JSON",
                 label
             );
         }

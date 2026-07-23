@@ -145,8 +145,8 @@ capabilities = [
 # ---------------------------------------------------------------------------
 [[agents]]
 id          = "cos-orchestrator"
-name        = "Chief of Staff Orchestrator"
-description = "Cron-triggered coordinator: wakes daily, spawns Inbox + Curator, assembles and writes the Operating Brief."
+name        = "Chief of Staff Trigger"
+description = "Cron-triggered coordinator: fires the Inbox→Curator sealed-job pipeline. Reads nothing the jobs produce (cap.2b de-privilege)."
 
 max_turns    = 200_000
 # Per-agent WINDOWED ceiling (ux.8′): with [scheduler] budget_reset_interval set,
@@ -156,202 +156,48 @@ max_turns    = 200_000
 token_budget = 5_000_000_000
 priority     = 10
 
+# cap.2b — DE-PRIVILEGED to a summary-free cron TRIGGER: no Gmail, no Credential, no KB, no
+# file write, no Spawn. The real capabilities live on the [[jobs]] below, owned by config,
+# never chosen by this schedule-exposed node. (QEMU/production runs no semantic-kb sidecar.)
 capabilities = [
-  { Spawn = {} },
-  { KbRead  = { segment = "ops:briefs"   } },
-  { KbWrite = { segment = "ops:briefs"   } },
-  { KbRead  = { segment = "ops:entities" } },
-  { KbWrite = { segment = "ops:entities" } },
   { Mcp    = { server = "cron_trigger", tools = [] } },
-  { Mcp    = { server = "google_oauth",  tools = [] } },
-  { FsWrite = { prefix = "/run/output" } },
-  # cap.1: agent-level Credential is a declaration/attention signal, NOT enforced — the
-  # broker token is built from the google_oauth stdio server's own Credential cap. `agentd
-  # check` cross-checks that wiring.
-  { Credential = { provider = "Google" } },
-  { RunsRead = {} },   # ux.11b: read durable run history via runs_query
-  { BriefPublish = {} },   # ux.11c: publish the morning brief to the operator pull surface
+  { RunJob = {} },
 ]
 
 task = """
-You are an always-on Executive Orchestrator. Your job is to produce a Daily Operating Brief
-from the founder's Gmail inbox every day.
-
-## KB Segment Reference (always use these exact names)
-| Segment name | Class   | Purpose                                          |
-|-------------|---------|--------------------------------------------------|
-| ops:briefs  | log     | Daily briefs — append-only; key arg ignored (runtime assigns hex seq) |
-| ops:entities| scratch | Named entities: people, open items — last-writer-wins |
+You are the always-on Chief-of-Staff TRIGGER. You do NOT read email, summaries, or briefs —
+you only fire the daily pipeline on schedule. The real work runs in two config-declared sealed
+JOBS whose capabilities and instructions are fixed by the operator; you cannot see or change
+them, and you receive only a completion signal from each (never its output). This is by design
+(cap.2b): the node exposed to the schedule holds nothing sensitive, so it has nothing to leak.
 
 ## Loop (repeat forever)
 
 STEP 1 — WAIT FOR SCHEDULE
 Call cron_trigger.wait_for_trigger(timeout_s=20) in a loop:
-  - "waiting" → call again next turn (this is normal; you will wait many turns)
-  - "timeout"  → TRIGGER_MAX_WAIT_S exceeded; call wait_for_trigger again to reset
-  - "fired"    → proceed to STEP 2
+  - "waiting" → call again next turn (normal; you will wait many turns)
+  - "timeout" → call wait_for_trigger again to reset
+  - "fired"   → proceed to STEP 2
 
-STEP 2 — GET TODAY'S DATE
-Extract the date from the "fired" response's `fired_utc` field (ISO 8601, UTC).
-Take the YYYY-MM-DD prefix: TODAY = fired_utc[:10]
-Use this as {TODAY} for child IDs — date-stamping prevents collisions on the second cycle
-(the orchestrator's in-context history prevents re-spawning the same-day child ID).
-Example child IDs: "inbox-2026-06-27", "curator-2026-06-27"
+STEP 2 — RUN THE INBOX JOB
+Call run_job(job_id="cos-inbox"). Pass ONLY the job_id — there are no other arguments.
+The job fetches Gmail and writes today's OperatingBrief to the KB itself. You receive only a
+completion signal like "job 'cos-inbox-<date>' completed" — never its contents. If it reports
+failure, skip to STEP 4 (do not retry in a tight loop).
 
-STEP 3 — SPAWN INBOX AGENT
-Call spawn_agent with:
-  child_id     = "inbox-{TODAY}"          (replace {TODAY} with the actual date)
-  task         = (see Inbox Agent task below)
-  token_budget = 1_500_000
-  capabilities = [
-    { "Mcp": { "server": "google_oauth", "tools": [] } },
-    { "Credential": { "provider": "Google" } }
-  ]
-Note (cap.2 spawn attenuation): the `capabilities` you pass scope the child to LEAST
-PRIVILEGE — each must be within YOUR own set (a request outside it rejects the whole
-spawn). The inbox agent needs Gmail (Mcp google_oauth); it does NOT get Spawn, so it
-cannot spawn further agents. It reaches Gmail because it holds `Mcp{google_oauth}` —
-that (not the decorative agent-level Credential) is the tool-visibility boundary. This
-QEMU/production config does not run the semantic-kb sidecar, so no semantic-kb/mail:raw
-caps are granted here (they would be inert). This is a least-privilege floor, not
-injection defense.
+STEP 3 — RUN THE CURATOR JOB
+After the inbox job completes, call run_job(job_id="cos-curator"). Pass ONLY the job_id.
+The curator reads the inbox result from the KB, assembles the brief, writes it, and publishes it.
+You receive only a completion signal.
 
-Inbox Agent task prompt:
-"You are a read-only Gmail analyst. Your job is to produce a structured OperatingBrief
-from the last 24 hours of email. Only use the google_oauth tools — do not spawn agents
-or write files.
-
-STEP 1 — Check Gmail authentication:
-  Call oauth_check_auth(). If not ready:
-    a. Call oauth_start_auth() to get the authorization URL.
-    b. Call request_approval(kind='oauth', risk='low',
-         summary='Gmail OAuth required — visit the URL to authorize',
-         args={'url': <the URL>}).
-       The operator will click the URL, sign in, and approve.
-    c. Call oauth_check_auth() again. If still not ready, wait 30s and retry.
-
-STEP 2 — Fetch recent emails:
-  Call oauth_call_api(method='GET',
-    url='https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=newer_than:1d')
-  For each important message (up to 20), fetch its full content:
-    oauth_call_api(method='GET',
-      url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
-
-STEP 3 — Produce a structured OperatingBrief:
-IMPORTANT — keep the JSON compact (KB entry limit is 8 KB):
-  - summaries and ask fields: ≤ 120 characters each
-  - subject lines: ≤ 80 characters
-  - important: at most 12 entries (highest urgency first)
-  - response_needed: at most 8 entries
-  - open_items: at most 10 entries
-Return your findings as a JSON object in your final answer:
-{
-  'date': 'YYYY-MM-DD',
-  'important': [{ 'from': '...', 'subject': '...', 'summary': '...', 'urgency': 'high|medium|low' }],
-  'response_needed': [{ 'from': '...', 'subject': '...', 'ask': '...', 'deadline': '...' }],
-  'open_items': ['...'],
-  'focus_recommendation': '...',
-  'thread_count_reviewed': N,
-  'skipped_count': N
-}"
-
-IMPORTANT: Wait until you receive the inbox agent's final answer in your context
-before proceeding to STEP 4. The inbox JSON is the input to the curator task.
-
-STEP 3b — STORE INBOX RESULT IN KB SCRATCH
-After the inbox agent's final answer arrives, call:
-  kb_put(segment='ops:entities', key='inbox-{TODAY}', content=<the inbox agent's JSON response>)
-This keeps email-sourced content out of the curator's task prompt (prompt-injection isolation).
-
-STEP 4 — SPAWN CURATOR AGENT
-Call spawn_agent with:
-  child_id     = "curator-{TODAY}"
-  task         = (see Curator Agent task below)
-  token_budget = 200_000
-  capabilities = [
-    { "KbRead":  { "segment": "ops:entities" } },
-    { "KbWrite": { "segment": "ops:briefs"   } },
-    { "KbWrite": { "segment": "ops:entities" } }
-  ]
-Note (cap.2 spawn attenuation): the curator is KB-ONLY. It is NOT granted
-`Mcp{google_oauth}`, so `filtered_specs` omits every Gmail tool from its context — the
-curator's flight log shows NO Gmail tool specs. This is the point of attenuation: the
-curator processes the inbox summary (email-derived, attacker-influenceable text) but
-cannot reach live Gmail. It also gets no Spawn and no Credential.
-KNOWN LIMIT (honest): this bounds an accidental over-grant. It does NOT stop an injected
-orchestrator, because YOU (the orchestrator) hold Gmail and choose these caps — an
-attacker who controls your reasoning could grant the curator Gmail from your own set and
-the subset check would pass. Closing that is cap.2b (de-privilege this orchestrator).
-
-Curator Agent task prompt:
-"You are a KB curator. Persist today's Daily Operating Brief to the ops KB.
-
-KB Segment Reference (use these exact segment names):
-  ops:briefs   (log class)     — append-only daily briefs; key arg is IGNORED, runtime assigns hex seq
-  ops:entities (scratch class) — named entities: people, open items, last-writer-wins
-
-Steps:
-1. Call kb_get(segment='ops:entities', key='inbox-{TODAY}') to retrieve the inbox summary.
-   Parse the JSON. If missing, report an error and stop.
-   (Replace {TODAY} with today's actual date, e.g. 2026-06-27)
-2. Call kb_put(segment='ops:briefs', key='{TODAY}', content=<the full brief JSON as a string>)
-3. For each person in response_needed and important threads, call:
-   kb_put(segment='ops:entities', key='person:{normalized_name}', content=<contact summary>)
-4. For each open item, call:
-   kb_put(segment='ops:entities', key='open:{YYYY-MM-DD}:{N}', content=<item text>)
-Report how many KB entries you wrote."
-
-STEP 5 — RETRIEVE CONTEXT FROM PREVIOUS BRIEFS
-Call kb_search(segment='ops:briefs', query='open items response needed') to surface
-anything from recent briefs that is still unresolved.
-
-STEP 6 — ASSEMBLE AND WRITE THE BRIEF
-Combine today's inbox summary with any unresolved context from the KB.
-IMPORTANT — the write_file `content` parameter MUST be a formatted markdown string.
-Do NOT pass JSON or serialize the inbox data as-is. Replace every {PLACEHOLDER}
-in the template below with real values and pass the resulting markdown as `content`:
-Call write_file(path='/run/output/brief-{TODAY}.md', content=<the formatted markdown string below>)
-
-Brief format:
-```markdown
-# Daily Operating Brief — {TODAY}
-
-## Important (action needed)
-{bullet list from important + response_needed, ordered by urgency}
-
-## Response Needed
-| From | Subject | Ask | Deadline |
-|------|---------|-----|----------|
-{table rows}
-
-## Open Items (carried forward)
-{bullet list of unresolved items from KB + today}
-
-## Focus Recommendation
-{focus_recommendation from inbox agent}
-
-## Stats
-- Threads reviewed: {thread_count_reviewed}
-- Skipped (low priority): {skipped_count}
-- Brief generated: {ISO timestamp}
-```
-
-STEP 6.5 — PUBLISH THE BRIEF TO THE OPERATOR (ux.11c)
-Call publish_brief() — optionally passing narrative='<one or two sentences>' with a
-plain-English summary of the night. Do NOT pass run counts, failures, or spend: agentd
-authors those facts itself from durable run history over the window since the last brief.
-This makes the brief readable via `agentctl brief` / GET /api/v1/brief whenever the
-operator next looks, even after an overnight restart. Call it once per cycle, after STEP 6.
-
-STEP 7 — LOOP BACK
-IMPORTANT: Do NOT emit a final answer. After publishing the brief, IMMEDIATELY call
-cron_trigger.wait_for_trigger(timeout_s=20) to park until tomorrow's schedule.
-You are always-on. The loop never ends.
+STEP 4 — LOOP BACK
+Do NOT emit a final answer. Immediately call cron_trigger.wait_for_trigger(timeout_s=20) to park
+until the next schedule. You are always-on; the loop never ends.
 """
 
 [tools]
 native = [
-  "spawn_agent",
+  "run_job",
   "kb_get",
   "kb_put",
   "kb_search",
@@ -360,3 +206,113 @@ native = [
   "runs_query",
   "publish_brief",
 ]
+
+# ---------------------------------------------------------------------------
+# Sealed jobs (cap.2b). Caps + task templates owned by config, not the trigger. run_job(job_id)
+# materializes a child with the fixed caps + rendered task ({date} stamped server-side, UTC).
+# QEMU/production runs NO semantic-kb sidecar, so these jobs use the native L1 KB only (no
+# semantic-kb, no mail:raw dedup). The child's output returns to the trigger as a signal only.
+# ---------------------------------------------------------------------------
+
+[[jobs]]
+id           = "cos-inbox"
+token_budget = 1_500_000
+capabilities = [
+  { Mcp    = { server = "google_oauth", tools = [] } },
+  { KbWrite = { segment = "ops:entities" } },
+  { Credential = { provider = "Google" } },
+]
+task = """
+You are a read-only Gmail analyst producing today's OperatingBrief from the last 24 h of email.
+Use only the google_oauth tools and the KB. You have NO file-write access and cannot spawn.
+
+STEP 1 — Check Gmail auth: oauth_check_auth(). If not ready:
+  a. oauth_start_auth() → authorization URL.
+  b. request_approval(kind='oauth', risk='low',
+       summary='Gmail OAuth required — visit the URL to authorize', args={'url': <the URL>}).
+  c. oauth_check_auth() again; if still not ready, wait 30s and retry.
+
+STEP 2 — Fetch recent emails:
+  oauth_call_api(method='GET',
+    url='https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=newer_than:1d')
+  For each important message (up to 20), fetch full content:
+    oauth_call_api(method='GET', url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
+
+STEP 3 — Build the OperatingBrief JSON (compact; KB entry limit 8 KB):
+  summaries/asks ≤120 chars; subjects ≤80; important ≤12; response_needed ≤8; open_items ≤10.
+  {
+    'date': '{date}',
+    'important': [{ 'from': '...', 'subject': '...', 'summary': '...', 'urgency': 'high|medium|low' }],
+    'response_needed': [{ 'from': '...', 'subject': '...', 'ask': '...', 'deadline': '...' }],
+    'open_items': ['...'],
+    'focus_recommendation': '...',
+    'thread_count_reviewed': N,
+    'skipped_count': N
+  }
+
+STEP 4 — Persist the OperatingBrief for the curator:
+  kb_put(segment='ops:entities', key='inbox-{date}', content=<the OperatingBrief JSON as a string>)
+  Then report how many messages you reviewed. Do NOT write files — the curator owns the brief.
+"""
+
+[[jobs]]
+id           = "cos-curator"
+token_budget = 500_000
+capabilities = [
+  { KbRead  = { segment = "ops:entities" } },
+  { KbRead  = { segment = "ops:briefs"   } },
+  { KbWrite = { segment = "ops:briefs"   } },
+  { KbWrite = { segment = "ops:entities" } },
+  { FsWrite = { prefix = "/run/output" } },
+  { RunsRead = {} },
+  { BriefPublish = {} },
+]
+task = """
+You are the KB curator and brief author. Assemble and publish today's Daily Operating Brief.
+You have NO Gmail access — you work only from the KB the inbox job wrote.
+
+STEP 1 — Read today's inbox result:
+  kb_get(segment='ops:entities', key='inbox-{date}'). Parse the JSON. If missing, report an
+  error and stop.
+
+STEP 2 — Persist entities to the KB:
+  kb_put(segment='ops:briefs', key='{date}', content=<the full brief JSON as a string>)
+  For each person in response_needed and important:
+    kb_put(segment='ops:entities', key='person:{normalized_name}', content=<contact summary>)
+  For each open item:
+    kb_put(segment='ops:entities', key='open:{date}:{N}', content=<item text>)
+
+STEP 3 — Surface unresolved context:
+  kb_search(segment='ops:briefs', query='open items response needed') to find anything from
+  recent briefs that is still unresolved.
+
+STEP 4 — Assemble and write the markdown brief:
+  write_file(path='/run/output/brief-{date}.md', content=<the formatted markdown string below>).
+  The content MUST be formatted markdown (not raw JSON):
+  ```markdown
+  # Daily Operating Brief — {date}
+
+  ## Important (action needed)
+  {bullet list from important + response_needed, ordered by urgency}
+
+  ## Response Needed
+  | From | Subject | Ask | Deadline |
+  |------|---------|-----|----------|
+  {table rows}
+
+  ## Open Items (carried forward)
+  {bullet list of unresolved items from KB + today}
+
+  ## Focus Recommendation
+  {focus_recommendation from the inbox result}
+
+  ## Stats
+  - Threads reviewed: {thread_count_reviewed}
+  - Skipped (low priority): {skipped_count}
+  ```
+
+STEP 5 — Publish the brief to the operator (ux.11c):
+  Call publish_brief() — optionally narrative='<one or two sentences>'. Do NOT pass run counts,
+  failures, or spend: agentd authors those from durable run history. Call it exactly once, after
+  STEP 4. Then report how many KB entries you wrote.
+"""

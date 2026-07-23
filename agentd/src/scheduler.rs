@@ -4241,13 +4241,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_attenuation_documents_injection_bypass() {
-        // KNOWN LIMIT (cap.2 is a FLOOR, not injection defense): an orchestrator that
-        // HOLDS Mcp{google_oauth} can spawn a child WITH Mcp{google_oauth} — it is ⊆ the
-        // parent's own set, so the subset check passes. This is exactly the injected-
-        // orchestrator gap the CEO gate accepted; cap.2b (orchestrator de-privilege)
-        // closes it. If this test ever starts FAILING, cap.2b has changed the model —
-        // update this test deliberately, do not paper over it.
+    async fn spawn_agent_floor_is_not_injection_defense() {
+        // spawn_agent (cap.2 FLOOR) is trusted-delegation: a parent that HOLDS Mcp{google_oauth}
+        // can spawn a child WITH it — ⊆ its own set, so the subset check passes. This is
+        // CORRECT for trusted delegation and remains unchanged by cap.2b. The injection-exposed
+        // CoS path no longer uses spawn_agent at all — it uses the sealed `run_job` (config-owned
+        // caps + task, deliver_content=false), tested below. This test pins that the spawn_agent
+        // floor still behaves as the documented trusted-delegation primitive.
         use crate::{capability::Capability, tools::native::register_native};
 
         let mut registry = ToolRegistry::new();
@@ -4295,8 +4295,127 @@ mod tests {
         let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
         assert!(
             !content.contains("\"agent_spawn_denied\""),
-            "the bypass is NOT denied — that is the documented limit cap.2b must close"
+            "spawn_agent trusted delegation is not denied (the sealed run_job path is what closes injection)"
         );
+    }
+
+    // ── cap.2b: sealed run_job ────────────────────────────────────────────────
+
+    fn cos_like_job(id: &str, caps: Vec<Capability>) -> crate::config::Job {
+        crate::config::Job {
+            id: id.to_string(),
+            token_budget: crate::config::default_token_budget(),
+            capabilities: caps,
+            task: "sealed job for {date}".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_job_materializes_sealed_child_with_config_caps() {
+        // A DE-PRIVILEGED trigger (only RunJob) fires a job whose caps live in config. The
+        // child runs with the CONFIG caps (no parent-subset check, because the trigger holds
+        // none of them), and there is no denial. This is the cap.2b inversion: cap authority
+        // moved off the injectable trigger onto config.
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj1".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-curator" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = MockGateway::new(vec![
+            run,
+            end_turn("child ok", 5, 3),   // the job child terminates
+            end_turn("trigger ok", 10, 5), // the trigger continues after the completion signal
+        ]);
+
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        // Curator job: KB-only, NO google_oauth — the trigger holds none of these caps.
+        let sched = sched.with_jobs(vec![cos_like_job(
+            "cos-curator",
+            vec![Capability::KbWrite { segment: "ops:briefs".into() }],
+        )]);
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["cos-orchestrator"].is_ok(), "trigger must complete: {:?}", outcomes["cos-orchestrator"]);
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(!content.contains("\"agent_spawn_denied\""), "a valid run_job must not be denied");
+        // The child materialized under the server-stamped id and ran (agent_spawned recorded).
+        assert!(content.contains("cos-curator-"), "job child should be id-stamped cos-curator-<date>");
+    }
+
+    #[tokio::test]
+    async fn run_job_rejects_unknown_job_id() {
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj_bad".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "no-such-job" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = MockGateway::new(vec![run, end_turn("trigger recovered", 10, 5)]);
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        let sched = sched.with_jobs(vec![cos_like_job("cos-inbox", vec![Capability::RunsRead])]);
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["cos-orchestrator"].is_ok(), "trigger recovers from a bad job id");
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"agent_spawn_denied\""), "unknown job id must be recorded as denied");
+        assert!(!outcomes.keys().any(|k| k.starts_with("no-such-job")), "no child for an unknown job");
+    }
+
+    #[tokio::test]
+    async fn run_job_requires_run_job_capability() {
+        // A trigger WITHOUT RunJob cannot fire jobs — capability-gated like spawn_agent/Spawn.
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj_nocap".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-inbox" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = MockGateway::new(vec![run, end_turn("recovered", 10, 5)]);
+        // Trigger holds some other cap but NOT RunJob.
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunsRead]),
+            ..agent_cfg("cos-orchestrator", "trigger")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        let sched = sched.with_jobs(vec![cos_like_job("cos-inbox", vec![Capability::RunsRead])]);
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["cos-orchestrator"].is_ok(), "trigger recovers from the denial");
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"capability_denied\""), "run_job without RunJob must be capability-denied");
     }
 
     // ── p1.6: send_message tests ─────────────────────────────────────────────
