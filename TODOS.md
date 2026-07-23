@@ -134,6 +134,18 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   to Telegram/webhook ingest). The former `spawn_attenuation_documents_injection_bypass` test was
   renamed `spawn_agent_floor_is_not_injection_defense` (the spawn_agent floor is unchanged; the
   sealed run_job path is what closes injection).
+- ~~**semantic-kb-colon (P1) [found in cap.2b live test] — L2 semantic KB never persisted colon segments (Qdrant 422).**~~ **[FIXED — `docker/semantic_kb_mcp.py` `_collection_name` now sanitizes `[^A-Za-z0-9_]`→`_` before the `kb_` prefix.]**
+  `_collection_name(segment)` returned `f"kb_{segment}"`, so `ops:entities`/`ops:briefs`/`mail:raw`
+  mapped to Qdrant collections `kb_ops:entities` etc. — and **Qdrant rejects `:` in collection
+  names** (`HTTP 422: collection name cannot contain ':' char`). So EVERY `kb_put` to a colon
+  segment through the semantic-kb sidecar (tool_override) has silently failed since memory-routing
+  (v0.81) — the L2 "semantic email dedup / brief persistence" never actually wrote to Qdrant for
+  these segments. Latent because the sidecar's own `_validate_segment` allows colons and the unit
+  tests use MOCK_EMBED (never hit real Qdrant collection creation). cap.2b surfaced it: the
+  inbox→curator handoff MUST go through the KB, so the curator found `ops:entities` empty. Fix
+  sanitizes the collection name (colons → `_`), applied in the ONE mapping used by
+  create/put/get/search so reads/writes align. No data migration needed (all prior writes 422'd).
+  Follow-up: add a `_collection_name` unit test + consider a non-mock Qdrant smoke in CI.
 - **cap.2b-ar-01 (P3) [new; found in cap.2b /review] — sealed-job pipeline date can skew across UTC midnight.**
   `dispatch_run_job` server-stamps `{date}` = `Utc::now()` independently for each `run_job` call
   (`scheduler.rs`). The CoS pipeline is two calls (cos-inbox then cos-curator); if they straddle

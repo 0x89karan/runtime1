@@ -221,8 +221,17 @@ def _qdrant(path: str, method: str = "GET", body: dict | None = None) -> dict:
 
 
 def _collection_name(segment: str) -> str:
-    """Map a KB segment name to a Qdrant collection name."""
-    return f"kb_{segment}"
+    """Map a KB segment name to a Qdrant collection name.
+
+    Qdrant rejects several characters in collection names — notably ':' (HTTP 422:
+    "collection name cannot contain ':' char"). KB segments routinely use colons
+    (ops:entities, ops:briefs, mail:raw), so map any char outside [A-Za-z0-9_] to '_'
+    before prefixing. Applied here (the ONE mapping used by create/put/get/search), so
+    writes and reads always resolve to the same collection. NOTE: this collapses e.g.
+    'ops:x' and 'ops/x' to the same name — acceptable for the current flat segment set;
+    revisit if segments ever need to differ only by a sanitized character."""
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", segment)
+    return f"kb_{safe}"
 
 
 def _ensure_collection(segment: str) -> None:
