@@ -180,6 +180,54 @@ pub fn check_config(cfg: &Config, strict: bool) -> CheckReport {
         }
     }
 
+    // cap.2b: config-declared sealed jobs (`[[jobs]]`) become a child agent's capability set
+    // when triggered via run_job, so lint each job's caps exactly like an agent's — same
+    // MCP-server / KB-segment existence, credential wiring, FS-prefix, and inert checks.
+    for j in &cfg.jobs {
+        for cap in &j.capabilities {
+            match cap {
+                Capability::Mcp { server, .. } => {
+                    if !server_names.contains(server.as_str()) {
+                        r.error(format!(
+                            "job '{}' grants Mcp {{ server = \"{server}\" }} but no \
+                             [[mcp_servers]] with that name exists",
+                            j.id
+                        ));
+                    }
+                }
+                Capability::KbRead { segment } | Capability::KbWrite { segment } => {
+                    if is_bare_agent_segment(segment) {
+                        r.error(format!(
+                            "job '{}' grants a bare '{segment}' KB segment — defeats per-agent \
+                             memory isolation. Grant the full 'agent/<id>' form.",
+                            j.id
+                        ));
+                    } else if !kb_segment_declared(segment, &seg_names) {
+                        r.warn(format!(
+                            "job '{}' grants KB segment '{segment}' but no [memory].segments \
+                             entry declares it",
+                            j.id
+                        ));
+                    }
+                }
+                Capability::Credential { provider } => {
+                    providers_referenced.insert(credential_provider_key(provider));
+                }
+                Capability::FsRead { prefix } | Capability::FsWrite { prefix }
+                    if is_suspect_fs_prefix(prefix) =>
+                {
+                    relative_prefix_finding(&mut r, rel_is_error, &format!("job '{}'", j.id), prefix);
+                }
+                _ => {}
+            }
+            if !matches!(cap, Capability::Credential { .. }) {
+                if let Legality::Inert(why) = tier_legality(cap, CapContext::Agent) {
+                    r.warn(format!("job '{}': capability {cap:?} is inert at agent level ({why})", j.id));
+                }
+            }
+        }
+    }
+
     // Credential wiring cross-check (G1 — the true Gmail-outage class). A provider granted
     // to an agent but carried by NO stdio MCP server yields an empty broker token → every
     // brokered call for it fails silently. This is an error in BOTH modes (the real config
@@ -227,6 +275,11 @@ pub fn capabilities_resolved_events(cfg: &Config) -> Vec<serde_json::Value> {
     for s in &cfg.tools.mcp_servers {
         let ctx = if s.is_http() { CapContext::HttpMcp } else { CapContext::StdioMcp };
         out.push(resolved_payload("mcp_server", &s.name, s.capabilities.as_deref().unwrap_or(&[]), ctx));
+    }
+    // cap.2b: a sealed job's caps become a child agent's set at run_job time — resolve them
+    // in the Agent context, same as any agent.
+    for j in &cfg.jobs {
+        out.push(resolved_payload("job", &j.id, &j.capabilities, CapContext::Agent));
     }
     out
 }
