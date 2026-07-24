@@ -163,14 +163,16 @@ impl HttpSource {
     }
 
     /// POST a confirm-channel verb (cancel/set-budget/set-caps) through the 3 s
-    /// `confirm_client`. Not gated by X-Approval-Token (that's approve/deny-only, ux.12);
-    /// these join spawn/inject/budget as loopback-trusted control routes. Returns Err with
-    /// the status + any body detail on a non-2xx.
+    /// `confirm_client`. Sends `X-Approval-Token` — cap.4 gates the whole mutating surface,
+    /// not just approve/deny. Returns Err with the status + any body detail on a non-2xx.
     fn post_confirm(&self, path: &str, body: Option<&Value>) -> Result<(), String> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let mut req = self.confirm_client.post(&url);
         if let Some(b) = body {
             req = req.json(b);
+        }
+        if let Some(tok) = &self.approval_token {
+            req = req.header("X-Approval-Token", tok);
         }
         let resp = req.send().map_err(|e| format!("HTTP error: {e}"))?;
         let status = resp.status();
@@ -207,7 +209,8 @@ impl HttpSource {
         if let Some(b) = body {
             req = req.json(b);
         }
-        // ux.12: approve/deny are gated by X-Approval-Token when agentd has a secret set.
+        // ux.12 + cap.4: mutating routes are gated by X-Approval-Token when agentd has a
+        // secret set.
         if let Some(tok) = &self.approval_token {
             req = req.header("X-Approval-Token", tok);
         }
@@ -290,9 +293,11 @@ impl DataSource for HttpSource {
         // waiting for the scheduler to confirm the agent ID. The short mutation_client
         // (500 ms) would time out before the confirmation arrives.
         let url = format!("{}/api/v1/spawn", self.base_url.trim_end_matches('/'));
-        let resp = self.confirm_client
-            .post(&url)
-            .json(&body)
+        let mut rb = self.confirm_client.post(&url).json(&body);
+        if let Some(tok) = &self.approval_token {
+            rb = rb.header("X-Approval-Token", tok); // cap.4: /spawn is now gated too
+        }
+        let resp = rb
             .send()
             .map_err(|e| format!("spawn HTTP error: {e}"))?;
         let status = resp.status();

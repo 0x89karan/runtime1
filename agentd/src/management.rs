@@ -37,8 +37,32 @@ use tokio::sync::broadcast;
 
 use tokio::sync::mpsc;
 
+use crate::capability::Capability;
 use crate::control::ControlCommand;
 use crate::events::EventKind;
+
+/// A spawned agent's capability is "privileged" unless it is in a small read-only-local safe
+/// set. DENY-BY-DEFAULT (cap.4 / AUDIT-v0.97 P2-3; Codex review): a hand-enumerated *denylist*
+/// is fragile — agent-level `Credential` is INERT, while `Mcp{google_oauth}` (NOT `Credential`)
+/// is what actually grants live Gmail (the broker derives the provider allowlist from the MCP
+/// *server's* own cap, not the agent's). So `/spawn` from an untrusted `:7999` caller may mint
+/// ONLY read-only-local caps without the operator opt-in; anything that grants tools (`Mcp`),
+/// network, writes, spawning, sealed-jobs, brief-publish, or credentials requires
+/// `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1`. (Unrestricted `capabilities: None` = every cap → also
+/// privileged; handled at the call site.)
+fn is_privileged_spawn_cap(c: &Capability) -> bool {
+    !matches!(
+        c,
+        Capability::KbRead { .. } | Capability::FsRead { .. } | Capability::RunsRead
+    )
+}
+
+/// Operator opt-in for privileged /spawn (env, per the secrets-from-env invariant).
+fn privileged_spawn_allowed() -> bool {
+    std::env::var("AGENTOS_ALLOW_PRIVILEGED_SPAWN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 use crate::flight_recorder::FlightRecorder;
 use crate::memory::MemoryStore;
 use surfaces::SharedSnapshot;
@@ -91,11 +115,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// True for the two write routes the approval secret gates.
-fn is_approval_mutation(method: &Method, path: &str) -> bool {
-    method == Method::POST
-        && path.starts_with("/api/v1/approvals/")
-        && (path.ends_with("/approve") || path.ends_with("/deny"))
+/// True for every MUTATING route the approval secret gates (cap.4 / AUDIT-v0.97 P2-3).
+/// The ux.12 gate covered only approve/deny, leaving the strictly-more-powerful routes
+/// (spawn — which mints capabilities — inject, budget, cancel, caps) unauthenticated on the
+/// identical `:7999` surface. The token now gates the whole mutating surface; GET/read routes
+/// stay ungated. When `AGENTOS_APPROVAL_SECRET` is unset, all routes are open (pre-ux.12).
+fn is_mutating_route(method: &Method, path: &str) -> bool {
+    if *method != Method::POST {
+        return false;
+    }
+    match path {
+        "/api/v1/spawn" | "/api/v1/budget/reset" | "/api/v1/budget/set" => true,
+        p if p.starts_with("/api/v1/approvals/")
+            && (p.ends_with("/approve") || p.ends_with("/deny")) => true,
+        p if p.starts_with("/api/v1/agents/")
+            && (p.ends_with("/inject") || p.ends_with("/cancel") || p.ends_with("/caps")) => true,
+        p if p.starts_with("/api/v1/credentials/") && p.ends_with("/reset-attention") => true,
+        _ => false,
+    }
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -131,9 +168,10 @@ async fn handle(
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
 
-    // ux.12: route-scoped approval-token gate. Enforced here (handle) rather than in
-    // route() so the header is in scope and route()'s signature stays test-stable.
-    if is_approval_mutation(&method, &path) {
+    // ux.12 + cap.4: approval-token gate over the whole MUTATING surface (not just
+    // approve/deny). Enforced here (handle) rather than in route() so the header is in
+    // scope and route()'s signature stays test-stable.
+    if is_mutating_route(&method, &path) {
         let provided = req
             .headers()
             .get("x-approval-token")
@@ -439,6 +477,24 @@ async fn route(
             };
             if req.task.is_empty() {
                 return error_response(StatusCode::BAD_REQUEST, "task must not be empty");
+            }
+            // cap.4 / AUDIT-v0.97 P2-3: /spawn mints caller-supplied capabilities verbatim.
+            // Refuse privileged caps from a `:7999` caller unless the operator opted in — closes
+            // "any bridge peer spawns a full-Gmail+Spawn agent". Operator-driven privileged
+            // spawns set AGENTOS_ALLOW_PRIVILEGED_SPAWN=1.
+            if !privileged_spawn_allowed() {
+                // Unrestricted (None) grants every capability → privileged. A concrete list is
+                // privileged if ANY cap is outside the read-only-local safe set (deny-by-default).
+                let refused: Option<String> = match req.capabilities.as_deref() {
+                    None => Some("unrestricted (all capabilities)".to_string()),
+                    Some(caps) => caps.iter().find(|c| is_privileged_spawn_cap(c)).map(|c| format!("{c:?}")),
+                };
+                if let Some(bad) = refused {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &format!("spawn refused: {bad} is privileged; set AGENTOS_ALLOW_PRIVILEGED_SPAWN=1 to allow operator-driven privileged spawns"),
+                    );
+                }
             }
             let Some(tx) = &state.control_tx else {
                 return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
@@ -883,13 +939,46 @@ mod tests {
     }
 
     #[test]
-    fn approval_mutation_matcher() {
-        assert!(is_approval_mutation(&Method::POST, "/api/v1/approvals/act_1/approve"));
-        assert!(is_approval_mutation(&Method::POST, "/api/v1/approvals/act_1/deny"));
-        // Non-approval routes and non-POST are not gated.
-        assert!(!is_approval_mutation(&Method::GET, "/api/v1/approvals"));
-        assert!(!is_approval_mutation(&Method::POST, "/api/v1/budget/set"));
-        assert!(!is_approval_mutation(&Method::POST, "/api/v1/spawn"));
+    fn mutating_route_matcher() {
+        // cap.4: the token now gates the WHOLE mutating surface, not just approve/deny.
+        for p in [
+            "/api/v1/approvals/act_1/approve",
+            "/api/v1/approvals/act_1/deny",
+            "/api/v1/spawn",
+            "/api/v1/budget/set",
+            "/api/v1/budget/reset",
+            "/api/v1/agents/a/inject",
+            "/api/v1/agents/a/cancel",
+            "/api/v1/agents/a/caps",
+            "/api/v1/credentials/google/reset-attention",
+        ] {
+            assert!(is_mutating_route(&Method::POST, p), "POST {p} must be gated");
+        }
+        // Reads and non-POST are NOT gated.
+        assert!(!is_mutating_route(&Method::GET, "/api/v1/approvals"));
+        assert!(!is_mutating_route(&Method::GET, "/api/v1/spawn"));
+        assert!(!is_mutating_route(&Method::GET, "/api/v1/brief"));
+        assert!(!is_mutating_route(&Method::POST, "/api/v1/snapshot"));
+    }
+
+    #[test]
+    fn privileged_spawn_cap_classification() {
+        use crate::capability::{Capability, CredentialProvider};
+        // Deny-by-default: everything outside the read-only-local safe set is privileged.
+        assert!(is_privileged_spawn_cap(&Capability::Spawn));
+        assert!(is_privileged_spawn_cap(&Capability::RunJob));
+        assert!(is_privileged_spawn_cap(&Capability::Credential { provider: CredentialProvider::Google }));
+        // The REAL live-Gmail vector Codex caught: Mcp{google_oauth} grants tools without a
+        // Credential cap — it MUST be privileged (the old denylist missed it).
+        assert!(is_privileged_spawn_cap(&Capability::Mcp { server: "google_oauth".into(), tools: vec![] }));
+        assert!(is_privileged_spawn_cap(&Capability::FsWrite { prefix: "/".into() }));
+        assert!(is_privileged_spawn_cap(&Capability::KbWrite { segment: "x".into() }));
+        assert!(is_privileged_spawn_cap(&Capability::BriefPublish));
+        assert!(is_privileged_spawn_cap(&Capability::Net { hosts: vec![], ports: vec![] }));
+        // Safe read-only-local set.
+        assert!(!is_privileged_spawn_cap(&Capability::RunsRead));
+        assert!(!is_privileged_spawn_cap(&Capability::KbRead { segment: "x".into() }));
+        assert!(!is_privileged_spawn_cap(&Capability::FsRead { prefix: "/data".into() }));
     }
 
     #[tokio::test]
