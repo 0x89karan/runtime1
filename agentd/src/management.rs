@@ -57,6 +57,45 @@ struct ApiState {
     control_tx:         Option<mpsc::Sender<ControlCommand>>,
     /// Credential gateway for reset-attention endpoint (cred.7). None when disabled.
     credential_gateway: Option<Arc<crate::credential::CredentialGateway>>,
+    /// Route-scoped shared secret for the approve/deny endpoints (ux.12). When `Some`,
+    /// `POST /api/v1/approvals/*/{approve,deny}` requires a matching `X-Approval-Token`
+    /// header (constant-time compared). When `None`, the routes are open (pre-ux.12
+    /// behavior) — the CoS deployment that runs the Telegram sidecar sets the secret;
+    /// non-secret deployments are no worse off than before. Full API auth stays ux.5.
+    approval_secret:    Option<String>,
+}
+
+/// Constant-time check of the `X-Approval-Token` header against the configured secret.
+/// `None` secret ⇒ open (returns true). `Some` secret ⇒ requires an exactly-matching
+/// header (constant-time to avoid a timing oracle on the token).
+fn approval_token_ok(secret: Option<&str>, provided: Option<&str>) -> bool {
+    match secret {
+        None => true,
+        Some(s) => match provided {
+            Some(p) => constant_time_eq(s.as_bytes(), p.as_bytes()),
+            None => false,
+        },
+    }
+}
+
+/// Constant-time byte-slice equality (no timing oracle on the matching prefix). The
+/// length comparison short-circuits — token length is not secret; the content is.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// True for the two write routes the approval secret gates.
+fn is_approval_mutation(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && path.starts_with("/api/v1/approvals/")
+        && (path.ends_with("/approve") || path.ends_with("/deny"))
 }
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -91,6 +130,25 @@ async fn handle(
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let query = req.uri().query().unwrap_or("").to_owned();
+
+    // ux.12: route-scoped approval-token gate. Enforced here (handle) rather than in
+    // route() so the header is in scope and route()'s signature stays test-stable.
+    if is_approval_mutation(&method, &path) {
+        let provided = req
+            .headers()
+            .get("x-approval-token")
+            .and_then(|v| v.to_str().ok());
+        if !approval_token_ok(state.approval_secret.as_deref(), provided) {
+            let resp = error_response(StatusCode::UNAUTHORIZED, "missing or invalid X-Approval-Token");
+            state.recorder.record(
+                "management",
+                None,
+                EventKind::ManagementRequest,
+                json!({"method": method.as_str(), "path": path, "status": 401}),
+            );
+            return Ok(resp);
+        }
+    }
 
     // Read body bytes for POST requests, bounded at 64 KiB; other methods ignore body.
     const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -625,6 +683,7 @@ pub async fn start(
     recorder: Arc<FlightRecorder>,
     control_tx: Option<mpsc::Sender<ControlCommand>>,
     credential_gateway: Option<Arc<crate::credential::CredentialGateway>>,
+    approval_secret: Option<String>,
 ) -> anyhow::Result<SocketAddr> {
     let addr = format!("{bind_addr}:{port}");
     let listener = TcpListener::bind(&addr)
@@ -662,6 +721,7 @@ pub async fn start(
         recorder,
         control_tx,
         credential_gateway,
+        approval_secret,
     });
 
     tracing::info!("management API listening on {bound}");
@@ -719,7 +779,32 @@ mod tests {
             recorder,
             control_tx,
             credential_gateway: None,
+            approval_secret: None,
         })
+    }
+
+    #[test]
+    fn approval_token_gate() {
+        // No secret configured → open (pre-ux.12 behavior).
+        assert!(approval_token_ok(None, None));
+        assert!(approval_token_ok(None, Some("anything")));
+        // Secret configured → exact match required (constant-time).
+        assert!(approval_token_ok(Some("s3cr3t"), Some("s3cr3t")));
+        assert!(!approval_token_ok(Some("s3cr3t"), Some("wrong")));
+        assert!(!approval_token_ok(Some("s3cr3t"), None));
+        assert!(!approval_token_ok(Some("s3cr3t"), Some("")));
+        // Length-mismatch must not match (and must not panic — constant_time handles it).
+        assert!(!approval_token_ok(Some("s3cr3t"), Some("s3cr3t-longer")));
+    }
+
+    #[test]
+    fn approval_mutation_matcher() {
+        assert!(is_approval_mutation(&Method::POST, "/api/v1/approvals/act_1/approve"));
+        assert!(is_approval_mutation(&Method::POST, "/api/v1/approvals/act_1/deny"));
+        // Non-approval routes and non-POST are not gated.
+        assert!(!is_approval_mutation(&Method::GET, "/api/v1/approvals"));
+        assert!(!is_approval_mutation(&Method::POST, "/api/v1/budget/set"));
+        assert!(!is_approval_mutation(&Method::POST, "/api/v1/spawn"));
     }
 
     #[tokio::test]
@@ -871,6 +956,7 @@ mod tests {
             recorder,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -898,6 +984,7 @@ mod tests {
             recorder,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "expected bind to succeed with allow_non_loopback=true, got: {result:?}");
@@ -919,6 +1006,7 @@ mod tests {
             None,
             tx,
             recorder,
+            None,
             None,
             None,
         )
@@ -961,6 +1049,7 @@ mod tests {
             recorder,
             None,
             None,
+            None,
         )
         .await;
         assert!(result.is_ok(), "expected loopback bind to succeed by default, got: {result:?}");
@@ -982,6 +1071,7 @@ mod tests {
             None,
             tx,
             recorder,
+            None,
             None,
             None,
         )
@@ -1172,6 +1262,7 @@ mod tests {
             recorder,
             control_tx: None,
             credential_gateway: None,
+            approval_secret: None,
         });
         let resp = route(state, Method::GET, "/api/v1/runs", "agent_id=inbox&limit=10", &[]).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1228,6 +1319,7 @@ mod tests {
             recorder,
             control_tx: None,
             credential_gateway: None,
+            approval_secret: None,
         });
         let resp = route(state, Method::GET, "/api/v1/brief", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1255,6 +1347,7 @@ mod tests {
             recorder,
             control_tx: None,
             credential_gateway: None,
+            approval_secret: None,
         });
         let resp = route(state, Method::GET, "/api/v1/brief", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::OK);

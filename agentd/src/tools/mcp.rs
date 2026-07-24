@@ -56,6 +56,10 @@ pub const PASSENV_BLOCKLIST: &[&str] = &[
     // OpenAI — used by the semantic KB sidecar for embeddings; must not leak to MCP subprocesses.
     "OPENAI_API_KEY",
 ];
+// NOTE (ux.12): AGENTOS_APPROVAL_SECRET is intentionally NOT blocklisted — the telegram_mcp
+// bridge receives it via its OWN `passenv` (like TELEGRAM_BOT_TOKEN). The passenv opt-in model
+// already prevents other MCP servers from receiving it (only telegram lists it); blocklisting
+// would strip it from the sidecar that needs it.
 
 use super::{Tool, ToolContext};
 use crate::capability::Capability;

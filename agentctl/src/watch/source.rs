@@ -102,6 +102,10 @@ pub struct HttpSource {
     mutation_client: reqwest::blocking::Client,
     /// Spawn waits up to 2 s for scheduler confirmation; this client must exceed that.
     spawn_client:    reqwest::blocking::Client,
+    /// ux.12: route-scoped approval token (env `AGENTOS_APPROVAL_SECRET`). Sent as the
+    /// `X-Approval-Token` header on approve/deny so agentd's gate accepts them. None when
+    /// unset (open deployment); Some when the CoS approval secret is configured.
+    approval_token:  Option<String>,
 }
 
 impl HttpSource {
@@ -122,7 +126,8 @@ impl HttpSource {
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .unwrap_or_default();
-        Self { base_url, client, mutation_client, spawn_client }
+        let approval_token = std::env::var("AGENTOS_APPROVAL_SECRET").ok().filter(|s| !s.is_empty());
+        Self { base_url, client, mutation_client, spawn_client, approval_token }
     }
 
     fn get_json(&self, path: &str) -> anyhow::Result<Value> {
@@ -145,6 +150,10 @@ impl HttpSource {
         let mut req = self.mutation_client.post(&url);
         if let Some(b) = body {
             req = req.json(b);
+        }
+        // ux.12: approve/deny are gated by X-Approval-Token when agentd has a secret set.
+        if let Some(tok) = &self.approval_token {
+            req = req.header("X-Approval-Token", tok);
         }
         let resp = req.send().map_err(|e| format!("HTTP error: {e}"))?;
         if resp.status().is_success() {

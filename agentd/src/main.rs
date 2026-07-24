@@ -1188,6 +1188,10 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             Arc::clone(&recorder),
             mgmt_control_tx,
             maybe_cred_gw.clone(),
+            // ux.12: route-scoped approval-token secret from env (secrets-from-env invariant).
+            // When set, gates POST /api/v1/approvals/*/{approve,deny}; the Telegram sidecar
+            // and agentctl must send the matching X-Approval-Token.
+            std::env::var("AGENTOS_APPROVAL_SECRET").ok().filter(|s| !s.is_empty()),
         ).await {
             Ok(bound) => {
                 tracing::info!(addr = %bound, "management API started");
