@@ -336,15 +336,16 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 - **audit86-P2-11 (P2) [new] — Published images are never executed before push.**
   `publish-docker` builds and pushes without so much as `agentd --help`. Fix: image smoke run
   pre-push; longer term a compose-boot job asserting flight.jsonl shape. → `ci.1`.
-- **audit86-P2-12 (P2) [new] — Shell env-sanitization denylist hand-duplicated across boot scripts.**
-  `entrypoint.sh:16-18` ≡ `overlay/init:49-51` verbatim; `shell_mcp.py:39` a third larger
-  variant; zero sync checks (a security addition to one won't propagate). Fix: golden-diff CI
-  test (a sourced lib is impossible — `init` is standalone busybox in an initramfs). → `par.1`.
-- **audit86-P2-13 (P2) [new] — agentctl matches flight-event kinds by raw string.**
-  `inspector.rs:48-54`, `reader.rs:340-341`, `converse.rs:289`, `orchestrate.rs:164`,
-  `views.rs:1194` — despite depending on the agentd crate; a rename in `events.rs` compiles
-  and silently blanks TUI filters/streams. Fix: export `EventKind::as_str()` and use it, or
-  copy the otel exhaustiveness-test pattern. → `par.1`.
+- ~~**audit86-P2-12 (P2) [new] — Shell env-sanitization denylist hand-duplicated across boot scripts.**~~ **[FIXED in par.1 (v0.103.0): `agentd/tests/env_denylist_parity.rs` asserts `entrypoint.sh` ≡ `overlay/init` token sets (drift panics naming the source + token) and the boot `LD_*` keys ⊆ `shell_mcp.py`'s (different-purpose) linker blocklist — the audit's "same list 3×" framing was inexact; the real relationship is equal-pair + subset-floor, and that is what the test encodes. Negative-control-verified.]**
+- ~~**audit86-P2-13 (P2) [new] — agentctl matches flight-event kinds by raw string.**~~ **[FIXED in par.1 (v0.103.0): added `EventKind::as_str()`/`ALL` (single source of truth, unit-proven against serde wire form + exhaustive); `agentctl/tests/event_kind_strings.rs` pins every kind string agentctl matches to a real variant so a rename breaks the test not the TUI. Surfaced a real pre-existing bug → par.1-ar-01.]**
+- **par.1-ar-01 (P2) [new; found by the par.1 exhaustiveness guard] — agentctl's error view is blind to tool + inference errors.**
+  Inspector "Errors" filter (`inspector.rs:47-48`) and the red colour rule (`views.rs:1229-1230`) match
+  `"kind":"tool_error"`/`"inference_error"` — neither is ever emitted by agentd. Tool failures are
+  `tool_result` + `data.is_error=true`; inference failures are `agent_failed`/`error` ("inference_error"
+  appears only as a `reason` *field*). Net: the operator's Errors filter/colour catches only `agent_failed`.
+  Fix is behavioral (the filter must check the `is_error` data field for `tool_result`, not a kind-string
+  swap), so it was deferred out of tests-only par.1. Tracked by a self-shrinking `KNOWN_NONCANONICAL`
+  allowlist test that fails the day it's fixed. → fold into par.2 or a small agentctl fix.
 - **audit86-P2-14 (P2) [new] — QEMU CoS fork silently missing the entire memory-routing feature set.**
   `distro/overlay/etc/agentd/cos.agents.toml` lacks the `semantic-kb` server, `mail:raw`
   segment/caps, and the dedup prompt step — production QEMU CoS runs without email dedup. The

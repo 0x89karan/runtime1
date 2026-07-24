@@ -3,6 +3,30 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.103.0] - 2026-07-25
+
+### Added
+- **par.1 — drift guards** (6th AUDIT-v0.97 increment; tests-only, upholds no invariant directly but
+  makes two cross-boundary duplications tamper-evident so a future edit — notably par.2 — can't silently
+  desync them):
+  - **Env-sanitization denylist parity** (P2-12): `docker/entrypoint.sh` and `distro/overlay/init`
+    carry hand-mirrored boot-env secret denylists. `agentd/tests/env_denylist_parity.rs` asserts their
+    token sets are equal (a drift panics naming the source + offending token) and that the boot loaders'
+    `LD_*` keys are a subset of `docker/shell_mcp.py`'s (different-purpose) linker-hijack blocklist.
+  - **EventKind string exhaustiveness** (P2-13): added `EventKind::as_str()`/`EventKind::ALL` as the
+    single source of truth (unit tests prove `as_str()` matches the serde `snake_case` wire form and that
+    `ALL` stays exhaustive). `agentctl/tests/event_kind_strings.rs` pins every flight-event kind string
+    agentctl matches on to a real variant, so an event rename breaks the test rather than the TUI at runtime.
+  - Both guards negative-control-verified (perturb → fail naming source, revert → green).
+
+### Known issues
+- **par.1-ar-01** (P2, pre-existing, surfaced by the par.1 exhaustiveness guard): agentctl's Inspector
+  "Errors" filter and red colour rule match `"kind":"tool_error"`/`"inference_error"` — strings agentd
+  never emits — so tool-level and inference-level errors are invisible in the operator's error view (only
+  `agent_failed` shows). Fix is a behavioral change (tool errors are `tool_result` + `is_error=true`, a
+  data-field check, not a string swap), deferred out of tests-only par.1. Tracked by a self-shrinking
+  `KNOWN_NONCANONICAL` allowlist test.
+
 ## [v0.102.0] - 2026-07-25
 
 ### Fixed
