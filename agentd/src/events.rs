@@ -24,6 +24,11 @@ pub enum EventKind {
     BudgetReset,
     /// Operator set a per-agent token budget at runtime (ux.11a SetBudget).
     BudgetSet,
+    /// Operator cancelled an agent at runtime (ux.13). Emitted once per cancelled node,
+    /// including cascaded children (`cause: "cascade from <parent>"`).
+    AgentCancelled,
+    /// Operator narrowed an agent's capabilities at runtime (ux.13 SetCaps).
+    CapabilitiesSet,
     MaxTurnsReached,
     CapabilityDenied,
     /// A spawn was rejected because the child requested a capability not covered by

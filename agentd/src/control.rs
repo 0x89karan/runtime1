@@ -68,6 +68,26 @@ pub enum ControlCommand {
         /// `None` on the fire-and-forget FUSE path.
         confirm_tx: Option<tokio::sync::oneshot::Sender<Result<(u64, u64), String>>>,
     },
+    /// Cancel a running/parked agent at the next step boundary (ux.13). Cascade-cancels
+    /// the whole spawned subtree; each node stops before any NEW world-affecting dispatch.
+    Cancel {
+        agent_id:   String,
+        /// Confirmation channel. Sends `Ok(count)` = number of cancelled nodes (incl.
+        /// cascaded children), or `Err` for an unknown agent (→ 404). `None` on the
+        /// fire-and-forget FUSE path.
+        confirm_tx: Option<tokio::sync::oneshot::Sender<Result<u64, String>>>,
+    },
+    /// Narrow a running agent's capabilities at runtime (ux.13, revoke/narrow-only — a
+    /// misconfig-repair ergonomic, NOT a security response). The new set must be covered
+    /// by the current set (widening is rejected). Takes effect at the next step boundary.
+    SetCaps {
+        agent_id:     String,
+        capabilities: Vec<Capability>,
+        /// Confirmation channel. Sends `Ok((old_len, new_len))` on success, `Err` for an
+        /// unknown agent (→ 404) or a widening / inert-cap request (→ 400 at the HTTP
+        /// layer). `None` on the fire-and-forget FUSE path.
+        confirm_tx:   Option<tokio::sync::oneshot::Sender<Result<(usize, usize), String>>>,
+    },
 }
 
 /// Which budget a `ResetBudget` command targets. Typed (not a bare string) so
@@ -110,6 +130,14 @@ enum TaggedCommand {
     SetBudget {
         target: BudgetTarget,
         limit:  u64,
+    },
+    Cancel {
+        agent_id: String,
+    },
+    #[serde(rename = "set_caps")]
+    SetCaps {
+        agent_id:     String,
+        capabilities: Vec<Capability>,
     },
 }
 
@@ -155,6 +183,14 @@ pub fn parse_control_command(bytes: &[u8]) -> anyhow::Result<ControlCommand> {
                 }
                 // FUSE path is fire-and-forget; the HTTP path supplies confirm_tx.
                 ControlCommand::SetBudget { target, limit, confirm_tx: None }
+            }
+            TaggedCommand::Cancel { agent_id } => {
+                anyhow::ensure!(!agent_id.is_empty(), "cancel: agent_id must not be empty");
+                ControlCommand::Cancel { agent_id, confirm_tx: None }
+            }
+            TaggedCommand::SetCaps { agent_id, capabilities } => {
+                anyhow::ensure!(!agent_id.is_empty(), "set_caps: agent_id must not be empty");
+                ControlCommand::SetCaps { agent_id, capabilities, confirm_tx: None }
             }
         });
     }
@@ -332,5 +368,45 @@ mod tests {
         let bytes = serde_json::json!({"inject": {"agent_id": "scout-1", "text": big_text}})
             .to_string();
         assert!(parse_control_command(bytes.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn parse_cancel_tagged() {
+        let bytes = br#"{"cancel":{"agent_id":"scout-1"}}"#;
+        let cmd = parse_control_command(bytes).unwrap();
+        let ControlCommand::Cancel { agent_id, confirm_tx } = cmd else { panic!("expected Cancel") };
+        assert_eq!(agent_id, "scout-1");
+        assert!(confirm_tx.is_none(), "FUSE path is fire-and-forget");
+    }
+
+    #[test]
+    fn parse_cancel_empty_id_is_error() {
+        assert!(parse_control_command(br#"{"cancel":{"agent_id":""}}"#).is_err());
+    }
+
+    #[test]
+    fn parse_set_caps_tagged() {
+        let bytes = br#"{"set_caps":{"agent_id":"scout-1","capabilities":[{"KbRead":{"segment":"ops:briefs"}}]}}"#;
+        let cmd = parse_control_command(bytes).unwrap();
+        let ControlCommand::SetCaps { agent_id, capabilities, confirm_tx } = cmd else {
+            panic!("expected SetCaps")
+        };
+        assert_eq!(agent_id, "scout-1");
+        assert_eq!(capabilities.len(), 1);
+        assert!(confirm_tx.is_none(), "FUSE path is fire-and-forget");
+    }
+
+    #[test]
+    fn parse_set_caps_empty_list_ok() {
+        // An empty cap set is the maximal narrow (deny-all) — valid.
+        let bytes = br#"{"set_caps":{"agent_id":"scout-1","capabilities":[]}}"#;
+        let cmd = parse_control_command(bytes).unwrap();
+        let ControlCommand::SetCaps { capabilities, .. } = cmd else { panic!("expected SetCaps") };
+        assert!(capabilities.is_empty());
+    }
+
+    #[test]
+    fn parse_set_caps_empty_id_is_error() {
+        assert!(parse_control_command(br#"{"set_caps":{"agent_id":"","capabilities":[]}}"#).is_err());
     }
 }
