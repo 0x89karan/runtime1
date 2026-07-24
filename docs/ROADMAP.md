@@ -1217,7 +1217,12 @@ increments, friction-ordered, each independently shippable. Full design + premis
   next step boundary (one in-flight call may complete; stream-abort is stretch). SetBudget only unifies
   ux.8′'s endpoint under ControlCommand (no new semantics). SetCaps is **revoke/narrow-only** in v1 (live
   grant is a different posture, cf. audit86-P1-10). Pause/resume deferred. Closes the "no kill" + respawn-
-  tax frictions.
+  tax frictions. **Built 2026-07-24; plan `docs/plans/ux.13-control-verbs.md`.** Cancel gates world-action
+  at the top of `enqueue_or_defer` (running agent = flag-only → funnel on future-return, no panic),
+  cascade-cancels via `parent_map` with per-child `AgentCancelled`; SetCaps narrows via a
+  `capability_covered_by` fail-closed check + recomputed specs. All three verbs reachable via management
+  HTTP + FUSE control + `agentctl {cancel,set-budget,set-caps}` CLI; **TUI keys deferred** (CLI/HTTP/FUSE
+  cover the surface — a convenience follow-up).
 
 **Cathedral expansions (accepted 2026-07-10, CEO review — re-scoped by the reshape):** the "CoS you live with."
 - ~~**ux.4** — Proactive push~~ **superseded by ux.12** (Telegram is push *and* reply; the old plan was
