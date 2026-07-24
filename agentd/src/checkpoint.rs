@@ -231,6 +231,11 @@ impl CheckpointStore {
                 let _ = dir.sync_all().await; // best-effort; never crash a checkpoint
             }
         }
+        // AUDIT-v0.97 P2-1 (review follow-up): a successful save supersedes the pre-restore
+        // copy — consume it now, regardless of whether this boot loaded from the primary or
+        // fell back to `.restored`. This closes the edge where a boot that recovered from
+        // `.restored` left it in place to be re-loaded on a later boot that never saved.
+        let _ = std::fs::remove_file(self.restored_path());
         Ok(())
     }
 
@@ -238,16 +243,52 @@ impl CheckpointStore {
     /// Returns `Ok(None)` when the file is absent.
     /// Returns `Err` when the file is present but cannot be parsed (caller should
     /// rename to .corrupt and start fresh — never fail-stop a restart).
-    pub fn load(&self) -> Result<Option<SchedulerCheckpoint>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let bytes = std::fs::read(&self.path).context("read checkpoint.json")?;
+    /// Pre-restore copy (AUDIT-v0.97 P2-1). On restore we rename `checkpoint.json` here
+    /// instead of deleting it, so a crash AFTER restore but BEFORE the first new save is
+    /// recoverable. `load()` falls back to it; the next boot's `mark_restored` rename
+    /// overwrites it, so it self-cleans (no accumulation, no scheduler hook needed).
+    fn restored_path(&self) -> PathBuf {
+        self.path.with_file_name("checkpoint.json.restored")
+    }
 
-        // Probe the version field before attempting full deserialization so we can
-        // distinguish "too new" (intentional refusal) from "corrupt" (parse error).
+    /// Rename the just-loaded checkpoint to the pre-restore copy. Call after a successful
+    /// `load()` instead of deleting — preserves recoverable state across a crash before
+    /// the first post-restore save.
+    pub fn mark_restored(&self) -> std::io::Result<()> {
+        std::fs::rename(&self.path, self.restored_path())
+    }
+
+    pub fn load(&self) -> Result<Option<SchedulerCheckpoint>> {
+        // Prefer the primary; fall back to the pre-restore copy left by a crash after
+        // restore but before the first new save (AUDIT-v0.97 P2-1).
+        let src = if self.path.exists() {
+            self.path.clone()
+        } else if self.restored_path().exists() {
+            self.restored_path()
+        } else {
+            return Ok(None);
+        };
+        match Self::read_and_parse(&src) {
+            Ok(cp) => Ok(Some(cp)),
+            Err(e) => {
+                // Source-aware quarantine (AUDIT-v0.97 P2-1 review): rename the ACTUAL bad
+                // file — primary OR .restored — to `<name>.corrupt` so the same corrupt/
+                // too-new checkpoint is not re-loaded on the next boot (the caller starts
+                // fresh). Best-effort; never fail-stop a restart.
+                if let Some(name) = src.file_name().and_then(|n| n.to_str()) {
+                    let _ = std::fs::rename(&src, src.with_file_name(format!("{name}.corrupt")));
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn read_and_parse(src: &Path) -> Result<SchedulerCheckpoint> {
+        let bytes = std::fs::read(src).context("read checkpoint")?;
+        // Probe the version field before full deserialization so we can distinguish
+        // "too new" (intentional refusal) from "corrupt" (parse error).
         let probe: VersionProbe = serde_json::from_slice(&bytes)
-            .context("checkpoint.json: cannot read format_version")?;
+            .context("checkpoint: cannot read format_version")?;
         if probe.format_version > FORMAT_VERSION {
             anyhow::bail!(
                 "checkpoint format_version {} > supported {}; \
@@ -256,10 +297,7 @@ impl CheckpointStore {
                 FORMAT_VERSION
             );
         }
-
-        let cp: SchedulerCheckpoint =
-            serde_json::from_slice(&bytes).context("parse checkpoint.json")?;
-        Ok(Some(cp))
+        serde_json::from_slice(&bytes).context("parse checkpoint")
     }
 }
 
@@ -452,9 +490,12 @@ mod tests {
         std::fs::write(&store.path, serde_json::to_string(&json).unwrap()).unwrap();
         let err = store.load().unwrap_err();
         let msg = format!("{err}");
-        assert!(store.load().is_err(), "newer format_version must return Err");
         // Must be identified as "too new" (explicit refusal), not "corrupt".
         assert!(msg.contains("refusing to load"), "error must say 'refusing to load': {msg}");
+        // AUDIT-v0.97 P2-1 (review): load() quarantines the source so it is NOT re-loaded
+        // next boot — the primary is renamed away and a subsequent load starts fresh.
+        assert!(!store.path.exists(), "too-new checkpoint quarantined away from the primary path");
+        assert!(store.load().unwrap().is_none(), "after quarantine, next load starts fresh");
     }
 
     #[test]
@@ -489,6 +530,62 @@ mod tests {
         assert_eq!(loaded.agents.len(), 1);
         assert_eq!(loaded.agents[0].agent_id, "agent-a");
         assert_eq!(loaded.tokens_spent, 15);
+    }
+
+    #[tokio::test]
+    async fn mark_restored_then_load_recovers_from_restored_copy() {
+        // AUDIT-v0.97 P2-1: after restore we rename (not delete) the checkpoint. A crash
+        // before the first new save must be recoverable — load() falls back to .restored.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        store.save(&minimal_scheduler_checkpoint()).await.unwrap();
+        // Simulate a restore: rename checkpoint.json -> checkpoint.json.restored.
+        store.mark_restored().unwrap();
+        assert!(!dir.path().join("checkpoint.json").exists(), "primary renamed away");
+        assert!(dir.path().join("checkpoint.json.restored").exists(), ".restored copy kept");
+        // A crash before the first new save: load() must still recover the state.
+        let loaded = store.load().unwrap().expect("load recovers from .restored");
+        assert_eq!(loaded.agents[0].agent_id, "agent-a");
+        assert_eq!(loaded.tokens_spent, 15);
+    }
+
+    #[tokio::test]
+    async fn load_prefers_primary_over_restored() {
+        // The next boot's fresh save recreates checkpoint.json; load() must prefer it over a
+        // stale .restored (which the next mark_restored rename then overwrites — self-cleaning).
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        store.save(&minimal_scheduler_checkpoint()).await.unwrap(); // valid primary
+        // A stale/garbage .restored must be ignored while the primary is present.
+        std::fs::write(dir.path().join("checkpoint.json.restored"), b"{\"format_version\":999}").unwrap();
+        let loaded = store.load().unwrap().expect("primary present -> loads, ignoring .restored");
+        assert_eq!(loaded.agents[0].agent_id, "agent-a");
+    }
+
+    #[tokio::test]
+    async fn save_consumes_restored_copy() {
+        // AUDIT-v0.97 P2-1 (review): a successful save supersedes the pre-restore copy, so a
+        // boot that recovered from .restored cannot re-load it on a later boot.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        store.save(&minimal_scheduler_checkpoint()).await.unwrap();
+        store.mark_restored().unwrap();
+        assert!(dir.path().join("checkpoint.json.restored").exists(), ".restored present pre-save");
+        store.save(&minimal_scheduler_checkpoint()).await.unwrap();
+        assert!(!dir.path().join("checkpoint.json.restored").exists(), "save consumes the .restored copy");
+        assert!(dir.path().join("checkpoint.json").exists(), "fresh primary written");
+    }
+
+    #[test]
+    fn load_quarantines_corrupt_restored_source() {
+        // AUDIT-v0.97 P2-1 (review): a corrupt FALLBACK is quarantined (not left to re-load
+        // every boot). Primary absent, .restored garbage -> Err + renamed to .restored.corrupt.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        std::fs::write(dir.path().join("checkpoint.json.restored"), b"not json").unwrap();
+        assert!(store.load().is_err(), "corrupt .restored -> Err");
+        assert!(!dir.path().join("checkpoint.json.restored").exists(), "corrupt .restored quarantined away");
+        assert!(dir.path().join("checkpoint.json.restored.corrupt").exists(), "renamed to .restored.corrupt");
     }
 
     #[cfg(unix)]

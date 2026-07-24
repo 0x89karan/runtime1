@@ -1219,16 +1219,20 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                     serde_json::json!({ "turn": agent_cp.turn }),
                 );
             }
-            // Remove checkpoint after successful load so a second restart starts fresh.
-            if let Err(e) = std::fs::remove_file("checkpoint.json") {
-                tracing::warn!("could not remove checkpoint.json after restore: {e}");
+            // AUDIT-v0.97 P2-1: rename (not delete) the checkpoint after load, so a crash
+            // AFTER restore but BEFORE the first new save is recoverable from the .restored
+            // copy (load() falls back to it). Deleting here meant a deterministic startup
+            // crash after restore erased all CoS state on the next boot.
+            if let Err(e) = store.mark_restored() {
+                tracing::warn!("could not rename checkpoint.json to .restored after restore: {e}");
             }
             Some(cp)
         }
         Ok(None) => None,
         Err(e) => {
-            tracing::error!("checkpoint corrupt, starting fresh: {e:#}");
-            let _ = std::fs::rename("checkpoint.json", "checkpoint.json.corrupt");
+            // load() already quarantined the actual bad source (primary or .restored) to
+            // <name>.corrupt (AUDIT-v0.97 P2-1 review) — just log and start fresh.
+            tracing::error!("checkpoint unreadable, starting fresh (bad file quarantined to *.corrupt): {e:#}");
             None
         }
     };
