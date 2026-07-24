@@ -232,6 +232,32 @@ capabilities = [
   { Credential = { provider = "Google" } },
 ]
 
+# telegram_bridge (ux.12): two-way Telegram reach — delivers the morning brief +
+# pushes pending approvals, and relays allowlisted approve/deny replies to the
+# management approvals API. A no-tools MCP server (empty tools/list): a background
+# thread runs the bridge; no agent calls it. It reaches api.telegram.org (443) and
+# the local management API (127.0.0.1:7999). Optional — omit the whole block to run
+# without Telegram; the TUI stays canonical and approvals degrade-safe.
+[[tools.mcp_servers]]
+name    = "telegram_bridge"
+command = "python3"
+# Dev mode (cargo run from repo root): ../docker/telegram_mcp.py
+# Distro/QEMU mode:                    /usr/lib/agentos/docker/telegram_mcp.py
+args    = ["../docker/telegram_mcp.py"]
+passenv = [
+  "TELEGRAM_BOT_TOKEN",       # bot token (secret, env-only); crown jewel — never logged
+  "TELEGRAM_CHAT_ID",         # the single allowlisted numeric user id (private chat only)
+  "MANAGEMENT_URL",           # default http://127.0.0.1:7999 if unset
+  "AGENTOS_APPROVAL_SECRET",  # X-Approval-Token for the gated approve/deny routes
+  "TELEGRAM_STATE_DIR",       # durable dir for the offset/binding file (default /data)
+  "TELEGRAM_POLL_INTERVAL_S",
+]
+capabilities = [
+  # ports-only is kernel-enforced (Net{hosts} is advisory, sandbox/lib.rs): 443 =
+  # api.telegram.org, 7999 = local management API. See THREAT_MODEL §9.2.
+  { Net = { hosts = ["api.telegram.org"], ports = [443, 7999] } },
+]
+
 # ---------------------------------------------------------------------------
 # Agent 1: Executive TRIGGER (cap.2b — de-privileged)
 # ---------------------------------------------------------------------------

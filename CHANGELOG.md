@@ -3,6 +3,36 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.96.0] - 2026-07-24
+
+### Added
+- **Telegram reach (ux.12)** — a two-way Telegram bridge: deliver the morning brief and push pending
+  approvals to your phone, and relay **approve/deny** replies to the CoS. New `docker/telegram_mcp.py`
+  is a **no-tools stdio MCP server** (empty `tools/list`; a background bridge thread, not an
+  agent-facing tool) spawned inside the `cos` container so it can reach the loopback management API.
+  Pulled ahead of ux.13 (reach-before-verbs). No remote inject. Wired into both `cos.agents.toml` files
+  + `docker-compose.yml` (all optional).
+- **Route-scoped approval auth** — `POST /api/v1/approvals/*/{approve,deny}` now require a
+  constant-time-matched `X-Approval-Token` header when `AGENTOS_APPROVAL_SECRET` is set (env). Closes
+  the unauthenticated-writer exposure that the Telegram bridge would otherwise create on the guessable,
+  sequential `act_{seq}` approval ids (see THREAT_MODEL §9.6). Unset ⇒ routes stay open (pre-ux.12);
+  full API auth remains ux.5. `agentctl` sends the header from the same env var.
+- Sidecar security discipline: `from.id` + private-chat allowlist; **relay-only + re-verify** (re-GET
+  pending + args-hash match before POST, closing a deleted-checkpoint `act_{seq}` cross-generation
+  collision); `update_id` dedup with a durable offset; fail-closed on POST errors; bot token + approval
+  secret never logged. Length-capped `args_json` preview (Telegram is a new egress sink, §8.7).
+
+### Fixed
+- **Optional path no longer bricks CoS** — the sidecar is declared unconditionally but now runs
+  **inert** (answers the MCP handshake, starts no bridge thread) when `TELEGRAM_BOT_TOKEN` /
+  `TELEGRAM_CHAT_ID` are unset, instead of `exit(1)` which failed agentd's MCP boot.
+- `distro/Makefile` now packages `telegram_mcp.py` into the QEMU rootfs (the distro config referenced
+  it; both caught by `/review`).
+
+### Docs
+- THREAT_MODEL §9.6 (Telegram remote approve/deny writer), DEPLOYMENT Telegram setup + the host-side
+  `agentctl` approval-secret requirement, ROADMAP ux.12 note.
+
 ## [v0.95.0] - 2026-07-23
 
 ### Added

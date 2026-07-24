@@ -143,7 +143,7 @@ overlay/usr/lib/agentos/docker/.gitkeep: $(PYTHON_MCP_SRCS)
 	mkdir -p overlay/usr/lib/agentos/docker
 	cp ../docker/cron_mcp.py ../docker/oauth_mcp.py ../docker/http_mcp.py \
 	   ../docker/shell_mcp.py ../docker/search_mcp.py ../docker/fs_watch_mcp.py \
-	   ../docker/webhook_mcp.py overlay/usr/lib/agentos/docker/
+	   ../docker/webhook_mcp.py ../docker/telegram_mcp.py overlay/usr/lib/agentos/docker/
 	chmod +x overlay/usr/lib/agentos/docker/*.py
 	touch $@
 

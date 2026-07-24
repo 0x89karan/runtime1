@@ -715,6 +715,57 @@ flows (Telegram, webhooks) without hand-decomposing each pipeline.
 
 ---
 
+## 9.6 Telegram reach: remote approve/deny writer (ux.12)
+
+ux.12 adds a two-way Telegram sidecar (`docker/telegram_mcp.py`, a no-tools stdio MCP server
+inside the `cos` container) that delivers the brief, pushes pending approvals, and relays
+allowlisted approve/deny replies to `POST /api/v1/approvals/*/{approve,deny}`. This turns an
+**untrusted-input bridge** (arbitrary Telegram messages) into a writer on the approval control
+plane, so the controls below are load-bearing, not cosmetic.
+
+**Route-scoped approval secret (the actual boundary).** The management API is otherwise
+unauthenticated (§9.3) and approval ids are sequential/guessable (`act_{seq}`), so a chat-ID
+allowlist alone protects nothing at the API — any peer that reaches `:7999` could approve by
+enumeration. ux.12 therefore gates the approve/deny routes with a shared secret: when
+`AGENTOS_APPROVAL_SECRET` is set, those routes require a constant-time-matched `X-Approval-Token`
+header (`management.rs` `approval_token_ok`). The sidecar and `agentctl` both send it; the secret
+is env-only (secrets invariant) and reaches only the sidecar via its own `passenv` (it is NOT in
+`PASSENV_BLOCKLIST` because the sidecar needs it; the passenv opt-in model keeps it off every
+other MCP server). This is route-scoped; full API auth remains ux.5. When the secret is unset the
+routes stay open (pre-ux.12 behavior) — set it whenever Telegram is enabled.
+
+**Pre-existing exposure this makes concrete (§9.2).** Because `cos` binds `0.0.0.0`
+(`allow_non_loopback = true`, for Docker hostfwd), `semantic-kb-mcp` on `cos-net` was *already*
+an unauthenticated, approve-capable peer of `:7999` before ux.12. The approval secret closes the
+approve/deny routes for all such peers, not just Telegram; the broader `0.0.0.0` bind is unchanged.
+
+**Chat-ID authZ + token secrecy.** Only `message` updates from `from.id == TELEGRAM_CHAT_ID` in a
+`private` chat are honored (a group would leak approval/args content). `from.id` is unforgeable via
+the Bot API, so the bot token is the crown jewel: env-only, never logged. Token compromise =
+read approval `args_json` + brief text + bridge DoS, but NOT approval injection (cannot forge
+`from.id`, and cannot mint an `X-Approval-Token` without the separate approval secret).
+
+**Relay-only + re-verify.** The sidecar never synthesizes an approval: before POSTing it re-GETs
+`/api/v1/approvals`, confirms the id is still pending, and confirms its `args_json` hashes to what
+was delivered to Telegram — refusing otherwise. This closes a cross-generation id collision (a
+deleted `checkpoint.json` resets `approval_seq`, so a redelivered "approve act_3" could hit a
+different freshly-minted `act_3`) and enforces "the human approved what they actually saw".
+
+**New egress sink (§8.7).** Approval `args_json` and brief text (email-derived) are sent to
+`api.telegram.org`, a third party, and egress content is not audited. The sidecar sends a
+length-capped args preview (the first 500 chars, not the full payload) with a "view full in TUI"
+pointer, but this is a real confidentiality sink the operator opts into by enabling Telegram. `Net{hosts}`
+is advisory (only `ports` is kernel-enforced, sandbox); the sidecar's `[443, 7999]` grant means a
+compromised sidecar could reach any host on 443 plus loopback:7999 — the approval secret and
+chat-ID allowlist are the compensating controls.
+
+**Degrade-safe.** `request_approval` parks based on `[management].enabled`, independent of the
+sidecar, so a sidecar/Telegram outage never auto-approves or blocks — approvals stay pending in the
+TUI (canonical); undelivered digests are dropped (durable in runs.redb). The sidecar fails closed on
+its own POST errors (never marks an approval resolved on a network failure).
+
+---
+
 ## 10. Summary table
 
 | Threat | Control | Gaps |
