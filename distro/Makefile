@@ -141,9 +141,11 @@ PYTHON_MCP_SRCS := $(wildcard ../docker/*_mcp.py)
 
 overlay/usr/lib/agentos/docker/.gitkeep: $(PYTHON_MCP_SRCS)
 	mkdir -p overlay/usr/lib/agentos/docker
-	cp ../docker/cron_mcp.py ../docker/oauth_mcp.py ../docker/http_mcp.py \
-	   ../docker/shell_mcp.py ../docker/search_mcp.py ../docker/fs_watch_mcp.py \
-	   ../docker/webhook_mcp.py ../docker/telegram_mcp.py overlay/usr/lib/agentos/docker/
+	# Package EVERY sidecar from the wildcard (AUDIT-v0.97 P2-8) — a hand-maintained cp list
+	# silently dropped new/renamed sidecars twice (cap.2 semantic-kb, ux.12 telegram), shipping
+	# a rootfs that boots then fails the tool call. Driving cp from $(PYTHON_MCP_SRCS) (the same
+	# wildcard used as the prerequisite) means a sidecar added to docker/ is always packaged.
+	cp $(PYTHON_MCP_SRCS) overlay/usr/lib/agentos/docker/
 	chmod +x overlay/usr/lib/agentos/docker/*.py
 	touch $@
 
