@@ -208,6 +208,30 @@ expression in `TRIGGER_INTERVAL` will not parse.
 **Stopping:** `Ctrl+C` checkpoints gracefully; state persists in `~/.agentos-data`, so the next run
 resumes.
 
+### Telegram reach (ux.12) — optional: brief + approve/deny from your phone
+
+Enable the two-way Telegram bridge to receive the morning brief and approve/deny pending actions
+from your phone. Omit these vars and the CoS runs exactly as above (the TUI stays canonical).
+
+```bash
+# 1. Create a bot: message @BotFather on Telegram → /newbot → copy the token.
+# 2. Get your numeric user id: message @userinfobot → it replies with your id.
+# 3. Pick a strong random approval secret (gates the approve/deny routes; see THREAT_MODEL §9.6):
+export AGENTOS_APPROVAL_SECRET="$(openssl rand -hex 32)"
+export TELEGRAM_BOT_TOKEN="123456:ABC-..."      # from BotFather (secret — never commit/log)
+export TELEGRAM_CHAT_ID="123456789"             # your numeric user id (private chat only)
+
+# 4. Add the -e flags to the `docker run` above (or the compose env — see docker-compose.yml):
+#      -e TELEGRAM_BOT_TOKEN -e TELEGRAM_CHAT_ID -e AGENTOS_APPROVAL_SECRET
+```
+
+Notes: the bot token is the crown jewel — env-only, never logged; a leaked token can read your
+brief/approval text but cannot *approve* (that needs the separate `AGENTOS_APPROVAL_SECRET` and your
+`from.id`). Set `AGENTOS_APPROVAL_SECRET` whenever Telegram is on — without it the approve/deny
+routes are unauthenticated on the Docker bridge (THREAT_MODEL §9.2/§9.6). Reply `approve <id>` or
+`deny <id> [reason]` to a pushed approval. If the bridge or Telegram is down, nothing blocks —
+approvals just stay pending in the TUI.
+
 **Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed action-receipt
 chain with `agentctl verify ~/.agentos-data/evidence.jsonl`.
 

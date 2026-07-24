@@ -1208,7 +1208,10 @@ increments, friction-ordered, each independently shippable. Full design + premis
   env): digest delivery + approval push + approve/deny replies through the existing approvals API. **No
   inject** (cut on cross-model challenge — no lived friction; re-add only if dogfood shows it).
   Degrades safe: sidecar down ⇒ approvals stay pending in the TUI. Subsumes the old ux.4 push (which was
-  push-only). `/plan-eng-review` (outbound egress via the credential broker + THREAT_MODEL note).
+  push-only). **Built 2026-07-24 (pulled ahead of ux.13 — reach-before-verbs); plan
+  `docs/plans/ux.12-telegram-reach.md`.** Autoplan added a **route-scoped `X-Approval-Token` secret**
+  on the approve/deny routes (the chat-ID allowlist alone doesn't protect the unauthenticated `:7999`
+  API; both Eng voices). `docker/telegram_mcp.py` is a no-tools stdio MCP bridge. See THREAT_MODEL §9.6.
 - **ux.13** — Verbs (lands **after cap.1** — SetCaps wants its validation machinery): `ControlCommand::
   {Cancel, SetBudget, SetCaps}` + management API + FUSE control + TUI keys. Cancel takes effect at the
   next step boundary (one in-flight call may complete; stream-abort is stretch). SetBudget only unifies
