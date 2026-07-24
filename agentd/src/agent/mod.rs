@@ -5,6 +5,12 @@ use serde_json::json;
 
 pub const PREVIEW_CHARS: usize = 200;
 
+/// Cap on the Tier-2 `short_term` eviction buffer (AUDIT-v0.97 P1-3). A never-terminating agent
+/// (the always-on orchestrator, parked/REPL agents) never reaches run-completion distillation —
+/// short_term's only other drain — so without this it grows unbounded and is cloned into every
+/// per-turn checkpoint. Generous enough that a normal completing agent distills long before it.
+pub(crate) const MAX_SHORT_TERM: usize = 1000;
+
 use crate::{
     config::{AgentConfig, ModelConfig, SpawnConfig},
     flight_recorder::{EventKind, FlightRecorder},
@@ -313,6 +319,19 @@ impl AgentTask {
         self.short_term.len()
     }
 
+    /// Bound `short_term` to `MAX_SHORT_TERM` (AUDIT-v0.97 P1-3). Ring-buffer: drop the OLDEST
+    /// paged summaries beyond the cap; returns the count evicted. Keeps RAM and the per-turn
+    /// `to_checkpoint` clone bounded for never-terminating agents (whose only other drain,
+    /// run-completion distillation, never fires). Safe/turn-granular — these are already-evicted
+    /// per-turn summaries, not live tool-call/response pairs.
+    fn cap_short_term(&mut self) -> usize {
+        let overflow = self.short_term.len().saturating_sub(MAX_SHORT_TERM);
+        if overflow > 0 {
+            self.short_term.drain(0..overflow);
+        }
+        overflow
+    }
+
     /// Number of messages in the active context window.
     #[cfg(test)]
     pub(crate) fn message_count(&self) -> usize {
@@ -589,17 +608,19 @@ impl AgentTask {
                     Ok(items) => {
                         let pages_moved = items.len();
                         self.short_term.extend(items);
+                        let evicted_overflow = self.cap_short_term();
                         recorder.record(
                             &self.agent_id,
                             Some(self.turn),
                             EventKind::MemoryPaged,
                             json!({
-                                "agent":            &self.agent_id,
-                                "turn":             self.turn,
-                                "pages_moved":      pages_moved,
-                                "short_term_depth": self.short_term.len(),
-                                "retained_pct":     retained_pct,
-                                "tokens_spent_pct": tokens_spent_pct,
+                                "agent":              &self.agent_id,
+                                "turn":               self.turn,
+                                "pages_moved":        pages_moved,
+                                "short_term_depth":   self.short_term.len(),
+                                "short_term_evicted": evicted_overflow,
+                                "retained_pct":       retained_pct,
+                                "tokens_spent_pct":   tokens_spent_pct,
                             }),
                         );
                     }
@@ -2098,6 +2119,31 @@ mod tests {
             msg_count_before,
             "messages must not change under soft pressure"
         );
+    }
+
+    #[test]
+    fn cap_short_term_bounds_and_drops_oldest() {
+        // AUDIT-v0.97 P1-3: short_term is bounded (ring-buffer) so a never-terminating agent's
+        // RAM + per-turn checkpoint clone stay bounded. Oldest paged summaries drop first.
+        use crate::memory::MemItem;
+        use crate::inference::Role;
+        let cfg = agent_cfg(20, 1_000_000);
+        let mut sm = AgentTask::new("cap-st", "task", &cfg, &model_cfg(), vec![]);
+        let total = MAX_SHORT_TERM + 500;
+        for t in 0..total {
+            sm.short_term.push(MemItem {
+                turn:            t as u32,
+                role:            Role::Assistant,
+                content_preview: format!("item {t}"),
+                blocks_json:     "[]".to_string(),
+            });
+        }
+        let evicted = sm.cap_short_term();
+        assert_eq!(evicted, 500, "overflow beyond the cap is evicted");
+        assert_eq!(sm.short_term_depth(), MAX_SHORT_TERM, "bounded to the cap");
+        assert_eq!(sm.short_term.first().unwrap().turn, 500, "oldest 500 dropped (ring-buffer)");
+        assert_eq!(sm.short_term.last().unwrap().turn, (total - 1) as u32, "newest retained");
+        assert_eq!(sm.to_checkpoint().short_term.len(), MAX_SHORT_TERM, "checkpoint clone is now bounded");
     }
 
     // AC14: to_checkpoint/from_checkpoint preserve short_term (items not zeroed on restore)
