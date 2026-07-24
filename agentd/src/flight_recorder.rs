@@ -2,7 +2,10 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::Path,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
 use anyhow::Context;
@@ -13,8 +16,19 @@ pub use crate::events::EventKind;
 
 const FLIGHT_LOG: &str = "flight.jsonl";
 
+/// Size cap for flight.jsonl (AUDIT-v0.97 P1-2). An always-on CoS otherwise grows the log
+/// unbounded (one line per SSE chunk with streaming), fills the data volume, and starves the
+/// co-located durable writers (checkpoint, runs.redb, evidence). At the cap we copy-truncate
+/// IN PLACE — `set_len(0)` keeps the same inode, which the otel `tail.rs` sentinel already
+/// follows — and keep appending. Truncation drops old events (acceptable for best-effort
+/// telemetry); a live system stays bounded rather than wedging.
+const MAX_FLIGHT_BYTES: u64 = 100 * 1024 * 1024;
+
 pub struct FlightRecorder {
     file: Mutex<File>,
+    /// Approximate current size of the log, bumped per write and reset on rotation, so we
+    /// avoid a stat() syscall on the hot path. Seeded from the file length at open.
+    size: AtomicU64,
     /// Optional SSE fan-out channel; each subscriber gets a clone of every JSON line.
     broadcast_tx: Option<broadcast::Sender<String>>,
 }
@@ -26,10 +40,34 @@ impl FlightRecorder {
             .append(true)
             .open(path)
             .with_context(|| format!("opening flight log at {path:?}"))?;
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             file: Mutex::new(file),
+            size: AtomicU64::new(size),
             broadcast_tx: None,
         })
+    }
+
+    /// Append one line to the log, copy-truncating in place first if the cap is exceeded
+    /// (P1-2). Caller must hold the file lock. Best-effort — never propagates an error.
+    fn write_disk_line(&self, file: &mut File, line: &str) {
+        if self.size.load(Ordering::Relaxed) >= MAX_FLIGHT_BYTES {
+            // Copy-truncate in place (same inode). O_APPEND writes then resume at offset 0.
+            if file.set_len(0).is_ok() {
+                self.size.store(0, Ordering::Relaxed);
+                tracing::info!(
+                    cap_bytes = MAX_FLIGHT_BYTES,
+                    "flight.jsonl exceeded cap — rotated (truncated in place)"
+                );
+            }
+            // If set_len failed, fall through and keep appending: bounded-growth is
+            // best-effort and a rotation failure must never crash an agent.
+        }
+        if let Err(e) = writeln!(file, "{line}") {
+            tracing::warn!("flight record write failed: {e}");
+            return;
+        }
+        self.size.fetch_add(line.len() as u64 + 1, Ordering::Relaxed);
     }
 
     pub fn open() -> anyhow::Result<Self> {
@@ -80,9 +118,7 @@ impl FlightRecorder {
             return;
         };
 
-        if let Err(e) = writeln!(file, "{line}") {
-            tracing::warn!("flight record write failed: {e}");
-        }
+        self.write_disk_line(&mut file, &line);
 
         // Best-effort broadcast; lagged subscribers are handled at the receiver.
         if let Some(tx) = &self.broadcast_tx {
@@ -133,9 +169,7 @@ impl FlightRecorder {
             tracing::warn!("flight recorder mutex poisoned; dropping event");
             return;
         };
-        if let Err(e) = writeln!(file, "{disk_line}") {
-            tracing::warn!("flight record write failed: {e}");
-        }
+        self.write_disk_line(&mut file, &disk_line);
         drop(file);
 
         if let Some(tx) = &self.broadcast_tx {
@@ -183,6 +217,28 @@ mod tests {
         assert_eq!(event["agent"], "test-agent");
         assert!(event["ts"].is_string());
         assert_eq!(event["data"]["model"], "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn record_rotates_in_place_when_over_cap() {
+        // AUDIT-v0.97 P1-2: at the size cap, the log copy-truncates in place and keeps
+        // appending (same inode). Force the size counter over the cap to trigger it without
+        // writing 100 MB.
+        let tmp = NamedTempFile::new().unwrap();
+        let recorder = FlightRecorder::new(tmp.path()).unwrap();
+        recorder.record("a", None, EventKind::AgentSpawned, serde_json::json!({"n": 1}));
+        recorder.size.store(MAX_FLIGHT_BYTES, Ordering::Relaxed);
+        // Triggers rotation (truncate) then appends the new line.
+        recorder.record("a", None, EventKind::AgentSpawned, serde_json::json!({"n": 2}));
+
+        let mut content = String::new();
+        File::open(tmp.path()).unwrap().read_to_string(&mut content).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "rotation dropped old content, kept only the post-rotation line");
+        let ev: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(ev["data"]["n"], 2, "the post-rotation line is intact + valid JSONL");
+        let sz = recorder.size.load(Ordering::Relaxed);
+        assert!(sz > 0 && sz < MAX_FLIGHT_BYTES, "size counter reset after rotation, got {sz}");
     }
 
     #[test]
