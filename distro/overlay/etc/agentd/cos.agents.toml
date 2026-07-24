@@ -143,6 +143,25 @@ capabilities = [
   { Credential = { provider = "Google" } },
 ]
 
+# telegram_bridge (ux.12): two-way Telegram reach — brief delivery + approve/deny relay
+# to the management approvals API. No-tools MCP server; a background thread runs the
+# bridge. Reaches api.telegram.org (443) + the local management API (7999). Optional.
+[[tools.mcp_servers]]
+name    = "telegram_bridge"
+command = "python3"
+args    = ["/usr/lib/agentos/docker/telegram_mcp.py"]
+passenv = [
+  "TELEGRAM_BOT_TOKEN",
+  "TELEGRAM_CHAT_ID",
+  "MANAGEMENT_URL",           # default http://127.0.0.1:7999
+  "AGENTOS_APPROVAL_SECRET",  # X-Approval-Token for the gated approve/deny routes
+  "TELEGRAM_STATE_DIR",       # durable dir (QEMU: /run/memory)
+  "TELEGRAM_POLL_INTERVAL_S",
+]
+capabilities = [
+  { Net = { hosts = ["api.telegram.org"], ports = [443, 7999] } },
+]
+
 # ---------------------------------------------------------------------------
 # Agent 1: Executive Orchestrator
 # ---------------------------------------------------------------------------

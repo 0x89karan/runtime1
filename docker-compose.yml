@@ -35,6 +35,16 @@ services:
       - TRIGGER_INTERVAL=${TRIGGER_INTERVAL:-every 2m}
       # OpenAI API key — required for semantic KB (email embeddings via text-embedding-3-small).
       - OPENAI_API_KEY
+      # Telegram reach (ux.12) — OPTIONAL. Set all three to enable the two-way bridge
+      # (brief delivery + approve/deny from your phone). Omit them and cos runs without
+      # Telegram (TUI stays canonical). TELEGRAM_STATE_DIR defaults to /data (the cos-data
+      # volume) so the getUpdates offset + delivered bindings survive a restart.
+      - TELEGRAM_BOT_TOKEN
+      - TELEGRAM_CHAT_ID
+      # AGENTOS_APPROVAL_SECRET gates the approve/deny routes. When set, the sidecar sends it
+      # and agentctl must too; when unset, the routes are open (pre-ux.12). Set it whenever
+      # TELEGRAM_* is set — the phone-approve path is only safe with the secret.
+      - AGENTOS_APPROVAL_SECRET
     depends_on:
       semantic-kb-mcp:
         condition: service_healthy
