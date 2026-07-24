@@ -915,6 +915,43 @@ fn json_response(status: u16, body: serde_json::Value) -> Response<Full<Bytes>> 
         .expect("credential json_response builder must not fail")
 }
 
+/// Build the header list for the upstream request: the passthrough-filtered caller headers
+/// (step 10 — caller `Authorization`, `X-Forwarded-For`, cookies etc. are DROPPED; only
+/// `PASSTHROUGH_HEADERS` survive) plus the attached credential header for header-based auth
+/// styles (step 11). `ApiKeyQuery` attaches via the query string, so it returns no credential
+/// header. Pure + side-effect-free so the security-critical drop+attach is unit-testable
+/// without a live TLS forward (AUDIT-v0.97 P2-7).
+fn build_upstream_headers(
+    caller: &reqwest::header::HeaderMap,
+    prov: &ProviderConfig,
+    credential: &str,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (name, value) in caller {
+        if !PASSTHROUGH_HEADERS.contains(&name.as_str().to_lowercase().as_str()) {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            out.push((name.as_str().to_string(), v.to_string()));
+        }
+    }
+    match prov.auth_style {
+        AuthStyle::OauthBearer => {
+            out.push(("Authorization".to_string(), format!("Bearer {credential}")));
+        }
+        AuthStyle::ApiKeyHeader => {
+            let hname = prov.header_name.as_deref().unwrap_or("X-Api-Key");
+            let value = match prov.header_value_prefix.as_deref() {
+                Some(pfx) => format!("{pfx} {credential}"),
+                None => credential.to_string(),
+            };
+            out.push((hname.to_string(), value));
+        }
+        AuthStyle::ApiKeyQuery => {} // attached via .query() in the handler
+    }
+    out
+}
+
 async fn handle_credential_request(
     state: Arc<GatewayState>,
     req:   Request<hyper::body::Incoming>,
@@ -1255,36 +1292,17 @@ async fn handle_credential_request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         &upstream_url,
     );
-    for (name, value) in &parts.headers {
-        let name_lower = name.as_str().to_lowercase();
-        if !PASSTHROUGH_HEADERS.contains(&name_lower.as_str()) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            req_builder = req_builder.header(name.as_str(), v);
-        }
+    // 10 + 11. Passthrough-filter the caller headers (dropping Authorization/X-Forwarded-For
+    // etc.) and attach the credential per auth_style — extracted into `build_upstream_headers`
+    // so the security-critical drop+attach is unit-testable without a live TLS forward (P2-7).
+    for (name, value) in build_upstream_headers(&parts.headers, &prov_cfg, &credential) {
+        req_builder = req_builder.header(name, value);
     }
-
-    // 11. Attach credential per auth_style. ApiKeyQuery uses reqwest's .query() so
-    //     the key and value are percent-encoded automatically.
-    req_builder = match prov_cfg.auth_style {
-        AuthStyle::OauthBearer => {
-            req_builder.header("Authorization", format!("Bearer {credential}"))
-        }
-        AuthStyle::ApiKeyHeader => {
-            let hname = prov_cfg.header_name.as_deref().unwrap_or("X-Api-Key");
-            // UC-2: apply optional prefix (e.g. "Bearer" for GitHub PATs).
-            let value = match prov_cfg.header_value_prefix.as_deref() {
-                Some(pfx) => format!("{pfx} {credential}"),
-                None      => credential.clone(),
-            };
-            req_builder.header(hname, &value)
-        }
-        AuthStyle::ApiKeyQuery => {
-            let key_param = prov_cfg.header_name.as_deref().unwrap_or("key");
-            req_builder.query(&[(key_param, &credential)])
-        }
-    };
+    // ApiKeyQuery attaches via reqwest's .query() so the key/value are percent-encoded.
+    if matches!(prov_cfg.auth_style, AuthStyle::ApiKeyQuery) {
+        let key_param = prov_cfg.header_name.as_deref().unwrap_or("key");
+        req_builder = req_builder.query(&[(key_param, &credential)]);
+    }
 
     if !body_bytes.is_empty() {
         req_builder = req_builder.body(body_bytes);
@@ -1889,6 +1907,43 @@ secret_key    = "BRAVE_SEARCH_API_KEY"
         assert_eq!(cfg.header_name.as_deref(), Some("X-Subscription-Token"));
         assert_eq!(cfg.secret_key.as_deref(), Some("BRAVE_SEARCH_API_KEY"));
         assert!(cfg.token_path.is_none());
+    }
+
+    // ── P2-7: upstream header build — credential attached, caller creds dropped ──
+    #[test]
+    fn build_upstream_headers_attaches_credential_and_drops_caller_creds() {
+        use reqwest::header::HeaderMap;
+        let mut caller = HeaderMap::new();
+        // Caller-supplied creds/spoofing headers that MUST NOT be forwarded upstream.
+        caller.insert("authorization", "Bearer CALLER-FORGED".parse().unwrap());
+        caller.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        caller.insert("cookie", "session=abc".parse().unwrap());
+        // A safe header that SHOULD pass through.
+        caller.insert("accept", "application/json".parse().unwrap());
+        let get = |h: &[(String, String)], k: &str| {
+            h.iter().find(|(n, _)| n.eq_ignore_ascii_case(k)).map(|(_, v)| v.clone())
+        };
+
+        // OAuth bearer: the gateway credential replaces any caller Authorization.
+        let oauth: ProviderConfig = toml::from_str(
+            "auth_style = \"oauth-bearer\"\nupstream_base = \"https://www.googleapis.com\"\ntoken_path = \"/x\"\n",
+        ).unwrap();
+        let h = build_upstream_headers(&caller, &oauth, "GATEWAY-TOKEN");
+        assert_eq!(get(&h, "authorization").as_deref(), Some("Bearer GATEWAY-TOKEN"),
+            "gateway credential attached (caller's forged Authorization replaced, not forwarded)");
+        assert!(get(&h, "x-forwarded-for").is_none(), "caller X-Forwarded-For dropped");
+        assert!(get(&h, "cookie").is_none(), "caller Cookie dropped");
+        assert_eq!(get(&h, "accept").as_deref(), Some("application/json"), "safe header forwarded");
+
+        // API-key header with a value prefix (e.g. GitHub PAT): attached to the named header;
+        // caller Authorization still dropped and NOT replaced (no Authorization attached).
+        let apikey: ProviderConfig = toml::from_str(
+            "auth_style = \"api-key-header\"\nupstream_base = \"https://api.example.com\"\nheader_name = \"X-Api-Key\"\nheader_value_prefix = \"token\"\n",
+        ).unwrap();
+        let h2 = build_upstream_headers(&caller, &apikey, "KEY123");
+        assert_eq!(get(&h2, "x-api-key").as_deref(), Some("token KEY123"), "api key attached with prefix");
+        assert!(get(&h2, "authorization").is_none(), "caller Authorization dropped, none attached for api-key");
+        assert!(get(&h2, "cookie").is_none(), "caller Cookie dropped");
     }
 
     // ── T3: disabled config skips gateway start ───────────────────────────────
