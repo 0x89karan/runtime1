@@ -3,6 +3,26 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.98.0] - 2026-07-25
+
+### Fixed
+- **audit.2 — acute batch of the AUDIT-v0.97 remediation sweep** (first of ~7 increments):
+  - **P1-1 arm64 CoS was non-functional** — `distro/buildroot.aarch64.config` omitted
+    `BR2_PACKAGE_PYTHON3`/`OPENSSL`, so the Python MCP sidecars couldn't run on arm64 and the flagship
+    never produced a brief. Mirror the x86_64 package set. (CI's `make -n` dry-run masked it; the
+    real-build gap is tracked as ci.2/P2-11.)
+  - **P1-class P2-1 checkpoint crash-loop state loss** — restore deleted `checkpoint.json` before the
+    first new save, so a deterministic startup crash after restore erased all CoS state. Now rename →
+    `checkpoint.json.restored` (recoverable via a `load()` fallback); `save()` consumes the copy on
+    success; `load()` quarantines a corrupt source (primary OR `.restored`) to `<name>.corrupt`.
+  - **P2-4 ux.13 cancel-resurrection** — a cancelled parked trigger (root awaiting a `run_job` child)
+    revived when the child later terminated (flipping `AgentCancelled`→done, spending more). The
+    child-delivery re-step is now gated on `!outcomes && !cancel_requested` for the parent.
+
+### Added
+- `docs/AUDIT-v0.97.md` — full 8-lane fan-out security+correctness audit (3 P1 · 12 P2 · 16 P3) with a
+  prioritized remediation build order. This release begins that remediation.
+
 ## [v0.97.0] - 2026-07-24
 
 ### Added
