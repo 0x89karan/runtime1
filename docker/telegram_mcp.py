@@ -8,9 +8,10 @@ spawned by agentd like any other `[[tools.mcp_servers]]` entry purely so it
 inherits the sandbox (caps → Landlock port allowlist), PASSENV handling, and the
 CI sidecar-tests contract that an entrypoint-launched process would not.
 
-The real work happens on ONE background daemon thread (started only AFTER the
-MCP `initialize`/`tools/list` handshake, so it never blocks the handshake on a
-Telegram long-poll). That thread does two jobs:
+The real work happens on ONE background daemon thread (started in `_init()`, before
+the stdin JSON-RPC loop). It runs independently of the handshake and only ever writes
+to stderr + HTTP — never stdout — so it cannot block or corrupt the JSON-RPC stream
+(`send()` is main-thread-only). That thread does two jobs:
 
   1. OUTBOUND — polls the management API (`GET /api/v1/approvals` + `/api/v1/brief`)
      and pushes new pending approvals and freshly-published briefs to Telegram.
@@ -249,6 +250,16 @@ def _persist_state():
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, _state_path)
+        # fsync the directory so the rename itself survives power loss (the offset dedup
+        # depends on this durability to prevent a redelivered "approve" after a hard crash).
+        try:
+            dir_fd = os.open(os.path.dirname(_state_path) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass  # best-effort; not all filesystems support directory fsync
     except Exception as exc:
         _log(f"WARNING: state persist failed, continuing in-memory: {exc}")
         _state_writable = False
@@ -307,6 +318,16 @@ def poll_management():
     """One outbound cycle: push undelivered approvals and any new brief."""
     approvals = fetch_approvals()
     if approvals is not None:
+        pending_ids = {a.get("id") for a in approvals if isinstance(a, dict) and a.get("id")}
+        # GC bindings no longer pending (resolved via TUI/CLI, or a 404/network branch left
+        # them behind). Without this, _delivered grows without bound AND a checkpoint reset
+        # that reuses act_N would find the stale binding and never re-push the new act_N.
+        with _state_lock:
+            stale = [k for k in _delivered if k not in pending_ids]
+            if stale:
+                for k in stale:
+                    _delivered.pop(k, None)
+                _persist_state()
         for a in approvals:
             if not isinstance(a, dict):
                 continue
@@ -335,6 +356,11 @@ def parse_command(text: str):
     if verb not in ("approve", "deny"):
         return None
     approval_id = parts[1]
+    # Defense-in-depth: ids are scheduler-issued act_{seq}; reject anything that isn't the
+    # [A-Za-z0-9_-] shape before it can be interpolated into a control-plane URL. (handle_command
+    # also requires it to match a live pending id, so this is a second, cheap guard.)
+    if not approval_id or len(approval_id) > 64 or not all(c.isalnum() or c in "_-" for c in approval_id):
+        return None
     reason = parts[2] if len(parts) >= 3 else None
     return verb, approval_id, reason
 
@@ -377,6 +403,9 @@ def handle_command(verb: str, approval_id: str, reason):
             _delivered.pop(approval_id, None)
             _persist_state()
     elif status == 404:
+        with _state_lock:
+            _delivered.pop(approval_id, None)   # resolved elsewhere — drop the stale binding
+            _persist_state()
         send_message(f"[{approval_id}] already resolved elsewhere.")
     elif status == 401:
         _log("approve/deny POST rejected (401) — approval secret missing or wrong")
@@ -461,15 +490,17 @@ def _init():
     global _bot_token, _chat_id, _management_url, _approval_secret
     global _state_dir, _poll_interval, _state_path, _state_writable
 
+    # Telegram is OPTIONAL: this server is declared unconditionally in cos.agents.toml,
+    # so when the operator has not configured Telegram we must NOT exit (that would fail
+    # agentd's MCP handshake and can brick CoS boot). Instead run as an INERT MCP server —
+    # the stdin JSON-RPC loop still answers initialize/tools-list — and skip the bridge
+    # thread. A malformed (non-numeric) chat id IS a hard error (misconfiguration).
     token = (os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
-    if not token:
-        _log("TELEGRAM_BOT_TOKEN is required")
-        sys.exit(1)
-
     chat_raw = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
-    if not chat_raw:
-        _log("TELEGRAM_CHAT_ID is required")
-        sys.exit(1)
+    if not token or not chat_raw:
+        _log("Telegram bridge disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set) — "
+             "running as an inert MCP server (no bridge thread).")
+        return
     try:
         _chat_id = int(chat_raw)
     except ValueError:

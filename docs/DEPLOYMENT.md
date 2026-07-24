@@ -232,6 +232,12 @@ routes are unauthenticated on the Docker bridge (THREAT_MODEL §9.2/§9.6). Repl
 `deny <id> [reason]` to a pushed approval. If the bridge or Telegram is down, nothing blocks —
 approvals just stay pending in the TUI.
 
+**⚠ If you set `AGENTOS_APPROVAL_SECRET`, host-side `agentctl` needs it too.** The gate applies to
+every HTTP caller of the approve/deny routes, so `agentctl watch --url …` / `agentctl approve --url …`
+run from your Mac must have `AGENTOS_APPROVAL_SECRET` exported in *that* shell, or they get
+`HTTP 401 — action stays pending`. (FUSE-mode `agentctl watch` inside the container is unaffected —
+it writes the `/agents/control` file, which is not gated.)
+
 **Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed action-receipt
 chain with `agentctl verify ~/.agentos-data/evidence.jsonl`.
 

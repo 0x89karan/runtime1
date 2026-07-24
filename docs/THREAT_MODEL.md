@@ -753,8 +753,8 @@ different freshly-minted `act_3`) and enforces "the human approved what they act
 
 **New egress sink (§8.7).** Approval `args_json` and brief text (email-derived) are sent to
 `api.telegram.org`, a third party, and egress content is not audited. The sidecar sends a
-length-capped, field-filtered args preview (not the full dump) with a "view full in TUI" pointer,
-but this is a real confidentiality sink the operator opts into by enabling Telegram. `Net{hosts}`
+length-capped args preview (the first 500 chars, not the full payload) with a "view full in TUI"
+pointer, but this is a real confidentiality sink the operator opts into by enabling Telegram. `Net{hosts}`
 is advisory (only `ports` is kernel-enforced, sandbox); the sidecar's `[443, 7999]` grant means a
 compromised sidecar could reach any host on 443 plus loopback:7999 — the approval secret and
 chat-ID allowlist are the compensating controls.
