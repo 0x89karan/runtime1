@@ -734,6 +734,12 @@ is env-only (secrets invariant) and reaches only the sidecar via its own `passen
 other MCP server). This is route-scoped; full API auth remains ux.5. When the secret is unset the
 routes stay open (pre-ux.12 behavior) — set it whenever Telegram is enabled.
 
+The ux.13 control verbs (`POST /api/v1/agents/{id}/cancel`, `.../caps`) are intentionally NOT behind
+this secret — they join `spawn`/`inject`/`budget` as loopback-trusted control routes (only approve/deny
+are gated, because only they are driven by the untrusted-input Telegram bridge). SetCaps is
+revoke/narrow-only (a `capability_covered_by` fail-closed check rejects any widening) so it cannot be
+used to escalate an agent; Cancel only terminates. Both fold into ux.5's eventual full-API-auth story.
+
 **Pre-existing exposure this makes concrete (§9.2).** Because `cos` binds `0.0.0.0`
 (`allow_non_loopback = true`, for Docker hostfwd), `semantic-kb-mcp` on `cos-net` was *already*
 an unauthenticated, approve-capable peer of `:7999` before ux.12. The approval secret closes the

@@ -3,6 +3,38 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.97.0] - 2026-07-24
+
+### Added
+- **Control verbs (ux.13)** — the final "trust after absence" cockpit increment. New
+  `ControlCommand::{Cancel, SetCaps}` + `AgentCancelled`/`CapabilitiesSet` flight events, reachable
+  via management HTTP (`POST /api/v1/agents/{id}/cancel` + `/caps`), the FUSE control file, and
+  `agentctl {cancel, set-budget, set-caps}`.
+  - **Cancel** stops a runaway/stuck agent (and its spawned subtree) without killing agentd. Guarantee:
+    *no new world-affecting dispatch after cancel* — a scheduler-side `cancel_requested` map (not
+    checkpointed) plus a gate at the top of `enqueue_or_defer` funnel a flagged agent when its in-flight
+    future returns (a running agent stays until then, so nothing panics). Cascade-cancels the
+    `parent_map` subtree (skips the `"operator"` root), closes each run as `"cancelled"`, emits one
+    `AgentCancelled` per node, and purges the agent from the deferred queue + pending approvals.
+  - **SetCaps** narrows a running agent's capabilities without a respawn (revoke/narrow-only
+    misconfig-repair, NOT a security response): per-capability `capability_covered_by` (unrestricted
+    accepts any narrow; inert caps rejected); the scheduler recomputes the tool specs so the model's
+    live tool list actually shrinks. Widening is fail-closed (400 "narrow-only; to widen, respawn").
+  - **SetBudget** keeps the ux.11a semantics; ux.13 only adds the `agentctl set-budget` CLI +
+    DataSource surface, routed through a ≥3s confirm client (the 3 confirm-channel verbs) so they
+    don't spuriously fail on the server's 2s confirm wait.
+
+### Fixed
+- **/review P0 (cross-model):** the cancel "parked" predicate used `awaiting.contains_key`, which
+  matched a *running* spawned child (a key in `awaiting` while its future is live) → funneling it
+  removed it from the agents map and the pending-result arm would panic. Fixed to
+  `awaiting.values().any(|v| v.parent_id == node)` (matches the parked *parent*), with two
+  deterministic regression tests.
+
+### Docs
+- ROADMAP ux.13 built-note; THREAT_MODEL note that the cancel/caps control routes are loopback-trusted
+  and intentionally ungated (like spawn/inject/budget) — Cancel only terminates, SetCaps is fail-closed.
+
 ## [v0.96.0] - 2026-07-24
 
 ### Added

@@ -45,6 +45,19 @@ pub trait DataSource: Send + Sync {
     fn inject(&self, _agent_id: &str, _text: &str) -> Result<(), String> {
         Err("inject not supported on this data source (use --url to connect to management API)".to_string())
     }
+    /// Cancel an agent (ux.13). Cascade-cancels its spawned subtree at the next step boundary.
+    fn cancel(&self, _agent_id: &str) -> Result<(), String> {
+        Err("cancel not supported on this data source".to_string())
+    }
+    /// Set a per-agent token budget at runtime (ux.13; `limit = 0` = unlimited).
+    fn set_budget(&self, _agent_id: &str, _limit: u64) -> Result<(), String> {
+        Err("set_budget not supported on this data source".to_string())
+    }
+    /// Narrow an agent's capabilities at runtime (ux.13, revoke/narrow-only). `caps_json` is a
+    /// JSON array of Capability values (e.g. `[{"KbRead":{"segment":"ops:briefs"}}]`).
+    fn set_caps(&self, _agent_id: &str, _caps_json: &str) -> Result<(), String> {
+        Err("set_caps not supported on this data source".to_string())
+    }
     /// Returns the base URL for SSE event streaming, if supported.
     fn event_stream_url(&self) -> Option<String> {
         None
@@ -91,6 +104,23 @@ impl DataSource for FuseSource {
         let payload = serde_json::json!({"inject": {"agent_id": agent_id, "text": text}});
         write_control_command(&self.agents_dir, &payload.to_string())
     }
+
+    fn cancel(&self, agent_id: &str) -> Result<(), String> {
+        let payload = serde_json::json!({"cancel": {"agent_id": agent_id}});
+        write_control_command(&self.agents_dir, &payload.to_string())
+    }
+
+    fn set_budget(&self, agent_id: &str, limit: u64) -> Result<(), String> {
+        let payload = serde_json::json!({"set_budget": {"target": {"agent": agent_id}, "limit": limit}});
+        write_control_command(&self.agents_dir, &payload.to_string())
+    }
+
+    fn set_caps(&self, agent_id: &str, caps_json: &str) -> Result<(), String> {
+        let caps: Value = serde_json::from_str(caps_json)
+            .map_err(|e| format!("capabilities must be a JSON array: {e}"))?;
+        let payload = serde_json::json!({"set_caps": {"agent_id": agent_id, "capabilities": caps}});
+        write_control_command(&self.agents_dir, &payload.to_string())
+    }
 }
 
 // ── HttpSource ──────────────────────────────────────────────────────────────
@@ -100,8 +130,10 @@ pub struct HttpSource {
     pub base_url:    String,
     client:          reqwest::blocking::Client,
     mutation_client: reqwest::blocking::Client,
-    /// Spawn waits up to 2 s for scheduler confirmation; this client must exceed that.
-    spawn_client:    reqwest::blocking::Client,
+    /// Confirm-channel verbs (spawn/cancel/set-budget/set-caps) block until the scheduler
+    /// confirms via a oneshot the server awaits up to 2 s; this client's timeout must exceed
+    /// that, else it spuriously reports failure on a mutation that actually succeeded (ux.13).
+    confirm_client:  reqwest::blocking::Client,
     /// ux.12: route-scoped approval token (env `AGENTOS_APPROVAL_SECRET`). Sent as the
     /// `X-Approval-Token` header on approve/deny so agentd's gate accepts them. None when
     /// unset (open deployment); Some when the CoS approval secret is configured.
@@ -122,12 +154,36 @@ impl HttpSource {
         // Spawn blocks until the scheduler confirms the agent ID (2 s server timeout).
         // This client must exceed that window to avoid spurious 500ms timeouts that
         // leave the agent running on the server while the caller sees a failure.
-        let spawn_client = reqwest::blocking::Client::builder()
+        let confirm_client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .unwrap_or_default();
         let approval_token = std::env::var("AGENTOS_APPROVAL_SECRET").ok().filter(|s| !s.is_empty());
-        Self { base_url, client, mutation_client, spawn_client, approval_token }
+        Self { base_url, client, mutation_client, confirm_client, approval_token }
+    }
+
+    /// POST a confirm-channel verb (cancel/set-budget/set-caps) through the 3 s
+    /// `confirm_client`. Not gated by X-Approval-Token (that's approve/deny-only, ux.12);
+    /// these join spawn/inject/budget as loopback-trusted control routes. Returns Err with
+    /// the status + any body detail on a non-2xx.
+    fn post_confirm(&self, path: &str, body: Option<&Value>) -> Result<(), String> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let mut req = self.confirm_client.post(&url);
+        if let Some(b) = body {
+            req = req.json(b);
+        }
+        let resp = req.send().map_err(|e| format!("HTTP error: {e}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let detail = resp.text().unwrap_or_default();
+            Err(if detail.is_empty() {
+                format!("HTTP {}", status.as_u16())
+            } else {
+                format!("HTTP {}: {}", status.as_u16(), detail.trim())
+            })
+        }
     }
 
     fn get_json(&self, path: &str) -> anyhow::Result<Value> {
@@ -234,7 +290,7 @@ impl DataSource for HttpSource {
         // waiting for the scheduler to confirm the agent ID. The short mutation_client
         // (500 ms) would time out before the confirmation arrives.
         let url = format!("{}/api/v1/spawn", self.base_url.trim_end_matches('/'));
-        let resp = self.spawn_client
+        let resp = self.confirm_client
             .post(&url)
             .json(&body)
             .send()
@@ -257,6 +313,22 @@ impl DataSource for HttpSource {
     fn inject(&self, agent_id: &str, text: &str) -> Result<(), String> {
         let body = serde_json::json!({"text": text});
         self.post_mutation(&format!("/api/v1/agents/{agent_id}/inject"), Some(&body))
+    }
+
+    fn cancel(&self, agent_id: &str) -> Result<(), String> {
+        self.post_confirm(&format!("/api/v1/agents/{agent_id}/cancel"), None)
+    }
+
+    fn set_budget(&self, agent_id: &str, limit: u64) -> Result<(), String> {
+        let body = serde_json::json!({"target": {"agent": agent_id}, "limit": limit});
+        self.post_confirm("/api/v1/budget/set", Some(&body))
+    }
+
+    fn set_caps(&self, agent_id: &str, caps_json: &str) -> Result<(), String> {
+        let caps: Value = serde_json::from_str(caps_json)
+            .map_err(|e| format!("capabilities must be a JSON array: {e}"))?;
+        let body = serde_json::json!({"capabilities": caps});
+        self.post_confirm(&format!("/api/v1/agents/{agent_id}/caps"), Some(&body))
     }
 
     fn event_stream_url(&self) -> Option<String> {

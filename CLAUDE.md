@@ -24,31 +24,31 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.96.0 (shipped 2026-07-24)
+**Current version:** v0.97.0 (shipped 2026-07-24)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.12 (v0.96.0) — **Telegram reach: two-way sidecar (brief + approve/deny from
-your phone)**, pulled ahead of ux.13 at the autoplan gate (reach-before-verbs serves the
-absent-operator "trust after absence" thesis). New **`docker/telegram_mcp.py`** — a **no-tools stdio
-MCP server** (empty `tools/list`; a background bridge thread, not an agent tool) spawned inside the
-`cos` container so it can reach the loopback management API. It delivers the morning brief, pushes
-pending approvals (length-capped `args_json` preview), and relays allowlisted **approve/deny** replies
-to the existing approvals API. **The load-bearing security addition (both Eng voices): a route-scoped
-`X-Approval-Token` secret** on `POST /api/v1/approvals/*/{approve,deny}` — the chat-ID allowlist alone
-does NOT protect the unauthenticated `:7999` API (guessable `act_{seq}` ids; because cos binds
-`0.0.0.0`, `semantic-kb-mcp` was *already* an approve-capable peer). Gated in `handle()` before
-`route()`, constant-time compared vs `AGENTOS_APPROVAL_SECRET` (env; unset ⇒ open, pre-ux.12); agentctl
-sends the header too. Sidecar discipline: `from.id`+private-chat allowlist, **relay-only + re-verify**
-(re-GET pending + args-hash match before POST — closes a deleted-checkpoint id collision), `update_id`
-dedup + durable offset, fail-closed on POST errors, secrets never logged. **Optional + degrade-safe:**
-declared unconditionally but runs **inert** (answers the MCP handshake, no bridge thread) when Telegram
-env is unset — no brick; sidecar/Telegram down ⇒ approvals stay pending in the TUI (canonical). No
-inject (cut on cross-model challenge). THREAT_MODEL §9.6. /review caught + fixed 2 distro-brick
-criticals (Makefile packaging + the exit-1→inert fix); /qa added an over-the-wire gate test with
-negative controls (rejected approve never reaches the scheduler). **Next:** ux.13 (verbs — plan
-reviewed/APPROVED on `ux.13-control-verbs`); then the tail (ux.2b, ux.3, ux.10); cap.2b-ar-01 (P3) +
-cap.3 (`AbsPathPrefix`) still open.
+**Latest shipped:** ux.13 (v0.97.0) — **control verbs (Cancel / SetCaps / SetBudget surface)**, the
+final increment of the "trust after absence" cockpit reshape (ux.8′→ux.11→ux.12→ux.13). New
+**`ControlCommand::{Cancel, SetCaps}`** + `AgentCancelled`/`CapabilitiesSet` events, reachable via
+management HTTP (`POST /api/v1/agents/{id}/cancel` + `/caps`), FUSE control, and `agentctl
+{cancel,set-budget,set-caps}` (TUI cancel-key deferred — CLI/HTTP/FUSE cover it). **Cancel** = "no new
+world-affecting dispatch after cancel": a scheduler-side `cancel_requested` map (NOT checkpointed) +
+a gate at the top of `enqueue_or_defer` that funnels a flagged agent when its in-flight future
+returns (a running agent is flag-only — funneling it early would panic the pending-result arm);
+cascade over `parent_map` (skips `"operator"`); `handle_agent_terminal` closes the run as
+`"cancelled"`, emits `AgentCancelled` per node, purges deferred + pending_approvals. **SetCaps** =
+revoke/narrow-only misconfig-repair (NOT a security response — cap.2b established runtime narrowing
+isn't the injection defense): per-cap `capability_covered_by` (None=unrestricted accepts any narrow;
+inert caps rejected), the scheduler computes `filtered_specs` and `set_capabilities` shrinks the
+model's live tool list. **SetBudget** = the ux.11a semantics unchanged; ux.13 only adds the CLI/
+DataSource surface + a ≥3s confirm client. **/review caught a cross-model-CONFIRMED P0** (the
+`parked` predicate matched a running awaited child via `awaiting.contains_key` → panic; fixed to
+`awaiting.values().any(|v| v.parent_id == node)` + 2 regression tests). /qa added an over-the-wire
+route round-trip test. cancel/caps routes are ungated (join spawn/inject/budget; THREAT_MODEL note).
+**Next:** the UX tail — ux.2b (idle/error signals), ux.3 (spawn-custom), ux.10 (TUI polish, incl. the
+deferred cancel-key); then evidence-gated ux.6/ux.5/ux.7. cap.2b-ar-01 (P3) + cap.3 (`AbsPathPrefix`)
++ Phase 11 skills + Phase 9 eBPF still open.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

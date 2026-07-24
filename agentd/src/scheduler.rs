@@ -149,6 +149,11 @@ struct SchedulerState {
     orchestrated: HashSet<String>,
     /// Agent IDs currently parked (terminal=true) between REPL turns, awaiting next inject.
     waiting: HashSet<String>,
+    /// Agent IDs with a pending operator cancel (ux.13): id → cause ("operator" or
+    /// "cascade from <parent>"). NOT checkpointed — a cancel must not survive a restart.
+    /// The enqueue_or_defer gate funnels a running agent when its future returns;
+    /// handle_agent_terminal consumes the entry (emits AgentCancelled + purges queues).
+    cancel_requested: HashMap<String, String>,
     /// Credential gateway for per-agent grant projection (cred.5). None when disabled.
     cred_gw: Option<Arc<crate::credential::CredentialGateway>>,
     /// Run-history tracker (ux.11b): lifecycle transitions send RunEvents off-loop.
@@ -491,6 +496,7 @@ impl Scheduler {
             universal_agents:   HashMap::new(),
             orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
+            cancel_requested:   HashMap::new(),
             cred_gw,
             run_tracker,
             jobs:               jobs.into_iter().map(|j| (j.id.clone(), j)).collect(),
@@ -1071,6 +1077,23 @@ fn handle_agent_terminal(
     registry: &Arc<ToolRegistry>,
     recorder: &Arc<FlightRecorder>,
 ) {
+    // ux.13: is this terminal an operator cancel? Consume the flag (so a reused agent id
+    // can't inherit a stale cancel) and, if so, emit AgentCancelled + purge the queues that
+    // handle_agent_terminal does not normally touch — the deferred heap (else drain_deferred
+    // would pop a stale entry and push a future for a removed agent → panic) and any pending
+    // approval for this agent (else it could be approved against a dead agent).
+    let cancel_cause = state.cancel_requested.remove(&agent_id);
+    if let Some(cause) = &cancel_cause {
+        recorder.record(
+            &agent_id,
+            None,
+            EventKind::AgentCancelled,
+            json!({ "agent_id": &agent_id, "cause": cause }),
+        );
+        state.deferred.retain(|e| e.agent_id != agent_id);
+        state.pending_approvals.retain(|_, p| p.agent_id != agent_id);
+    }
+
     // Always clear orchestration membership on termination — prevents phantom entries.
     state.waiting.remove(&agent_id);
     state.orchestrated.remove(&agent_id);
@@ -1079,10 +1102,15 @@ fn handle_agent_terminal(
     // every native terminal (child, root, admission-denial). Spend = Δ context_tokens
     // captured while the task still exists; status from the outcome.
     {
-        let (status, stop_reason, last_error): (&str, Option<String>, Option<String>) = match &result {
-            Ok(_)  => ("done", Some("completed".to_string()), None),
-            Err(e) => ("failed", None, Some(e.to_string())),
-        };
+        let (status, stop_reason, last_error): (&str, Option<String>, Option<String>) =
+            if cancel_cause.is_some() {
+                ("cancelled", Some("operator_cancelled".to_string()), None)
+            } else {
+                match &result {
+                    Ok(_)  => ("done", Some("completed".to_string()), None),
+                    Err(e) => ("failed", None, Some(e.to_string())),
+                }
+            };
         let end_tokens = state.agents.get(&agent_id).map(|t| t.context_tokens());
         state.run_tracker.close(&agent_id, status, stop_reason, last_error, end_tokens);
     }
@@ -1615,6 +1643,26 @@ fn enqueue_or_defer(
     registry: &Arc<ToolRegistry>,
     recorder: &Arc<FlightRecorder>,
 ) {
+    // ux.13 Cancel — the single choke point. Every world-affecting effect (Infer, CallTools,
+    // SpawnAgent, SendMessage, RunJob, RequestApproval) funnels through here before dispatch,
+    // so gating on the cancel flag here stops the agent BEFORE any NEW world action (and before
+    // scheduling one more inference). A running agent's flag is set by the dispatch arm and
+    // consumed here when its in-flight future returns (in_flight already decremented, so the
+    // assert is safe); this also closes the mid-spawn cascade leak (a SpawnAgent effect from the
+    // parent's just-returned inference is funneled before dispatch_spawn creates the child).
+    if state.cancel_requested.contains_key(&agent_id) {
+        handle_agent_terminal(
+            agent_id,
+            Err(anyhow::anyhow!("operator cancelled")),
+            state,
+            sched,
+            gateway,
+            registry,
+            recorder,
+        );
+        return;
+    }
+
     let slot_ok   = sched.max_concurrent_inferences == 0 || state.in_flight < sched.max_concurrent_inferences;
     // Windowed global spend (ux.8′): lifetime − anchor vs the (per-window) ceiling.
     let global_windowed = state.global_windowed_spent();
@@ -2563,6 +2611,119 @@ fn dispatch_control_command(
                             EventKind::FuseControlError,
                             json!({ "error": e, "is_error": true }),
                         );
+                    }
+                }
+            }
+        }
+
+        ControlCommand::Cancel { agent_id, confirm_tx } => {
+            let result: Result<u64, String> = if !state.agents.contains_key(&agent_id) {
+                Err(format!("agent '{agent_id}' not found"))
+            } else {
+                // Collect the cancellation subtree via the scheduler-authoritative parent_map
+                // (child → parent). Only include nodes still live in state.agents (skip ghosts
+                // and the "operator" root sentinel, which never appears as a node here).
+                let mut subtree: Vec<String> = vec![agent_id.clone()];
+                let mut frontier: Vec<String> = vec![agent_id.clone()];
+                while let Some(parent) = frontier.pop() {
+                    for (child, p) in state.parent_map.iter() {
+                        if p == &parent
+                            && child != "operator"
+                            && state.agents.contains_key(child)
+                            && !subtree.contains(child)
+                        {
+                            subtree.push(child.clone());
+                            frontier.push(child.clone());
+                        }
+                    }
+                }
+                // Flag every node: root = operator-initiated, descendants = cascade.
+                for node in &subtree {
+                    let cause = if node == &agent_id {
+                        "operator".to_string()
+                    } else {
+                        format!("cascade from {agent_id}")
+                    };
+                    state.cancel_requested.insert(node.clone(), cause);
+                }
+                // Funnel PARKED nodes now (they have no in-flight future); RUNNING nodes stay
+                // flagged and are funneled by the enqueue_or_defer gate when their future returns.
+                for node in subtree.clone() {
+                    // "Parked" = has no in-flight future to trigger the enqueue_or_defer gate,
+                    // so it must be funneled NOW. A running spawned child is a KEY in `awaiting`
+                    // (child_id → parent) the whole time its inference future is live — matching
+                    // on keys would funnel a live child and panic when its future returns
+                    // (get_mut().expect on a removed agent). The genuinely-parked node is the
+                    // PARENT awaiting a child (a value's parent_id, no in-flight future). Match
+                    // that; leave running children flagged for the gate. (Mirrors update_snapshot's
+                    // AwaitingChild classification.)
+                    let parked = state.deferred.iter().any(|e| e.agent_id == node)
+                        || state.waiting.contains(&node)
+                        || state.awaiting.values().any(|v| v.parent_id == node)
+                        || state.pending_approvals.values().any(|p| p.agent_id == node);
+                    if parked {
+                        handle_agent_terminal(
+                            node,
+                            Err(anyhow::anyhow!("operator cancelled")),
+                            state, sched, gateway, registry, recorder,
+                        );
+                    }
+                }
+                Ok(subtree.len() as u64)
+            };
+            match confirm_tx {
+                Some(tx) => { let _ = tx.send(result); }
+                None => {
+                    if let Err(e) = result {
+                        recorder.record("agentd", None, EventKind::FuseControlError,
+                            json!({ "error": e, "is_error": true }));
+                    }
+                }
+            }
+        }
+
+        ControlCommand::SetCaps { agent_id, capabilities, confirm_tx } => {
+            use crate::capability::{capability_covered_by, tier_legality, CapContext, Legality};
+            // Snapshot current caps (owned clone) so the immutable borrow is not held across
+            // registry.filtered_specs + the get_mut below.
+            let current = state.agents.get(&agent_id).map(|t| t.cap_set_cloned());
+            let result: Result<(usize, usize), String> = match current {
+                None => Err(format!("agent '{agent_id}' not found")),
+                Some(current_caps) => {
+                    // Narrow-only: every requested cap must be covered by the CURRENT set.
+                    // `None` current = unrestricted = covers everything → any concrete set is a narrow.
+                    let narrow_ok = match &current_caps {
+                        None => true,
+                        Some(cur) => capabilities.iter().all(|c| capability_covered_by(cur, c)),
+                    };
+                    if !narrow_ok {
+                        Err("SetCaps is narrow-only; to widen, respawn".to_string())
+                    } else if let Some(inert) = capabilities
+                        .iter()
+                        .find(|c| matches!(tier_legality(c, CapContext::Agent), Legality::Inert(_)))
+                    {
+                        Err(format!(
+                            "capability {inert:?} is inert in agent context (narrowing it is a no-op)"
+                        ))
+                    } else {
+                        let new_specs = registry.filtered_specs(Some(capabilities.as_slice()));
+                        let old_caps = current_caps.clone().unwrap_or_default();
+                        let task = state.agents.get_mut(&agent_id).expect("agent present (checked above)");
+                        let old_len = task.set_capabilities(capabilities.clone(), new_specs);
+                        recorder.record(
+                            &agent_id, None, EventKind::CapabilitiesSet,
+                            json!({ "target": &agent_id, "old": old_caps, "new": &capabilities }),
+                        );
+                        Ok((old_len, capabilities.len()))
+                    }
+                }
+            };
+            match confirm_tx {
+                Some(tx) => { let _ = tx.send(result); }
+                None => {
+                    if let Err(e) = result {
+                        recorder.record("agentd", None, EventKind::FuseControlError,
+                            json!({ "error": e, "is_error": true }));
                     }
                 }
             }
@@ -4696,6 +4857,7 @@ mod tests {
             universal_agents:   HashMap::new(),
             orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
+            cancel_requested:   HashMap::new(),
             cred_gw:            None,
             run_tracker:        RunTracker::disabled(),
             jobs:               HashMap::new(),
@@ -6762,6 +6924,218 @@ mod tests {
         );
         assert!(rx.blocking_recv().unwrap().is_err(), "global set is rejected");
     }
+
+    // ── ux.13 control verbs: Cancel + SetCaps ─────────────────────────────────
+
+    fn dispatch(cmd: crate::control::ControlCommand, state: &mut SchedulerState) {
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mdl = model_cfg();
+        dispatch_control_command(cmd, &mdl, state, &unlimited(), &gateway, &registry, &rec);
+    }
+
+    #[test]
+    fn setcaps_unknown_agent_errs() {
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("a");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::SetCaps { agent_id: "ghost".into(), capabilities: vec![], confirm_tx: Some(tx) }, &mut state);
+        let e = rx.blocking_recv().unwrap().unwrap_err();
+        assert!(e.contains("not found"), "unknown agent → not-found (→404), got: {e}");
+    }
+
+    #[test]
+    fn setcaps_narrow_from_unrestricted_succeeds() {
+        use crate::{control::ControlCommand, capability::Capability};
+        let mut state = minimal_state("a"); // caps = None (unrestricted)
+        let new = vec![Capability::KbRead { segment: "ops:briefs".into() }];
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::SetCaps { agent_id: "a".into(), capabilities: new.clone(), confirm_tx: Some(tx) }, &mut state);
+        let (_old, newlen) = rx.blocking_recv().unwrap().expect("narrow of unrestricted must succeed");
+        assert_eq!(newlen, 1);
+        assert_eq!(state.agents["a"].cap_set_cloned(), Some(new), "cfg.capabilities mutated to the narrowed set");
+    }
+
+    #[test]
+    fn setcaps_widen_denied() {
+        use crate::{control::ControlCommand, capability::Capability};
+        let mut state = minimal_state("a");
+        // First narrow None → [KbRead].
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::SetCaps {
+            agent_id: "a".into(),
+            capabilities: vec![Capability::KbRead { segment: "ops:briefs".into() }],
+            confirm_tx: Some(tx),
+        }, &mut state);
+        rx.blocking_recv().unwrap().expect("initial narrow ok");
+        // Now attempt to widen: add FsWrite that the current set does not cover → denied.
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::SetCaps {
+            agent_id: "a".into(),
+            capabilities: vec![
+                Capability::KbRead { segment: "ops:briefs".into() },
+                Capability::FsWrite { prefix: "/tmp".into() },
+            ],
+            confirm_tx: Some(tx2),
+        }, &mut state);
+        let e = rx2.blocking_recv().unwrap().unwrap_err();
+        assert!(e.contains("narrow-only"), "widening must be rejected, got: {e}");
+        assert_eq!(state.agents["a"].cap_set_cloned().unwrap().len(), 1, "cap set unchanged after a rejected widen");
+    }
+
+    #[test]
+    fn setcaps_inert_cap_rejected() {
+        use crate::{control::ControlCommand, capability::Capability};
+        let mut state = minimal_state("a");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Net is Inert in the agent context — narrowing to it is a misleading no-op.
+        dispatch(ControlCommand::SetCaps {
+            agent_id: "a".into(),
+            capabilities: vec![Capability::Net { hosts: vec![], ports: vec![443] }],
+            confirm_tx: Some(tx),
+        }, &mut state);
+        let e = rx.blocking_recv().unwrap().unwrap_err();
+        assert!(e.contains("inert"), "inert cap target must be rejected, got: {e}");
+    }
+
+    #[test]
+    fn cancel_unknown_agent_errs() {
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("a");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "ghost".into(), confirm_tx: Some(tx) }, &mut state);
+        assert!(rx.blocking_recv().unwrap().is_err(), "unknown agent cancel → Err (→404)");
+    }
+
+    #[test]
+    fn cancel_running_agent_flags_only() {
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("a"); // "a" is in agents, not parked → "running"
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "a".into(), confirm_tx: Some(tx) }, &mut state);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap(), 1, "one node flagged");
+        assert!(state.cancel_requested.contains_key("a"), "running agent is flagged, not funneled");
+        assert!(state.agents.contains_key("a"), "running agent stays until its in-flight future returns (gate funnels it)");
+    }
+
+    #[test]
+    fn cancel_parked_agent_funnels_and_consumes_flag() {
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("a");
+        state.waiting.insert("a".into()); // parked (waiting) → funnel immediately
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "a".into(), confirm_tx: Some(tx) }, &mut state);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap(), 1);
+        assert!(!state.cancel_requested.contains_key("a"), "flag consumed by handle_agent_terminal");
+        assert!(!state.waiting.contains("a"), "removed from waiting");
+        assert!(state.outcomes.contains_key("a"), "terminal outcome recorded for the root");
+    }
+
+    #[test]
+    fn cancel_purges_deferred_entry_without_panic() {
+        // The panic-safety guarantee: a cancelled agent's stale DeferredInfer must be purged,
+        // else the next drain_deferred pushes a future for a removed agent.
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("a");
+        state.waiting.insert("a".into());
+        state.deferred.push(DeferredInfer { priority: 0, seq: 0, agent_id: "a".into(), request: test_infer_req(), turn: 0 });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "a".into(), confirm_tx: Some(tx) }, &mut state);
+        rx.blocking_recv().unwrap().unwrap();
+        assert!(state.deferred.is_empty(), "cancel purges the stale deferred entry");
+    }
+
+    #[test]
+    fn cancel_awaiting_approval_purges_pending_approval() {
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("a");
+        // Park "a" on an approval so it counts as parked and has a pending_approvals entry.
+        state.pending_approvals.insert("act_0".into(), parked_approval("a"));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "a".into(), confirm_tx: Some(tx) }, &mut state);
+        rx.blocking_recv().unwrap().unwrap();
+        assert!(state.pending_approvals.is_empty(), "cancel purges the dangling approval");
+    }
+
+    #[test]
+    fn cancel_cascades_over_parent_map() {
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("parent");
+        // Add a child agent + record the spawn parentage.
+        let cfg = agent_cfg("child", "child task");
+        let mdl = model_cfg();
+        state.agents.insert("child".into(), AgentTask::new("child", &cfg.task, &cfg, &mdl, vec![]));
+        state.parent_map.insert("child".into(), "parent".into());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "parent".into(), confirm_tx: Some(tx) }, &mut state);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap(), 2, "parent + child both cancelled");
+        assert!(state.cancel_requested.contains_key("parent"));
+        assert_eq!(state.cancel_requested.get("child").map(|s| s.as_str()), Some("cascade from parent"));
+    }
+
+    #[test]
+    fn cancel_running_awaited_child_stays_flagged_not_funneled() {
+        // REGRESSION (ux.13 /review P0, cross-model): a spawned child is a KEY in `awaiting`
+        // (child→parent) the entire time its inference future is live. It must be classified
+        // RUNNING (flag-only), NOT parked — funneling it here would remove it from state.agents
+        // while its future is in flight, and the future's `state.agents.get_mut().expect(...)`
+        // would panic. The buggy predicate used `awaiting.contains_key`, which matched this
+        // running child; the fix matches a parked PARENT via `awaiting.values()`.
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("parent");
+        let cfg = agent_cfg("child", "child task");
+        let mdl = model_cfg();
+        state.agents.insert("child".into(), AgentTask::new("child", &cfg.task, &cfg, &mdl, vec![]));
+        // The child is a running spawned agent: a KEY in awaiting, with NO deferred/waiting/
+        // approval entry (its inference future is live, not represented in this unit state).
+        state.awaiting.insert("child".into(), AwaitingParent {
+            parent_id: "parent".into(), call_id: "c1".into(), deliver_content: true,
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "child".into(), confirm_tx: Some(tx) }, &mut state);
+        rx.blocking_recv().unwrap().unwrap();
+        assert!(state.cancel_requested.contains_key("child"), "running awaited child is flagged");
+        assert!(
+            state.agents.contains_key("child"),
+            "running awaited child MUST stay in agents (gate funnels it when its future returns) — \
+             funneling now would panic the pending-result arm",
+        );
+    }
+
+    #[test]
+    fn cancel_parked_parent_funnels_child_flag_only() {
+        // The complement: the PARENT awaiting a child has no in-flight future → parked → funnel
+        // now; the still-running child is flagged for the gate.
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("parent");
+        let cfg = agent_cfg("child", "child task");
+        let mdl = model_cfg();
+        state.agents.insert("child".into(), AgentTask::new("child", &cfg.task, &cfg, &mdl, vec![]));
+        state.parent_map.insert("child".into(), "parent".into());
+        state.awaiting.insert("child".into(), AwaitingParent {
+            parent_id: "parent".into(), call_id: "c1".into(), deliver_content: true,
+        });
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "parent".into(), confirm_tx: Some(tx) }, &mut state);
+        assert_eq!(rx.blocking_recv().unwrap().unwrap(), 2, "parent + child in the subtree");
+        // Parent (awaiting a child, no in-flight future) was funneled: flag consumed + terminal
+        // outcome recorded. (A funneled root stays in state.agents with an outcome; the run()
+        // loop reaps it — see cancel_parked_agent_funnels_and_consumes_flag.)
+        assert!(!state.cancel_requested.contains_key("parent"), "parked parent funneled (flag consumed)");
+        assert!(state.outcomes.contains_key("parent"), "parked parent has a terminal outcome");
+        // Running child stays flagged for the enqueue_or_defer gate.
+        assert!(state.agents.contains_key("child"), "running child stays for the gate");
+        assert_eq!(state.cancel_requested.get("child").map(|s| s.as_str()), Some("cascade from parent"));
+    }
+
+    // NOTE: a run()-level "cancel a live agent, assert no panic" integration test was
+    // considered but omitted — driving it through the real select! loop over a SHARED
+    // MockGateway is timing-nondeterministic (the cancel races the agent's own progress and
+    // a spawned child inherits the next mock response), which made it flaky. The panic-hazard
+    // paths (parked funnel, deferred purge, pending-approval purge, cascade) are covered
+    // deterministically by the dispatch-level tests above; the gate itself is a trivial
+    // `cancel_requested.contains_key` guard at the top of enqueue_or_defer.
 
     #[test]
     fn set_budget_unknown_agent_errors() {

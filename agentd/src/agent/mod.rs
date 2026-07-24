@@ -206,6 +206,26 @@ impl AgentTask {
         old
     }
 
+    /// Narrow the agent's capabilities at runtime (ux.13 SetCaps, revoke/narrow-only).
+    /// The scheduler validates the narrow and recomputes the tool specs from the new cap
+    /// set (`registry.filtered_specs`) — `AgentTask` holds no registry, so the specs are
+    /// passed in. Overwrites the **checkpointed** `cfg.capabilities` (survives restart; on
+    /// restore the scheduler recomputes `filtered_specs` from it, so specs stay consistent)
+    /// AND the cached model-facing `specs`/`tool_names`, so the model's tool list, the FUSE
+    /// snapshot (`spec_names`), and tool dispatch all agree — otherwise the model would keep
+    /// seeing tools it can no longer call. Returns the previous capability-set length.
+    pub fn set_capabilities(
+        &mut self,
+        new_caps: Vec<crate::capability::Capability>,
+        new_specs: Vec<ToolSpec>,
+    ) -> usize {
+        let old_len = self.cfg.capabilities.as_ref().map_or(0, |c| c.len());
+        self.cfg.capabilities = Some(new_caps);
+        self.tool_names = new_specs.iter().map(|s| s.name.clone()).collect();
+        self.specs = new_specs;
+        old_len
+    }
+
     /// Clone of the model configuration. Used by the scheduler to seed child agents.
     pub fn model_cfg_cloned(&self) -> ModelConfig {
         self.model_cfg.clone()
