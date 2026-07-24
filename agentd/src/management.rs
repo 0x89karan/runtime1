@@ -563,6 +563,91 @@ async fn route(
             }
         }
 
+        (Method::POST, path) if path.starts_with("/api/v1/agents/") && path.ends_with("/cancel") => {
+            // ux.13 Cancel. Cascade-cancels the agent's spawned subtree at the next step
+            // boundary. Confirm-channel reports the node count; 404 for an unknown agent.
+            let agent_id = path
+                .strip_prefix("/api/v1/agents/")
+                .and_then(|s| s.strip_suffix("/cancel"))
+                .unwrap_or("")
+                .trim();
+            if agent_id.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "agent id must not be empty");
+            }
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<Result<u64, String>>();
+            let cmd = ControlCommand::Cancel { agent_id: agent_id.to_string(), confirm_tx: Some(confirm_tx) };
+            match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running");
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(2), confirm_rx).await {
+                Ok(Ok(Ok(count))) => json_response(StatusCode::OK, json!({ "cancelled": agent_id, "count": count })),
+                Ok(Ok(Err(e))) => error_response(StatusCode::NOT_FOUND, &e),
+                Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
+                Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for cancel"),
+            }
+        }
+
+        (Method::POST, path) if path.starts_with("/api/v1/agents/") && path.ends_with("/caps") => {
+            // ux.13 SetCaps (revoke/narrow-only). Body: {"capabilities":[...]}.
+            // 404 for an unknown agent; 400 for a widening or inert-cap request.
+            let agent_id = path
+                .strip_prefix("/api/v1/agents/")
+                .and_then(|s| s.strip_suffix("/caps"))
+                .unwrap_or("")
+                .trim();
+            if agent_id.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "agent id must not be empty");
+            }
+            if body.is_empty() {
+                return error_response(StatusCode::BAD_REQUEST, "request body required");
+            }
+            #[derive(serde::Deserialize)]
+            struct CapsReq {
+                capabilities: Vec<crate::capability::Capability>,
+            }
+            let req: CapsReq = match serde_json::from_slice(body) {
+                Ok(r) => r,
+                Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid JSON: {e}")),
+            };
+            let Some(tx) = &state.control_tx else {
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<Result<(usize, usize), String>>();
+            let cmd = ControlCommand::SetCaps {
+                agent_id: agent_id.to_string(),
+                capabilities: req.capabilities,
+                confirm_tx: Some(confirm_tx),
+            };
+            match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running");
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(2), confirm_rx).await {
+                Ok(Ok(Ok((old, new)))) => json_response(StatusCode::OK, json!({ "agent": agent_id, "old": old, "new": new })),
+                // "not found" → 404; narrow-only / inert-cap rejections → 400.
+                Ok(Ok(Err(e))) => {
+                    let code = if e.contains("not found") { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
+                    error_response(code, &e)
+                }
+                Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
+                Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for set-caps"),
+            }
+        }
+
         (Method::POST, path) if path.starts_with("/api/v1/agents/") && path.ends_with("/inject") => {
             let agent_id = path
                 .strip_prefix("/api/v1/agents/")
@@ -1163,6 +1248,35 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let ct = resp.headers().get("retry-after").map(|v| v.to_str().unwrap_or(""));
         assert_eq!(ct, Some("1"));
+    }
+
+    // ux.13 route wiring: cancel/caps mirror the budget/set confirm-channel handler.
+    #[tokio::test]
+    async fn cancel_route_503_without_control_tx() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/agents/solo/cancel", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn cancel_route_empty_id_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/agents//cancel", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn caps_route_requires_body_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/agents/solo/caps", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn caps_route_bad_json_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/agents/solo/caps", "", b"{not json}").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

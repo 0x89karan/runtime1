@@ -10,6 +10,7 @@ mod inject;
 mod list;
 mod orchestrate;
 mod spawn;
+mod verbs;
 mod verify;
 mod watch;
 
@@ -37,6 +38,12 @@ enum Commands {
     Brief(brief::BriefArgs),
     /// Inject a new user turn into a waiting orchestrated agent
     Inject(inject::InjectArgs),
+    /// Cancel an agent (cascade-cancels its spawned subtree) — ux.13
+    Cancel(verbs::CancelArgs),
+    /// Set a per-agent token budget at runtime (0 = unlimited) — ux.13
+    SetBudget(verbs::SetBudgetArgs),
+    /// Narrow an agent's capabilities at runtime (revoke/narrow-only) — ux.13
+    SetCaps(verbs::SetCapsArgs),
     ListTemplates(list::Args),
     /// Start an interactive orchestration REPL (orch.1+)
     Orchestrate(orchestrate::OrchestrateArgs),
@@ -53,6 +60,9 @@ fn main() {
         Commands::Auth(cmd) => auth::run(cmd),
         Commands::Brief(args) => brief::run(args),
         Commands::Inject(args) => inject::run(args),
+        Commands::Cancel(args) => verbs::run_cancel(args),
+        Commands::SetBudget(args) => verbs::run_set_budget(args),
+        Commands::SetCaps(args) => verbs::run_set_caps(args),
         Commands::ListTemplates(args) => list::run(args),
         Commands::Orchestrate(args) => orchestrate::run(args),
         Commands::Spawn(args) => spawn::run(args),
