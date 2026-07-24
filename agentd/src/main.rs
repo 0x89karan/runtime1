@@ -1143,18 +1143,20 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
     // Safety: called before scheduler.run() (i.e. before any agent tasks are spawned),
     // so no concurrent threads are reading env vars at this point.
     std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-PLACEHOLDER-agentd");
-    let egress_proxy = Arc::new(agentd::egress::EgressProxy::new(
-        Arc::clone(&evidence_writer),
-        Arc::clone(&recorder),
-    ));
+    // budget.1 / P2-2: seed the shared global meter with the configured windowed
+    // ceiling so the HTTP proxy self-throttles universal-tier spend against the
+    // SAME budget as native inference (0 = count-only, no throttle).
+    let egress_proxy = Arc::new(
+        agentd::egress::EgressProxy::new(Arc::clone(&evidence_writer), Arc::clone(&recorder))
+            .with_global_ceiling(cfg.scheduler.global_token_budget),
+    );
     let proxy_registry = Arc::new(agentd::egress::ProxyRegistry::new());
     let egress_bound_addr: Option<std::net::SocketAddr> = if let Some(ref addr) = cfg.egress.proxy_addr {
         match agentd::egress::start_http_proxy(
             addr,
             real_api_key,
             Arc::clone(&proxy_registry),
-            Arc::clone(&recorder),
-            Arc::clone(&evidence_writer),
+            Arc::clone(&egress_proxy),
         ).await {
             Ok(bound) => {
                 tracing::info!(addr = %bound, "egress proxy started");
