@@ -3,6 +3,24 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.100.0] - 2026-07-25
+
+### Fixed
+- **cap.4 — auth-consistency + capability-scoping** (3rd AUDIT-v0.97 increment):
+  - **P2-3 management-API auth** — the ux.12 `X-Approval-Token` gate covered only approve/deny while
+    `/spawn`, `/inject`, `/budget/*`, `/agents/*/{cancel,caps}` were ungated on the same `:7999`
+    surface. Now the gate (`is_mutating_route` + `approval_token_ok`) covers the **entire mutating
+    surface** when `AGENTOS_APPROVAL_SECRET` is set; reads stay ungated; unset stays open. agentctl
+    sends the token on all mutations. Additionally, **`/spawn` is deny-by-default on capabilities** —
+    without `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1` it mints only read-only-local caps
+    (`KbRead`/`FsRead`/`RunsRead`); tools (`Mcp`), network, writes, spawn, run_job, brief-publish,
+    credentials, and unrestricted `null` are refused (a denylist was fragile — `Mcp{google_oauth}`,
+    not the inert agent-level `Credential`, is the real live-Gmail vector).
+  - **P2-5 tool_override KB scoping** — the invoke gate now derives + enforces `KbWrite/KbRead{segment}`
+    by tool name (byte-identical to the native tools) in addition to the `Mcp` grant, so segment
+    scoping survives semantic-kb's `tool_override`. The injection-exposed cos-inbox job can no longer
+    overwrite the curator's brief despite its wildcard `Mcp` grant.
+
 ## [v0.99.0] - 2026-07-25
 
 ### Fixed
