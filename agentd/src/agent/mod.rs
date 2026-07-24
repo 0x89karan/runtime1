@@ -717,7 +717,11 @@ impl AgentTask {
         });
 
         match response.stop_reason {
-            StopReason::MaxTokens => {
+            // Legacy (no reset window): a truncated response hard-terminates. Under a reset
+            // window (`budget_resettable`) this would permanently brick a resident agent on ONE
+            // truncated response (audit86-P0-2 / ux.8-ar-02 self-brick class), so the resettable
+            // case falls through to the recoverable turn-end arm below.
+            StopReason::MaxTokens if !self.budget_resettable => {
                 recorder.record(
                     &self.agent_id,
                     Some(self.turn),
@@ -730,7 +734,19 @@ impl AgentTask {
                 )
             }
 
-            StopReason::EndTurn | StopReason::Other(_) => {
+            // EndTurn/Other, and a resettable MaxTokens truncation: treat as a (possibly partial)
+            // turn end — a resident agent parks and is reactivatable rather than bricked.
+            StopReason::EndTurn | StopReason::Other(_) | StopReason::MaxTokens => {
+                if matches!(response.stop_reason, StopReason::MaxTokens) {
+                    recorder.record(
+                        &self.agent_id,
+                        Some(self.turn),
+                        EventKind::BudgetExceeded,
+                        json!({ "total_tokens": total, "budget": self.cfg.token_budget,
+                                "recoverable": true,
+                                "note": "max_tokens truncation; resident agent kept resumable (budget_resettable)" }),
+                    );
+                }
                 let answer = response
                     .blocks
                     .iter()
@@ -1859,6 +1875,35 @@ mod tests {
             matches!(effect, AgentEffect::Failed(_)),
             "MaxTokens with partial text must be Failed, not Completed (partial text discarded)"
         );
+    }
+
+    #[test]
+    fn max_tokens_resettable_agent_parks_not_bricked() {
+        // budget.1 / AUDIT-v0.97 P3: a resident agent under a reset window
+        // (`budget_resettable`) must NOT be hard-Failed on a single truncated
+        // response — that was the self-brick class. It falls through to the
+        // recoverable turn-end arm: Completed with whatever partial text exists,
+        // leaving the scheduler free to re-activate it on the next window.
+        let (rec, _tmp) = recorder();
+        let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
+        task.set_budget_resettable(true);
+
+        let response = InferenceResponse {
+            blocks:            vec![Block::Text { text: "partial but usable".to_string() }],
+            stop_reason:       StopReason::MaxTokens,
+            input_tokens:      10,
+            output_tokens:     5,
+            transport_retries: 0,
+        };
+        task.provide_inference(response, &rec);
+        let effect = task.step(&rec);
+        match effect {
+            AgentEffect::Completed(answer) => {
+                assert_eq!(answer, "partial but usable", "partial text is surfaced, not discarded");
+            }
+            AgentEffect::Failed(msg) => panic!("resettable MaxTokens must park as Completed, not Failed: {msg}"),
+            _ => panic!("resettable MaxTokens must park as Completed"),
+        }
     }
 
     #[test]
