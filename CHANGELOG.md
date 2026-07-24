@@ -3,6 +3,22 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.99.0] - 2026-07-25
+
+### Fixed
+- **run.1 — durability cluster of the AUDIT-v0.97 sweep** (2nd increment):
+  - **P1-2 flight.jsonl rotation** — copy-truncate in place at 100 MB (AtomicU64 size counter, under
+    the recorder's file mutex, same inode so the otel `tail.rs` sentinel follows it). Best-effort;
+    closes the always-on disk-fill that starved the co-located durable writers.
+  - **P1-3 short_term cap** — ring-drop oldest paged summaries beyond `MAX_SHORT_TERM` so a
+    never-terminating orchestrator's per-turn checkpoint clone stays bounded (short_term is evicted
+    summaries, never live tool-call/result pairs). Mid-run distillation of dropped context deferred.
+  - **P2-6 cron missed-fire catch-up** — persist next-fire to `/data`; fire once on boot if a fire was
+    missed while down. Schedule-fingerprinted (mode + raw cron/interval) so a config change across
+    restart cannot trigger a spurious catch-up.
+  - **P2-9 runs.redb retention prune** — bound by count/age (5000/90d), closed records only; bounds the
+    `list()`/`publish_brief()` full-scan. Time-indexed query re-key deferred.
+
 ## [v0.98.0] - 2026-07-25
 
 ### Fixed
