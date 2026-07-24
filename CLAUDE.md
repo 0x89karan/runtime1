@@ -24,31 +24,31 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.95.0 (shipped 2026-07-23)
+**Current version:** v0.96.0 (shipped 2026-07-24)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** cap.2b (v0.95.0) — **orchestrator de-privilege, the REAL audit P1-10 closure**
-(cap.2 shipped only the floor). The CEO/Eng gate established that tool-input caps can't close the
-injected-orchestrator threat because the cap-chooser is downstream of untrusted email, so cap.2b
-moves cap + task authority OFF the injectable node. New **`Capability::RunJob`** + **`run_job(job_id)`**
-tool (job_id is the ONLY input) + **`[[jobs]]`** config (`Job {capabilities, task, max_turns,
-token_budget}`) + **`dispatch_run_job`**. A sealed job's caps + task template are **owned by config,
-not the caller**, so the subset check is bypassed *soundly* (trust root moved to config) and there is
-no caller-supplied task/param to carry an injection (`{date}` is server-stamped). **The crux:
-`AwaitingParent.deliver_content=false`** — a sealed job returns an agentd-authored `"job X
-completed/failed"` signal to the trigger, never its (email-derived) output (both branches
-agentd-authored — no raw-error echo; checkpoint-safe via serde default true). The CoS orchestrator is
-de-privileged to a summary-free cron **trigger** (`{Mcp{cron_trigger}, RunJob}` only); Gmail is the
-`cos-inbox` job and brief authoring (FsWrite + BriefPublish) is the KB-only `cos-curator` job.
-`agentd check` lints `[[jobs]]`; `spawn_agent` (cap.2 floor) is untouched for trusted operator-driven
-delegation (task-provenance rule: operator-typed = trusted, data-derived = untrusted). **P1-10 CLOSED**
-against the pinned claim (*no child obtains live Gmail via injection; no untrusted-data node holds
-spawn/credential authority*) — NOT "injection defeated": an injected curator can still write a
-misleading brief (integrity, not credential exfil; detective controls only — THREAT_MODEL §9.5).
-North star = data-taint (recorded, not built). Runtime no-read proof + topology guard both
-negative-control-verified in /qa. `max_turns` for jobs added (default 20 would trip mid-pipeline).
-**Next:** ux.13 (verbs) or ux.12 (Telegram); cap.2b-ar-01 (pipeline date-skew, P3) + cap.3 (`AbsPathPrefix`) open.
+**Latest shipped:** ux.12 (v0.96.0) — **Telegram reach: two-way sidecar (brief + approve/deny from
+your phone)**, pulled ahead of ux.13 at the autoplan gate (reach-before-verbs serves the
+absent-operator "trust after absence" thesis). New **`docker/telegram_mcp.py`** — a **no-tools stdio
+MCP server** (empty `tools/list`; a background bridge thread, not an agent tool) spawned inside the
+`cos` container so it can reach the loopback management API. It delivers the morning brief, pushes
+pending approvals (length-capped `args_json` preview), and relays allowlisted **approve/deny** replies
+to the existing approvals API. **The load-bearing security addition (both Eng voices): a route-scoped
+`X-Approval-Token` secret** on `POST /api/v1/approvals/*/{approve,deny}` — the chat-ID allowlist alone
+does NOT protect the unauthenticated `:7999` API (guessable `act_{seq}` ids; because cos binds
+`0.0.0.0`, `semantic-kb-mcp` was *already* an approve-capable peer). Gated in `handle()` before
+`route()`, constant-time compared vs `AGENTOS_APPROVAL_SECRET` (env; unset ⇒ open, pre-ux.12); agentctl
+sends the header too. Sidecar discipline: `from.id`+private-chat allowlist, **relay-only + re-verify**
+(re-GET pending + args-hash match before POST — closes a deleted-checkpoint id collision), `update_id`
+dedup + durable offset, fail-closed on POST errors, secrets never logged. **Optional + degrade-safe:**
+declared unconditionally but runs **inert** (answers the MCP handshake, no bridge thread) when Telegram
+env is unset — no brick; sidecar/Telegram down ⇒ approvals stay pending in the TUI (canonical). No
+inject (cut on cross-model challenge). THREAT_MODEL §9.6. /review caught + fixed 2 distro-brick
+criticals (Makefile packaging + the exit-1→inert fix); /qa added an over-the-wire gate test with
+negative controls (rejected approve never reaches the scheduler). **Next:** ux.13 (verbs — plan
+reviewed/APPROVED on `ux.13-control-verbs`); then the tail (ux.2b, ux.3, ux.10); cap.2b-ar-01 (P3) +
+cap.3 (`AbsPathPrefix`) still open.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 
