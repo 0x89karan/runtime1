@@ -209,6 +209,200 @@ pub enum EventKind {
     Error,
 }
 
+impl EventKind {
+    /// Canonical wire string for this event kind — byte-identical to the serde
+    /// `snake_case` serialization written to `flight.jsonl`'s `"kind"` field.
+    ///
+    /// This is the **single source of truth** for code that matches events by raw
+    /// string rather than by variant — notably `agentctl`'s flight-log filters
+    /// (`watch/inspector.rs`, `watch/views.rs`, `watch/converse.rs`,
+    /// `orchestrate.rs`, `watch/topology.rs`), which depend on the `agentd` crate
+    /// but historically hard-coded the strings. A renamed variant that used to
+    /// silently blank a TUI filter now breaks `as_str_matches_serde` (canonical
+    /// drift) and `agentctl`'s `event_kind_strings` guard (raw-string drift).
+    /// (audit86-P2-13 / AUDIT-v0.97 P2-10 / par.1)
+    ///
+    /// Exhaustive by construction: adding a variant without a string here is a
+    /// compile error, forcing the author to pick its canonical form.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            EventKind::AgentSpawned => "agent_spawned",
+            EventKind::ToolsRegistered => "tools_registered",
+            EventKind::Perceive => "perceive",
+            EventKind::InferenceRequest => "inference_request",
+            EventKind::InferenceResponse => "inference_response",
+            EventKind::ToolCall => "tool_call",
+            EventKind::ToolResult => "tool_result",
+            EventKind::Observe => "observe",
+            EventKind::AgentCompleted => "agent_completed",
+            EventKind::AgentFailed => "agent_failed",
+            EventKind::AgentScheduled => "agent_scheduled",
+            EventKind::AgentDeferred => "agent_deferred",
+            EventKind::AgentAdmissionDenied => "agent_admission_denied",
+            EventKind::BudgetExceeded => "budget_exceeded",
+            EventKind::BudgetReset => "budget_reset",
+            EventKind::BudgetSet => "budget_set",
+            EventKind::AgentCancelled => "agent_cancelled",
+            EventKind::CapabilitiesSet => "capabilities_set",
+            EventKind::MaxTurnsReached => "max_turns_reached",
+            EventKind::CapabilityDenied => "capability_denied",
+            EventKind::AgentSpawnDenied => "agent_spawn_denied",
+            EventKind::AgentChildResultDelivered => "agent_child_result_delivered",
+            EventKind::AgentCardRegistered => "agent_card_registered",
+            EventKind::AgentCheckpointed => "agent_checkpointed",
+            EventKind::AgentRestored => "agent_restored",
+            EventKind::MessageSent => "message_sent",
+            EventKind::MessageReceived => "message_received",
+            EventKind::SystemShutdownRequested => "system_shutdown_requested",
+            EventKind::FuseMounted => "fuse_mounted",
+            EventKind::FuseUnmounted => "fuse_unmounted",
+            EventKind::FuseSkipped => "fuse_skipped",
+            EventKind::SandboxApplied => "sandbox_applied",
+            EventKind::SandboxSkipped => "sandbox_skipped",
+            EventKind::MemoryRead => "memory_read",
+            EventKind::MemoryWrite => "memory_write",
+            EventKind::MemoryUnavailable => "memory_unavailable",
+            EventKind::MemoryQuarantined => "memory_quarantined",
+            EventKind::RunsUnavailable => "runs_unavailable",
+            EventKind::BriefWritten => "brief_written",
+            EventKind::CapabilitiesResolved => "capabilities_resolved",
+            EventKind::MemoryPressureAdvisory => "memory_pressure_advisory",
+            EventKind::MemoryPaged => "memory_paged",
+            EventKind::MemoryDistilled => "memory_distilled",
+            EventKind::KbSearch => "kb_search",
+            EventKind::MemoryEvicted => "memory_evicted",
+            EventKind::McpHttpConnected => "mcp_http_connected",
+            EventKind::McpHttpError => "mcp_http_error",
+            EventKind::McpPassenvForwarded => "mcp_passenv_forwarded",
+            EventKind::InferenceStreamStarted => "inference_stream_started",
+            EventKind::InferenceStreamCompleted => "inference_stream_completed",
+            EventKind::InferenceStreamDelta => "inference_stream_delta",
+            EventKind::FuseControlReceived => "fuse_control_received",
+            EventKind::FuseControlError => "fuse_control_error",
+            EventKind::ApprovalRequested => "approval_requested",
+            EventKind::ApprovalGranted => "approval_granted",
+            EventKind::ApprovalRejected => "approval_rejected",
+            EventKind::EgressBrokered => "egress_brokered",
+            EventKind::EgressDenied => "egress_denied",
+            EventKind::ActionReceiptEmitted => "action_receipt_emitted",
+            EventKind::EgressProxyFailed => "egress_proxy_failed",
+            EventKind::UniversalAgentStarted => "universal_agent_started",
+            EventKind::UniversalAgentExited => "universal_agent_exited",
+            EventKind::UniversalAgentIsolationDegraded => "universal_agent_isolation_degraded",
+            EventKind::SchedulerStarted => "scheduler_started",
+            EventKind::SchedulerStopped => "scheduler_stopped",
+            EventKind::InferenceTransportRetried => "inference_transport_retried",
+            EventKind::ManagementStarted => "management_started",
+            EventKind::ManagementRequest => "management_request",
+            EventKind::ApprovalHttpApproved => "approval_http_approved",
+            EventKind::ApprovalHttpDenied => "approval_http_denied",
+            EventKind::CredentialEgressBrokered => "credential_egress_brokered",
+            EventKind::CredentialAccessed => "credential_accessed",
+            EventKind::CredentialRefreshFailed => "credential_refresh_failed",
+            EventKind::CredentialNotProvisioned => "credential_not_provisioned",
+            EventKind::CredentialDenied => "credential_denied",
+            EventKind::CredentialCapExceeded => "credential_cap_exceeded",
+            EventKind::OrchestratorDispatched => "orchestrator_dispatched",
+            EventKind::OrchestratorInjected => "orchestrator_injected",
+            EventKind::OrchestratorTurnComplete => "orchestrator_turn_complete",
+            EventKind::OrchestratorExited => "orchestrator_exited",
+            EventKind::IsolationProbed => "isolation_probed",
+            EventKind::CredentialAttentionRequired => "credential_attention_required",
+            EventKind::CredentialRecovered => "credential_recovered",
+            EventKind::Error => "error",
+        }
+    }
+
+    /// Every variant, for enumeration in tests and string-set guards. Kept complete
+    /// by `all_is_exhaustive` (a variant added without an entry here fails to compile).
+    pub const ALL: &'static [EventKind] = &[
+        EventKind::AgentSpawned,
+        EventKind::ToolsRegistered,
+        EventKind::Perceive,
+        EventKind::InferenceRequest,
+        EventKind::InferenceResponse,
+        EventKind::ToolCall,
+        EventKind::ToolResult,
+        EventKind::Observe,
+        EventKind::AgentCompleted,
+        EventKind::AgentFailed,
+        EventKind::AgentScheduled,
+        EventKind::AgentDeferred,
+        EventKind::AgentAdmissionDenied,
+        EventKind::BudgetExceeded,
+        EventKind::BudgetReset,
+        EventKind::BudgetSet,
+        EventKind::AgentCancelled,
+        EventKind::CapabilitiesSet,
+        EventKind::MaxTurnsReached,
+        EventKind::CapabilityDenied,
+        EventKind::AgentSpawnDenied,
+        EventKind::AgentChildResultDelivered,
+        EventKind::AgentCardRegistered,
+        EventKind::AgentCheckpointed,
+        EventKind::AgentRestored,
+        EventKind::MessageSent,
+        EventKind::MessageReceived,
+        EventKind::SystemShutdownRequested,
+        EventKind::FuseMounted,
+        EventKind::FuseUnmounted,
+        EventKind::FuseSkipped,
+        EventKind::SandboxApplied,
+        EventKind::SandboxSkipped,
+        EventKind::MemoryRead,
+        EventKind::MemoryWrite,
+        EventKind::MemoryUnavailable,
+        EventKind::MemoryQuarantined,
+        EventKind::RunsUnavailable,
+        EventKind::BriefWritten,
+        EventKind::CapabilitiesResolved,
+        EventKind::MemoryPressureAdvisory,
+        EventKind::MemoryPaged,
+        EventKind::MemoryDistilled,
+        EventKind::KbSearch,
+        EventKind::MemoryEvicted,
+        EventKind::McpHttpConnected,
+        EventKind::McpHttpError,
+        EventKind::McpPassenvForwarded,
+        EventKind::InferenceStreamStarted,
+        EventKind::InferenceStreamCompleted,
+        EventKind::InferenceStreamDelta,
+        EventKind::FuseControlReceived,
+        EventKind::FuseControlError,
+        EventKind::ApprovalRequested,
+        EventKind::ApprovalGranted,
+        EventKind::ApprovalRejected,
+        EventKind::EgressBrokered,
+        EventKind::EgressDenied,
+        EventKind::ActionReceiptEmitted,
+        EventKind::EgressProxyFailed,
+        EventKind::UniversalAgentStarted,
+        EventKind::UniversalAgentExited,
+        EventKind::UniversalAgentIsolationDegraded,
+        EventKind::SchedulerStarted,
+        EventKind::SchedulerStopped,
+        EventKind::InferenceTransportRetried,
+        EventKind::ManagementStarted,
+        EventKind::ManagementRequest,
+        EventKind::ApprovalHttpApproved,
+        EventKind::ApprovalHttpDenied,
+        EventKind::CredentialEgressBrokered,
+        EventKind::CredentialAccessed,
+        EventKind::CredentialRefreshFailed,
+        EventKind::CredentialNotProvisioned,
+        EventKind::CredentialDenied,
+        EventKind::CredentialCapExceeded,
+        EventKind::OrchestratorDispatched,
+        EventKind::OrchestratorInjected,
+        EventKind::OrchestratorTurnComplete,
+        EventKind::OrchestratorExited,
+        EventKind::IsolationProbed,
+        EventKind::CredentialAttentionRequired,
+        EventKind::CredentialRecovered,
+        EventKind::Error,
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +497,131 @@ mod tests {
         assert_eq!(kind_str(EventKind::BriefWritten), "brief_written");
         assert_eq!(kind_str(EventKind::CapabilitiesResolved), "capabilities_resolved");
         assert_eq!(kind_str(EventKind::Error), "error");
+    }
+
+    /// `as_str()` is the canonical-string single source of truth, so it must be
+    /// byte-identical to the serde serialization for EVERY variant — otherwise the
+    /// two forms drift and a consumer that trusts `as_str()` (agentctl) filters on
+    /// a string that never appears in `flight.jsonl`. (par.1 / AUDIT-v0.97 P2-10)
+    #[test]
+    fn as_str_matches_serde() {
+        for k in EventKind::ALL {
+            assert_eq!(
+                k.as_str(),
+                kind_str(*k),
+                "EventKind::{k:?}.as_str() drifted from its serde serialization"
+            );
+        }
+        // No two variants may share a wire string, or a string match is ambiguous.
+        let mut seen = std::collections::HashSet::new();
+        for k in EventKind::ALL {
+            assert!(seen.insert(k.as_str()), "duplicate wire string: {}", k.as_str());
+        }
+    }
+
+    /// `EventKind::ALL` must list every variant. The exhaustive `match` makes adding
+    /// a variant without extending `ALL` a compile error (the developer is forced to
+    /// touch this arm, at which point they add it to the array the assert below counts).
+    #[test]
+    fn all_is_exhaustive() {
+        fn touch(k: EventKind) {
+            #[allow(clippy::match_like_matches_macro)]
+            match k {
+                EventKind::AgentSpawned
+                | EventKind::ToolsRegistered
+                | EventKind::Perceive
+                | EventKind::InferenceRequest
+                | EventKind::InferenceResponse
+                | EventKind::ToolCall
+                | EventKind::ToolResult
+                | EventKind::Observe
+                | EventKind::AgentCompleted
+                | EventKind::AgentFailed
+                | EventKind::AgentScheduled
+                | EventKind::AgentDeferred
+                | EventKind::AgentAdmissionDenied
+                | EventKind::BudgetExceeded
+                | EventKind::BudgetReset
+                | EventKind::BudgetSet
+                | EventKind::AgentCancelled
+                | EventKind::CapabilitiesSet
+                | EventKind::MaxTurnsReached
+                | EventKind::CapabilityDenied
+                | EventKind::AgentSpawnDenied
+                | EventKind::AgentChildResultDelivered
+                | EventKind::AgentCardRegistered
+                | EventKind::AgentCheckpointed
+                | EventKind::AgentRestored
+                | EventKind::MessageSent
+                | EventKind::MessageReceived
+                | EventKind::SystemShutdownRequested
+                | EventKind::FuseMounted
+                | EventKind::FuseUnmounted
+                | EventKind::FuseSkipped
+                | EventKind::SandboxApplied
+                | EventKind::SandboxSkipped
+                | EventKind::MemoryRead
+                | EventKind::MemoryWrite
+                | EventKind::MemoryUnavailable
+                | EventKind::MemoryQuarantined
+                | EventKind::RunsUnavailable
+                | EventKind::BriefWritten
+                | EventKind::CapabilitiesResolved
+                | EventKind::MemoryPressureAdvisory
+                | EventKind::MemoryPaged
+                | EventKind::MemoryDistilled
+                | EventKind::KbSearch
+                | EventKind::MemoryEvicted
+                | EventKind::McpHttpConnected
+                | EventKind::McpHttpError
+                | EventKind::McpPassenvForwarded
+                | EventKind::InferenceStreamStarted
+                | EventKind::InferenceStreamCompleted
+                | EventKind::InferenceStreamDelta
+                | EventKind::FuseControlReceived
+                | EventKind::FuseControlError
+                | EventKind::ApprovalRequested
+                | EventKind::ApprovalGranted
+                | EventKind::ApprovalRejected
+                | EventKind::EgressBrokered
+                | EventKind::EgressDenied
+                | EventKind::ActionReceiptEmitted
+                | EventKind::EgressProxyFailed
+                | EventKind::UniversalAgentStarted
+                | EventKind::UniversalAgentExited
+                | EventKind::UniversalAgentIsolationDegraded
+                | EventKind::SchedulerStarted
+                | EventKind::SchedulerStopped
+                | EventKind::InferenceTransportRetried
+                | EventKind::ManagementStarted
+                | EventKind::ManagementRequest
+                | EventKind::ApprovalHttpApproved
+                | EventKind::ApprovalHttpDenied
+                | EventKind::CredentialEgressBrokered
+                | EventKind::CredentialAccessed
+                | EventKind::CredentialRefreshFailed
+                | EventKind::CredentialNotProvisioned
+                | EventKind::CredentialDenied
+                | EventKind::CredentialCapExceeded
+                | EventKind::OrchestratorDispatched
+                | EventKind::OrchestratorInjected
+                | EventKind::OrchestratorTurnComplete
+                | EventKind::OrchestratorExited
+                | EventKind::IsolationProbed
+                | EventKind::CredentialAttentionRequired
+                | EventKind::CredentialRecovered
+                | EventKind::Error => {
+                    // Every variant must appear in ALL. If you just added a variant to
+                    // the enum, the compiler pointed you here — add it to `EventKind::ALL`.
+                    assert!(
+                        EventKind::ALL.iter().any(|x| x.as_str() == k.as_str()),
+                        "EventKind::{k:?} is missing from EventKind::ALL"
+                    );
+                }
+            }
+        }
+        for k in EventKind::ALL {
+            touch(*k);
+        }
     }
 }
