@@ -10,6 +10,14 @@
 #   - [management] bind_addr = "0.0.0.0" so QEMU hostfwd can reach the API from host
 #   - FsWrite capability uses /run/output (host-shared output volume)
 #   - Credentials come from agentos.env (parsed by /init from /run/secrets/agentos.env)
+#   - NO semantic-kb sidecar / mail:raw segment / dedup step. This is DELIBERATE, not
+#     drift: the QEMU image ships no Qdrant + no semantic-kb sidecar (that stack is a
+#     Docker/compose concern). It is TEST-PINNED by agentd/tests/cos_spawn_caps_subset.rs
+#     (`distro_cos2b_topology` asserts these jobs never reference semantic-kb). This is
+#     a STRUCTURAL difference from the dev config, not a path substitution — which is why
+#     par.2's "one env-expanded config for both" was retired at /autoplan (2026-07-25);
+#     ${VAR} expansion cannot add/remove a section. See docs/plans/par.2-config-unification.md.
+#     If QEMU should ever gain semantic KB, that is a distro Qdrant+OpenAI lift, not a merge.
 #
 # Required vars in ~/.agentos-secrets/agentos.env on the Linux host:
 #   ANTHROPIC_API_KEY, OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET,
