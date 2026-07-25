@@ -3,35 +3,6 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [v0.104.0] - 2026-07-25
-
-### Changed
-- **par.2 reshaped** (AUDIT-v0.97 tail; the config-unification refactor was **retired at /autoplan**).
-  A three-voice dual-model gauntlet (Codex + two Claude subagents) was unanimous that the planned
-  "one env-expanded `cos.agents.toml` for both Docker + QEMU" could not work: the two configs differ
-  *structurally* (a whole semantic-kb `[[mcp_servers]]` block, a `mail:raw` segment, job-cap array
-  membership, a `10M`-vs-`50M` integer budget), which `${VAR}` string-substitution can't express — and
-  the divergence is **deliberate and test-pinned** (`cos_spawn_caps_subset.rs::distro_cos2b_topology`),
-  so the premise (P2-14 "silent drift") was stale. It ships instead as a targeted ~1h fix:
-
-### Fixed
-- **Boot-guard bare-key escape closed** (audit86-P1-5 remainder): the cos boot path-guard ERE was
-  `[a-z_]*_(path|dir)` — it required an underscore, so a **bare** `path = "x"` / `dir = "x"` (relative,
-  no `./`, no `_` prefix) escaped both the dot-slash scan and the key scan and would boot with a
-  silently-relative path. Tightened to `[a-z_]*(path|dir)` (underscore optional). Proven by a new CI
-  negative-control fixture (`.github/fixtures/cos-bare-relative-dir.toml`) that the old ERE booted and
-  the new one refuses — with `store_path` absolute so only the bare `dir` line can trip the guard.
-  (audit86-P1-8 in `capability.rs` is a separate runtime-matching issue → cap.3, untouched.)
-  - *Tradeoff (review-flagged):* a **bind-mounted custom** config with a bare `dir`/`path`/`*dir`/`*path`
-    key holding a relative value (incl. in task prose) now fails the boot guard where the older pattern
-    let it pass — use `AGENTOS_SKIP_PATH_GUARDS=1` for such configs. The baked CoS config is unaffected
-    (verified: the loosened ERE adds zero matches on both shipped configs after the sed rewrite).
-
-### Documentation
-- The QEMU CoS fork header now documents that the semantic-kb / `mail:raw` / dedup omission is
-  **intentional** (the image ships no Qdrant) and **test-pinned**, so it isn't re-filed as drift.
-  P2-14 reclassified accordingly. `agent)`-mode sed retirement deferred to par.3.
-
 ## [v0.103.0] - 2026-07-25
 
 ### Added

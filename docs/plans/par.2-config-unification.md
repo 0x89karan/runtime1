@@ -118,8 +118,19 @@ do NOT build the `${VAR}`-expansion unification. It's a **User Challenge** the o
 4. **The plan's env layout had a live bug** (`MGMT_BIND=127.0.0.1` for Docker) — both configs
    deliberately bind `0.0.0.0`; that would have regressed the Docker management API.
 
-### What ships instead (this branch) — the ~1h targeted fix
-- **Close audit86-P1-8** (the one genuinely-live pain): tighten the cos boot-guard ERE from
+### UPDATE — the ERE fix was ALSO dropped (par.2 /autoplan-recovery, 2026-07-25)
+After building the ERE tightening below, CI surfaced it as the wrong fix too: (1) its negative-control
+fixture (`cos-bare-relative-dir.toml`, a bare `dir` key) is **not a valid Config** — `dir` is an unknown
+field — so `config_parse_all.rs` (which requires everything in `.github/fixtures/` to parse) went red;
+(2) that exposed the deeper point — **a bare `path`/`dir` key isn't reachable by a valid config** (no
+such field in the schema; `agentd check --strict` rejects it before boot regardless), and the genuinely-
+reachable escapes (`prefix = "output"`, relative MCP `args`) aren't caught by a key-suffix ERE anyway.
+The real fix is the runtime path-identity newtype in **cap.3** (audit86-P1-8). So par.2 slimmed to
+**DOCS ONLY** — the QEMU-fork header note + the P2-14 reclassification; no code, no fixture, no version
+bump. The P1-5 boot-guard remainder stays OPEN, superseded by cap.3. Struck-through recipe kept for record.
+
+### ~~What ships instead (this branch) — the ~1h targeted fix~~ (DROPPED — see UPDATE)
+- ~~**Close audit86-P1-8** (the one genuinely-live pain): tighten the cos boot-guard ERE from~~
   `[a-z_]*_(path|dir)` to `[a-z_]*(path|dir)` so a **bare** `path = "x"` / `dir = "x"` (relative,
   no `./`, no `_` prefix) can no longer escape the guard. (audit86-P1-8 in capability.rs is a SEPARATE runtime-matching issue → cap.3, untouched here.) Proven by a new CI negative-control
   fixture (`cos-bare-relative-dir.toml`) that the old ERE would have booted.

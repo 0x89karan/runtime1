@@ -571,26 +571,3 @@ jobs:
             exit 1
           fi
           echo "negative control OK (guard tripped, line named)"
-
-      - name: negative control — bare path/dir key must refuse to boot (audit86-P1-5 remainder)
-        # par.2 reshape: proves the tightened boot-guard ERE catches a BARE `dir = "x"`
-        # (no `_` prefix, no `./`) that the old `[a-z_]*_(path|dir)` pattern let escape.
-        # store_path is absolute in this fixture, so ONLY the bare `dir` line can trip
-        # the guard — a green here means the boot-guard bare-key gap is closed.
-        run: |
-          set +e
-          docker run --rm -e DRY_RUN_ONLY=1 \
-            -v "$PWD/.github/fixtures/cos-bare-relative-dir.toml":/etc/agentd/cos.agents.toml:ro \
-            agentos:smoke cos >bare.log 2>&1; rc=$?
-          set -e
-          cat bare.log
-          if [ $rc -eq 0 ]; then
-            echo "::error title=boot-guard bare-key regressed::bare 'dir = relative' booted — the tightened guard ERE regressed"
-            exit 1
-          fi
-          if ! grep -q "relative path survived the boot rewrite" bare.log \
-             || ! grep -qE "^[0-9]+:[[:space:]]*dir[[:space:]]*=" bare.log; then
-            echo "::error title=wrong failure::bare-key fixture failed but not via the path guard naming the bare 'dir =' line"
-            exit 1
-          fi
-          echo "negative control OK (bare path/dir key caught, line named)"

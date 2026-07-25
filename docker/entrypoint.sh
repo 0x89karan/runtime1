@@ -263,16 +263,9 @@ case "${1:-shell}" in
     # General negative assertion (audit.1): no quoted relative path — in either
     # quote style — and no path-bearing key with a non-absolute value may survive
     # the rewrite. Covers future relative paths no sed rule knows about yet.
-    # audit86-P1-5 boot-guard remainder (par.2 reshape): the key pattern is `[a-z_]*(path|dir)` — the
-    # underscore before path/dir is OPTIONAL, so a BARE `path = "x"` / `dir = "x"`
-    # (a relative value with no `./` and no `_` prefix) is caught too. The prior
-    # `[a-z_]*_(path|dir)` required the underscore, letting a bare key escape both
-    # this guard and the dot-slash scan — the last string-identity gap the audit
-    # flagged. /autoplan (2026-07-25) retired the broader config-unification here in
-    # favor of this targeted tightening; see docs/plans/par.2-config-unification.md.
     guard_no_relative_paths /data/cos.agents.toml \
       "[\"']\.\.?/" \
-      "^[[:space:]]*[a-z_]*(path|dir)[[:space:]]*=[[:space:]]*[\"'][^/]" \
+      "^[[:space:]]*[a-z_]*_(path|dir)[[:space:]]*=[[:space:]]*[\"'][^/]" \
       "docker run --rm -e DRY_RUN_ONLY=1 <image> cos"
     # cap.1: real capability-declaration linter on the REWRITTEN config (replaces the grep
     # guards' partial coverage with actual parsing + the shared tier_legality resolver).
