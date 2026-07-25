@@ -726,24 +726,35 @@ plane, so the controls below are load-bearing, not cosmetic.
 **Route-scoped approval secret (the actual boundary).** The management API is otherwise
 unauthenticated (§9.3) and approval ids are sequential/guessable (`act_{seq}`), so a chat-ID
 allowlist alone protects nothing at the API — any peer that reaches `:7999` could approve by
-enumeration. ux.12 therefore gates the approve/deny routes with a shared secret: when
-`AGENTOS_APPROVAL_SECRET` is set, those routes require a constant-time-matched `X-Approval-Token`
-header (`management.rs` `approval_token_ok`). The sidecar and `agentctl` both send it; the secret
-is env-only (secrets invariant) and reaches only the sidecar via its own `passenv` (it is NOT in
-`PASSENV_BLOCKLIST` because the sidecar needs it; the passenv opt-in model keeps it off every
-other MCP server). This is route-scoped; full API auth remains ux.5. When the secret is unset the
-routes stay open (pre-ux.12 behavior) — set it whenever Telegram is enabled.
+enumeration. **cap.4 (AUDIT-v0.97 P2-3) gates the ENTIRE mutating surface with the shared secret**
+— not just approve/deny. When `AGENTOS_APPROVAL_SECRET` is set, every mutating POST
+(`/spawn`, `/agents/*/{inject,cancel,caps}`, `/budget/{set,reset}`, `/approvals/*/{approve,deny}`,
+`/credentials/*/reset-attention`) requires a constant-time-matched `X-Approval-Token` header
+(`management.rs` `is_mutating_route` + `approval_token_ok`); GET/read routes stay ungated. The
+sidecar and `agentctl` send it on all mutations; the secret is env-only (secrets invariant) and
+reaches only the sidecar via its own `passenv` (NOT in `PASSENV_BLOCKLIST`; the passenv opt-in model
+keeps it off other servers). Route-scoped in mechanism, whole-surface in coverage; full session auth
+remains ux.5. When the secret is unset all routes stay open (pre-ux.12 behavior) — set it whenever the
+API is reachable beyond a trusted loopback (i.e. whenever Telegram or a bridge peer exists).
 
-The ux.13 control verbs (`POST /api/v1/agents/{id}/cancel`, `.../caps`) are intentionally NOT behind
-this secret — they join `spawn`/`inject`/`budget` as loopback-trusted control routes (only approve/deny
-are gated, because only they are driven by the untrusted-input Telegram bridge). SetCaps is
-revoke/narrow-only (a `capability_covered_by` fail-closed check rejects any widening) so it cannot be
-used to escalate an agent; Cancel only terminates. Both fold into ux.5's eventual full-API-auth story.
+**Why this matters (the ux.12→cap.4 correction):** ux.12 originally gated only approve/deny, leaving
+the strictly-more-powerful `/spawn` — which mints caller-supplied capabilities verbatim — unauthenticated
+on the identical surface, so the gate protected the weak route and left arbitrary-capability spawn open.
+cap.4 closes that: the token now covers spawn/inject/budget/cancel/caps too. **Additionally, `/spawn`
+is DENY-BY-DEFAULT on capabilities** — without `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1` it may mint ONLY
+read-only-local caps (`KbRead`/`FsRead`/`RunsRead`); anything that grants tools (`Mcp`), network,
+writes, spawning, sealed-jobs, brief-publish, or credentials — and unrestricted `capabilities: null` —
+is refused. A denylist would be fragile: agent-level `Credential` is *inert*, while `Mcp{google_oauth}`
+(no `Credential` cap) is the real live-Gmail vector, since the broker derives the provider allowlist
+from the MCP *server's* cap. So even an authorized caller cannot mint a Gmail-capable or spawn-capable
+agent by default. SetCaps remains revoke/narrow-only (fail-closed `capability_covered_by`);
+Cancel only terminates — neither escalates. Both fold into ux.5's eventual full-API-auth story.
 
 **Pre-existing exposure this makes concrete (§9.2).** Because `cos` binds `0.0.0.0`
 (`allow_non_loopback = true`, for Docker hostfwd), `semantic-kb-mcp` on `cos-net` was *already*
-an unauthenticated, approve-capable peer of `:7999` before ux.12. The approval secret closes the
-approve/deny routes for all such peers, not just Telegram; the broader `0.0.0.0` bind is unchanged.
+an unauthenticated, mutation-capable peer of `:7999` before ux.12. With cap.4 the approval secret
+closes ALL mutating routes for every such peer (not just Telegram, not just approve/deny); the broader
+`0.0.0.0` bind is unchanged (full re-scoping is ux.5).
 
 **Chat-ID authZ + token secrecy.** Only `message` updates from `from.id == TELEGRAM_CHAT_ID` in a
 `private` chat are honored (a group would leak approval/args content). `from.id` is unforgeable via

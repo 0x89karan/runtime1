@@ -108,3 +108,58 @@ async fn approval_gate_open_when_no_secret_configured() {
         .expect("channel should not be closed");
     assert!(matches!(cmd, ControlCommand::Approve { .. }));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cap4_gate_covers_the_whole_mutating_surface() {
+    // cap.4 / AUDIT-v0.97 P2-3: with a secret set, EVERY mutating route (not just approve/deny)
+    // requires the token — and none of them reach the scheduler control channel without it.
+    let (base, mut rx) = boot(Some("test-secret".to_string())).await;
+    let client = reqwest::Client::new();
+    let posts = [
+        ("/api/v1/spawn", serde_json::json!({"task": "x"})),
+        ("/api/v1/agents/a/inject", serde_json::json!({"text": "x"})),
+        ("/api/v1/agents/a/cancel", serde_json::json!({})),
+        ("/api/v1/agents/a/caps", serde_json::json!({"capabilities": []})),
+        ("/api/v1/budget/set", serde_json::json!({"target": {"agent": "a"}, "limit": 1})),
+        ("/api/v1/budget/reset", serde_json::json!({"target": "global"})),
+    ];
+    for (path, body) in posts {
+        let r = client.post(format!("{base}{path}")).json(&body).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401, "POST {path} must require X-Approval-Token");
+    }
+    // A read stays open without the token.
+    let r = client.get(format!("{base}/api/v1/approvals")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200, "GET must stay ungated");
+    // Nothing reached the scheduler.
+    assert!(matches!(rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)),
+        "no rejected mutation may reach the control channel");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_refuses_privileged_caps_without_optin() {
+    // cap.4 / AUDIT-v0.97 P2-3: /spawn must refuse caller-supplied privileged caps
+    // (Spawn/Credential/RunJob) unless AGENTOS_ALLOW_PRIVILEGED_SPAWN is set. Gate is open
+    // here (no secret) so the token is not the blocker — the refusal is. Runs before the
+    // control-channel send, so no scheduler responder is needed.
+    let (base, _rx) = boot(None).await;
+    let client = reqwest::Client::new();
+    // Deny-by-default across the vectors: Spawn, the Mcp{google_oauth} live-Gmail vector Codex
+    // caught (no Credential cap needed), and unrestricted (capabilities omitted = all caps).
+    for body in [
+        serde_json::json!({"task": "x", "capabilities": ["Spawn"]}),
+        serde_json::json!({"task": "x", "capabilities": [{"Mcp": {"server": "google_oauth", "tools": []}}]}),
+        serde_json::json!({"task": "x"}),  // no capabilities field → unrestricted
+    ] {
+        let r = client.post(format!("{base}/api/v1/spawn")).json(&body).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "privileged/unrestricted /spawn refused without opt-in: {body}");
+        let resp: serde_json::Value = r.json().await.unwrap();
+        assert!(resp["error"].as_str().unwrap_or("").contains("privileged"),
+            "error names the privileged refusal: {resp}");
+    }
+    // A read-only-local spawn (KbRead) is allowed without the opt-in (deny-by-default lets safe
+    // caps through) — it reaches the control channel (503 here: no scheduler responder wired).
+    let r = client.post(format!("{base}/api/v1/spawn"))
+        .json(&serde_json::json!({"task": "x", "capabilities": [{"KbRead": {"segment": "ops:briefs"}}]}))
+        .send().await.unwrap();
+    assert_ne!(r.status().as_u16(), 400, "read-only-local spawn is not refused as privileged");
+}

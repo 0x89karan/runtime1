@@ -24,23 +24,24 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.99.0 (shipped 2026-07-25)
+**Current version:** v0.100.0 (shipped 2026-07-25)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** run.1 (v0.99.0) — **the durability cluster** of the AUDIT-v0.97 sweep (2nd of ~7).
-Four fixes: **P1-2** flight.jsonl copy-truncate rotation at 100MB (AtomicU64 counter, under the file
-mutex, same inode so otel's `tail.rs` follows it) — closes the always-on disk-fill that starved the
-co-located durable writers; **P1-3** `cap_short_term` ring-drops oldest paged summaries beyond
-MAX_SHORT_TERM so a never-terminating orchestrator's per-turn checkpoint clone stays bounded (safe —
-short_term is evicted summaries, not live tool-pairs; mid-run distillation deferred); **P2-6** cron
-missed-fire catch-up (persist next-fire to `/data`, fire-once-on-boot-if-missed) — schedule-fingerprinted
-so a changed `TRIGGER_CRON`/`INTERVAL` across restart can't spuriously catch up (Codex review); **P2-9**
-runs.redb retention prune (5000/90d, closed records only) bounds the full-scan queries (time-index
-re-key deferred). Stacked on **audit.2 (v0.98.0)** — arm64 python packaging (P1-1), checkpoint
-`.restored` crash-loop fix (P2-1), ux.13 cancel-resurrection (P2-4). Both PRs pushed but blocked by a
-GitHub API outage at ship time. **Sweep remaining:** cap.4 (auth-consistency + tool_override KbWrite) →
-ci.2/packaging → budget.1 → par.1/2 → P3. Full audit: `docs/AUDIT-v0.97.md` (PR #141).
+**Latest shipped:** cap.4 (v0.100.0) — **auth-consistency + capability-scoping** (3rd AUDIT-v0.97
+increment). **P2-3:** the ux.12 `X-Approval-Token` gate now covers the ENTIRE mutating `:7999` surface
+(spawn/inject/budget/cancel/caps/approve-deny), not just approve/deny (reads ungated; unset-secret
+stays open); and **`/spawn` is deny-by-default on caps** — without `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1`
+it mints only read-only-local caps, refusing Mcp/Net/writes/spawn/run_job/brief-publish/credentials +
+unrestricted null (a denylist was fragile — `Mcp{google_oauth}`, not the inert agent-level
+`Credential`, is the real live-Gmail vector; Codex review caught this). **P2-5:** KbRead/KbWrite
+segment scoping is now enforced under `tool_override` (derived by tool name, byte-identical to native)
+so the injection-exposed cos-inbox can't overwrite the curator's brief. **Sweep remaining:** ci.2/
+packaging → budget.1 → par.1/2 → P3.
+**Prior (AUDIT-v0.97 sweep):** run.1 (v0.99.0) durability cluster — flight.jsonl copy-truncate rotation
+(P1-2), short_term cap (P1-3), cron missed-fire catch-up (P2-6), runs.redb retention (P2-9). audit.2
+(v0.98.0) — arm64 python packaging (P1-1), checkpoint `.restored` crash-loop fix (P2-1), ux.13
+cancel-resurrection (P2-4). Full audit: `docs/AUDIT-v0.97.md`.
 **Prior:** ux.13 (v0.97.0) — control verbs, final increment of the "trust after absence" cockpit
 reshape (ux.8′→ux.11→ux.12→ux.13). ux.12 (v0.96.0) — Telegram reach.
 **After the sweep:** the UX tail (ux.2b/ux.3/ux.10 — the last picks up the deferred ux.13 cancel-key),

@@ -10,6 +10,20 @@ use crate::capability::{satisfies, satisfies_type, Capability};
 use crate::flight_recorder::{EventKind, FlightRecorder};
 use crate::inference::ToolSpec;
 
+/// The KB segment capability a well-known KB tool requires, derived by tool NAME from the
+/// call input — used to enforce segment scoping even when the concrete tool is a
+/// `tool_override` MCP shadow whose own `required_capability_for` returns only the Mcp grant
+/// (cap.4 / AUDIT-v0.97 P2-5). Derivation is byte-identical to the native kb tools
+/// (`input["segment"]` or `""`), so on the native path this is a redundant, safe re-check.
+fn kb_segment_capability(name: &str, input: &Value) -> Option<Capability> {
+    let segment = input["segment"].as_str().unwrap_or("").to_string();
+    match name {
+        "kb_put" => Some(Capability::KbWrite { segment }),
+        "kb_get" | "kb_search" => Some(Capability::KbRead { segment }),
+        _ => None,
+    }
+}
+
 /// Runtime context injected by the scheduler for every tool invocation.
 ///
 /// Fields are runtime-stamped and unforgeable — the agent cannot set them
@@ -189,6 +203,32 @@ impl ToolRegistry {
                     );
                     return Err(anyhow::anyhow!(
                         "capability denied: tool '{name}' requires {required:?}"
+                    ));
+                }
+            }
+            // cap.4 / AUDIT-v0.97 P2-5: KB segment scoping must survive `tool_override`.
+            // The native kb tools carry KbRead/KbWrite{segment} in required_capability_for,
+            // but a `tool_override=true` MCP server (e.g. semantic-kb) replaces them with an
+            // McpTool whose required cap is only `Mcp{server}` — so the segment check above is
+            // skipped, letting an agent write any segment it can name (the cos-inbox brief
+            // overwrite). Enforce the segment cap ADDITIONALLY, by tool NAME, from the call
+            // input — identical derivation to the native tools, so the native (non-override)
+            // path is a harmless idempotent re-check and behavior is unchanged when off.
+            if let Some(seg_required) = kb_segment_capability(name, &input) {
+                if !satisfies(caps, &seg_required) {
+                    recorder.record(
+                        &ctx.agent_id,
+                        None,
+                        EventKind::CapabilityDenied,
+                        serde_json::json!({
+                            "tool": name,
+                            "required": serde_json::to_value(&seg_required)
+                                .unwrap_or_else(|_| format!("{seg_required:?}").into()),
+                            "reason": "kb_segment_scope",
+                        }),
+                    );
+                    return Err(anyhow::anyhow!(
+                        "capability denied: tool '{name}' requires {seg_required:?} (KB segment scope)"
                     ));
                 }
             }
@@ -391,6 +431,48 @@ mod tests {
         async fn invoke(&self, _: serde_json::Value, _: &ToolContext) -> anyhow::Result<String> {
             Ok(format!("stub:{}", self.name))
         }
+    }
+
+    #[tokio::test]
+    async fn kb_segment_scope_enforced_under_tool_override() {
+        // cap.4 / AUDIT-v0.97 P2-5: a tool_override kb_put (here a StubTool declaring NO
+        // capability, like an McpTool that returns only Mcp{server}) is STILL gated by the
+        // name-derived KbWrite{segment} — closes the override bypass that let the injection-
+        // exposed inbox overwrite the curator's brief.
+        let mut reg = ToolRegistry::new();
+        reg.register_override(Box::new(StubTool { name: "kb_put", desc: "mcp-override" })).unwrap();
+        let (rec, _tmp) = recorder();
+        let input = serde_json::json!({"segment": "ops:briefs", "content": "x"});
+
+        // Holds the Mcp grant but NOT KbWrite{ops:briefs} → DENIED.
+        let no_write = vec![Capability::Mcp { server: "semantic-kb".into(), tools: vec![] }];
+        let err = reg.invoke("kb_put", input.clone(), &ctx("inbox"), Some(&no_write), &rec)
+            .await.unwrap_err();
+        assert!(err.to_string().contains("KbWrite"), "override kb_put denied without KbWrite: {err}");
+
+        // With KbWrite{ops:briefs} → allowed.
+        let ok = vec![
+            Capability::Mcp { server: "semantic-kb".into(), tools: vec![] },
+            Capability::KbWrite { segment: "ops:briefs".into() },
+        ];
+        let out = reg.invoke("kb_put", input, &ctx("curator"), Some(&ok), &rec).await.unwrap();
+        assert_eq!(out, "stub:kb_put");
+    }
+
+    #[tokio::test]
+    async fn kb_read_segment_scope_enforced_under_override() {
+        // Same for kb_get/kb_search → KbRead{segment}.
+        let mut reg = ToolRegistry::new();
+        reg.register_override(Box::new(StubTool { name: "kb_get", desc: "mcp-override" })).unwrap();
+        let (rec, _tmp) = recorder();
+        let input = serde_json::json!({"segment": "ops:briefs", "key": "k"});
+        let no_read = vec![Capability::Mcp { server: "semantic-kb".into(), tools: vec![] }];
+        assert!(reg.invoke("kb_get", input.clone(), &ctx("inbox"), Some(&no_read), &rec).await.is_err());
+        let ok = vec![
+            Capability::Mcp { server: "semantic-kb".into(), tools: vec![] },
+            Capability::KbRead { segment: "ops:briefs".into() },
+        ];
+        assert!(reg.invoke("kb_get", input, &ctx("curator"), Some(&ok), &rec).await.is_ok());
     }
 
     #[test]
