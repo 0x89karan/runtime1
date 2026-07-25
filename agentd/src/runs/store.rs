@@ -668,6 +668,32 @@ mod tests {
     }
 
     #[test]
+    fn close_segment_prunes_aged_records_at_its_call_site() {
+        // run.1-ar-01: the P2-9 retention prune runs INSIDE close_segment (store.rs:309) on
+        // every close, not only when prune() is invoked directly. Drive it by AGE: close an
+        // old record, then close a second record far enough in the future that the first ages
+        // past MAX_RUN_AGE_SECS — the second close's internal prune must evict the first. The
+        // existing prune test only calls prune() directly, so no-op'ing the :309 call leaves it
+        // green; THIS test goes red, covering the call-site wiring (not just the helper).
+        let (s, _d) = store();
+        s.open_segment("old", None, "child_spawn", Some(0), "native", 100).unwrap();
+        s.close_segment("old", "done", Some("completed".into()), None, Some(0), 101).unwrap();
+        assert!(s.get("old:0").unwrap().is_some(), "first record present before the aging close");
+
+        // Second record opened+closed > MAX_RUN_AGE_SECS later. Its close() calls prune(now=ts2),
+        // whose age cutoff (ts2 - MAX_RUN_AGE_SECS) is now past the first record's end (101).
+        let ts2 = 100 + MAX_RUN_AGE_SECS + 1_000;
+        s.open_segment("new", None, "child_spawn", Some(0), "native", ts2).unwrap();
+        s.close_segment("new", "done", Some("completed".into()), None, Some(0), ts2 + 1).unwrap();
+
+        assert!(
+            s.get("old:0").unwrap().is_none(),
+            "close_segment's internal prune (store.rs:309) must age out the old closed record"
+        );
+        assert!(s.get("new:0").unwrap().is_some(), "the just-closed record survives");
+    }
+
+    #[test]
     fn child_spawn_then_terminal_one_closed_record() {
         let (s, _d) = store();
         s.open_segment("inbox", Some("cos".into()), "child_spawn", Some(0), "native", 10).unwrap();

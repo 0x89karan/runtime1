@@ -242,6 +242,28 @@ mod tests {
     }
 
     #[test]
+    fn new_seeds_size_from_metadata_so_a_preexisting_oversized_log_rotates() {
+        // run.1-ar-01: the rotation threshold reads `size`, seeded at open from file metadata
+        // (flight_recorder.rs:43). The existing rotation test fakes the counter via size.store()
+        // and never exercises that seed — so an agentd RESTART over an already-oversized
+        // flight.jsonl would silently NOT rotate if the seed regressed to 0. Use a SPARSE file
+        // (set_len reports the length in metadata but writes ~0 bytes to disk — instant, no 100 MB
+        // write) so opening a FlightRecorder on it seeds `size >= cap` and the first record rotates.
+        let tmp = NamedTempFile::new().unwrap();
+        tmp.as_file().set_len(MAX_FLIGHT_BYTES + 1).unwrap();
+
+        let recorder = FlightRecorder::new(tmp.path()).unwrap();
+        assert!(
+            recorder.size.load(Ordering::Relaxed) >= MAX_FLIGHT_BYTES,
+            "size must be seeded from file metadata at open (:43), not 0"
+        );
+        // First record sees size >= cap → copy-truncates in place → counter resets small.
+        recorder.record("a", None, EventKind::AgentSpawned, serde_json::json!({"n": 1}));
+        let sz = recorder.size.load(Ordering::Relaxed);
+        assert!(sz > 0 && sz < MAX_FLIGHT_BYTES, "rotated on the metadata-seeded size, got {sz}");
+    }
+
+    #[test]
     fn record_with_turn_number() {
         let tmp = NamedTempFile::new().unwrap();
         let recorder = FlightRecorder::new(tmp.path()).unwrap();

@@ -3,6 +3,34 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.104.0] - 2026-07-25
+
+### Fixed
+- **Unbreak `main` — oauth in-image test-22** (P0, ci.2 escaped bug): ci.2's docker-smoke job runs
+  `oauth_mcp.py --test` *inside the built image*, where test 22 (the `google.json` schema-drift guard)
+  reads a fixture resolved relative to the script — `/etc/agentd/../tests/fixtures/google.json`, which
+  isn't shipped in the image. It `fail()`ed, turning a legitimately-absent test fixture into a red
+  `main`. Test 22 now **SKIPs when the fixture is absent** (`FileNotFoundError` only); a present-but-
+  malformed/drifted fixture still `FAIL`s, so the guard keeps its teeth on the runner. A new
+  `repo_consistency` assert pins the fixture's existence so the skip can never silently disable the
+  guard repo-wide.
+- **audit86-P3-1 — UTF-8 panic in the credential gateway**: three `token_url[..len().min(64)]`
+  byte-slices (`credential/mod.rs`) panicked on a multi-byte char straddling byte 64 (reachable via a
+  malformed operator secrets file). Replaced with a `token_url_preview()` char-boundary helper
+  (`.chars().take(64)`, the existing `MAX_NARRATIVE_CHARS` idiom). Upholds "the loop never panics on
+  bad input". Error-string-only; matching still uses the full string.
+- **audit86-P3-2 — raw exception leaks in oauth_mcp error responses**: four sites returned the raw
+  exception string (`broker_request_failed` — the primary broker path — `request_failed`,
+  `Internal error`, and a stderr WARNING). Scrubbed to `type(exc).__name__` (matching the cred.5-ar-01
+  siblings); HTTPError status paths untouched. New self-tests T36/T37.
+
+### Added
+- **run.1-ar-01 — call-site regression tests** for three run.1 durability fixes that were only
+  helper-tested (so deleting the wiring left every test green): `close_segment → prune` (age-driven),
+  the flight-recorder metadata-seed rotation path (sparse `set_len`), and the `MemoryPaged`
+  `cap_short_term` drain (pre-seeded, asserts `evicted > 0` AND `len == MAX_SHORT_TERM`). Each is
+  negative-control-verified (red when the fix is neutralized).
+
 ## [v0.103.0] - 2026-07-25
 
 ### Added
