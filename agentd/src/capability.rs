@@ -1,6 +1,91 @@
+use std::cell::RefCell;
 use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+
+/// Process-wide FS anchor: agentd's working directory captured once at startup.
+/// FS-capability prefixes (grant + request) are absolutized against this so the
+/// authorization check reasons in absolute terms (cap.3 / audit86-P1-8). It must
+/// equal the CWD the runtime tool call resolves against — i.e. agentd must not
+/// `chdir` after startup (scheduler.rs documents the same no-chdir assumption).
+static FS_ANCHOR: OnceLock<PathBuf> = OnceLock::new();
+
+thread_local! {
+    /// Per-thread test override for the FS anchor. Lets a unit test pin a
+    /// deterministic base WITHOUT a process-global mutation that would race other
+    /// parallel tests. `None` in production; only `set_fs_anchor_for_test` sets it.
+    static TEST_FS_ANCHOR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+/// Capture the startup CWD as the FS anchor. Call ONCE, early in `main`, before any
+/// agent runs / any `satisfies` call. Idempotent (a second call is a no-op).
+pub fn init_fs_anchor() {
+    let _ = FS_ANCHOR.set(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+}
+
+/// Test-only seam: pin the FS anchor for the current thread. `#[cfg(test)]` so
+/// production code can never poison the per-thread anchor. Keeps unit tests pure
+/// (no dependency on the real process CWD or on `init_fs_anchor` ordering).
+#[cfg(test)]
+fn set_fs_anchor_for_test(base: PathBuf) {
+    TEST_FS_ANCHOR.with(|a| *a.borrow_mut() = Some(base));
+}
+
+/// The active FS anchor: a per-thread test override if set, else the startup anchor,
+/// else the live CWD (fallback so a process that never called `init_fs_anchor` — e.g.
+/// a test binary — still absolutizes both sides against the same base).
+fn fs_anchor() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = TEST_FS_ANCHOR.with(|a| a.borrow().clone()) {
+        return p;
+    }
+    match FS_ANCHOR.get() {
+        Some(a) => {
+            // Harden the no-chdir invariant: authorization anchors to the frozen startup
+            // CWD, but the runtime tool call resolves against the LIVE CWD. If agentd ever
+            // chdir'd, the two would diverge (authorize `<frozen>/x`, write `<live>/x`).
+            // In debug builds, catch that divergence loudly at the authorization site.
+            debug_assert!(
+                std::env::current_dir().map(|c| &c == a).unwrap_or(true),
+                "cap.3 no-chdir invariant violated: live CWD != frozen FS_ANCHOR — \
+                 agentd must not chdir after init_fs_anchor()"
+            );
+            a.clone()
+        }
+        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+    }
+}
+
+/// Absolutize a capability prefix against the FS anchor, then normalize. An absolute
+/// path is normalized as-is; a relative path is joined onto the anchor first. This is
+/// the SINGLE place the CWD anchor enters capability matching (cap.3 / audit86-P1-8).
+///
+/// This is NOT behaviour-preserving vs the old CWD-blind string-identity match, and that
+/// is the point: absolutizing BOTH grant and request makes matching absolute-vs-absolute,
+/// which CHANGES the mixed relative/absolute cases. A relative request that lands inside
+/// an ABSOLUTE grant (or an absolute request inside a relative grant) now correctly
+/// ALLOWS where the old lexical `starts_with` wrongly denied — sound because the runtime
+/// resolves the request against this same anchor CWD, so there is no over-grant and no
+/// previously-working flow breaks. (agentd must not chdir after startup — see `fs_anchor`.)
+pub fn anchor_abs(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        normalize_path(p)
+    } else {
+        normalize_path(&fs_anchor().join(p))
+    }
+}
+
+/// A GRANTED FS prefix is invalid → fail-safe deny. Two cases, both checked on the
+/// PRE-anchor lexical normalize (cap.3 /review):
+///   1. Empty (`""`/`"."`/`"./"`) — would match every path via `starts_with`.
+///   2. Leading `..` (escapes the anchor) — `anchor_abs("..")` resolves ABOVE the
+///      anchor (e.g. anchor `/data` → `/`), so the grant would authorize the entire
+///      filesystem. No shipped config grants `..`; this is correct fail-closed.
+fn granted_prefix_is_invalid(g_prefix: &str) -> bool {
+    let norm = normalize_path(Path::new(g_prefix));
+    norm.as_os_str().is_empty() || matches!(norm.components().next(), Some(Component::ParentDir))
+}
 
 /// Credential provider selector for `Capability::Credential`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,11 +107,24 @@ pub enum CredentialProvider {
 ///   - In a *required* capability (returned by `required_capability_for`): the
 ///     actual path being accessed at invocation time.
 ///
-/// `satisfies` tests `normalize(actual).starts_with(normalize(granted_prefix))`.
+/// `satisfies` absolutizes BOTH sides against agentd's working directory —
+/// captured once at startup by [`init_fs_anchor`] — then tests
+/// `abs(actual).starts_with(abs(granted_prefix))` (see [`anchor_abs`]).
 ///
-/// **Absolute paths assumed.** Relative paths fail-safe to deny (no prefix match
-/// since `normalize` does not resolve relative roots). Callers should pass
-/// absolute paths; `~` expansion is not performed.
+/// **Prefixes are absolutized, not assumed-absolute (cap.3 / audit86-P1-8).** A
+/// relative prefix (`"./output"`) resolves to `<startup_cwd>/output`; an absolute
+/// prefix is used as-is. Both grant and request are anchored to the SAME base, so
+/// matching is absolute-vs-absolute. This CHANGES the old CWD-blind string-identity
+/// match in the mixed relative/absolute cases (and that is the fix): a relative
+/// request landing inside an absolute grant — or an absolute request inside a
+/// relative grant — now correctly ALLOWS where the old lexical `starts_with` wrongly
+/// denied. It is sound because the runtime resolves the request against this same
+/// anchor CWD, so there is no over-grant and no previously-working flow breaks.
+/// Relies on **agentd not `chdir`-ing after startup** (see `fs_anchor`).
+/// (The prior doc claimed "relative paths fail-safe to deny"; that was FALSE — they
+/// matched by relative string identity. cap.3 makes the representation honest.)
+/// An empty/`"."` prefix, and a grant that escapes the anchor with a leading `..`,
+/// still fail safe to deny (guarded before anchoring). `~` expansion is not performed.
 ///
 /// **Case-sensitive.** `starts_with` is byte-exact. On case-insensitive
 /// filesystems (macOS HFS+) a grant of `/Workspace` will not match
@@ -87,7 +185,8 @@ pub enum Capability {
 
 /// Normalize a path by resolving `.` and `..` components without filesystem
 /// access. Relative paths are kept relative (a leading `..` is preserved).
-/// Enforcement assumes absolute paths; relative paths fail-safe to deny.
+/// For FS-capability matching, callers absolutize first via [`anchor_abs`]
+/// (cap.3); this helper is the pure lexical normalizer underneath it.
 pub fn normalize_path(p: &Path) -> PathBuf {
     let mut components: Vec<Component> = Vec::new();
     for c in p.components() {
@@ -150,25 +249,29 @@ pub fn satisfies_type(granted: &[Capability], required: &Capability) -> bool {
 pub fn satisfies(granted: &[Capability], required: &Capability) -> bool {
     match required {
         Capability::FsRead { prefix: req_path } => {
-            let norm_req = normalize_path(Path::new(req_path));
+            let abs_req = anchor_abs(Path::new(req_path));
             granted.iter().any(|g| {
                 if let Capability::FsRead { prefix: g_prefix } = g {
-                    let norm_granted = normalize_path(Path::new(g_prefix));
-                    // An empty (non-absolute) granted prefix is not a valid grant —
-                    // it would match every path via starts_with semantics. Fail-safe to deny.
-                    !norm_granted.as_os_str().is_empty() && norm_req.starts_with(&norm_granted)
+                    // Fail-safe on an invalid granted prefix (empty/`.`, or leading `..`
+                    // that escapes the anchor) BEFORE anchoring — else it would resolve to
+                    // (or above) the anchor dir and match everything. See granted_prefix_is_invalid.
+                    if granted_prefix_is_invalid(g_prefix) {
+                        return false;
+                    }
+                    abs_req.starts_with(anchor_abs(Path::new(g_prefix)))
                 } else {
                     false
                 }
             })
         }
         Capability::FsWrite { prefix: req_path } => {
-            let norm_req = normalize_path(Path::new(req_path));
+            let abs_req = anchor_abs(Path::new(req_path));
             granted.iter().any(|g| {
                 if let Capability::FsWrite { prefix: g_prefix } = g {
-                    let norm_granted = normalize_path(Path::new(g_prefix));
-                    // An empty (non-absolute) granted prefix is not a valid grant — fail-safe.
-                    !norm_granted.as_os_str().is_empty() && norm_req.starts_with(&norm_granted)
+                    if granted_prefix_is_invalid(g_prefix) {
+                        return false;
+                    }
+                    abs_req.starts_with(anchor_abs(Path::new(g_prefix)))
                 } else {
                     false
                 }
@@ -520,6 +623,117 @@ mod tests {
         assert!(!satisfies(&caps, &Capability::FsRead { prefix: "/workspace/x".to_string() }));
         let caps_write = vec![Capability::FsWrite { prefix: "".to_string() }];
         assert!(!satisfies(&caps_write, &Capability::FsWrite { prefix: "/tmp/x".to_string() }));
+    }
+
+    // ── cap.3 (audit86-P1-8): relative FS prefixes are anchored to the startup CWD ──
+    // (behaviour-preserving — same allow/deny as pre-cap.3, but the representation is
+    // absolute and the doc is honest). `set_fs_anchor_for_test` pins a deterministic base.
+
+    #[test]
+    fn cap3_relative_grant_anchored_allows_in_subtree_denies_outside() {
+        set_fs_anchor_for_test(PathBuf::from("/data"));
+        let caps = vec![Capability::FsWrite { prefix: "./output".to_string() }];
+        // In-subtree request (relative) is ALLOWED and resolves under /data/output.
+        assert!(satisfies(&caps, &Capability::FsWrite { prefix: "output/brief.md".to_string() }));
+        assert!(satisfies(&caps, &Capability::FsWrite { prefix: "./output/x".to_string() }));
+        // Sibling / traversal / absolute-elsewhere are DENIED (unchanged from pre-cap.3).
+        assert!(!satisfies(&caps, &Capability::FsWrite { prefix: "secret/x".to_string() }));
+        assert!(!satisfies(&caps, &Capability::FsWrite { prefix: "output/../secret".to_string() }));
+        assert!(!satisfies(&caps, &Capability::FsWrite { prefix: "/etc/passwd".to_string() }));
+    }
+
+    #[test]
+    fn cap3_relative_grant_normalizes_to_an_absolute_prefix() {
+        // The anchoring makes the matched prefix ABSOLUTE (kills CWD-blindness): a request
+        // that is absolute-under-the-anchor matches; one under a DIFFERENT root does not.
+        set_fs_anchor_for_test(PathBuf::from("/data"));
+        let caps = vec![Capability::FsWrite { prefix: "output".to_string() }];
+        assert!(satisfies(&caps, &Capability::FsWrite { prefix: "/data/output/x".to_string() }));
+        assert!(!satisfies(&caps, &Capability::FsWrite { prefix: "/other/output/x".to_string() }));
+    }
+
+    #[test]
+    fn cap3_absolute_grant_unchanged_by_anchoring() {
+        // A prod-style absolute grant behaves identically regardless of the anchor.
+        set_fs_anchor_for_test(PathBuf::from("/data"));
+        let caps = vec![Capability::FsWrite { prefix: "/run/output".to_string() }];
+        assert!(satisfies(&caps, &Capability::FsWrite { prefix: "/run/output/brief.md".to_string() }));
+        assert!(!satisfies(&caps, &Capability::FsWrite { prefix: "/etc/x".to_string() }));
+        // A relative request never matches an absolute grant under a different root.
+        assert!(!satisfies(&caps, &Capability::FsWrite { prefix: "output/x".to_string() }));
+    }
+
+    #[test]
+    fn cap3_mixed_relative_grant_absolute_request_denied_both_ways() {
+        set_fs_anchor_for_test(PathBuf::from("/data"));
+        // relative grant vs absolute request under a different root → deny
+        let rel_grant = vec![Capability::FsRead { prefix: "output".to_string() }];
+        assert!(!satisfies(&rel_grant, &Capability::FsRead { prefix: "/run/output/x".to_string() }));
+        // absolute grant vs relative request (anchors under /data, not /run) → deny
+        let abs_grant = vec![Capability::FsRead { prefix: "/run/output".to_string() }];
+        assert!(!satisfies(&abs_grant, &Capability::FsRead { prefix: "output/x".to_string() }));
+    }
+
+    #[test]
+    fn cap3_empty_grant_still_denies_after_anchoring() {
+        // The empty-prefix fail-safe must survive anchoring (an empty prefix would
+        // otherwise resolve to the anchor dir and match everything under it).
+        set_fs_anchor_for_test(PathBuf::from("/data"));
+        for empty in ["", ".", "./"] {
+            let caps = vec![Capability::FsWrite { prefix: empty.to_string() }];
+            assert!(
+                !satisfies(&caps, &Capability::FsWrite { prefix: "data/anything".to_string() }),
+                "empty/./ grant {empty:?} must still deny after anchoring"
+            );
+        }
+    }
+
+    #[test]
+    fn cap3_no_chdir_invariant_documented() {
+        // The anchor is captured ONCE and both grant+request use it, so a hypothetical
+        // chdir between them would diverge (check-base != exec-base). We pin the
+        // captured-once behaviour: two anchors on the same thread — the LAST set wins,
+        // and BOTH sides of a single satisfies() use that one value (never two).
+        set_fs_anchor_for_test(PathBuf::from("/a"));
+        let caps = vec![Capability::FsWrite { prefix: "out".to_string() }];
+        assert!(satisfies(&caps, &Capability::FsWrite { prefix: "out/x".to_string() }));
+        // Re-pin: both sides now anchor to /b consistently; still matches (proves single anchor).
+        set_fs_anchor_for_test(PathBuf::from("/b"));
+        assert!(satisfies(&caps, &Capability::FsWrite { prefix: "out/x".to_string() }));
+    }
+
+    #[test]
+    fn cap3_dotdot_grant_denies_everything() {
+        // cap.3 /review FIX 2: a `..` grant escapes the anchor (`anchor_abs("..")` with
+        // anchor /data = `/`), which would authorize the WHOLE filesystem. It must fail-closed.
+        // (Correct fail-closed: pre-cap.3 a `..` grant matched `../`-prefixed requests; no
+        // shipped config grants `..`.)
+        set_fs_anchor_for_test(PathBuf::from("/data"));
+        let caps = vec![Capability::FsRead { prefix: "..".to_string() }];
+        assert!(!satisfies(&caps, &Capability::FsRead { prefix: "output/x".to_string() }));
+        assert!(!satisfies(&caps, &Capability::FsRead { prefix: "/etc/passwd".to_string() }));
+        let caps_w = vec![Capability::FsWrite { prefix: "../..".to_string() }];
+        assert!(!satisfies(&caps_w, &Capability::FsWrite { prefix: "anything/x".to_string() }));
+    }
+
+    #[test]
+    fn cap3_absolute_grant_relative_request_inside_now_allows() {
+        // cap.3 /review FIX 4 (the INTENDED soundness flip — NOT behavior-preserving): an
+        // absolute grant UNDER the anchor + a relative request that lands inside it now
+        // correctly ALLOWS. Pre-cap.3 the lexical `starts_with("/data/output")` on the raw
+        // relative request `"output/x"` wrongly DENIED. Sound because the runtime resolves the
+        // request against the same anchor CWD, so `output/x` really is `/data/output/x`.
+        set_fs_anchor_for_test(PathBuf::from("/data"));
+        let caps = vec![Capability::FsWrite { prefix: "/data/output".to_string() }];
+        assert!(
+            satisfies(&caps, &Capability::FsWrite { prefix: "output/x".to_string() }),
+            "relative request inside an absolute-under-anchor grant must ALLOW (soundness fix)"
+        );
+        // Symmetric: relative grant under anchor + absolute request inside it also allows.
+        let caps2 = vec![Capability::FsRead { prefix: "output".to_string() }];
+        assert!(satisfies(&caps2, &Capability::FsRead { prefix: "/data/output/x".to_string() }));
+        // And an absolute request NOT under the anchored grant still denies.
+        assert!(!satisfies(&caps2, &Capability::FsRead { prefix: "/etc/x".to_string() }));
     }
 
     #[test]
