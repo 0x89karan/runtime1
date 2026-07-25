@@ -83,6 +83,11 @@ pub(crate) async fn run(
             }
 
             AgentEffect::Completed(answer) => return Ok(answer),
+            // A lone CLI agent is a one-shot: a max_tokens truncation is a failure, not a partial
+            // "Ok" answer (matches the non-resettable semantics). budget.1-ar-01.
+            AgentEffect::CompletedTruncated(_) => {
+                return Err(anyhow::anyhow!("model output truncated at max_tokens"))
+            }
             AgentEffect::Failed(msg) => return Err(anyhow::anyhow!("{msg}")),
         }
     }

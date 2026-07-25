@@ -1956,6 +1956,42 @@ fn enqueue_or_defer(
                 handle_agent_terminal(agent_id, Ok(answer), state, sched, gateway, registry, recorder);
             }
         }
+        AgentEffect::CompletedTruncated(answer) => {
+            // budget.1-ar-01: a resettable agent whose response was truncated at max_tokens. Role-gate:
+            // a resident/orchestrated agent PARKS + resumes exactly like Completed (audit86-P0-2 — it
+            // must NOT brick on a single truncation); a one-shot/child FAILS via handle_agent_terminal
+            // so the parent gets an is_error result (not silently-truncated text as a finished answer)
+            // and a sealed job emits a "failed" signal. This is the ONLY branch that diverges from
+            // Completed — the resident park path below is byte-for-byte the Completed park path.
+            if state.orchestrated.contains(&agent_id) {
+                let answer_preview: String = if answer.chars().count() > 512 {
+                    let mut s: String = answer.chars().take(512).collect();
+                    s.push_str("\n[output truncated — full text streamed above]");
+                    s
+                } else {
+                    answer.clone()
+                };
+                recorder.record(
+                    &agent_id,
+                    None,
+                    EventKind::OrchestratorTurnComplete,
+                    json!({ "agent_id": &agent_id, "answer": &answer_preview }),
+                );
+                state.waiting.insert(agent_id);
+            } else {
+                handle_agent_terminal(
+                    agent_id,
+                    Err(anyhow::anyhow!(
+                        "model output truncated at max_tokens (partial response discarded)"
+                    )),
+                    state,
+                    sched,
+                    gateway,
+                    registry,
+                    recorder,
+                );
+            }
+        }
         AgentEffect::Failed(msg) => {
             // AgentFailed event already emitted by AgentTask (budget/max-turns/etc.).
             // Inference-error AgentFailed is emitted in run() before this call.
@@ -6809,6 +6845,76 @@ mod tests {
             !log.contains(&long_answer),
             "full 600-char answer must not appear verbatim in the flight log"
         );
+    }
+
+    #[test]
+    fn orchestrated_maxtokens_truncation_parks_not_terminates() {
+        // budget.1-ar-01 — pins audit86-P0-2 at the DISPATCH layer (previously unpinned there).
+        // A resettable ORCHESTRATED agent whose response truncated at max_tokens returns
+        // CompletedTruncated; the scheduler must PARK it (waiting), keep it in state.agents, and
+        // record NO outcome — it stays resumable and NEVER bricks.
+        let (rec, _tmp) = recorder();
+        let gw: Arc<dyn crate::inference::InferenceGateway + Send + Sync> =
+            Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let mut state = minimal_state("orch");
+        state.orchestrated.insert("orch".to_string());
+
+        enqueue_or_defer(
+            AgentEffect::CompletedTruncated("partial but usable".to_string()),
+            "orch".to_string(),
+            0,
+            0,
+            None,
+            &mut state,
+            &SchedulerConfig::default(),
+            &gw,
+            &registry,
+            &rec,
+        );
+
+        assert!(state.waiting.contains("orch"), "orchestrated truncation must PARK (waiting)");
+        assert!(state.agents.contains_key("orch"), "agent must remain in state.agents (resumable)");
+        assert!(
+            !state.outcomes.contains_key("orch"),
+            "orchestrated truncation must NOT terminate (no outcome) — bricking is the P0-2 regression"
+        );
+    }
+
+    #[test]
+    fn oneshot_maxtokens_truncation_fails_not_silent_success() {
+        // budget.1-ar-01 — the other half of the role-gate: a NON-orchestrated (one-shot root)
+        // agent whose response truncated at max_tokens must FAIL (outcome = Err), not report a
+        // clean success carrying silently-truncated text. Proves the reported bug is fixed.
+        let (rec, _tmp) = recorder();
+        let gw: Arc<dyn crate::inference::InferenceGateway + Send + Sync> =
+            Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let mut state = minimal_state("one");
+        // NOT orchestrated, NOT an awaiting child → a plain one-shot root.
+
+        enqueue_or_defer(
+            AgentEffect::CompletedTruncated("partial and incomplete".to_string()),
+            "one".to_string(),
+            0,
+            0,
+            None,
+            &mut state,
+            &SchedulerConfig::default(),
+            &gw,
+            &registry,
+            &rec,
+        );
+
+        assert!(!state.waiting.contains("one"), "one-shot truncation must NOT park");
+        match state.outcomes.get("one") {
+            Some(Err(e)) => assert!(
+                e.to_string().contains("truncated at max_tokens"),
+                "outcome error must name the truncation, got: {e}"
+            ),
+            Some(Ok(_)) => panic!("one-shot truncation must FAIL, not report success with partial text"),
+            None => panic!("one-shot truncation must record a terminal outcome"),
+        }
     }
 
     #[test]

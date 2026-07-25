@@ -55,6 +55,12 @@ pub enum AgentEffect {
     /// The scheduler parks the agent until an operator approves or rejects.
     RequestApproval { call_id: String, action: crate::config::PendingActionRequest },
     Completed(String),
+    /// A resettable agent whose response was truncated at `max_tokens` (budget.1-ar-01). Distinct
+    /// from `Completed` so the scheduler MUST consciously role-gate it: a resident/orchestrated
+    /// agent PARKS + resumes (never bricks — audit86-P0-2), while a one-shot/child FAILS (the parent
+    /// sees an `is_error` result, not silently-truncated text presented as a finished answer). The
+    /// `String` is the partial text (used by the resident park path, discarded on the fail path).
+    CompletedTruncated(String),
     Failed(String),
 }
 
@@ -734,10 +740,15 @@ impl AgentTask {
                 )
             }
 
-            // EndTurn/Other, and a resettable MaxTokens truncation: treat as a (possibly partial)
-            // turn end — a resident agent parks and is reactivatable rather than bricked.
+            // EndTurn/Other, and a RESETTABLE MaxTokens truncation (arm 1 caught the non-resettable
+            // case). A resident/orchestrated agent parks and is reactivatable rather than bricked; the
+            // scheduler role-gates on the returned effect — `CompletedTruncated` for a truncation (a
+            // one-shot/child then FAILS instead of silently delivering partial text as a finished
+            // answer), plain `Completed` for a clean turn end (budget.1-ar-01). The RECORDING below is
+            // identical for both, so the resident park flow's dependencies are unchanged.
             StopReason::EndTurn | StopReason::Other(_) | StopReason::MaxTokens => {
-                if matches!(response.stop_reason, StopReason::MaxTokens) {
+                let truncated = matches!(response.stop_reason, StopReason::MaxTokens);
+                if truncated {
                     recorder.record(
                         &self.agent_id,
                         Some(self.turn),
@@ -767,10 +778,15 @@ impl AgentTask {
                         "turns":          self.turn + 1,
                         "total_tokens":   total,
                         "answer_preview": truncate(&answer, PREVIEW_CHARS),
+                        "truncated":      truncated,
                     }),
                 );
                 self.terminal = true;
-                AgentEffect::Completed(answer)
+                if truncated {
+                    AgentEffect::CompletedTruncated(answer)
+                } else {
+                    AgentEffect::Completed(answer)
+                }
             }
 
             StopReason::ToolUse => {
@@ -1879,11 +1895,12 @@ mod tests {
 
     #[test]
     fn max_tokens_resettable_agent_parks_not_bricked() {
-        // budget.1 / AUDIT-v0.97 P3: a resident agent under a reset window
-        // (`budget_resettable`) must NOT be hard-Failed on a single truncated
-        // response — that was the self-brick class. It falls through to the
-        // recoverable turn-end arm: Completed with whatever partial text exists,
-        // leaving the scheduler free to re-activate it on the next window.
+        // budget.1 / AUDIT-v0.97 P3 + budget.1-ar-01: a resident agent under a reset window
+        // (`budget_resettable`) must NOT be hard-Failed on a single truncated response — that was
+        // the self-brick class. It returns the DISTINCT `CompletedTruncated` effect (not plain
+        // `Completed`), carrying the partial text, so the scheduler can role-gate: a resident/
+        // orchestrated agent parks + resumes on this, while a one-shot/child fails. This test pins
+        // the "must not Fail/brick" half (the P0-2 guarantee) at the AgentTask layer.
         let (rec, _tmp) = recorder();
         let mut task = AgentTask::new("t", "task", &agent_cfg(5, 100_000), &model_cfg(), vec![]);
         task.set_budget_resettable(true);
@@ -1898,11 +1915,11 @@ mod tests {
         task.provide_inference(response, &rec);
         let effect = task.step(&rec);
         match effect {
-            AgentEffect::Completed(answer) => {
-                assert_eq!(answer, "partial but usable", "partial text is surfaced, not discarded");
+            AgentEffect::CompletedTruncated(answer) => {
+                assert_eq!(answer, "partial but usable", "partial text is carried for the resident park path");
             }
-            AgentEffect::Failed(msg) => panic!("resettable MaxTokens must park as Completed, not Failed: {msg}"),
-            _ => panic!("resettable MaxTokens must park as Completed"),
+            AgentEffect::Failed(msg) => panic!("resettable MaxTokens must NOT brick (Failed): {msg}"),
+            _ => panic!("resettable MaxTokens must be CompletedTruncated"),
         }
     }
 
