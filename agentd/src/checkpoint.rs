@@ -255,7 +255,17 @@ impl CheckpointStore {
     /// `load()` instead of deleting — preserves recoverable state across a crash before
     /// the first post-restore save.
     pub fn mark_restored(&self) -> std::io::Result<()> {
-        std::fs::rename(&self.path, self.restored_path())
+        match std::fs::rename(&self.path, self.restored_path()) {
+            Ok(()) => Ok(()),
+            // Benign on a repeat restart that recovered from `.restored` (AUDIT-v0.97 holistic
+            // review NIT): the primary was already renamed on a prior boot and no save has
+            // happened since, so the recoverable copy is already in place. Don't surface a
+            // scary "could not rename" warning for the more-resilient path — only real errors.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.restored_path().exists() => {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn load(&self) -> Result<Option<SchedulerCheckpoint>> {
@@ -277,6 +287,26 @@ impl CheckpointStore {
                 // fresh). Best-effort; never fail-stop a restart.
                 if let Some(name) = src.file_name().and_then(|n| n.to_str()) {
                     let _ = std::fs::rename(&src, src.with_file_name(format!("{name}.corrupt")));
+                }
+                // AUDIT-v0.97 holistic review (Codex Medium): a CORRUPT primary must not
+                // suppress a valid pre-restore copy. If we just quarantined the primary and a
+                // `.restored` copy exists (crash after restore, then a partial/garbled primary
+                // write or on-disk corruption), fall back to it before giving up — the whole
+                // point of the pre-restore copy is to survive exactly this. Quarantine it too
+                // if it is also unreadable, so the next boot starts genuinely fresh.
+                if src == self.path && self.restored_path().exists() {
+                    match Self::read_and_parse(&self.restored_path()) {
+                        Ok(cp) => return Ok(Some(cp)),
+                        Err(_) => {
+                            let restored = self.restored_path();
+                            if let Some(name) = restored.file_name().and_then(|n| n.to_str()) {
+                                let _ = std::fs::rename(
+                                    &restored,
+                                    restored.with_file_name(format!("{name}.corrupt")),
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e)
             }
@@ -586,6 +616,26 @@ mod tests {
         assert!(store.load().is_err(), "corrupt .restored -> Err");
         assert!(!dir.path().join("checkpoint.json.restored").exists(), "corrupt .restored quarantined away");
         assert!(dir.path().join("checkpoint.json.restored.corrupt").exists(), "renamed to .restored.corrupt");
+    }
+
+    #[test]
+    fn load_falls_back_to_restored_when_primary_corrupt() {
+        // AUDIT-v0.97 holistic review (Codex Medium): a CORRUPT primary must not suppress a
+        // valid pre-restore copy. Crash after restore leaves a good `.restored`; a later partial
+        // primary write / on-disk corruption then leaves `checkpoint.json` present-but-garbled.
+        // load() must quarantine the bad primary AND recover from `.restored`, not start fresh.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let good = serde_json::to_vec(&minimal_scheduler_checkpoint()).unwrap();
+        std::fs::write(dir.path().join("checkpoint.json.restored"), &good).unwrap();
+        std::fs::write(dir.path().join("checkpoint.json"), b"garbled primary").unwrap();
+
+        let loaded = store.load().expect("primary corrupt but .restored valid -> recover, not Err");
+        let cp = loaded.expect("recovered checkpoint is Some");
+        assert_eq!(cp.tokens_spent, 15, "recovered the pre-restore copy's state");
+        assert!(!dir.path().join("checkpoint.json").exists(), "corrupt primary quarantined away");
+        assert!(dir.path().join("checkpoint.json.corrupt").exists(), "bad primary renamed to .corrupt");
+        assert!(dir.path().join("checkpoint.json.restored").exists(), ".restored preserved for the next boot");
     }
 
     #[cfg(unix)]

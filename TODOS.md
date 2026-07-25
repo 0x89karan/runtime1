@@ -336,15 +336,16 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 - **audit86-P2-11 (P2) [new] — Published images are never executed before push.**
   `publish-docker` builds and pushes without so much as `agentd --help`. Fix: image smoke run
   pre-push; longer term a compose-boot job asserting flight.jsonl shape. → `ci.1`.
-- **audit86-P2-12 (P2) [new] — Shell env-sanitization denylist hand-duplicated across boot scripts.**
-  `entrypoint.sh:16-18` ≡ `overlay/init:49-51` verbatim; `shell_mcp.py:39` a third larger
-  variant; zero sync checks (a security addition to one won't propagate). Fix: golden-diff CI
-  test (a sourced lib is impossible — `init` is standalone busybox in an initramfs). → `par.1`.
-- **audit86-P2-13 (P2) [new] — agentctl matches flight-event kinds by raw string.**
-  `inspector.rs:48-54`, `reader.rs:340-341`, `converse.rs:289`, `orchestrate.rs:164`,
-  `views.rs:1194` — despite depending on the agentd crate; a rename in `events.rs` compiles
-  and silently blanks TUI filters/streams. Fix: export `EventKind::as_str()` and use it, or
-  copy the otel exhaustiveness-test pattern. → `par.1`.
+- ~~**audit86-P2-12 (P2) [new] — Shell env-sanitization denylist hand-duplicated across boot scripts.**~~ **[FIXED in par.1 (v0.103.0): `agentd/tests/env_denylist_parity.rs` asserts `entrypoint.sh` ≡ `overlay/init` token sets (drift panics naming the source + token) and the boot `LD_*` keys ⊆ `shell_mcp.py`'s (different-purpose) linker blocklist — the audit's "same list 3×" framing was inexact; the real relationship is equal-pair + subset-floor, and that is what the test encodes. Negative-control-verified.]**
+- ~~**audit86-P2-13 (P2) [new] — agentctl matches flight-event kinds by raw string.**~~ **[FIXED in par.1 (v0.103.0): added `EventKind::as_str()`/`ALL` (single source of truth, unit-proven against serde wire form + exhaustive); `agentctl/tests/event_kind_strings.rs` pins every kind string agentctl matches to a real variant so a rename breaks the test not the TUI. Surfaced a real pre-existing bug → par.1-ar-01.]**
+- **par.1-ar-01 (P2) [new; found by the par.1 exhaustiveness guard] — agentctl's error view is blind to tool + inference errors.**
+  Inspector "Errors" filter (`inspector.rs:47-48`) and the red colour rule (`views.rs:1229-1230`) match
+  `"kind":"tool_error"`/`"inference_error"` — neither is ever emitted by agentd. Tool failures are
+  `tool_result` + `data.is_error=true`; inference failures are `agent_failed`/`error` ("inference_error"
+  appears only as a `reason` *field*). Net: the operator's Errors filter/colour catches only `agent_failed`.
+  Fix is behavioral (the filter must check the `is_error` data field for `tool_result`, not a kind-string
+  swap), so it was deferred out of tests-only par.1. Tracked by a self-shrinking `KNOWN_NONCANONICAL`
+  allowlist test that fails the day it's fixed. → fold into par.2 or a small agentctl fix.
 - **audit86-P2-14 (P2) [new] — QEMU CoS fork silently missing the entire memory-routing feature set.**
   `distro/overlay/etc/agentd/cos.agents.toml` lacks the `semantic-kb` server, `mail:raw`
   segment/caps, and the dedup prompt step — production QEMU CoS runs without email dedup. The
@@ -389,6 +390,39 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   (nullified by `env_clear()`); `agentd/README.md:63` streaming default documented backwards;
   CONVENTIONS event table missing `mcp_passenv_forwarded` + FUSE table missing 5 files & all of
   `/agents/system/`; README self-contradicts on version. → `doc.1` + CONVENTIONS-completeness test.
+
+**AUDIT-v0.97 holistic-stack review (2026-07-25, cross-model /review over main..par.1 — 6 increments).**
+Two Codex High/Medium findings were FIXED in the review (F1 FsRead-privileged in `management.rs`,
+F4 checkpoint `.restored`-fallback in `checkpoint.rs`); the two below are deferred with a precise fix
+direction. Claude adversarial pass was SOUND on all 5 focus areas; Codex caught F1/F3/F4 that Claude missed.
+- **budget.1-ar-01 (P2) [new; Codex Medium, holistic review] — `MaxTokens` truncation now reports clean
+  completion for ALL resettable agents, not just resident ones.** `agent/mod.rs:724` only hard-fails
+  `StopReason::MaxTokens` when `!budget_resettable`, but `scheduler.rs:1510` sets `budget_resettable` for
+  *every* agent whenever `budget_reset_interval > 0` (the recommended prod config). So a one-shot job /
+  spawned child that hits the model's per-response `max_tokens` output cap falls through to the recoverable
+  arm (`:739`), which sets `terminal=true` and returns `AgentEffect::Completed(truncated_text)` — silent
+  truncation presented as success, and (for `deliver_content=true` children) fed to the parent. Rare-trigger
+  (only on a genuinely truncated generation) and non-security; the sealed-job CoS path is shielded by
+  cap.2b `deliver_content=false`. Fix needs a resident/resumable signal on `AgentTask` (doesn't exist today)
+  so the recoverable path gates on "resident+parked", not the global window flag — do NOT just revert the
+  self-brick fix (reopens audit86-P0-2). Minimum honest interim: mark the completion `truncated:true` so the
+  parent isn't misled. → future increment.
+- **budget.1-ar-02 (P3) [new; Codex High + Claude INVESTIGATE, both agree bounded] — universal-tier global
+  ceiling is a soft cap under concurrency.** `egress.rs:479` reads `meter.windowed()` pre-forward but
+  `add_universal` runs post-response (`:591`), and the check isn't atomic with the forward (unlike the
+  per-workload budget's `AcqRel fetch_update` at `:585`). N concurrent universal requests at `windowed ==
+  ceiling−ε` all pass, overshooting by up to `(N−1)×max_tokens`. This is the SAME post-hoc metering shape the
+  native tier already has (not a budget.1 regression); the "cognition is bounded" invariant still holds
+  asymptotically (the next request 429s). Real hard-cap fix = reservation-before-forward (reserve `max_tokens`
+  + input estimate, reconcile on response) across both tiers. → cap.3 / a metering-hardening increment.
+- **run.1-ar-01 (P3) [new; testing-specialist, holistic review] — durability fixes are helper-tested, not
+  call-site-tested.** Three run.1 fixes assert the helper in isolation but not the wiring that invokes it, so
+  deleting the call site leaves every test green while the bug returns: `runs/store.rs:309` `close_segment →
+  prune` (only `prune()` is tested directly), `agent/mod.rs:611` `cap_short_term` call in the `MemoryPaged`
+  path, and `flight_recorder.rs:43` the metadata-seed rotation path (tests seed the counter manually, never
+  from file metadata on open). Also the par.1 agentctl kind-string guard pins a hand-maintained mirror, not a
+  scan of agentctl source — a NEW `"kind":"…"` match added to agentctl and never added to the list isn't
+  caught. Add call-site / metadata-seed / source-scan tests. → a test-hardening pass.
 - ~~**Reconciliation — fixed-but-not-struck TODOS entries (verify, then move to Completed):**~~ **[DONE in audit.1 (2026-07-17): all 6 entries verified against code and struck in place — see each entry's FIXED/SUPERSEDED annotation.]**
   `audit-S1`/`audit-S2` (`TODOS.md:387,392`; closed in cred.3.1 / v0.61.0 as cred.3-ar-S1/S2);
   `F-012` (`:1583`; = F-05/audit-C3, fsync landed v0.70.0 — corroborated by the ops pass at

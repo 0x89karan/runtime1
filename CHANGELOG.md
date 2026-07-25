@@ -3,6 +3,44 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.103.0] - 2026-07-25
+
+### Added
+- **par.1 — drift guards** (6th AUDIT-v0.97 increment; tests-only, upholds no invariant directly but
+  makes two cross-boundary duplications tamper-evident so a future edit — notably par.2 — can't silently
+  desync them):
+  - **Env-sanitization denylist parity** (P2-12): `docker/entrypoint.sh` and `distro/overlay/init`
+    carry hand-mirrored boot-env secret denylists. `agentd/tests/env_denylist_parity.rs` asserts their
+    token sets are equal (a drift panics naming the source + offending token) and that the boot loaders'
+    `LD_*` keys are a subset of `docker/shell_mcp.py`'s (different-purpose) linker-hijack blocklist.
+  - **EventKind string exhaustiveness** (P2-13): added `EventKind::as_str()`/`EventKind::ALL` as the
+    single source of truth (unit tests prove `as_str()` matches the serde `snake_case` wire form and that
+    `ALL` stays exhaustive). `agentctl/tests/event_kind_strings.rs` pins every flight-event kind string
+    agentctl matches on to a real variant, so an event rename breaks the test rather than the TUI at runtime.
+  - Both guards negative-control-verified (perturb → fail naming source, revert → green).
+
+### Fixed (AUDIT-v0.97 holistic-stack review, 2026-07-25)
+Cross-model /review over the whole `main..par.1` stack (6 increments). Codex caught three the
+per-increment passes and the Claude adversarial pass missed; two are fixed here, two deferred (TODOS
+budget.1-ar-01/-02, run.1-ar-01):
+- **`/spawn` FsRead exfiltration closed** (cap.4 gap, Codex High): `is_privileged_spawn_cap` classified
+  every `FsRead` as safe regardless of prefix, so `FsRead { prefix: "/" }` let an un-opted-in `/spawn`
+  caller mint an agent reading any file (egress signing key, OAuth cache, checkpoints, mounted secrets)
+  via `read_file`/`list_dir`. `FsRead` is now privileged (requires `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1`);
+  the bounded read paths a benign caller needs stay covered by `KbRead { segment }` + `RunsRead`.
+- **Corrupt primary checkpoint no longer suppresses the `.restored` fallback** (audit.2 gap, Codex Medium):
+  `load()` quarantined a garbled primary and gave up even when a valid pre-restore copy existed. It now
+  falls back to `.restored` (quarantining the bad primary), completing the crash-after-restore resilience
+  story. Also silenced a spurious "could not rename" warning on benign repeat-restart recovery.
+
+### Known issues
+- **par.1-ar-01** (P2, pre-existing, surfaced by the par.1 exhaustiveness guard): agentctl's Inspector
+  "Errors" filter and red colour rule match `"kind":"tool_error"`/`"inference_error"` — strings agentd
+  never emits — so tool-level and inference-level errors are invisible in the operator's error view (only
+  `agent_failed` shows). Fix is a behavioral change (tool errors are `tool_result` + `is_error=true`, a
+  data-field check, not a string swap), deferred out of tests-only par.1. Tracked by a self-shrinking
+  `KNOWN_NONCANONICAL` allowlist test.
+
 ## [v0.102.0] - 2026-07-25
 
 ### Fixed

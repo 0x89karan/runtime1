@@ -24,7 +24,7 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.102.0 (shipped 2026-07-25)
+**Current version:** v0.103.0 (shipped 2026-07-25)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 

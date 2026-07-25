@@ -148,6 +148,9 @@ async fn spawn_refuses_privileged_caps_without_optin() {
     for body in [
         serde_json::json!({"task": "x", "capabilities": ["Spawn"]}),
         serde_json::json!({"task": "x", "capabilities": [{"Mcp": {"server": "google_oauth", "tools": []}}]}),
+        // AUDIT-v0.97 holistic review (Codex High): FsRead{"/"} is whole-filesystem read (egress
+        // signing key, OAuth cache, secrets) — deny-by-default must refuse it without the opt-in.
+        serde_json::json!({"task": "x", "capabilities": [{"FsRead": {"prefix": "/"}}]}),
         serde_json::json!({"task": "x"}),  // no capabilities field → unrestricted
     ] {
         let r = client.post(format!("{base}/api/v1/spawn")).json(&body).send().await.unwrap();
