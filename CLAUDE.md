@@ -24,24 +24,25 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.98.0 (shipped 2026-07-25)
+**Current version:** v0.99.0 (shipped 2026-07-25)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** audit.2 (v0.98.0) — **acute batch of the AUDIT-v0.97 remediation sweep** (first of
-~7). Three high-severity, independent fixes: **P1-1** the arm64 rootfs now packages python3+openssl
-(the Python MCP sidecars were unrunnable on arm64 → flagship non-functional there); **P2-1** checkpoint
-recovery renames→`checkpoint.json.restored` instead of deleting before the first save (a startup crash
-after restore was erasing all CoS state — crash-loop data loss), with save() consuming the copy +
-load() quarantining a corrupt source; **P2-4** the ux.13 cancel-resurrection (a cancelled parked
-trigger revived when its child terminated, flipping `AgentCancelled`→done) closed by gating the
-child-delivery re-step on `!outcomes && !cancel_requested`. Full 8-lane fan-out audit landed as
-`docs/AUDIT-v0.97.md` (3 P1 · 12 P2 · 16 P3; PR #141). Remediation sweep in progress (operator opted
-into autonomous drive): **run.1 next** (flight.jsonl rotation P1-2 + short_term cap P1-3 + cron
-catch-up P2-6 + runs retention P2-9), then cap.4 (auth-consistency + tool_override KbWrite) → ci.2/
-packaging → budget.1 → par.1/2 → P3 sweep.
-**Prior:** ux.13 (v0.97.0) — control verbs (Cancel/SetCaps/SetBudget surface), final increment of the
-"trust after absence" cockpit reshape (ux.8′→ux.11→ux.12→ux.13). ux.12 (v0.96.0) — Telegram reach.
+**Latest shipped:** run.1 (v0.99.0) — **the durability cluster** of the AUDIT-v0.97 sweep (2nd of ~7).
+Four fixes: **P1-2** flight.jsonl copy-truncate rotation at 100MB (AtomicU64 counter, under the file
+mutex, same inode so otel's `tail.rs` follows it) — closes the always-on disk-fill that starved the
+co-located durable writers; **P1-3** `cap_short_term` ring-drops oldest paged summaries beyond
+MAX_SHORT_TERM so a never-terminating orchestrator's per-turn checkpoint clone stays bounded (safe —
+short_term is evicted summaries, not live tool-pairs; mid-run distillation deferred); **P2-6** cron
+missed-fire catch-up (persist next-fire to `/data`, fire-once-on-boot-if-missed) — schedule-fingerprinted
+so a changed `TRIGGER_CRON`/`INTERVAL` across restart can't spuriously catch up (Codex review); **P2-9**
+runs.redb retention prune (5000/90d, closed records only) bounds the full-scan queries (time-index
+re-key deferred). Stacked on **audit.2 (v0.98.0)** — arm64 python packaging (P1-1), checkpoint
+`.restored` crash-loop fix (P2-1), ux.13 cancel-resurrection (P2-4). Both PRs pushed but blocked by a
+GitHub API outage at ship time. **Sweep remaining:** cap.4 (auth-consistency + tool_override KbWrite) →
+ci.2/packaging → budget.1 → par.1/2 → P3. Full audit: `docs/AUDIT-v0.97.md` (PR #141).
+**Prior:** ux.13 (v0.97.0) — control verbs, final increment of the "trust after absence" cockpit
+reshape (ux.8′→ux.11→ux.12→ux.13). ux.12 (v0.96.0) — Telegram reach.
 **After the sweep:** the UX tail (ux.2b/ux.3/ux.10 — the last picks up the deferred ux.13 cancel-key),
 then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
 

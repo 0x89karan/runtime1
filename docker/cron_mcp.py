@@ -193,13 +193,87 @@ def _next_fire_cron(spec, after: datetime.datetime) -> datetime.datetime:
 _MODE            = None   # "cron" or "interval"
 _CRON_SPEC       = None
 _INTERVAL_S      = None
+_SPEC_RAW        = None   # raw TRIGGER_CRON/TRIGGER_INTERVAL string — the catch-up fingerprint
+                          # (stable, unlike the parsed _CRON_SPEC whose repr can reorder)
 _NEXT_FIRE_TS    = None   # float (UTC epoch)
 _MAX_WAIT_S      = None   # int or None
 _WAIT_START      = None   # float or None — set on first call
+_STATE_PATH      = None   # durable next-fire persistence (AUDIT-v0.97 P2-6); None = in-memory only
+
+DEFAULT_STATE_DIR = "/data"
+STATE_FILENAME    = "cron_state.json"
 
 
 def _now() -> float:
     return time.time()
+
+
+# ---------------------------------------------------------------------------
+# Durable next-fire persistence + missed-fire catch-up (AUDIT-v0.97 P2-6)
+# ---------------------------------------------------------------------------
+
+def _state_init():
+    """Resolve the durable state path (env CRON_STATE_DIR, default /data). Degrade to
+    in-memory (_STATE_PATH=None) if the dir is not writable — the trigger still works,
+    it just loses missed-fire catch-up across a restart."""
+    global _STATE_PATH
+    state_dir = (os.environ.get("CRON_STATE_DIR") or DEFAULT_STATE_DIR).strip()
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        _STATE_PATH = os.path.join(state_dir, STATE_FILENAME)
+    except OSError as exc:
+        print(f"cron_mcp.py: state dir '{state_dir}' not writable ({exc}) — "
+              f"missed-fire catch-up disabled (in-memory only)", file=sys.stderr)
+        _STATE_PATH = None
+
+
+def _spec_fingerprint() -> str:
+    """Identity of the CURRENT schedule config. Persisted with next-fire so a catch-up is
+    honored ONLY when the schedule is unchanged across restart — a stale missed-fire under
+    the OLD schedule must not fire under a NEW TRIGGER_CRON/TRIGGER_INTERVAL (Codex review)."""
+    return f"{_MODE}:{_SPEC_RAW}"
+
+
+def _load_persisted_next():
+    """Return the persisted next-fire epoch (float) from a prior run, or None. Returns None
+    when the persisted schedule fingerprint does not match the current config, so a schedule
+    change across restart cannot trigger a spurious catch-up."""
+    if not _STATE_PATH:
+        return None
+    try:
+        with open(_STATE_PATH) as f:
+            data = json.load(f)
+        if data.get("spec") != _spec_fingerprint():
+            return None  # schedule changed across restart → ignore stale catch-up state
+        v = data.get("next_fire_ts")
+        return float(v) if v is not None else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _persist_next():
+    """Atomically persist the current next-fire so a fire missed while down is caught up
+    on the next boot. Best-effort — never raise."""
+    if not _STATE_PATH or _NEXT_FIRE_TS is None:
+        return
+    try:
+        tmp = _STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"next_fire_ts": _NEXT_FIRE_TS, "mode": _MODE, "spec": _spec_fingerprint()}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _STATE_PATH)
+    except OSError as exc:
+        print(f"cron_mcp.py: could not persist next-fire ({exc})", file=sys.stderr)
+
+
+def _apply_catchup(fresh: float, persisted, now: float) -> float:
+    """Decide the effective next-fire. If a fire was scheduled while we were down (persisted
+    is in the past), catch up by firing now; otherwise use the freshly-computed next fire per
+    the CURRENT config (robust to a changed cron expression across restart)."""
+    if persisted is not None and persisted <= now:
+        return now  # missed fire while down → fire once immediately on the next wait
+    return fresh
 
 
 def _utcnow() -> datetime.datetime:
@@ -217,10 +291,12 @@ def _advance_next_fire():
     else:
         dt = _next_fire_cron(_CRON_SPEC, _utcnow())
         _NEXT_FIRE_TS = dt.timestamp()
+    _persist_next()  # P2-6: persist so a fire missed while down is caught up next boot
 
 
 def _init():
-    global _MODE, _CRON_SPEC, _INTERVAL_S, _NEXT_FIRE_TS, _MAX_WAIT_S
+    global _MODE, _CRON_SPEC, _INTERVAL_S, _NEXT_FIRE_TS, _MAX_WAIT_S, _SPEC_RAW
+    _state_init()
     cron_expr    = (os.environ.get("TRIGGER_CRON") or "").strip()
     interval_str = (os.environ.get("TRIGGER_INTERVAL") or "").strip()
     max_wait_raw = (os.environ.get("TRIGGER_MAX_WAIT_S") or "").strip()
@@ -241,17 +317,30 @@ def _init():
             print(f"cron_mcp.py: TRIGGER_MAX_WAIT_S must be a positive integer, got '{max_wait_raw}'", file=sys.stderr)
             sys.exit(1)
 
+    now = _now()
+    # Set the schedule identity BEFORE loading persisted state — _load_persisted_next()'s
+    # fingerprint check reads _MODE/_SPEC_RAW, so they must be current first (else catch-up
+    # is always disabled by a None-fingerprint mismatch).
     if interval_str:
-        _MODE       = "interval"
-        _INTERVAL_S = parse_interval(interval_str)
-        _NEXT_FIRE_TS = _now() + _INTERVAL_S
-        print(f"cron_mcp.py: interval mode — every {_INTERVAL_S}s; first fire in {_INTERVAL_S}s", file=sys.stderr)
+        _MODE = "interval"; _INTERVAL_S = parse_interval(interval_str); _SPEC_RAW = interval_str
     else:
-        _MODE      = "cron"
-        _CRON_SPEC = parse_cron(cron_expr)
+        _MODE = "cron"; _CRON_SPEC = parse_cron(cron_expr); _SPEC_RAW = cron_expr
+    persisted = _load_persisted_next()
+    if _MODE == "interval":
+        _NEXT_FIRE_TS = _apply_catchup(now + _INTERVAL_S, persisted, now)
+        _persist_next()
+        caught = _NEXT_FIRE_TS <= now
+        print(f"cron_mcp.py: interval mode — every {_INTERVAL_S}s; "
+              f"{'CATCH-UP fire now (missed while down)' if caught else f'first fire in {_INTERVAL_S}s'}",
+              file=sys.stderr)
+    else:
         dt = _next_fire_cron(_CRON_SPEC, _utcnow())
-        _NEXT_FIRE_TS = dt.timestamp()
-        print(f"cron_mcp.py: cron mode — '{cron_expr}'; next fire {_format_utc(_NEXT_FIRE_TS)} UTC", file=sys.stderr)
+        _NEXT_FIRE_TS = _apply_catchup(dt.timestamp(), persisted, now)
+        _persist_next()
+        caught = _NEXT_FIRE_TS <= now
+        print(f"cron_mcp.py: cron mode — '{cron_expr}'; "
+              f"{'CATCH-UP fire now (missed while down)' if caught else f'next fire {_format_utc(_NEXT_FIRE_TS)} UTC'}",
+              file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +463,9 @@ def process_line(line: str):
 # ---------------------------------------------------------------------------
 
 def _self_test():
-    import os as _os
+    import os as _os, tempfile as _tf
+    # Keep persistence hermetic (don't touch /data on the CI runner / dev box).
+    _os.environ["CRON_STATE_DIR"] = _tf.mkdtemp()
     # Interval: every 1s should fire within 2 seconds
     _os.environ["TRIGGER_CRON"]     = ""
     _os.environ["TRIGGER_INTERVAL"] = "every 1s"
@@ -385,7 +476,7 @@ def _self_test():
     print("  [1/5] interval fire: PASS", file=sys.stderr)
 
     # Cron: a past minute should compute to next occurrence
-    global _MODE, _CRON_SPEC, _NEXT_FIRE_TS, _WAIT_START, _MAX_WAIT_S
+    global _MODE, _CRON_SPEC, _NEXT_FIRE_TS, _WAIT_START, _MAX_WAIT_S, _SPEC_RAW, _STATE_PATH
     _MODE       = "cron"
     _CRON_SPEC  = parse_cron("* * * * *")  # every minute
     _NEXT_FIRE_TS = _now() + 2
@@ -433,9 +524,27 @@ def _self_test():
     assert r4["status"] == "waiting", f"waiting status expected: {r4}"
     assert "fired_utc" not in r4, f"fired_utc must not appear in waiting response: {r4}"
     assert "next_fire_utc" in r4, f"next_fire_utc must appear in waiting response: {r4}"
-    print("  [6/6] waiting status: PASS", file=sys.stderr)
+    print("  [6/7] waiting status: PASS", file=sys.stderr)
 
-    print("cron_mcp.py: self-test PASSED (6/6)", file=sys.stderr)
+    # AUDIT-v0.97 P2-6: missed-fire catch-up decision (deterministic, no filesystem needed).
+    assert _apply_catchup(1000.0, 500.0, 900.0) == 900.0, "missed fire (persisted in the past) → catch up now"
+    assert _apply_catchup(1000.0, 950.0, 900.0) == 1000.0, "persisted in the future → use the fresh schedule"
+    assert _apply_catchup(1000.0, None, 900.0) == 1000.0, "no persisted next-fire → fresh schedule"
+    print("  [7/7] missed-fire catch-up: PASS", file=sys.stderr)
+
+    # [8/8] schedule-change fingerprint: a persisted next-fire under the OLD schedule must be
+    # ignored across a config change (Codex review) — no spurious catch-up under the NEW one.
+    _sd = _tf.mkdtemp()
+    _STATE_PATH = _os.path.join(_sd, "cron_state.json")
+    _MODE = "cron"; _SPEC_RAW = "0 8 * * *"; _CRON_SPEC = parse_cron("0 8 * * *"); _NEXT_FIRE_TS = 500.0
+    _persist_next()
+    assert _load_persisted_next() == 500.0, "unchanged schedule loads the persisted next-fire"
+    _SPEC_RAW = "0 9 * * *"; _CRON_SPEC = parse_cron("0 9 * * *")  # operator changed the cron
+    assert _load_persisted_next() is None, "changed schedule ignores the stale catch-up state"
+    _STATE_PATH = None  # restore hermetic
+    print("  [8/8] schedule-change fingerprint: PASS", file=sys.stderr)
+
+    print("cron_mcp.py: self-test PASSED (8/8)", file=sys.stderr)
     sys.exit(0)
 
 

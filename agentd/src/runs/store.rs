@@ -27,6 +27,13 @@ const BRIEFS: TableDefinition<&str, &str> = TableDefinition::new("briefs");
 
 pub const RUNS_SCHEMA_VERSION: u64 = 1;
 
+/// Retention bounds for the runs table (AUDIT-v0.97 P2-9). An always-on CoS otherwise accretes
+/// run records forever, so `list()` / `publish_brief()` full-scans grow without limit. Pruning
+/// (in the run_writer lane, after each close) keeps the table — and thus every scan — bounded.
+/// Only CLOSED records are eligible; a live/open run is never pruned.
+const MAX_RUNS: usize = 5_000;
+const MAX_RUN_AGE_SECS: u64 = 90 * 24 * 3600; // 90 days
+
 /// First-ever brief covers at most the last 24h (Eng G5) — a long-lived install must not
 /// report "every run ever" on day one. Subsequent briefs derive `window_from` from the
 /// previous brief's `window_to`.
@@ -297,6 +304,49 @@ impl RunsStore {
             // else: no open segment (double-close / close-before-open) → no-op.
         }
         txn.commit().context("commit close_segment")?;
+        // P2-9: prune after a close (same writer lane → no concurrency). Best-effort: a prune
+        // failure must not fail the close (the run record is already durably committed).
+        if let Err(e) = self.prune(ts, MAX_RUNS, MAX_RUN_AGE_SECS) {
+            tracing::warn!("runs prune failed (non-fatal): {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Bound the runs table (AUDIT-v0.97 P2-9): remove CLOSED records older than `max_age_secs`
+    /// or beyond the newest `max_runs`. Open records (end_ts=None) are never pruned. Runs in a
+    /// dedicated write txn — call only from the run_writer lane (after a close), never
+    /// concurrently with another write txn.
+    fn prune(&self, now: u64, max_runs: usize, max_age_secs: u64) -> anyhow::Result<()> {
+        let txn = self.db.begin_write().context("begin prune")?;
+        {
+            let mut runs_tbl = txn.open_table(RUNS).context("open runs for prune")?;
+            // Collect closed records with a sort timestamp (prefer end_ts, fall back to start).
+            let mut closed: Vec<(String, u64)> = Vec::new();
+            for entry in runs_tbl.iter().context("iter runs for prune")? {
+                let (k, v) = entry.context("read run entry")?;
+                if let Ok(rec) = serde_json::from_str::<RunRecord>(v.value()) {
+                    if let Some(end) = rec.end_ts {
+                        closed.push((k.value().to_string(), end.max(rec.start_ts)));
+                    }
+                }
+            }
+            let cutoff = now.saturating_sub(max_age_secs);
+            let mut remove: Vec<String> =
+                closed.iter().filter(|(_, ts)| *ts < cutoff).map(|(k, _)| k.clone()).collect();
+            if closed.len() > max_runs {
+                let mut by_ts = closed.clone();
+                by_ts.sort_by_key(|(_, ts)| *ts); // oldest first
+                for (k, _) in by_ts.into_iter().take(closed.len() - max_runs) {
+                    if !remove.contains(&k) {
+                        remove.push(k);
+                    }
+                }
+            }
+            for k in remove {
+                runs_tbl.remove(k.as_str()).context("prune remove")?;
+            }
+        }
+        txn.commit().context("commit prune")?;
         Ok(())
     }
 
@@ -590,6 +640,31 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].segment_seq, 0);
         assert_eq!(all[0].start_reason, "config_seed");
+    }
+
+    #[test]
+    fn prune_bounds_by_count_and_age_and_never_prunes_open() {
+        // AUDIT-v0.97 P2-9: retention keeps the runs table bounded. Count + age caps prune
+        // only CLOSED records; a live/open run always survives.
+        let (s, _d) = store();
+        for (a, ts) in [("a1", 100u64), ("a2", 200), ("a3", 300)] {
+            s.open_segment(a, None, "child_spawn", Some(0), "native", ts).unwrap();
+            s.close_segment(a, "done", Some("completed".into()), None, Some(0), ts + 1).unwrap();
+        }
+        s.open_segment("live", None, "config_seed", Some(0), "native", 50).unwrap(); // in-progress
+
+        // Count cap = 2 → the oldest closed (a1) is pruned; a2/a3 + the open one remain.
+        s.prune(1_000, 2, u64::MAX).unwrap();
+        assert!(s.get("a1:0").unwrap().is_none(), "oldest closed pruned by count cap");
+        assert!(s.get("a2:0").unwrap().is_some());
+        assert!(s.get("a3:0").unwrap().is_some());
+        assert!(s.latest_open("live").unwrap().is_some(), "open record never pruned");
+
+        // Age cap: now=1000, max_age=750 → cutoff 250 → a2 (end 201) pruned, a3 (end 301) kept.
+        s.prune(1_000, usize::MAX, 750).unwrap();
+        assert!(s.get("a2:0").unwrap().is_none(), "aged-out closed pruned");
+        assert!(s.get("a3:0").unwrap().is_some());
+        assert!(s.latest_open("live").unwrap().is_some(), "open still not pruned after age prune");
     }
 
     #[test]
