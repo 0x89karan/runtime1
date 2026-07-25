@@ -219,3 +219,20 @@ fn claude_md_version_line_matches_cargo_and_changelog() {
         "CHANGELOG.md has no `{heading}` entry for the current Cargo version"
     );
 }
+
+/// hardening.1 (/review catch): `docker/oauth_mcp.py`'s schema-drift guard (self-test 22) reads
+/// `tests/fixtures/google.json` relative to its own path, and now SKIPs when that file is absent
+/// — correct in-image (the fixture isn't shipped), but it means deleting or moving the fixture in
+/// the repo would silently disable the drift guard with CI staying green. This runner-side assert
+/// pins the fixture's existence so a "skip" can only ever mean "in-image", never "someone moved it".
+/// If the fixture is intentionally relocated, update oauth_mcp.py's path AND this test together.
+#[test]
+fn oauth_schema_drift_fixture_present_on_runner() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/fixtures/google.json");
+    assert!(
+        fixture.exists(),
+        "tests/fixtures/google.json is missing — oauth_mcp.py's schema-drift guard (self-test 22) \
+         reads it and SKIPs when absent, so removing/renaming it silently disables the guard \
+         repo-wide. Restore it, or move it and update oauth_mcp.py's fixture path + this assert."
+    );
+}
