@@ -22,6 +22,10 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   negative-control fixture (`.github/fixtures/cos-bare-relative-dir.toml`) that the old ERE booted and
   the new one refuses — with `store_path` absolute so only the bare `dir` line can trip the guard.
   (audit86-P1-8 in `capability.rs` is a separate runtime-matching issue → cap.3, untouched.)
+  - *Tradeoff (review-flagged):* a **bind-mounted custom** config with a bare `dir`/`path`/`*dir`/`*path`
+    key holding a relative value (incl. in task prose) now fails the boot guard where the older pattern
+    let it pass — use `AGENTOS_SKIP_PATH_GUARDS=1` for such configs. The baked CoS config is unaffected
+    (verified: the loosened ERE adds zero matches on both shipped configs after the sed rewrite).
 
 ### Documentation
 - The QEMU CoS fork header now documents that the semantic-kb / `mail:raw` / dedup omission is

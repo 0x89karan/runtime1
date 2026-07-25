@@ -589,8 +589,8 @@ jobs:
             exit 1
           fi
           if ! grep -q "relative path survived the boot rewrite" bare.log \
-             || ! grep -qE "^[0-9]+:.*dir" bare.log; then
-            echo "::error title=wrong failure::bare-key fixture failed but not via the path guard naming the dir line"
+             || ! grep -qE "^[0-9]+:[[:space:]]*dir[[:space:]]*=" bare.log; then
+            echo "::error title=wrong failure::bare-key fixture failed but not via the path guard naming the bare 'dir =' line"
             exit 1
           fi
           echo "negative control OK (bare path/dir key caught, line named)"
