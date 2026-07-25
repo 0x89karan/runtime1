@@ -2,7 +2,7 @@ use std::{io::IsTerminal, path::PathBuf, sync::{Arc, RwLock}};
 
 use anyhow::Context;
 use agentd::{agent::{truncate, PREVIEW_CHARS}, checkpoint::CheckpointStore, config, scheduler::Scheduler};
-use agentd::capability::{normalize_path, Capability};
+use agentd::capability::{anchor_abs, normalize_path, Capability};
 use agentd::credential::CredentialGateway;
 use agentd::flight_recorder::{EventKind, FlightRecorder};
 use agentd::inference::anthropic::AnthropicGateway;
@@ -102,6 +102,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathBuf>) -> anyhow::Result<()> {
+    // cap.3 (audit86-P1-8): capture agentd's working directory ONCE as the FS-capability
+    // anchor, before any capability check. Grant + request FS prefixes are absolutized
+    // against this, so authorization reasons in absolute terms and agrees with the runtime
+    // tool call (which resolves relative paths against this same live CWD). agentd must not
+    // chdir after this point.
+    agentd::capability::init_fs_anchor();
+
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("loading config from {path:?}"))?;
     let mut cfg: config::Config =
@@ -253,9 +260,15 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         // Startup invariant (p5.8): the memory store must not fall inside any MCP
         // server's AllowFsRead or AllowFsWrite sandbox prefix.  A sandboxed server
         // that can read/write the store path could corrupt or exfiltrate all memory.
-        // We only enforce the absolute-path requirement when MCP FS prefixes are
-        // present — without them, starts_with is not applicable and relative paths
-        // are harmless (they resolve relative to CWD as before p5.8).
+        // The containment check below (`starts_with`) is only run when MCP FS prefixes
+        // are present. cap.3: FS-capability prefixes are now anchored to the startup CWD
+        // (`init_fs_anchor`), so relative prefixes are no longer CWD-blind — but this
+        // startup containment uses the pure lexical `normalize_path` on both sides, which
+        // stays equivalent to the anchored runtime check (anchoring prepends the same base
+        // to store and prefix, so `starts_with` is unchanged) while keeping the helpful
+        // "store must be absolute when FS prefixes are configured" boot error intact.
+        // is_absolute() boot-error is checked on the RAW normalize (must still fire on a
+        // relative store). The containment starts_with below is anchored (cap.3 /review FIX 1).
         let norm_store = normalize_path(&store_path);
         let has_mcp_fs_prefix = cfg.tools.mcp_servers.iter().any(|srv| {
             srv.capabilities.iter().flatten().any(|cap| {
@@ -271,27 +284,30 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                 store_path.display()
             );
         }
+        // Anchor the store so a RELATIVE MCP prefix (which the kernel sandbox resolves
+        // against CWD) is compared in the same absolute space — a lexical starts_with
+        // misses `store=/run/memory/x` inside `prefix="memory"` at CWD `/run` (cap.3 FIX 1).
+        let abs_store = anchor_abs(&store_path);
         for srv in &cfg.tools.mcp_servers {
             for cap in srv.capabilities.iter().flatten() {
                 let prefix = match cap {
                     Capability::FsRead { prefix } | Capability::FsWrite { prefix } => prefix,
                     _ => continue,
                 };
-                let norm_prefix = normalize_path(std::path::Path::new(prefix));
-                // Empty prefix after normalization is not a valid grant — skip it.
-                // (mirrors the guard in capability.rs satisfies())
-                if norm_prefix.as_os_str().is_empty() {
+                // Empty prefix is not a valid grant — skip it (pre-anchor check).
+                if normalize_path(std::path::Path::new(prefix)).as_os_str().is_empty() {
                     continue;
                 }
+                let abs_prefix = anchor_abs(std::path::Path::new(prefix));
                 anyhow::ensure!(
-                    !norm_store.starts_with(&norm_prefix),
+                    !abs_store.starts_with(&abs_prefix),
                     "memory store {} falls inside MCP server {:?}'s {} sandbox prefix {}; \
                      move the store outside all server FS prefixes \
                      (e.g. set store_path = \"/run/memory/memory.redb\" in [memory])",
-                    norm_store.display(),
+                    abs_store.display(),
                     srv.name,
                     if matches!(cap, Capability::FsRead { .. }) { "FsRead" } else { "FsWrite" },
-                    norm_prefix.display()
+                    abs_prefix.display()
                 );
             }
         }
@@ -508,18 +524,20 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                                 Capability::FsRead { prefix } | Capability::FsWrite { prefix } => prefix,
                                 _ => continue,
                             };
-                            let norm_prefix = normalize_path(std::path::Path::new(prefix));
-                            if norm_prefix.as_os_str().is_empty() {
+                            if normalize_path(std::path::Path::new(prefix)).as_os_str().is_empty() {
                                 continue;
                             }
+                            // Anchor the prefix so a relative MCP prefix is compared absolutely
+                            // (cap.3 FIX 1); norm_caps is already absolute here (gated above).
+                            let abs_prefix = anchor_abs(std::path::Path::new(prefix));
                             anyhow::ensure!(
-                                !norm_caps.starts_with(&norm_prefix),
+                                !norm_caps.starts_with(&abs_prefix),
                                 "caps_db_path {} falls inside MCP server {:?}'s {} sandbox prefix {}; \
                                  move caps_db_path outside all server FS prefixes",
                                 norm_caps.display(),
                                 srv.name,
                                 if matches!(cap, Capability::FsRead { .. }) { "FsRead" } else { "FsWrite" },
-                                norm_prefix.display()
+                                abs_prefix.display()
                             );
                         }
                     }
@@ -1073,18 +1091,19 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                     Capability::FsWrite { prefix } => prefix,
                     _ => continue,
                 };
-                let norm_prefix = normalize_path(std::path::Path::new(prefix));
-                if norm_prefix.as_os_str().is_empty() {
+                if normalize_path(std::path::Path::new(prefix)).as_os_str().is_empty() {
                     continue;
                 }
+                // Anchor the prefix (cap.3 FIX 1); norm_ev is already absolute (absolutized above).
+                let abs_prefix = anchor_abs(std::path::Path::new(prefix));
                 anyhow::ensure!(
-                    !norm_ev.starts_with(&norm_prefix),
+                    !norm_ev.starts_with(&abs_prefix),
                     "evidence file {} falls inside MCP server {:?}'s FsWrite sandbox prefix {}; \
                      move the evidence file outside all server FS write prefixes \
                      (e.g. set evidence_path = \"/run/evidence.jsonl\" in [egress])",
                     norm_ev.display(),
                     srv.name,
-                    norm_prefix.display()
+                    abs_prefix.display()
                 );
             }
         }
@@ -1100,18 +1119,19 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
                     Capability::FsRead { prefix } => prefix,
                     _ => continue,
                 };
-                let norm_prefix = normalize_path(std::path::Path::new(prefix));
-                if norm_prefix.as_os_str().is_empty() {
+                if normalize_path(std::path::Path::new(prefix)).as_os_str().is_empty() {
                     continue;
                 }
+                // Anchor the prefix (cap.3 FIX 1); norm_key is already absolute (absolutized above).
+                let abs_prefix = anchor_abs(std::path::Path::new(prefix));
                 anyhow::ensure!(
-                    !norm_key.starts_with(&norm_prefix),
+                    !norm_key.starts_with(&abs_prefix),
                     "egress signing key {} falls inside MCP server {:?}'s FsRead sandbox prefix {}; \
                      move key_path outside all server FS read prefixes \
                      (e.g. set key_path = \"/run/egress/signing.key\" in [egress])",
                     norm_key.display(),
                     srv.name,
-                    norm_prefix.display()
+                    abs_prefix.display()
                 );
             }
         }
@@ -2015,54 +2035,56 @@ mod tests {
 
     #[test]
     fn store_path_inside_sandbox_prefix_fails_startup() {
-        use agentd::capability::normalize_path;
+        use agentd::capability::{anchor_abs, normalize_path};
         use std::path::{Path, PathBuf};
 
-        // Replicates the startup assertion logic from run() in isolation.
+        // Replicates the startup assertion logic from run_agent() in isolation, FAITHFUL to
+        // cap.3 FIX 1: is_absolute() is checked on the RAW normalize, but the containment
+        // starts_with anchors BOTH operands (so a relative MCP prefix — which the kernel
+        // sandbox resolves against CWD — is compared in the same absolute space).
         fn check(store_path_str: &str, prefix_str: &str) -> anyhow::Result<()> {
             let store_path = PathBuf::from(store_path_str);
-            let norm_store = normalize_path(&store_path);
             anyhow::ensure!(
-                norm_store.is_absolute(),
+                normalize_path(&store_path).is_absolute(),
                 "memory.store_path must be an absolute path: {}",
                 store_path.display()
             );
-            let norm_prefix = normalize_path(Path::new(prefix_str));
-            if norm_prefix.as_os_str().is_empty() {
+            if normalize_path(Path::new(prefix_str)).as_os_str().is_empty() {
                 return Ok(());
             }
+            let abs_store = anchor_abs(&store_path);
+            let abs_prefix = anchor_abs(Path::new(prefix_str));
             anyhow::ensure!(
-                !norm_store.starts_with(&norm_prefix),
+                !abs_store.starts_with(&abs_prefix),
                 "store {} inside prefix {}",
-                norm_store.display(),
-                norm_prefix.display()
+                abs_store.display(),
+                abs_prefix.display()
             );
             Ok(())
         }
 
-        // Case 1: absolute store inside FS prefix → error
-        assert!(
-            check("/var/run/memory.redb", "/var/run").is_err(),
-            "absolute store inside FS prefix must be rejected"
-        );
-
+        // Case 1: absolute store inside absolute FS prefix → error
+        assert!(check("/var/run/memory.redb", "/var/run").is_err());
         // Case 2: absolute store outside all FS prefixes → ok
-        assert!(
-            check("/run/memory/memory.redb", "/tmp/workspace").is_ok(),
-            "absolute store outside FS prefixes must be accepted"
-        );
+        assert!(check("/run/memory/memory.redb", "/tmp/workspace").is_ok());
+        // Case 3: store path with '..' resolving inside prefix → error
+        assert!(check("/var/run/../run/memory.redb", "/var/run").is_err());
+        // Case 4: empty prefix is skipped → ok
+        assert!(check("/run/memory/memory.redb", "").is_ok());
 
-        // Case 3: store path with '..' that normalizes into prefix → error
+        // Case 5 (cap.3 FIX 1 — the boot-hole that lexical matching MISSED): an absolute store
+        // inside a RELATIVE MCP prefix. Lexically `/cwd/memory/x`.starts_with("memory") is false
+        // (RootDir vs Normal) → boot proceeded, but the sandbox gives the server `<cwd>/memory`
+        // which CONTAINS the store (p5.8 exfiltration). With anchoring it now ERRORS. Construct
+        // the absolute store under the REAL cwd so the relative prefix anchors to the same base.
+        let cwd = std::env::current_dir().unwrap();
+        let store_in_rel = cwd.join("memory/memory.redb");
         assert!(
-            check("/var/run/../run/memory.redb", "/var/run").is_err(),
-            "store path with '..' resolving inside prefix must be rejected"
+            check(store_in_rel.to_str().unwrap(), "memory").is_err(),
+            "cap.3 FIX 1: absolute store inside a RELATIVE MCP prefix must now be rejected"
         );
-
-        // Case 4: empty prefix is skipped; absolute store → ok
-        assert!(
-            check("/run/memory/memory.redb", "").is_ok(),
-            "empty MCP FS prefix must be skipped (not a wildcard match)"
-        );
+        // Control: the same store with an unrelated relative prefix is still OK.
+        assert!(check(store_in_rel.to_str().unwrap(), "workspace").is_ok());
     }
 
     // ── cred.3.1 (S1) startup invariant: signing key must not fall inside MCP FsRead prefix ──
