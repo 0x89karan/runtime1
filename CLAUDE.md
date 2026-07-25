@@ -24,31 +24,26 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.97.0 (shipped 2026-07-24)
+**Current version:** v0.98.0 (shipped 2026-07-25)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.13 (v0.97.0) — **control verbs (Cancel / SetCaps / SetBudget surface)**, the
-final increment of the "trust after absence" cockpit reshape (ux.8′→ux.11→ux.12→ux.13). New
-**`ControlCommand::{Cancel, SetCaps}`** + `AgentCancelled`/`CapabilitiesSet` events, reachable via
-management HTTP (`POST /api/v1/agents/{id}/cancel` + `/caps`), FUSE control, and `agentctl
-{cancel,set-budget,set-caps}` (TUI cancel-key deferred — CLI/HTTP/FUSE cover it). **Cancel** = "no new
-world-affecting dispatch after cancel": a scheduler-side `cancel_requested` map (NOT checkpointed) +
-a gate at the top of `enqueue_or_defer` that funnels a flagged agent when its in-flight future
-returns (a running agent is flag-only — funneling it early would panic the pending-result arm);
-cascade over `parent_map` (skips `"operator"`); `handle_agent_terminal` closes the run as
-`"cancelled"`, emits `AgentCancelled` per node, purges deferred + pending_approvals. **SetCaps** =
-revoke/narrow-only misconfig-repair (NOT a security response — cap.2b established runtime narrowing
-isn't the injection defense): per-cap `capability_covered_by` (None=unrestricted accepts any narrow;
-inert caps rejected), the scheduler computes `filtered_specs` and `set_capabilities` shrinks the
-model's live tool list. **SetBudget** = the ux.11a semantics unchanged; ux.13 only adds the CLI/
-DataSource surface + a ≥3s confirm client. **/review caught a cross-model-CONFIRMED P0** (the
-`parked` predicate matched a running awaited child via `awaiting.contains_key` → panic; fixed to
-`awaiting.values().any(|v| v.parent_id == node)` + 2 regression tests). /qa added an over-the-wire
-route round-trip test. cancel/caps routes are ungated (join spawn/inject/budget; THREAT_MODEL note).
-**Next:** the UX tail — ux.2b (idle/error signals), ux.3 (spawn-custom), ux.10 (TUI polish, incl. the
-deferred cancel-key); then evidence-gated ux.6/ux.5/ux.7. cap.2b-ar-01 (P3) + cap.3 (`AbsPathPrefix`)
-+ Phase 11 skills + Phase 9 eBPF still open.
+**Latest shipped:** audit.2 (v0.98.0) — **acute batch of the AUDIT-v0.97 remediation sweep** (first of
+~7). Three high-severity, independent fixes: **P1-1** the arm64 rootfs now packages python3+openssl
+(the Python MCP sidecars were unrunnable on arm64 → flagship non-functional there); **P2-1** checkpoint
+recovery renames→`checkpoint.json.restored` instead of deleting before the first save (a startup crash
+after restore was erasing all CoS state — crash-loop data loss), with save() consuming the copy +
+load() quarantining a corrupt source; **P2-4** the ux.13 cancel-resurrection (a cancelled parked
+trigger revived when its child terminated, flipping `AgentCancelled`→done) closed by gating the
+child-delivery re-step on `!outcomes && !cancel_requested`. Full 8-lane fan-out audit landed as
+`docs/AUDIT-v0.97.md` (3 P1 · 12 P2 · 16 P3; PR #141). Remediation sweep in progress (operator opted
+into autonomous drive): **run.1 next** (flight.jsonl rotation P1-2 + short_term cap P1-3 + cron
+catch-up P2-6 + runs retention P2-9), then cap.4 (auth-consistency + tool_override KbWrite) → ci.2/
+packaging → budget.1 → par.1/2 → P3 sweep.
+**Prior:** ux.13 (v0.97.0) — control verbs (Cancel/SetCaps/SetBudget surface), final increment of the
+"trust after absence" cockpit reshape (ux.8′→ux.11→ux.12→ux.13). ux.12 (v0.96.0) — Telegram reach.
+**After the sweep:** the UX tail (ux.2b/ux.3/ux.10 — the last picks up the deferred ux.13 cancel-key),
+then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

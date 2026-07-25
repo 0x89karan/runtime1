@@ -1157,7 +1157,16 @@ fn handle_agent_terminal(
             }),
         );
 
-        if state.agents.contains_key(&parent_id) {
+        // AUDIT-v0.97 P2-4: do NOT re-step a parent that is already terminal or has a
+        // pending cancel. A cancelled parked ROOT parent (e.g. the CoS trigger awaiting a
+        // run_job child) is funneled + recorded in `outcomes` but stays in `state.agents`;
+        // without this guard, the child's later terminal would re-step it, its consumed
+        // cancel flag would NOT re-trip the enqueue_or_defer gate, and the cancelled trigger
+        // would resurrect (spend more, flip AgentCancelled→done). Skip delivery in that case.
+        let parent_live = state.agents.contains_key(&parent_id)
+            && !state.outcomes.contains_key(&parent_id)
+            && !state.cancel_requested.contains_key(&parent_id);
+        if parent_live {
             let priority = state.agents[&parent_id].priority();
             let caps = state.agents[&parent_id].cap_set_cloned();
             let (parent_effect, parent_turn) = {
@@ -1192,7 +1201,7 @@ fn handle_agent_terminal(
                 EventKind::Error,
                 json!({
                     "stage":     "child_result",
-                    "error":     "parent agent not found when delivering child result",
+                    "error":     "parent agent not live (gone, terminal, or cancelled) when delivering child result — delivery skipped",
                     "child_id":  &agent_id,
                     "parent_id": &parent_id,
                 }),
@@ -6397,6 +6406,40 @@ mod tests {
         let r = sched.restored.as_ref().unwrap();
         assert!(r.orchestrated_agents.contains(&"orch-1".to_string()), "orchestrated set must be restored");
         assert!(r.waiting_agents.contains(&"orch-1".to_string()), "waiting set must be restored");
+    }
+
+    #[test]
+    fn cancelled_parent_not_resurrected_by_late_child_terminal() {
+        // AUDIT-v0.97 P2-4 regression: a cancelled parked ROOT parent (funneled, recorded in
+        // outcomes, but still in state.agents) must NOT be re-stepped when its awaited child
+        // later terminates — else the cancelled trigger resurrects (flips cancelled->done,
+        // spends more). Deterministic: drive the child terminal directly and assert the
+        // parent's turn does not advance and its cancelled outcome is preserved.
+        let mut state = minimal_state("parent");
+        let cfg = agent_cfg("child", "child task");
+        let mdl = model_cfg();
+        state.agents.insert("child".into(), AgentTask::new("child", &cfg.task, &cfg, &mdl, vec![]));
+        state.awaiting.insert("child".into(), AwaitingParent {
+            parent_id: "parent".into(), call_id: "c1".into(), deliver_content: false,
+        });
+        // Post-cancel state of the parent: terminal outcome recorded, flag already consumed,
+        // still present in state.agents (a funneled root is not removed).
+        state.outcomes.insert("parent".into(), Err(anyhow::anyhow!("operator cancelled")));
+        let turn_before = state.agents["parent"].turn();
+
+        let (rec, _tmp) = recorder();
+        let gw: Arc<dyn crate::inference::InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        handle_agent_terminal(
+            "child".into(), Ok("child done".into()),
+            &mut state, &SchedulerConfig::default(), &gw, &registry, &rec,
+        );
+
+        assert_eq!(state.agents.get("parent").map(|p| p.turn()), Some(turn_before),
+            "cancelled parent must NOT be re-stepped by the child terminal (turn unchanged)");
+        assert!(state.outcomes.get("parent").is_some_and(|r| r.is_err()),
+            "cancelled parent's terminal outcome must be preserved (not flipped to done)");
+        assert!(!state.agents.contains_key("child"), "child is removed on its terminal");
     }
 
     #[test]
