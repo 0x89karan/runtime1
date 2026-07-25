@@ -22,18 +22,23 @@ use agentd::flight_recorder::EventKind;
 /// (Test-module fixtures such as inspector.rs's `"kind":"some_event"` are excluded
 /// on purpose — they exercise the matcher, they are not contract with agentd.)
 const AGENTCTL_KIND_MATCHES: &[&str] = &[
-    // src/watch/inspector.rs — InspectorFilter::matches() (lines ~47-55)
-    "tool_error",              // Errors filter  [KNOWN-DEAD — see below]
-    "inference_error",         // Errors filter  [KNOWN-DEAD — see below]
-    "agent_failed",            // Errors filter
-    "sandbox_applied",         // Sandbox filter
-    "sandbox_skipped",         // Sandbox filter
-    "capability_denied",       // CapDenied filter
-    "egress_brokered",         // Egress filter
-    "egress_denied",           // Egress filter
-    "action_receipt_emitted",  // Egress filter
-    // src/watch/views.rs — inspector colour-coding (lines ~1229-1238)
-    // (tool_error / inference_error / agent_failed / sandbox_* / capability_denied — subset of above)
+    // src/watch/inspector.rs — InspectorFilter::matches() + is_error_event() (lines ~47, ~62)
+    // The Errors filter (par.1-ar-01) matches the real error kinds via `is_error_event`:
+    "agent_failed",              // Errors filter (is_error_event)
+    "error",                     // Errors filter (is_error_event)
+    "mcp_http_error",            // Errors filter (is_error_event)
+    "fuse_control_error",        // Errors filter (is_error_event)
+    "egress_proxy_failed",       // Errors filter (is_error_event)
+    "credential_refresh_failed", // Errors filter (is_error_event)
+    "tool_result",               // Errors filter (is_error_event, gated on data.is_error:true)
+    "sandbox_applied",           // Sandbox filter
+    "sandbox_skipped",           // Sandbox filter
+    "capability_denied",         // CapDenied filter
+    "egress_brokered",           // Egress filter
+    "egress_denied",             // Egress filter
+    "action_receipt_emitted",    // Egress filter
+    // src/watch/views.rs — inspector colour-coding (lines ~1229) shares `is_error_event`
+    // (same error subset as above) + sandbox_* / capability_denied.
     // src/orchestrate.rs — SSE turn loop (lines ~164-191)
     "inference_stream_delta",
     "orchestrator_turn_complete",
@@ -46,26 +51,21 @@ const AGENTCTL_KIND_MATCHES: &[&str] = &[
     "message_sent",
 ];
 
-/// Strings agentctl matches on that are NOT (currently) emitted by agentd under any
-/// `EventKind`. Documented here so the guard stays green while the drift is TRACKED,
-/// not hidden. Each entry is a real, pre-existing bug found by par.1:
+/// Strings agentctl matches on that are NOT emitted by agentd under any `EventKind`.
+/// Documented here so the guard stays green while such a drift is TRACKED, not hidden.
 ///
-///   * `tool_error`, `inference_error` — the Inspector "Errors" filter
-///     (`inspector.rs:47-48`) and the red colour rule (`views.rs:1229-1230`) match
-///     these, but agentd emits NEITHER: tool failures are `EventKind::ToolResult`
-///     with `data.is_error=true` (or `EventKind::Error`), and inference failures are
-///     `EventKind::AgentFailed` / `EventKind::Error` (the string "inference_error"
-///     only ever appears as a `reason` FIELD inside such an event, never as `kind`).
-///     Net effect: the "Errors" filter catches only `agent_failed`; tool/inference
-///     errors are invisible to it. The fix is a behavioral change to the two agentctl
-///     match sites (map to `tool_result`+is_error / `error`+`agent_failed`) — out of
-///     scope for par.1, which is tests-only. Tracked as a follow-up.
+/// EMPTY as of par.1-ar-01: the two former entries — `tool_error`, `inference_error` —
+/// were the Inspector "Errors" filter (`inspector.rs`) and red colour rule (`views.rs`)
+/// matching kinds agentd never emits, so the operator's error view was blind to every
+/// tool + inference failure. Both sites now share `inspector::is_error_event`, which
+/// matches the REAL error kinds (`tool_result`+`data.is_error`, `error`, `agent_failed`,
+/// `mcp_http_error`, `fuse_control_error`, `egress_proxy_failed`, `credential_refresh_failed`),
+/// all listed in `AGENTCTL_KIND_MATCHES` above. The bug is fixed; nothing is non-canonical now.
 ///
-/// Invariant kept by `known_noncanonical_entries_are_actually_absent`: an entry may
-/// live here ONLY while it is genuinely not a real kind. The day agentd grows a
-/// matching variant (or agentctl is fixed to use the real one), this list must shrink
-/// — the test forces that cleanup.
-const KNOWN_NONCANONICAL: &[&str] = &["tool_error", "inference_error"];
+/// Invariant kept by `known_noncanonical_entries_are_actually_absent`: an entry may live
+/// here ONLY while it is genuinely not a real kind AND agentctl still matches it. Add one
+/// only when agentctl deliberately matches a string agentd doesn't emit, with the reason.
+const KNOWN_NONCANONICAL: &[&str] = &[];
 
 fn valid_kind_strings() -> BTreeSet<&'static str> {
     EventKind::ALL.iter().map(|k| k.as_str()).collect()

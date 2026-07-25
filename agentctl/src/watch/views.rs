@@ -1225,11 +1225,9 @@ fn render_inspector(f: &mut Frame, app: &App) {
         .take(height)
         .map(|l| {
             let s = l.as_str();
-            // Colour-code by event kind.
-            let style = if s.contains("\"kind\":\"tool_error\"")
-                || s.contains("\"kind\":\"inference_error\"")
-                || s.contains("\"kind\":\"agent_failed\"")
-            {
+            // Colour-code by event kind. Errors share ONE predicate with the Inspector
+            // `Errors` filter (par.1-ar-01) so the highlight and the filter can't drift.
+            let style = if super::inspector::is_error_event(s) {
                 Style::default().fg(Color::Red)
             } else if s.contains("\"kind\":\"sandbox_applied\"")
                 || s.contains("\"kind\":\"sandbox_skipped\"")

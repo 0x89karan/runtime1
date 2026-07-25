@@ -3,6 +3,21 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.105.0] - 2026-07-25
+
+### Fixed
+- **par.1-ar-01 — agentctl error view was blind to tool + inference errors.** The operator "Errors"
+  filter (`inspector.rs`) and the red-colour rule (`views.rs`) matched `"kind":"tool_error"` /
+  `"inference_error"` — kind strings agentd never emits — so only `agent_failed` ever showed; every
+  tool failure and inference failure was invisible in the one view meant to surface them. (Found by
+  par.1's exhaustiveness guard.) Now a shared `is_error_event(line)` predicate — used by BOTH sites,
+  killing the duplicated dead-string list — matches the seven real error kinds: `agent_failed`,
+  `error`, `mcp_http_error`, `fuse_control_error`, `egress_proxy_failed`, `credential_refresh_failed`
+  (by kind), plus `tool_result` when `data.is_error` is true (an AND-guard, since a successful
+  `tool_result` carries `is_error:false`). par.1's `AGENTCTL_KIND_MATCHES`/`KNOWN_NONCANONICAL`
+  allowlists updated to the real strings; both drift-guard tests stay green. Autoplan dual-voice
+  reviewed (D1=7 kinds).
+
 ## [v0.104.0] - 2026-07-25
 
 ### Fixed

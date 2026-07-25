@@ -44,9 +44,7 @@ impl InspectorFilter {
     pub fn matches(&self, line: &str, search: &str) -> bool {
         let base = match self {
             InspectorFilter::All       => true,
-            InspectorFilter::Errors    => line.contains("\"kind\":\"tool_error\"")
-                || line.contains("\"kind\":\"inference_error\"")
-                || line.contains("\"kind\":\"agent_failed\""),
+            InspectorFilter::Errors    => is_error_event(line),
             InspectorFilter::Sandbox   => line.contains("\"kind\":\"sandbox_applied\"")
                 || line.contains("\"kind\":\"sandbox_skipped\""),
             InspectorFilter::CapDenied => line.contains("\"kind\":\"capability_denied\""),
@@ -56,6 +54,31 @@ impl InspectorFilter {
         };
         base && (search.is_empty() || line.contains(search))
     }
+}
+
+/// Shared "this flight line is an error event" predicate — used by BOTH the Inspector
+/// `Errors` filter AND the red colour rule in `views.rs`, so the two can never drift
+/// (par.1-ar-01: they previously duplicated a dead-string list and both went blind to
+/// tool + inference errors). Matches the SEVEN real error `EventKind`s:
+///   `agent_failed`, `error`, `mcp_http_error`, `fuse_control_error`, `egress_proxy_failed`,
+///   `credential_refresh_failed` (by kind), plus `tool_result` WHEN `data.is_error` is true.
+///
+/// The `tool_result` AND-guard is load-bearing: a *successful* tool call is also a
+/// `tool_result` but carries `"is_error":false`, and `fuse_control_error` ALSO carries
+/// `data.is_error:true` (already matched by its own kind — so a bare `is_error` match would
+/// be redundant AND could catch a future non-error carrier). Flight lines are compact
+/// `serde_json` (`FlightRecorder::record`), so these substrings match the exact on-disk form
+/// (`"is_error":true`, no spaces; `is_error` nested under `data`). `"kind":"error"` does not
+/// substring-collide with `mcp_http_error`/`fuse_control_error`/`egress_proxy_failed` (the
+/// char after `"kind":"` differs).
+pub(crate) fn is_error_event(line: &str) -> bool {
+    line.contains("\"kind\":\"agent_failed\"")
+        || line.contains("\"kind\":\"error\"")
+        || line.contains("\"kind\":\"mcp_http_error\"")
+        || line.contains("\"kind\":\"fuse_control_error\"")
+        || line.contains("\"kind\":\"egress_proxy_failed\"")
+        || line.contains("\"kind\":\"credential_refresh_failed\"")
+        || (line.contains("\"kind\":\"tool_result\"") && line.contains("\"is_error\":true"))
 }
 
 /// State for the flight-log Inspector view.
@@ -165,10 +188,26 @@ mod tests {
     #[test]
     fn inspector_filter_errors_matches_error_events() {
         let f = InspectorFilter::Errors;
-        assert!(f.matches(r#"{"kind":"tool_error","agent":"a"}"#, ""));
-        assert!(f.matches(r#"{"kind":"inference_error"}"#, ""));
+        // par.1-ar-01: the Errors view surfaces the SEVEN real error kinds.
         assert!(f.matches(r#"{"kind":"agent_failed"}"#, ""));
-        assert!(!f.matches(r#"{"kind":"tool_result"}"#, ""));
+        assert!(f.matches(r#"{"kind":"error"}"#, ""));
+        assert!(f.matches(r#"{"kind":"mcp_http_error"}"#, ""));
+        assert!(f.matches(r#"{"kind":"fuse_control_error","data":{"is_error":true}}"#, ""));
+        assert!(f.matches(r#"{"kind":"egress_proxy_failed"}"#, ""));
+        assert!(f.matches(r#"{"kind":"credential_refresh_failed"}"#, ""));
+        // Tool failure = tool_result with data.is_error:true (exact on-disk compact shape).
+        assert!(f.matches(
+            r#"{"ts":1,"agent":"a","turn":2,"kind":"tool_result","data":{"id":"t1","name":"read_file","is_error":true,"error":"boom"}}"#,
+            "",
+        ));
+        // A SUCCESS tool_result must NOT be flagged (is_error:false).
+        assert!(!f.matches(
+            r#"{"ts":1,"agent":"a","kind":"tool_result","data":{"id":"t1","name":"read_file","is_error":false}}"#,
+            "",
+        ));
+        // The old dead strings agentd never emits must NOT match (the bug this fixes).
+        assert!(!f.matches(r#"{"kind":"tool_error"}"#, ""));
+        assert!(!f.matches(r#"{"kind":"inference_error"}"#, ""));
     }
 
     #[test]
@@ -257,27 +296,35 @@ mod tests {
     fn inspector_state_rebuild_applies_filter() {
         let mut s = InspectorState {
             raw_lines: vec![
-                r#"{"kind":"tool_error"}"#.to_string(),
-                r#"{"kind":"tool_result"}"#.to_string(),
+                r#"{"kind":"agent_failed"}"#.to_string(),                          // real error → kept
+                r#"{"kind":"tool_result","data":{"is_error":false}}"#.to_string(), // success → dropped
             ],
             filter: InspectorFilter::Errors,
             ..Default::default()
         };
         s.rebuild_view();
         assert_eq!(s.lines.len(), 1);
-        assert!(s.lines[0].contains("tool_error"));
+        assert!(s.lines[0].contains("agent_failed"));
     }
 
     #[test]
     fn inspector_state_rebuild_caps_scroll() {
         let mut s = InspectorState {
-            raw_lines: vec![r#"{"kind":"tool_error"}"#.to_string()],
+            // TWO real error kinds so the filter matches a NON-empty list AND scroll caps to a
+            // NON-ZERO value (par.1-ar-01 + /review: the old `tool_error` fixture matched nothing
+            // — an empty list caps scroll to 0 trivially, so `scroll == 0` proved nothing. Two
+            // matched lines cap scroll to len-1 = 1, which an empty/one-line list can't produce).
+            raw_lines: vec![
+                r#"{"kind":"agent_failed"}"#.to_string(),
+                r#"{"kind":"tool_result","data":{"is_error":true}}"#.to_string(),
+            ],
             scroll: 100,
             filter: InspectorFilter::Errors,
             ..Default::default()
         };
         s.rebuild_view();
-        assert_eq!(s.scroll, 0, "scroll must be capped to line count after rebuild");
+        assert_eq!(s.lines.len(), 2, "both error lines must pass the Errors filter");
+        assert_eq!(s.scroll, 1, "scroll (100) must cap to len-1 = 1 after rebuild");
     }
 
     #[test]
