@@ -3,6 +3,23 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.106.0] - 2026-07-25
+
+### Fixed
+- **budget.1-ar-01 — MaxTokens truncation reported clean success for one-shot agents.** Under a reset
+  window (the recommended prod config, which sets `budget_resettable` for every agent), a model
+  `max_tokens` truncation returned `AgentEffect::Completed(truncated_text)` for ANY agent — so a
+  one-shot job or a spawned child fed its silently-truncated output to the parent as a finished answer.
+  (Filed at the AUDIT-v0.97 holistic review.) Now a new `AgentEffect::CompletedTruncated` variant is
+  role-gated by the scheduler: a resident/orchestrated agent still **parks and is resumable** (the CoS
+  self-brick fix, audit86-P0-2, preserved byte-for-byte), while a one-shot/child **fails** through the
+  existing terminal funnel — the parent receives an `is_error` `ToolResult` naming the truncation, a
+  sealed job gets a "failed" signal (cap.2b shielding intact), and `run_tracker` records "failed". The
+  new variant forces every match site (scheduler + CLI shim) to handle truncation explicitly.
+  P0-2 is now pinned at BOTH the AgentTask layer and — newly — the scheduler dispatch layer (previously
+  unpinned there). Autoplan dual-voice reviewed (D1=new-variant, D2=fail-one-shot); both adversarial
+  passes approved with no findings.
+
 ## [v0.105.0] - 2026-07-25
 
 ### Fixed
