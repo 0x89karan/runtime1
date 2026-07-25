@@ -145,7 +145,7 @@ def _load_config() -> Optional[str]:
             file_client_secret = (data.get("client_secret") or "").strip()
             file_refresh_token = (data.get("refresh_token") or "").strip()
         except Exception as exc:
-            print(f"oauth_mcp: WARNING: could not read {SECRETS_FILE}: {exc}", file=sys.stderr)
+            print(f"oauth_mcp: WARNING: could not read {SECRETS_FILE}: {type(exc).__name__}", file=sys.stderr)
 
     # Env vars override the secrets file if non-empty.
     client_id     = os.environ.get("OAUTH_CLIENT_ID",     "").strip() or file_client_id
@@ -682,7 +682,9 @@ def handle_oauth_call_api(args: dict) -> tuple:
                 pass
             return None, json.dumps({"error": f"http_{e.code}", "body": body_str})
         except Exception as exc:
-            return None, json.dumps({"error": f"broker_request_failed: {exc}"})
+            # audit86-P3-2: scrub to the exception TYPE — the raw {exc} can leak URLs /
+            # internal paths / credential-shaped args into a response the model reads.
+            return None, json.dumps({"error": f"broker_request_failed: {type(exc).__name__}"})
 
     # Legacy path: direct call with in-memory token.
     if _auth_state not in ("authorized",):
@@ -730,7 +732,8 @@ def handle_oauth_call_api(args: dict) -> tuple:
                 pass
             return None, json.dumps({"error": f"http_{e.code}", "body": body_str})
         except Exception as exc:
-            return None, json.dumps({"error": f"request_failed: {exc}"})
+            # audit86-P3-2: scrub to the exception TYPE (see broker_request_failed above).
+            return None, json.dumps({"error": f"request_failed: {type(exc).__name__}"})
 
     return _do_call(0)
 
@@ -787,7 +790,8 @@ def process_line(line: str):
             result, err = handler(args)
         except Exception as exc:
             send({"jsonrpc": "2.0", "id": req_id, "result": {
-                "content": [{"type": "text", "text": f"Internal error: {exc}"}],
+                # audit86-P3-2: scrub to the exception TYPE — this text is returned to the model.
+                "content": [{"type": "text", "text": f"Internal error: {type(exc).__name__}"}],
                 "isError": True,
             }})
             return
@@ -1192,33 +1196,45 @@ def _self_test():
     _fixture_path = _os.path.join(
         _os.path.dirname(_os.path.abspath(__file__)), "..", "tests", "fixtures", "google.json"
     )
+    _fixture_json = None
+    _fixture_data = None
     try:
         with open(_fixture_path) as _ff:
             _fixture_data = _ff.read()
         _fixture_json = json.loads(_fixture_data)
+    except FileNotFoundError:
+        # The schema-drift fixture is a TEST asset, correctly NOT shipped in the production
+        # image: in-image oauth_mcp.py lives at /etc/agentd/, so this resolves to a nonexistent
+        # /etc/tests/fixtures/google.json. Absent fixture ⇒ SKIP, not fail — the guard only has
+        # meaning where tests/fixtures/google.json exists (CI runner + dev checkout). ci.2's
+        # docker-smoke runs `oauth_mcp.py --test` in-image; failing here would redden main.
+        print("  SKIP  22: schema-drift fixture not present (not shipped in-image) — "
+              "guard only runs where tests/fixtures/google.json exists", file=sys.stderr)
     except (OSError, json.JSONDecodeError) as _fe:
-        fail("22", f"cannot read/parse fixture {_fixture_path}: {_fe}")
-        _fixture_json = {}
-        _fixture_data = "{}"
+        # Fixture IS present but unreadable / malformed JSON — that's a real guard failure,
+        # not a legitimately-absent asset. Keep the guard's teeth.
+        fail("22", f"cannot read/parse fixture {_fixture_path}: {type(_fe).__name__}")
 
-    _reset_state()
-    _cfg.clear()
-    with patch("os.path.isfile", return_value=True), \
-         patch("builtins.open", return_value=__import__("io").StringIO(_fixture_data)), \
-         patch("os.makedirs"):
-        for k in ("OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
-                  "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL", "OAUTH_SCOPES",
-                  "OAUTH_PROVIDER_NAME", "OAUTH_ALLOWED_HOSTS"):
-            _os.environ.pop(k, None)
-        err22 = _load_config()
-    if (err22 is None
-            and _fixture_json.get("client_id")
-            and _cfg.get("OAUTH_CLIENT_ID") == _fixture_json["client_id"]
-            and _cfg.get("OAUTH_CLIENT_SECRET") == _fixture_json["client_secret"]
-            and _cfg.get("OAUTH_REFRESH_TOKEN") == _fixture_json["refresh_token"]):
-        ok("22: schema-drift guard — {client_id,client_secret,refresh_token} maps to expected _cfg keys")
-    else:
-        fail("22", f"err={err22} cfg={dict(_cfg)} fixture={_fixture_json}")
+    # Only run the drift assertion where the fixture actually loaded (present + valid JSON).
+    if _fixture_json is not None:
+        _reset_state()
+        _cfg.clear()
+        with patch("os.path.isfile", return_value=True), \
+             patch("builtins.open", return_value=__import__("io").StringIO(_fixture_data)), \
+             patch("os.makedirs"):
+            for k in ("OAUTH_CLIENT_ID", "OAUTH_CLIENT_SECRET", "OAUTH_REFRESH_TOKEN",
+                      "OAUTH_AUTH_URL", "OAUTH_TOKEN_URL", "OAUTH_SCOPES",
+                      "OAUTH_PROVIDER_NAME", "OAUTH_ALLOWED_HOSTS"):
+                _os.environ.pop(k, None)
+            err22 = _load_config()
+        if (err22 is None
+                and _fixture_json.get("client_id")
+                and _cfg.get("OAUTH_CLIENT_ID") == _fixture_json["client_id"]
+                and _cfg.get("OAUTH_CLIENT_SECRET") == _fixture_json["client_secret"]
+                and _cfg.get("OAUTH_REFRESH_TOKEN") == _fixture_json["refresh_token"]):
+            ok("22: schema-drift guard — {client_id,client_secret,refresh_token} maps to expected _cfg keys")
+        else:
+            fail("22", f"err={err22} cfg={dict(_cfg)} fixture={_fixture_json}")
 
     _reset_state()
     _cfg.clear()
@@ -1468,8 +1484,56 @@ def _self_test():
     else:
         fail("35", f"err={err35!r} (exc message sentinel must be absent)")
 
+    # --- Test 36: broker path scrubs the raw exception from broker_request_failed ---
+    # audit86-P3-2: a generic Exception in the broker call must NOT leak its message
+    # (URLs / paths / credential-shaped args) into the response the model reads.
+    _reset_state()
+    _cfg.clear()
+    _cfg["ALLOWED_HOSTS"]       = {"www.googleapis.com"}
+    _cfg["OAUTH_PROVIDER_NAME"] = "google"
+    _old_burl36 = _BROKER_URL
+    _old_btok36 = _BROKER_TOKEN
+    _BROKER_URL   = "http://127.0.0.1:19998"
+    _BROKER_TOKEN = "tok36"
+    sentinel36 = "X-Credential-Token=SENTINELVALUE36"
+    with patch("urllib.request.urlopen", side_effect=Exception(sentinel36)):
+        result36, err36 = handle_oauth_call_api(
+            {"url": "https://www.googleapis.com/calendar/v3/calendars"}
+        )
+    _BROKER_URL   = _old_burl36
+    _BROKER_TOKEN = _old_btok36
+    if (result36 is None and err36 is not None
+            and "broker_request_failed" in err36 and sentinel36 not in err36):
+        ok("36: broker_request_failed scrubs raw exception message (audit86-P3-2)")
+    else:
+        fail("36", f"result={result36} err={err36!r} (sentinel must be absent)")
+
+    # --- Test 37: legacy (direct in-memory token) path scrubs request_failed ---
+    # Same scrub on the non-broker path. Legacy calls opener.open(), so patch that.
+    _reset_state()
+    _cfg["ALLOWED_HOSTS"] = {"www.googleapis.com"}
+    _auth_state   = "authorized"
+    _access_token = "at-for-t37"
+    _token_expiry = time.monotonic() + 3600  # fresh → _ensure_fresh_token does no network
+    _old_burl37 = _BROKER_URL
+    _old_btok37 = _BROKER_TOKEN
+    _BROKER_URL   = ""   # force the legacy path
+    _BROKER_TOKEN = ""
+    sentinel37 = "Authorization=Bearer SENTINELVALUE37"
+    with patch("urllib.request.OpenerDirector.open", side_effect=Exception(sentinel37)):
+        result37, err37 = handle_oauth_call_api(
+            {"url": "https://www.googleapis.com/calendar/v3/calendars"}
+        )
+    _BROKER_URL   = _old_burl37
+    _BROKER_TOKEN = _old_btok37
+    if (result37 is None and err37 is not None
+            and "request_failed" in err37 and sentinel37 not in err37):
+        ok("37: request_failed scrubs raw exception message (audit86-P3-2)")
+    else:
+        fail("37", f"result={result37} err={err37!r} (sentinel must be absent)")
+
     print(file=sys.stderr)
-    total = 35
+    total = 37
     if not failures:
         print(f"oauth_mcp.py: self-test PASSED ({total}/{total})", file=sys.stderr)
         sys.exit(0)
