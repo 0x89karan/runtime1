@@ -1,0 +1,22 @@
+# CI negative-control fixture (par.2 reshape / audit86-P1-5 boot-guard remainder): a BARE `dir` key with a
+# relative value. Mounted over /etc/agentd/cos.agents.toml in the docker-smoke job.
+#
+# The point this proves:
+#   - The OLD boot-guard ERE required an underscore before path/dir (`[a-z_]*_(path|dir)`),
+#     so `dir = "relative-output"` — no `_` prefix, no leading `./` — escaped BOTH the
+#     dot-slash scan AND the key scan, and the CoS would boot with a silently-relative path.
+#   - The tightened ERE (`[a-z_]*(path|dir)`, underscore optional) must now catch it.
+#
+# Load-bearing properties (same contract as cos-broken-relative.toml):
+#   1. Carries the write_file(path='./output/ literal so the sed rewrites it and the
+#      pre-existing prompt-vs-grant grep passes — boot reaches the general path guard.
+#   2. store_path is ABSOLUTE, so the guard does NOT trip on it — the ONLY relative
+#      path is the bare `dir` line, isolating the fix under test.
+
+[agent]
+id   = "fixture"
+task = "Call write_file(path='./output/brief.md', content='x') and stop."
+
+[memory]
+store_path = "/data/memory.redb"
+dir        = "relative-output"
