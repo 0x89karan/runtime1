@@ -2112,6 +2112,78 @@ mod tests {
         );
     }
 
+    // run.1-ar-01: the cap_short_term() call at the MemoryPaged site (agent/mod.rs:611) is only
+    // regression-covered if short_term is PRE-SEEDED to the cap before paging — otherwise
+    // `short_term_evicted` is 0 and a no-op'd drain still passes. This drives the real call site.
+    #[test]
+    fn step_hard_pressure_caps_short_term_when_preseeded_full() {
+        use crate::inference::Role;
+        use crate::memory::MemItem;
+        let (rec, tmp) = recorder();
+        let budget = 1_000u64;
+        let cfg = agent_cfg(20, budget);
+        let mut sm = AgentTask::new("pg-cap", "task", &cfg, &model_cfg(), vec![]);
+
+        // Build hard retained pressure exactly like step_hard_pressure_emits_memory_paged.
+        let big = "x".repeat(1_300);
+        for i in 0..3usize {
+            let _ = sm.step(&rec);
+            sm.provide_inference(
+                InferenceResponse {
+                    blocks:            vec![Block::ToolUse {
+                        id:    format!("c{i}"),
+                        name:  "no_tool".to_string(),
+                        input: serde_json::json!({}),
+                    }],
+                    stop_reason:       StopReason::ToolUse,
+                    input_tokens:      5,
+                    output_tokens:     5,
+                    transport_retries: 0,
+                },
+                &rec,
+            );
+            let _ = sm.step(&rec);
+            sm.provide_tool_results(
+                vec![Block::ToolResult {
+                    tool_use_id: format!("c{i}"),
+                    content:     big.clone(),
+                    is_error:    false,
+                }],
+                &rec,
+            );
+        }
+
+        // PRE-SEED short_term to exactly the cap. Now the paging step's `short_term.extend(items)`
+        // pushes it over MAX_SHORT_TERM, so cap_short_term() at :611 MUST evict `pages_moved`.
+        for t in 0..MAX_SHORT_TERM {
+            sm.short_term.push(MemItem {
+                turn:            t as u32,
+                role:            Role::Assistant,
+                content_preview: format!("seed {t}"),
+                blocks_json:     "[]".to_string(),
+            });
+        }
+        assert_eq!(sm.short_term_depth(), MAX_SHORT_TERM, "pre-seeded full");
+
+        let _ = sm.step(&rec); // Hard pressure → page_turns → extend → cap_short_term() at :611
+
+        let paged: Vec<serde_json::Value> = std::fs::read_to_string(tmp.path())
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .filter(|e: &serde_json::Value| e["kind"] == "memory_paged")
+            .collect();
+        assert_eq!(paged.len(), 1, "exactly one memory_paged event");
+        let evicted = paged[0]["data"]["short_term_evicted"].as_u64().unwrap_or(0);
+        // BOTH must hold — without the cap call, evicted would be 0 AND depth would exceed the cap.
+        assert!(evicted > 0, "cap_short_term must evict the overflow at the paging site, got {evicted}");
+        assert_eq!(
+            sm.short_term_depth(),
+            MAX_SHORT_TERM,
+            "short_term stays bounded to the cap after paging over a full buffer"
+        );
+    }
+
     // AC11: Soft pressure emits MemoryPressureAdvisory event; no text injected into messages
     #[test]
     fn step_soft_pressure_emits_advisory_no_injection() {

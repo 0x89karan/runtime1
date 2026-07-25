@@ -164,6 +164,17 @@ fn default_google_token_url() -> String {
     "https://oauth2.googleapis.com/token".to_string()
 }
 
+/// Char-boundary-safe preview of an operator-supplied `token_url` for error/log
+/// messages (audit86-P3-1). `token_url` comes from a secrets file (arbitrary
+/// Unicode), so a raw byte-slice `[..len().min(64)]` panics on a multi-byte char
+/// straddling byte 64 ("byte index 64 is not a char boundary"). 64 chars is a
+/// generous preview; real matching always uses the full string
+/// (`starts_with` / `extract_host` / `is_ssrf_blocked`), so truncation here is
+/// display-only. Upholds "the loop never panics on bad input."
+fn token_url_preview(url: &str) -> String {
+    url.chars().take(64).collect()
+}
+
 /// Runtime state written to `state_path` (atomic tmp→rename).
 #[derive(Debug, Serialize, Deserialize)]
 struct OAuthState {
@@ -380,7 +391,7 @@ impl OAuthTokenCache {
                         format!(
                             "provider '{}' token_url must use https://, got '{}'",
                             provider,
-                            &secrets.token_url[..secrets.token_url.len().min(64)],
+                            token_url_preview(&secrets.token_url),
                         ),
                     ));
                 }
@@ -392,7 +403,7 @@ impl OAuthTokenCache {
                         format!(
                             "provider '{}' token_url '{}' is malformed",
                             provider,
-                            &secrets.token_url[..secrets.token_url.len().min(64)],
+                            token_url_preview(&secrets.token_url),
                         ),
                     )
                 })?;
@@ -412,7 +423,7 @@ impl OAuthTokenCache {
                                             "provider '{}' token_url '{}' resolves to SSRF-blocked \
                                              address {} — refusing token refresh (ar-04c)",
                                             provider,
-                                            &secrets.token_url[..secrets.token_url.len().min(64)],
+                                            token_url_preview(&secrets.token_url),
                                             sa.ip(),
                                         ),
                                     ));
@@ -1846,6 +1857,22 @@ impl CredentialGateway {
 mod tests {
     use super::*;
     use crate::config::{AuthStyle, CredentialGatewayConfig, ProviderConfig};
+
+    #[test]
+    fn token_url_preview_is_char_boundary_safe() {
+        // audit86-P3-1: a raw `&url[..url.len().min(64)]` byte-slice panics when a
+        // multi-byte char straddles byte 64. token_url is operator-supplied JSON, so
+        // this is reachable via a malformed secrets file. The preview must NOT panic.
+        // "あ" is 3 bytes; "http://" (7 bytes) + 60×"あ" = 187 bytes, and byte 64
+        // lands mid-character — the exact case the old slice aborted on.
+        let hostile = format!("http://{}", "あ".repeat(60));
+        assert!(hostile.len() > 64, "fixture must exceed the byte cap");
+        let preview = token_url_preview(&hostile); // must not panic
+        assert!(preview.chars().count() <= 64, "preview capped at 64 chars");
+        assert!(hostile.starts_with(&preview), "preview is a valid UTF-8 prefix");
+        // ASCII-only stays exact under the cap.
+        assert_eq!(token_url_preview("https://x.example/token"), "https://x.example/token");
+    }
 
     fn provider_cfg_oauth() -> ProviderConfig {
         ProviderConfig {
