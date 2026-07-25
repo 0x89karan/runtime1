@@ -112,15 +112,112 @@ impl ProxyRegistry {
 
 // ── EgressProxy ───────────────────────────────────────────────────────────────
 
+/// Global budget-window meter shared between the scheduler and the HTTP egress
+/// proxy (budget.1 / AUDIT-v0.97 P2-2). Universal-tier subprocesses forward
+/// through the proxy and are metered here; the scheduler publishes its own
+/// native lifetime + native window anchor so BOTH sides compute the *same*
+/// combined windowed spend — closing the gap where the global $/token ceiling
+/// silently excluded an entire execution tier.
+///
+/// The native and universal terms carry SEPARATE anchors:
+///
+/// windowed = (native_lifetime − native_anchor) + (universal_spent − universal_anchor)
+///
+/// This is deliberate for checkpoint consistency (review Finding 2). The NATIVE
+/// anchor (`native_anchor`) mirrors the scheduler's persisted `global_window_anchor`
+/// and is rebased on native-only lifetime — unchanged from pre-budget.1, so restart
+/// semantics are preserved exactly. The UNIVERSAL term is runtime-only: universal
+/// subprocesses do NOT survive a restart, so `universal_spent`/`universal_anchor`
+/// both reset to 0 on boot, which correctly forgives pre-restart universal spend
+/// (folding universal into the persisted anchor instead would strand the anchor
+/// above the restored native lifetime and suppress post-restart metering).
+///
+/// The universal term is read live; the native terms change only under scheduler
+/// activity (which republishes synchronously), so the proxy's view is fresh
+/// without any periodic tick.
+#[derive(Clone, Default)]
+pub struct GlobalBudgetMeter {
+    /// Lifetime universal-tier tokens (monotonic; owned + incremented here). Runtime-only.
+    universal_spent:  Arc<AtomicU64>,
+    /// Runtime-only universal window anchor; universal windowed = spent − anchor.
+    universal_anchor: Arc<AtomicU64>,
+    /// Native lifetime tokens, published by the scheduler = `tokens_spent`.
+    native_lifetime:  Arc<AtomicU64>,
+    /// Native window anchor, published by the scheduler = `global_window_anchor` (persisted).
+    native_anchor:    Arc<AtomicU64>,
+    /// Global windowed ceiling (0 = disabled — count but never throttle).
+    ceiling:          Arc<AtomicU64>,
+}
+
+impl GlobalBudgetMeter {
+    /// Lifetime universal-tier spend (monotonic).
+    pub fn universal_spent(&self) -> u64 {
+        self.universal_spent.load(Ordering::Acquire)
+    }
+    /// Universal spend within the current window (spent − anchor), saturating.
+    pub fn universal_windowed(&self) -> u64 {
+        self.universal_spent
+            .load(Ordering::Acquire)
+            .saturating_sub(self.universal_anchor.load(Ordering::Acquire))
+    }
+    /// Meter a forwarded universal inference. Saturating — never wraps.
+    pub fn add_universal(&self, tokens: u64) {
+        self.universal_spent
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| Some(c.saturating_add(tokens)))
+            .ok();
+    }
+    /// Rebase the universal window anchor to the current lifetime — zeroing the
+    /// universal windowed term. Called by the scheduler on every global window reset
+    /// alongside the native anchor rebase.
+    pub fn rebase_universal(&self) {
+        self.universal_anchor
+            .store(self.universal_spent.load(Ordering::Acquire), Ordering::Release);
+    }
+    /// Scheduler-side publish of the native lifetime + native window anchor. Called
+    /// after every mutation of either so the proxy's combined view stays fresh.
+    pub fn publish(&self, native_lifetime: u64, native_anchor: u64) {
+        self.native_lifetime.store(native_lifetime, Ordering::Release);
+        self.native_anchor.store(native_anchor, Ordering::Release);
+    }
+    /// Combined windowed spend: native-since-anchor + universal-since-anchor, saturating.
+    pub fn windowed(&self) -> u64 {
+        let native = self
+            .native_lifetime
+            .load(Ordering::Acquire)
+            .saturating_sub(self.native_anchor.load(Ordering::Acquire));
+        native.saturating_add(self.universal_windowed())
+    }
+    /// The configured global ceiling (0 = disabled).
+    pub fn ceiling(&self) -> u64 {
+        self.ceiling.load(Ordering::Acquire)
+    }
+}
+
 /// In-process egress mediator for native agents.
 pub struct EgressProxy {
     writer:   Arc<EvidenceWriter>,
     recorder: Arc<FlightRecorder>,
+    /// Shared global budget meter (budget.1). One instance is shared between the
+    /// scheduler (via `with_egress`) and the HTTP proxy (via `start_http_proxy`).
+    meter:    GlobalBudgetMeter,
 }
 
 impl EgressProxy {
     pub fn new(writer: Arc<EvidenceWriter>, recorder: Arc<FlightRecorder>) -> Self {
-        Self { writer, recorder }
+        Self { writer, recorder, meter: GlobalBudgetMeter::default() }
+    }
+
+    /// Set the global windowed ceiling for universal-tier self-throttling (budget.1).
+    /// 0 keeps counting active but never throttles. Builder-style so the single
+    /// shared `EgressProxy` can be configured before being wrapped in `Arc`.
+    pub fn with_global_ceiling(self, ceiling: u64) -> Self {
+        self.meter.ceiling.store(ceiling, Ordering::Release);
+        self
+    }
+
+    /// Access the shared global budget meter (budget.1).
+    pub fn meter(&self) -> &GlobalBudgetMeter {
+        &self.meter
     }
 
     /// Record a permitted model inference. Emits `EgressBrokered` + `ActionReceiptEmitted`.
@@ -373,6 +470,23 @@ async fn handle_proxy_request(
         ));
     }
 
+    // 7b. Global-window pre-forward reject (budget.1 / P2-2). The per-workload
+    //     check above bounds each universal agent in isolation; this bounds the
+    //     whole universal tier against the SAME global window as native inference,
+    //     so universal work self-throttles once the combined ceiling is reached
+    //     rather than over-spending up to the sum of every workload's budget.
+    let meter = state.egress.meter();
+    let ceiling = meter.ceiling();
+    if ceiling != 0 && meter.windowed() >= ceiling {
+        state.egress.record_proxy_failed(&entry.agent_id, "global_budget_window_exhausted");
+        return Ok(json_error_response(
+            429,
+            "global_budget_exhausted",
+            "Global token budget window is exhausted; universal tier throttled until the window resets",
+            "global_budget_exhausted",
+        ));
+    }
+
     // 8. Forward to Anthropic.
     let send_result = state
         .client
@@ -472,6 +586,9 @@ async fn handle_proxy_request(
             Some(cur.saturating_sub(total_toks))
         })
         .ok();
+    // budget.1 / P2-2: also fold this spend into the global universal-tier meter
+    // so it counts against the combined global window (native + universal).
+    state.egress.meter().add_universal(total_toks);
 
     // 12. Emit egress events + signed receipt.
     state
@@ -493,8 +610,7 @@ pub async fn start_http_proxy(
     addr:     &str,
     real_key: String,
     registry: Arc<ProxyRegistry>,
-    recorder: Arc<FlightRecorder>,
-    writer:   Arc<EvidenceWriter>,
+    egress:   Arc<EgressProxy>,
 ) -> Result<std::net::SocketAddr> {
     // Guard at the public entry: the real API key must only travel over TLS.
     anyhow::ensure!(
@@ -505,8 +621,7 @@ pub async fn start_http_proxy(
         addr,
         real_key,
         registry,
-        recorder,
-        writer,
+        egress,
         ANTHROPIC_MESSAGES_URL.to_string(),
     )
     .await
@@ -516,8 +631,7 @@ async fn start_http_proxy_impl(
     addr:         &str,
     real_key:     String,
     registry:     Arc<ProxyRegistry>,
-    recorder:     Arc<FlightRecorder>,
-    writer:       Arc<EvidenceWriter>,
+    egress:       Arc<EgressProxy>,
     upstream_url: String,
 ) -> Result<std::net::SocketAddr> {
     let listener = TcpListener::bind(addr)
@@ -535,7 +649,6 @@ async fn start_http_proxy_impl(
         crate::loopback_proxy::LoopbackClientConfig::egress(),
     ).context("egress proxy: failed to build HTTP client")?;
 
-    let egress = Arc::new(EgressProxy::new(writer, recorder));
     let state = Arc::new(ProxyState {
         registry,
         real_key,
@@ -863,23 +976,34 @@ mod tests {
         real_key:     &str,
         upstream_url: String,
     ) -> (std::net::SocketAddr, Arc<ProxyRegistry>) {
+        let (bound, registry, _egress) = start_test_proxy_full(dir, real_key, upstream_url).await;
+        (bound, registry)
+    }
+
+    /// Like `start_test_proxy` but also returns the shared `EgressProxy` so tests
+    /// can configure the global ceiling / publish native lifetime (budget.1).
+    async fn start_test_proxy_full(
+        dir:          &TempDir,
+        real_key:     &str,
+        upstream_url: String,
+    ) -> (std::net::SocketAddr, Arc<ProxyRegistry>, Arc<EgressProxy>) {
         let ev       = dir.path().join("evidence.jsonl");
         let key_path = dir.path().join("egress.pkcs8");
         let writer   = Arc::new(EvidenceWriter::open(&ev, &key_path).unwrap());
         let log      = dir.path().join("flight.jsonl");
         let recorder = Arc::new(FlightRecorder::new(&log).unwrap());
         let registry = Arc::new(ProxyRegistry::new());
+        let egress   = Arc::new(EgressProxy::new(writer, recorder));
         let bound = start_http_proxy_impl(
             "127.0.0.1:0",
             real_key.to_string(),
             Arc::clone(&registry),
-            recorder,
-            writer,
+            Arc::clone(&egress),
             upstream_url,
         )
         .await
         .unwrap();
-        (bound, registry)
+        (bound, registry, egress)
     }
 
     async fn register_workload(registry: &Arc<ProxyRegistry>, key: &str, agent: &str, budget: u64) -> Arc<AtomicU64> {
@@ -998,6 +1122,99 @@ mod tests {
         let ev = std::fs::read_to_string(dir.path().join("evidence.jsonl")).unwrap();
         assert!(!ev.is_empty(), "evidence.jsonl should contain a receipt");
         assert!(ev.contains("\"verdict\":\"allowed\""), "receipt should have allowed verdict");
+    }
+
+    /// budget.1 / AUDIT-v0.97 P2-2: universal-tier spend is folded into the shared
+    /// global meter AND the tier self-throttles once the global window is exhausted.
+    #[test]
+    fn global_budget_meter_folds_universal_and_rebases() {
+        let m = GlobalBudgetMeter::default();
+        // (a) combined windowed = native-since-anchor + universal-since-anchor.
+        m.publish(200, 100); // native lifetime 200, native anchor 100 → native windowed 100
+        assert_eq!(m.windowed(), 100);
+        m.add_universal(50);
+        assert_eq!(m.universal_spent(), 50);
+        assert_eq!(m.universal_windowed(), 50);
+        assert_eq!(m.windowed(), 150, "universal spend folds into the window");
+
+        // Window reset: native anchor rebases to native lifetime AND universal anchor
+        // rebases to universal lifetime — both terms zero together.
+        m.publish(200, 200);
+        m.rebase_universal();
+        assert_eq!(m.windowed(), 0, "reset zeroes BOTH terms of the window");
+        m.add_universal(30);
+        assert_eq!(m.windowed(), 30, "post-reset universal spend re-accrues");
+    }
+
+    #[test]
+    fn global_budget_meter_restart_not_suppressed() {
+        // Finding 2: universal spend must NOT be folded into the persisted native
+        // anchor, else a restart (universal_spent → 0, native lifetime + anchor
+        // restored) would strand the anchor above native lifetime and suppress
+        // post-restart metering. Model a restart with a FRESH meter (runtime-only
+        // universal state resets to 0) and the RESTORED native lifetime + native
+        // anchor — the window must reflect native spend immediately, not suppress it.
+        let pre = GlobalBudgetMeter::default();
+        pre.publish(1_000, 400); // native windowed 600
+        pre.add_universal(500);  // + universal windowed 500 → 1100
+        assert_eq!(pre.windowed(), 1_100);
+
+        // Restart: new process, universal subprocesses gone (spent/anchor = 0),
+        // native lifetime + native anchor restored from checkpoint unchanged.
+        let post = GlobalBudgetMeter::default();
+        post.publish(1_000, 400);
+        assert_eq!(post.universal_spent(), 0, "universal is runtime-only, gone on restart");
+        assert_eq!(post.windowed(), 600, "native window preserved exactly, NOT suppressed");
+        // New native spend keeps accruing normally (no stranded anchor).
+        post.publish(1_200, 400);
+        assert_eq!(post.windowed(), 800, "post-restart native spend accrues immediately");
+    }
+
+    #[tokio::test]
+    async fn universal_spend_counted_and_globally_throttled() {
+        let upstream = start_mock_upstream(|_req| async move {
+            let body = serde_json::json!({
+                "id": "msg_u",
+                "usage": { "input_tokens": 100, "output_tokens": 50 },
+            });
+            Ok(Response::builder()
+                .status(200)
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(body.to_string())))
+                .unwrap())
+        })
+        .await;
+
+        let dir = TempDir::new().unwrap();
+        let upstream_url = format!("http://{upstream}");
+        let (bound, registry, egress) =
+            start_test_proxy_full(&dir, "sk-ant-REAL-KEY", upstream_url).await;
+        register_workload(&registry, "sk-ant-WORKLOAD-univ", "univ-agent", 10_000).await;
+        let client = reqwest::Client::new();
+        let fire = || {
+            client
+                .post(format!("http://{bound}/v1/messages"))
+                .header("x-api-key", "sk-ant-WORKLOAD-univ")
+                .header("content-type", "application/json")
+                .body(r#"{"model":"test","max_tokens":1}"#)
+                .send()
+        };
+
+        // First forward succeeds and folds its 150 tokens into the global meter.
+        let r1 = fire().await.unwrap();
+        assert_eq!(r1.status(), 200);
+        assert_eq!(egress.meter().universal_spent(), 150, "universal spend metered globally");
+
+        // Arm the global ceiling BELOW the accrued spend and publish an empty native
+        // window → the combined windowed spend (0 + 150) now exceeds it, so the whole
+        // tier self-throttles at the pre-forward global gate (per-workload budget is
+        // still 9_850, so ONLY the global gate can be the blocker here).
+        egress.meter().ceiling.store(100, Ordering::Release);
+        egress.meter().publish(0, 0);
+        let r2 = fire().await.unwrap();
+        assert_eq!(r2.status(), 429, "universal tier throttled at the global window");
+        let body: serde_json::Value = r2.json().await.unwrap();
+        assert_eq!(body["error"]["detail"], "global_budget_exhausted");
     }
 
     /// Plan acceptance: Anthropic error responses (e.g. 401 auth failure) are passed

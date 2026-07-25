@@ -3,6 +3,23 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.102.0] - 2026-07-25
+
+### Fixed
+- **budget.1 — metering completeness** (5th AUDIT-v0.97 increment; upholds the "cognition is always
+  accounted and bounded" invariant across both execution tiers):
+  - **P2-2 universal-tier spend now counted + globally bounded** — universal (subprocess) inference,
+    mediated by the HTTP egress proxy, was never added to `tokens_spent`, so the global window excluded
+    it entirely. One shared `EgressProxy` + `GlobalBudgetMeter` now folds it in
+    (`windowed = (native − native_anchor) + (universal − universal_anchor)`, separate anchors so a
+    restart leaves the native window unchanged and forgives ephemeral universal spend) and
+    pre-forward-rejects (429) on global exhaustion.
+  - **MaxTokens self-brick** — `StopReason::MaxTokens` was an unconditional hard-fail; now gated on
+    `!budget_resettable` so a resident agent parks/continues instead of bricking (reopened P0-2 class).
+  - **universal-tier cancellable** — Cancel now reaches universal agents (flag → async drain
+    deregisters the ephemeral egress key + emits `AgentCancelled`); the run loop polls `control_rx`
+    while universal agents are live (fixing a review-caught starvation of universal-only Cancels).
+
 ## [v0.101.0] - 2026-07-25
 
 ### Added / Testing

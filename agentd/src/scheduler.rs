@@ -154,6 +154,11 @@ struct SchedulerState {
     /// The enqueue_or_defer gate funnels a running agent when its future returns;
     /// handle_agent_terminal consumes the entry (emits AgentCancelled + purges queues).
     cancel_requested: HashMap<String, String>,
+    /// Universal-tier agent IDs flagged for cancellation (budget.1 / AUDIT-v0.97 P3).
+    /// The sync control handler can't `.await` kill()/deregister, so it flags here and
+    /// the async run loop drains this via `drain_universal_cancels` after each command.
+    /// NOT checkpointed — universal subprocesses never survive a restart.
+    universal_cancel_requested: HashSet<String>,
     /// Credential gateway for per-agent grant projection (cred.5). None when disabled.
     cred_gw: Option<Arc<crate::credential::CredentialGateway>>,
     /// Run-history tracker (ux.11b): lifecycle transitions send RunEvents off-loop.
@@ -165,12 +170,57 @@ struct SchedulerState {
 }
 
 impl SchedulerState {
-    /// Global spend within the current budget window (ux.8′): lifetime − anchor.
-    /// The single source of truth for the windowed global ceiling comparison, so
-    /// the four call sites (admission, drain, rebase, reset) never drift on this
-    /// enforcement-path arithmetic. Mirrors `AgentTask::windowed_spent()`.
+    /// Universal-tier lifetime token spend (budget.1 / AUDIT-v0.97 P2-2). p7.6
+    /// subprocesses forward through the egress proxy, which meters into the shared
+    /// `GlobalBudgetMeter`. 0 when no egress proxy is attached.
+    fn universal_lifetime_spent(&self) -> u64 {
+        self.egress.as_ref().map(|e| e.meter().universal_spent()).unwrap_or(0)
+    }
+
+    /// Universal-tier spend within the current window (budget.1 / P2-2). Carries its
+    /// OWN runtime anchor, separate from the persisted native `global_window_anchor`,
+    /// so a restart (universal_spent → 0) never strands the native window (Finding 2).
+    fn universal_windowed_spent(&self) -> u64 {
+        self.egress.as_ref().map(|e| e.meter().universal_windowed()).unwrap_or(0)
+    }
+
+    /// Combined native + universal LIFETIME spend — reported on the metering surface
+    /// so the snapshot no longer under-counts the universal tier (display only, not an
+    /// enforcement anchor).
+    fn combined_lifetime_spent(&self) -> u64 {
+        self.tokens_spent.saturating_add(self.universal_lifetime_spent())
+    }
+
+    /// Global spend within the current budget window (ux.8′): native-since-anchor +
+    /// universal-since-anchor. The native term is `tokens_spent − global_window_anchor`
+    /// (unchanged from pre-budget.1, persisted-anchor consistent); the universal term
+    /// (budget.1 / P2-2) is runtime-only. The single source of truth for the windowed
+    /// global ceiling comparison, so the call sites (admission, drain, rebase, reset)
+    /// never drift on this enforcement-path arithmetic.
     fn global_windowed_spent(&self) -> u64 {
-        self.tokens_spent.saturating_sub(self.global_window_anchor)
+        self.tokens_spent
+            .saturating_sub(self.global_window_anchor)
+            .saturating_add(self.universal_windowed_spent())
+    }
+
+    /// Publish the native lifetime + native window anchor to the shared egress meter
+    /// so the HTTP proxy computes the SAME combined windowed spend and self-throttles
+    /// universal forwarding at the global ceiling (budget.1 / P2-2). Called after every
+    /// mutation of `tokens_spent` or `global_window_anchor`; both change only under
+    /// scheduler activity, so the proxy's view stays fresh without a tick.
+    fn publish_budget(&self) {
+        if let Some(e) = self.egress.as_ref() {
+            e.meter().publish(self.tokens_spent, self.global_window_anchor);
+        }
+    }
+
+    /// Rebase the universal window anchor on the shared meter — zeroing the universal
+    /// windowed term. Called alongside every native `global_window_anchor` rebase so
+    /// both terms of the window reset together (budget.1 / P2-2, Finding 2).
+    fn rebase_universal_window(&self) {
+        if let Some(e) = self.egress.as_ref() {
+            e.meter().rebase_universal();
+        }
     }
 }
 
@@ -497,6 +547,7 @@ impl Scheduler {
             orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
             cancel_requested:   HashMap::new(),
+            universal_cancel_requested: HashSet::new(),
             cred_gw,
             run_tracker,
             jobs:               jobs.into_iter().map(|j| (j.id.clone(), j)).collect(),
@@ -535,6 +586,10 @@ impl Scheduler {
         }
 
         init_budget_window(&mut state, &sched, now_unix_secs());
+        // budget.1 / P2-2: seed the egress meter with the (possibly restored) native
+        // lifetime + anchor so universal throttling is correct before the first
+        // native inference republishes.
+        state.publish_budget();
 
         // ux.11b: open a run segment for every seeded/restored native agent. Idempotent
         // (G3) — on a restart the persisted open segment is continued, not duplicated.
@@ -669,6 +724,7 @@ impl Scheduler {
                             cmd = rx.recv() => {
                                 let Some(cmd) = cmd else { break 'main; };
                                 dispatch_control_command(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
+                                drain_universal_cancels(&mut state, &recorder).await;
                                 update_snapshot(&snapshot, &state);
                             }
                             // Periodic wake so a fully idle agentd still rebases its
@@ -703,8 +759,28 @@ impl Scheduler {
 
             // When native agents are done but universal agents are still running,
             // yield briefly so the poll at the top of the loop can detect their exit.
+            // budget.1 / P3: this branch MUST also service operator control commands —
+            // otherwise a Cancel targeting a universal-ONLY workload is never read
+            // (the idle/control-polling branch above is gated on universal_agents being
+            // empty), so universal-cancel would be starved in exactly the case it exists
+            // for. Poll control_rx here too and drain any resulting universal cancels.
             if state.pending.is_empty() {
                 tokio::select! {
+                    cmd = async {
+                        match control_rx.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None     => std::future::pending::<Option<crate::control::ControlCommand>>().await,
+                        }
+                    } => {
+                        match cmd {
+                            Some(cmd) => {
+                                dispatch_control_command(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
+                                drain_universal_cancels(&mut state, &recorder).await;
+                                update_snapshot(&snapshot, &state);
+                            }
+                            None => { control_rx = None; }
+                        }
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
                     _ = sigterm.recv() => {
                         recorder.record(
@@ -741,6 +817,7 @@ impl Scheduler {
                     match cmd {
                         Some(cmd) => {
                             dispatch_control_command(cmd, &default_model_cfg, &mut state, &sched, &gateway, &registry, &recorder);
+                            drain_universal_cancels(&mut state, &recorder).await;
                             update_snapshot(&snapshot, &state);
                         }
                         None => { control_rx = None; }
@@ -808,6 +885,9 @@ impl Scheduler {
                             };
                             drain_mailbox(&agent_id, &mut state, &recorder);
                             state.tokens_spent = state.tokens_spent.saturating_add(new_tokens);
+                            // budget.1 / P2-2: republish native lifetime so the egress
+                            // proxy's global window reflects this spend immediately.
+                            state.publish_budget();
                             let cap_set = state.agents[&agent_id].cap_set_cloned();
                             // Drain deferred agents first (they were waiting for a slot to open),
                             // then re-enqueue the completing agent's next step. This gives queued
@@ -1001,6 +1081,9 @@ impl Scheduler {
 
                             state.tokens_spent +=
                                 resp.input_tokens as u64 + resp.output_tokens as u64;
+                            // budget.1 / P2-2: republish so the egress proxy's global
+                            // window reflects fresh native spend.
+                            state.publish_budget();
 
                             let ns = format!("agent/{agent_id}");
                             let key = format!(
@@ -1415,6 +1498,8 @@ fn init_budget_window(state: &mut SchedulerState, sched: &SchedulerConfig, now: 
     if state.budget_window_start == 0 {
         state.budget_window_start = now;
         state.global_window_anchor = state.tokens_spent;
+        state.rebase_universal_window();
+        state.publish_budget();
         for task in state.agents.values_mut() {
             let _ = task.reset_budget_window();
         }
@@ -1476,6 +1561,8 @@ fn maybe_rebase_windows_at(
     }
     let spent_before = state.global_windowed_spent();
     state.global_window_anchor = state.tokens_spent;
+    state.rebase_universal_window();
+    state.publish_budget();
     state.budget_window_start = state
         .budget_window_start
         .saturating_add(n * sched.budget_reset_interval);
@@ -1508,8 +1595,12 @@ fn drain_deferred(
     // Windowed global spend (ux.8′): capture the anchor by value so the closure
     // does not borrow `state` (which is mutated in the admit loop below).
     let anchor = state.global_window_anchor;
+    // budget.1 / P2-2: fold universal-tier WINDOWED spend into the snapshot so the
+    // closure (which must not borrow `state`) still bounds the combined total. Mirrors
+    // global_windowed_spent: native-since-anchor + universal-since-anchor.
+    let universal = state.universal_windowed_spent();
     let budget_ok = |lifetime: u64| {
-        let w = lifetime.saturating_sub(anchor);
+        let w = lifetime.saturating_sub(anchor).saturating_add(universal);
         sched.global_token_budget == 0 || w < sched.global_token_budget
     };
     let slot_ok   = |inf: usize| sched.max_concurrent_inferences == 0 || inf < sched.max_concurrent_inferences;
@@ -2503,6 +2594,8 @@ fn dispatch_control_command(
                 BudgetTarget::Global => {
                     let old = state.global_windowed_spent();
                     state.global_window_anchor = state.tokens_spent;
+                    state.rebase_universal_window();
+                    state.publish_budget();
                     // F4: advance the window start to now, else the next loop-tick
                     // maybe_rebase sees the old start and immediately rebases AGAIN
                     // (a manual reset at T+interval-1 would double-reset 1s later).
@@ -2626,14 +2719,18 @@ fn dispatch_control_command(
         }
 
         ControlCommand::Cancel { agent_id, confirm_tx } => {
-            let result: Result<u64, String> = if !state.agents.contains_key(&agent_id) {
+            let is_native    = state.agents.contains_key(&agent_id);
+            let is_universal = state.universal_agents.contains_key(&agent_id);
+            let result: Result<u64, String> = if !is_native && !is_universal {
                 Err(format!("agent '{agent_id}' not found"))
             } else {
-                // Collect the cancellation subtree via the scheduler-authoritative parent_map
-                // (child → parent). Only include nodes still live in state.agents (skip ghosts
-                // and the "operator" root sentinel, which never appears as a node here).
-                let mut subtree: Vec<String> = vec![agent_id.clone()];
-                let mut frontier: Vec<String> = vec![agent_id.clone()];
+                // Collect the native cancellation subtree via the scheduler-authoritative
+                // parent_map (child → parent). Seed only when the ROOT is native — a universal
+                // root has no native subtree and must not enter cancel_requested (which only
+                // handle_agent_terminal, a native-only funnel, consumes). Skip ghosts and the
+                // "operator" root sentinel, which never appears as a node here.
+                let mut subtree: Vec<String> = if is_native { vec![agent_id.clone()] } else { vec![] };
+                let mut frontier: Vec<String> = subtree.clone();
                 while let Some(parent) = frontier.pop() {
                     for (child, p) in state.parent_map.iter() {
                         if p == &parent
@@ -2678,7 +2775,22 @@ fn dispatch_control_command(
                         );
                     }
                 }
-                Ok(subtree.len() as u64)
+                // budget.1 / P3: universal-tier cancellation. A universal subprocess is
+                // never in state.agents, so the native funnel above cannot reach it.
+                // Flag the target itself (universal root) AND any universal agent whose
+                // parent is in the cancelled native subtree (cascade). The sync handler
+                // cannot .await kill()/deregister — the async run loop drains this set via
+                // drain_universal_cancels() immediately after dispatch returns.
+                let mut ua_flagged = 0u64;
+                let ua_ids: Vec<String> = state.universal_agents.keys().cloned().collect();
+                for uid in ua_ids {
+                    let is_target = uid == agent_id;
+                    let is_desc = state.parent_map.get(&uid).is_some_and(|p| subtree.contains(p));
+                    if (is_target || is_desc) && state.universal_cancel_requested.insert(uid) {
+                        ua_flagged += 1;
+                    }
+                }
+                Ok(subtree.len() as u64 + ua_flagged)
             };
             match confirm_tx {
                 Some(tx) => { let _ = tx.send(result); }
@@ -3218,12 +3330,53 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
 
     if let Ok(mut s) = snapshot.try_write() {
         s.agents              = agents;
-        s.global_tokens_spent = state.tokens_spent;
+        // budget.1 / P2-2: report combined native + universal spend so the metering
+        // surface no longer under-counts the universal tier.
+        s.global_tokens_spent = state.combined_lifetime_spent();
         s.in_flight           = state.in_flight;
         s.queue_depth         = state.deferred.len();
         s.pending_actions     = pending_actions;
         s.egress_addr         = state.egress_addr.map(|a| format!("http://{a}"));
         s.credential_snapshot = credential_snapshot;
+    }
+}
+
+/// Drain operator-requested universal-tier cancellations (budget.1 / AUDIT-v0.97 P3).
+/// The sync control handler flags IDs in `universal_cancel_requested`; this async pass
+/// kills each subprocess and deregisters its ephemeral egress key BEFORE the kill so the
+/// child cannot authenticate further inference during the SIGTERM grace window (mirrors
+/// the shutdown path). Emits AgentCancelled + UniversalAgentExited and closes the run.
+async fn drain_universal_cancels(
+    state:    &mut SchedulerState,
+    recorder: &Arc<FlightRecorder>,
+) {
+    if state.universal_cancel_requested.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = state.universal_cancel_requested.drain().collect();
+    for id in ids {
+        let Some(mut ua) = state.universal_agents.remove(&id) else { continue };
+        let ephemeral_key = ua.ephemeral_key.clone();
+        if let Some(reg) = &state.proxy_registry {
+            reg.deregister_by_key(&ephemeral_key).await;
+        }
+        ua.kill().await;
+        recorder.record(
+            &id,
+            None,
+            EventKind::AgentCancelled,
+            json!({ "agent_id": &id, "cause": "operator", "tier": "universal" }),
+        );
+        recorder.record(
+            &id,
+            None,
+            EventKind::UniversalAgentExited,
+            json!({ "agent_id": &id, "reason": "cancelled" }),
+        );
+        state.outcomes
+            .entry(id.clone())
+            .or_insert_with(|| Err(anyhow::anyhow!("operator cancelled")));
+        state.run_tracker.close(&id, "cancelled", Some("operator_cancelled".into()), None, None);
     }
 }
 
@@ -4867,6 +5020,7 @@ mod tests {
             orchestrated:       HashSet::new(),
             waiting:            HashSet::new(),
             cancel_requested:   HashMap::new(),
+            universal_cancel_requested: HashSet::new(),
             cred_gw:            None,
             run_tracker:        RunTracker::disabled(),
             jobs:               HashMap::new(),
@@ -6284,6 +6438,122 @@ mod tests {
 
         // Cleanup.
         state.universal_agents.get_mut("univ_snap").unwrap().kill().await;
+    }
+
+    #[test]
+    fn global_windowed_spent_folds_universal_tier() {
+        // budget.1 / AUDIT-v0.97 P2-2: the scheduler's global window must count
+        // universal-tier spend (read live through the attached egress meter), not
+        // just native tokens_spent.
+        use crate::evidence::EvidenceWriter;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (rec, _tmp) = recorder();
+        let writer = Arc::new(
+            EvidenceWriter::open(&dir.path().join("ev.jsonl"), &dir.path().join("k.pkcs8")).unwrap(),
+        );
+        let egress = Arc::new(EgressProxy::new(writer, rec));
+        let mut state = minimal_state("host");
+        state.egress = Some(Arc::clone(&egress));
+        state.tokens_spent = 200;
+        state.global_window_anchor = 100;
+        assert_eq!(state.global_windowed_spent(), 100, "native-only baseline");
+
+        egress.meter().add_universal(50);
+        assert_eq!(state.universal_lifetime_spent(), 50);
+        assert_eq!(state.combined_lifetime_spent(), 250);
+        assert_eq!(state.global_windowed_spent(), 150, "universal folds into the global window");
+    }
+
+    #[tokio::test]
+    async fn cancel_universal_agent_flags_then_drains() {
+        // budget.1 / AUDIT-v0.97 P3: a universal-tier agent (never in state.agents)
+        // must be cancellable. The sync handler flags it (it cannot .await kill), and
+        // the async drain reaps the subprocess + records a terminal outcome.
+        use crate::control::ControlCommand;
+        let addr: std::net::SocketAddr = "127.0.0.1:19878".parse().unwrap();
+        let (rec, _tmp) = recorder();
+        let cfg = AgentConfig {
+            tier:    crate::config::AgentTier::Universal,
+            command: Some("sleep".to_string()),
+            args:    vec!["30".to_string()],
+            ..agent_cfg("univ_cancel", "work")
+        };
+        let ua = UniversalAgent::spawn(&cfg, addr, "ua-cancel-key", &rec).unwrap();
+        let mut state = minimal_state("native");
+        state.universal_agents.insert(cfg.id.clone(), ua);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::Cancel { agent_id: "univ_cancel".into(), confirm_tx: Some(tx) }, &mut state);
+        let confirmed = rx.await.unwrap().expect("universal cancel accepted");
+        assert_eq!(confirmed, 1, "one universal agent flagged");
+        assert!(state.universal_cancel_requested.contains("univ_cancel"), "flagged for async drain");
+        assert!(state.universal_agents.contains_key("univ_cancel"), "not killed synchronously");
+
+        drain_universal_cancels(&mut state, &rec).await;
+        assert!(!state.universal_agents.contains_key("univ_cancel"), "subprocess reaped");
+        assert!(state.universal_cancel_requested.is_empty(), "flag consumed by drain");
+        assert!(
+            state.outcomes.get("univ_cancel").is_some_and(|o| o.is_err()),
+            "cancel recorded as a terminal error outcome"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn universal_only_cancel_is_not_starved() {
+        // budget.1 / Finding 1: with NO native agents and one LIVE universal agent,
+        // native `pending` is empty the whole time. The run loop MUST still service
+        // control commands in that state, else a Cancel for the universal-only workload
+        // is never read. Regression: run the real scheduler, send a Cancel, and assert
+        // the universal agent is actively CANCELLED (AgentCancelled recorded) rather
+        // than merely left to exit on its own.
+        use crate::control::ControlCommand;
+        let registry = Arc::new(crate::egress::ProxyRegistry::new());
+        let addr: std::net::SocketAddr = "127.0.0.1:9333".parse().unwrap();
+        let cfg = AgentConfig {
+            tier:    crate::config::AgentTier::Universal,
+            command: Some("sleep".to_string()),
+            args:    vec!["30".to_string()],
+            ..agent_cfg("univ_only", "work")
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let (rec, tmp) = recorder();
+        let scheduler = Scheduler::new(
+            vec![cfg],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(MockGateway::new(vec![])),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        )
+        .unwrap()
+        .with_egress_addr(Some(addr))
+        .with_proxy_registry(Arc::clone(&registry))
+        .with_control(rx);
+
+        // Buffer the Cancel and close the channel BEFORE running. run()'s future is
+        // not Send (single-threaded cooperative scheduler), so it can't be spawned —
+        // instead the loop reads the buffered command, drains the cancel, then sees the
+        // closed channel and exits. Dropping tx makes the idle branch break once the
+        // universal agent is gone.
+        tx.send(ControlCommand::Cancel { agent_id: "univ_only".into(), confirm_tx: None })
+            .await
+            .unwrap();
+        drop(tx);
+
+        // If the cancel were starved, run() would only return when the sleep(30) exits
+        // (> timeout) and WITHOUT an AgentCancelled event. The 10s bound proves it is read.
+        tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.run())
+            .await
+            .expect("scheduler must return promptly — universal cancel was not starved");
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            log.contains("agent_cancelled") && log.contains("univ_only"),
+            "universal agent must be actively cancelled (AgentCancelled), not left to exit; log:\n{log}"
+        );
     }
 
     #[tokio::test]
