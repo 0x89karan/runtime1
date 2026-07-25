@@ -19,6 +19,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     agentctl matches on to a real variant, so an event rename breaks the test rather than the TUI at runtime.
   - Both guards negative-control-verified (perturb → fail naming source, revert → green).
 
+### Fixed (AUDIT-v0.97 holistic-stack review, 2026-07-25)
+Cross-model /review over the whole `main..par.1` stack (6 increments). Codex caught three the
+per-increment passes and the Claude adversarial pass missed; two are fixed here, two deferred (TODOS
+budget.1-ar-01/-02, run.1-ar-01):
+- **`/spawn` FsRead exfiltration closed** (cap.4 gap, Codex High): `is_privileged_spawn_cap` classified
+  every `FsRead` as safe regardless of prefix, so `FsRead { prefix: "/" }` let an un-opted-in `/spawn`
+  caller mint an agent reading any file (egress signing key, OAuth cache, checkpoints, mounted secrets)
+  via `read_file`/`list_dir`. `FsRead` is now privileged (requires `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1`);
+  the bounded read paths a benign caller needs stay covered by `KbRead { segment }` + `RunsRead`.
+- **Corrupt primary checkpoint no longer suppresses the `.restored` fallback** (audit.2 gap, Codex Medium):
+  `load()` quarantined a garbled primary and gave up even when a valid pre-restore copy existed. It now
+  falls back to `.restored` (quarantining the bad primary), completing the crash-after-restore resilience
+  story. Also silenced a spurious "could not rename" warning on benign repeat-restart recovery.
+
 ### Known issues
 - **par.1-ar-01** (P2, pre-existing, surfaced by the par.1 exhaustiveness guard): agentctl's Inspector
   "Errors" filter and red colour rule match `"kind":"tool_error"`/`"inference_error"` — strings agentd

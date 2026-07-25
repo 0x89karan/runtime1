@@ -46,14 +46,22 @@ use crate::events::EventKind;
 /// is fragile — agent-level `Credential` is INERT, while `Mcp{google_oauth}` (NOT `Credential`)
 /// is what actually grants live Gmail (the broker derives the provider allowlist from the MCP
 /// *server's* own cap, not the agent's). So `/spawn` from an untrusted `:7999` caller may mint
-/// ONLY read-only-local caps without the operator opt-in; anything that grants tools (`Mcp`),
+/// ONLY caps from the safe set without the operator opt-in; anything that grants tools (`Mcp`),
 /// network, writes, spawning, sealed-jobs, brief-publish, or credentials requires
 /// `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1`. (Unrestricted `capabilities: None` = every cap → also
 /// privileged; handled at the call site.)
+///
+/// `FsRead` is DELIBERATELY NOT in the safe set (AUDIT-v0.97 holistic review, Codex High):
+/// its prefix is caller-controlled and unbounded, so `FsRead { prefix: "/" }` would satisfy
+/// every absolute path — `read_file`/`list_dir` on the egress signing key, OAuth token cache,
+/// checkpoints, and mounted secrets. "read-only-local" is only safe when the *scope* is bounded;
+/// a caller-supplied prefix is not. The bounded read paths a benign untrusted caller needs are
+/// covered by `KbRead { segment }` (a named KB segment) and `RunsRead` (run history). An operator
+/// who genuinely wants an arbitrary-filesystem read spawn sets `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1`.
 fn is_privileged_spawn_cap(c: &Capability) -> bool {
     !matches!(
         c,
-        Capability::KbRead { .. } | Capability::FsRead { .. } | Capability::RunsRead
+        Capability::KbRead { .. } | Capability::RunsRead
     )
 }
 
@@ -975,10 +983,14 @@ mod tests {
         assert!(is_privileged_spawn_cap(&Capability::KbWrite { segment: "x".into() }));
         assert!(is_privileged_spawn_cap(&Capability::BriefPublish));
         assert!(is_privileged_spawn_cap(&Capability::Net { hosts: vec![], ports: vec![] }));
-        // Safe read-only-local set.
+        // FsRead is privileged too (AUDIT-v0.97 holistic review, Codex High): its prefix is
+        // caller-controlled, so FsRead{"/"} would read the whole filesystem — egress signing
+        // key, OAuth cache, secrets. "read-only-local" is only safe when the scope is bounded.
+        assert!(is_privileged_spawn_cap(&Capability::FsRead { prefix: "/".into() }));
+        assert!(is_privileged_spawn_cap(&Capability::FsRead { prefix: "/data".into() }));
+        // Safe set: only the bounded read paths a benign untrusted caller needs.
         assert!(!is_privileged_spawn_cap(&Capability::RunsRead));
         assert!(!is_privileged_spawn_cap(&Capability::KbRead { segment: "x".into() }));
-        assert!(!is_privileged_spawn_cap(&Capability::FsRead { prefix: "/data".into() }));
     }
 
     #[tokio::test]
