@@ -24,24 +24,22 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.100.0 (shipped 2026-07-25)
+**Current version:** v0.101.0 (shipped 2026-07-25)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** cap.4 (v0.100.0) — **auth-consistency + capability-scoping** (3rd AUDIT-v0.97
-increment). **P2-3:** the ux.12 `X-Approval-Token` gate now covers the ENTIRE mutating `:7999` surface
-(spawn/inject/budget/cancel/caps/approve-deny), not just approve/deny (reads ungated; unset-secret
-stays open); and **`/spawn` is deny-by-default on caps** — without `AGENTOS_ALLOW_PRIVILEGED_SPAWN=1`
-it mints only read-only-local caps, refusing Mcp/Net/writes/spawn/run_job/brief-publish/credentials +
-unrestricted null (a denylist was fragile — `Mcp{google_oauth}`, not the inert agent-level
-`Credential`, is the real live-Gmail vector; Codex review caught this). **P2-5:** KbRead/KbWrite
-segment scoping is now enforced under `tool_override` (derived by tool name, byte-identical to native)
-so the injection-exposed cos-inbox can't overwrite the curator's brief. **Sweep remaining:** ci.2/
-packaging → budget.1 → par.1/2 → P3.
-**Prior (AUDIT-v0.97 sweep):** run.1 (v0.99.0) durability cluster — flight.jsonl copy-truncate rotation
-(P1-2), short_term cap (P1-3), cron missed-fire catch-up (P2-6), runs.redb retention (P2-9). audit.2
-(v0.98.0) — arm64 python packaging (P1-1), checkpoint `.restored` crash-loop fix (P2-1), ux.13
-cancel-resurrection (P2-4). Full audit: `docs/AUDIT-v0.97.md`.
+**Latest shipped:** ci.2 (v0.101.0) — **close the test blind-spots** (4th AUDIT-v0.97 increment).
+**P2-8:** distro-packaging guard — Makefile `cp` driven from the `*_mcp.py` wildcard + a Rust test
+asserting every config-referenced sidecar path is packaged (would've caught both distro-bricks).
+**P2-7:** broker credential attach+drop happy-path coverage via an extracted pure `build_upstream_headers()`
+(the core seam had zero success-path tests; full-TLS-loopback E2E deferred as ci.2-ar-01). **P2-11:**
+run the sidecar `--test` marker contract inside the shipped image (in-image python + `import ssl`) —
+the lane that hid P1-1. **Sweep remaining:** budget.1 → par.1/2 → P3.
+**Prior (AUDIT-v0.97 sweep):** cap.4 (v0.100.0) auth-consistency — whole-mutating-surface X-Approval-Token
+gate + deny-by-default `/spawn` caps (P2-3) + tool_override KbWrite/KbRead scoping (P2-5). run.1 (v0.99.0)
+durability — flight rotation (P1-2), short_term cap (P1-3), cron catch-up (P2-6), runs retention (P2-9).
+audit.2 (v0.98.0) — arm64 python (P1-1), checkpoint `.restored` (P2-1), ux.13 cancel-resurrection (P2-4).
+Full audit: `docs/AUDIT-v0.97.md`.
 **Prior:** ux.13 (v0.97.0) — control verbs, final increment of the "trust after absence" cockpit
 reshape (ux.8′→ux.11→ux.12→ux.13). ux.12 (v0.96.0) — Telegram reach.
 **After the sweep:** the UX tail (ux.2b/ux.3/ux.10 — the last picks up the deferred ux.13 cancel-key),

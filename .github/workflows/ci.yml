@@ -481,6 +481,28 @@ jobs:
           cache-from: type=gha,scope=buildkit-full
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=buildkit-full,ignore-error=true' || '' }}
 
+      - name: Sidecar self-tests IN the built image (ci.2 / P2-11)
+        # The sidecar-tests job runs the marker contract on the RUNNER's python (glibc, full
+        # ssl) — so a musl/apk-python incompatibility or a missing interpreter in the shipped
+        # image ships undetected (the exact blind spot that hid P1-1's arm64 python omission).
+        # Re-run the contract inside agentos:smoke (already built above — no extra build) so the
+        # IN-IMAGE python actually exercises every sidecar, and confirm ssl is importable.
+        run: |
+          docker run --rm agentos:smoke sh -c '
+            fail=0
+            for f in /etc/agentd/*_mcp.py; do
+              out=$(timeout 60 python3 "$f" --test </dev/null 2>&1); rc=$?
+              if [ "$rc" -eq 0 ] && printf "%s" "$out" | grep -q "self-test PASSED"; then
+                echo "PASS (in-image): $f"
+              else
+                echo "in-image sidecar self-test FAILED: $f (rc=$rc)"; printf "%s\n" "$out"; fail=1
+              fi
+            done
+            python3 -c "import ssl; print(\"in-image ssl OK:\", ssl.OPENSSL_VERSION)" || fail=1
+            exit $fail
+          ' || { echo "::error title=in-image sidecar self-tests failed::a sidecar fails under the image python (musl/apk) even though the runner python passed"; exit 1; }
+          echo "in-image sidecar self-tests OK"
+
       - name: cos dry-run (credential-free)
         run: |
           set +e

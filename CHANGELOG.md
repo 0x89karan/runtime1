@@ -3,6 +3,22 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.101.0] - 2026-07-25
+
+### Added / Testing
+- **ci.2 — close the AUDIT-v0.97 test blind-spots** (4th increment):
+  - **P2-8** distro-packaging guard: `distro/Makefile` `cp` now driven from the `docker/*_mcp.py`
+    wildcard, + `agentd/tests/distro_packaging.rs` asserts every `/usr/lib/agentos/docker/<x>.py`
+    referenced in the distro overlay configs resolves to a real file (fails at the workspace-test
+    gate, not QEMU boot). Would have caught both prior distro-bricks (cap.2, ux.12).
+  - **P2-7** broker credential attach+drop coverage: extracted a pure `build_upstream_headers()`
+    (behavior-preserving) + a test asserting the gateway credential is attached and caller
+    `Authorization`/`X-Forwarded-For`/`Cookie` are dropped, for OauthBearer + ApiKeyHeader. A full
+    TLS-loopback forward E2E is deferred (ci.2-ar-01 — the gateway is https-only + IP-pinned).
+  - **P2-11** in-image sidecar tests: `docker-smoke` now runs each `*_mcp.py --test` with the shipped
+    image's python + an `import ssl` check — the in-image python the runner-python job never exercised
+    (the lane that hid P1-1 arm64).
+
 ## [v0.100.0] - 2026-07-25
 
 ### Fixed

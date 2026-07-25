@@ -2446,3 +2446,10 @@ Findings from `docs/AUDIT-phase-4-6.md` that are real bugs but do not block Phas
 - Deferred: `list_namespaces` full-scan → p5.8 (NAMESPACES table).
 - 445 tests pass (33 surfaces + 412 agentd).
 - **Completed:** v0.24.0
+
+- **ci.2-ar-01 (P3) [deferred from ci.2] — broker full TLS-loopback forward E2E.**
+  ci.2 P2-7 unit-tests the credential attach/drop transform (`build_upstream_headers`) directly, but
+  a full request-through-the-gateway-to-a-mock-upstream E2E isn't covered: the gateway is https-only +
+  IP-pinned with a non-injectable cert store, so a plaintext mock upstream is rejected at startup.
+  Needs an `allow_insecure_local`-style gateway test-seam or a mock-TLS harness. The security-critical
+  drop/attach + D3 query filter ARE covered; this is the last-mile transport E2E.
