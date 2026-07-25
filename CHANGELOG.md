@@ -3,6 +3,26 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.107.0] - 2026-07-25
+
+### Fixed
+- **cap.3 — FS-capability matching was CWD-blind + a boot containment hole (audit86-P1-8).** Capability
+  path matching compared relative prefixes by string-identity while the `capability.rs` doc falsely
+  claimed "relative paths fail-safe to deny" (the v0.86.2 root-cause class). A relative grant `./output`
+  authorized `./output/x` regardless of where agentd was launched — the operator couldn't reason about
+  the real absolute region. Now a startup-captured CWD anchor + a single `anchor_abs()` chokepoint in
+  `satisfies()` absolutizes both grant and request, so matching is absolute-vs-absolute.
+  - This **changes** mixed relative/absolute decisions (it is not representational): a relative request
+    that lands inside an absolute grant (or vice versa) now correctly **allows** where the old lexical
+    match wrongly denied — sound because the runtime resolves against the same anchor, so no over-grant
+    and no previously-working flow breaks (both adversarial reviews confirmed zero reachable ALLOW→DENY).
+  - **Closed a pre-existing boot exfiltration hole:** `main.rs`'s store/evidence/key containment guards
+    now anchor both sides, so a config with an absolute memory store inside a **relative** MCP FS prefix
+    (which the kernel sandbox resolves against CWD → the sandboxed server gets a dir *containing* the
+    store) now fails at boot instead of silently passing the lexical guard.
+  - Fail-closed on a grant that escapes the anchor (leading `..`, which would otherwise anchor to `/`
+    and authorize the whole filesystem); no-chdir invariant hardened with a debug-build assert.
+
 ## [v0.106.0] - 2026-07-25
 
 ### Fixed
