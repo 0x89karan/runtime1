@@ -935,6 +935,9 @@ impl Scheduler {
                                     update_snapshot(&snapshot, &state);
                                     continue;
                                 };
+                                // ux.2b: last_error (→ Error attention) is updated inside
+                                // provide_tool_results, so it covers this async batch AND every
+                                // synthetic reject/error path uniformly (see agent/mod.rs).
                                 let p = sm.priority();
                                 sm.provide_tool_results(results, &recorder);
                                 p
@@ -1794,6 +1797,14 @@ fn enqueue_or_defer(
             recorder,
         );
         return;
+    }
+
+    // ux.2b: stamp the last completed progress event at the universal effect choke point, so the
+    // read-time Idle signal reflects real work. Covers Infer/CallTools/Spawn/RunJob/SendMessage/
+    // RequestApproval in one place (a busy or pure-reasoning agent never false-reads Idle).
+    // Defensive get_mut — a missing agent is a no-op, never a panic ("loop never panics").
+    if let Some(task) = state.agents.get_mut(&agent_id) {
+        task.mark_event();
     }
 
     let slot_ok   = sched.max_concurrent_inferences == 0 || state.in_flight < sched.max_concurrent_inferences;
@@ -3174,12 +3185,15 @@ struct AttentionInputs<'a> {
     credential_providers: &'a [String],
     pending_approvals:    &'a HashMap<String, ParkedApproval>,
     credential_snapshot:  Option<&'a surfaces::CredentialSnapshot>,
+    /// ux.2b: latest still-running tool error, if any — drives the `Error` signal. `Idle` is
+    /// NOT here: it is computed READ-TIME by `AgentSnapshot::idle_signal`, not at build.
+    last_error:           Option<&'a str>,
 }
 
 fn derive_attention(inputs: AttentionInputs) -> Vec<surfaces::AttentionSignal> {
     let AttentionInputs {
         agent_id, windowed_spent, token_budget, credential_providers,
-        pending_approvals, credential_snapshot,
+        pending_approvals, credential_snapshot, last_error,
     } = inputs;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3192,6 +3206,16 @@ fn derive_attention(inputs: AttentionInputs) -> Vec<surfaces::AttentionSignal> {
             reason:   surfaces::AttentionReason::ApprovalPending,
             since:    now.saturating_sub(pa.created_at.elapsed().as_secs()),
             evidence: Some(approval_id.clone()),
+        });
+    }
+
+    // ux.2b Error: a tool call errored while the agent kept running. `since: now` (no tracked
+    // onset — like BudgetRisk), rendered "active" by agentctl; evidence carries a short excerpt.
+    if let Some(err) = last_error {
+        signals.push(surfaces::AttentionSignal {
+            reason:   surfaces::AttentionReason::Error,
+            since:    now,
+            evidence: Some(err.to_string()),
         });
     }
 
@@ -3267,6 +3291,12 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
     // Computed once, reused both per-agent (attention derivation) and for the final
     // `s.credential_snapshot` field below — avoids calling `gw.snapshot()` twice per cycle.
     let credential_snapshot = state.cred_gw.as_ref().map(|gw| gw.snapshot());
+    // ux.2b: wall-clock now, used to convert each task's monotonic `last_event_at` into the
+    // carried `last_event_at_unix` anchor that the read surfaces derive Idle from.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     let agents: Vec<AgentSnapshot> = state
         .agents
@@ -3310,6 +3340,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     credential_providers: &cred_providers,
                     pending_approvals:    &state.pending_approvals,
                     credential_snapshot:  credential_snapshot.as_ref(),
+                    last_error:           task.last_error(),
                 });
                 AgentSnapshot {
                     id:             id.clone(),
@@ -3345,6 +3376,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                     credential_denied_counts:  cred_denied,
                     credential_last_access_at: cred_access,
                     attention,
+                    last_event_at_unix: now_unix.saturating_sub(task.last_event_elapsed_secs()),
                 }
             }
         })
@@ -3380,6 +3412,12 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 credential_denied_counts:  HashMap::new(),
                 credential_last_access_at: HashMap::new(),
                 attention:                 vec![],
+                // Universal-tier liveness is proxy-tracked, not event-stamped — these agents are
+                // never idle-eligible. `u64::MAX` makes `idle_signal`'s saturating_sub → 0 forever,
+                // so a STALE universal snapshot (>threshold old, e.g. scheduler blocked on native
+                // pending effects) can never false-read Idle. Anchoring to `now_unix` instead would
+                // silently break the moment the snapshot stops refreshing (Codex review finding).
+                last_event_at_unix:        u64::MAX,
             }
         })
         .collect();
@@ -7017,6 +7055,7 @@ mod tests {
         derive_attention(AttentionInputs {
             agent_id, windowed_spent, token_budget, credential_providers,
             pending_approvals, credential_snapshot,
+            last_error: None,
         })
     }
 
@@ -7053,6 +7092,23 @@ mod tests {
     fn derive_attention_clean_agent_has_no_signals() {
         let signals = da("a1", 100, 50_000, &[], &HashMap::new(), None);
         assert!(signals.is_empty(), "an agent with no active signal sources must be Clean");
+    }
+
+    #[test]
+    fn derive_attention_error_fires_and_clears() {
+        // ux.2b: a still-running tool error surfaces as an Error signal with the excerpt as
+        // evidence; None (a cleared/never-set error) produces no Error signal.
+        let with_err = derive_attention(AttentionInputs {
+            agent_id: "a1", windowed_spent: 100, token_budget: 50_000,
+            credential_providers: &[], pending_approvals: &HashMap::new(),
+            credential_snapshot: None, last_error: Some("boom: connection refused"),
+        });
+        assert_eq!(with_err.len(), 1);
+        assert_eq!(with_err[0].reason, surfaces::AttentionReason::Error);
+        assert_eq!(with_err[0].evidence.as_deref(), Some("boom: connection refused"));
+        // Cleared (auto-clear on next all-ok batch → last_error None): no Error signal.
+        let cleared = da("a1", 100, 50_000, &[], &HashMap::new(), None);
+        assert!(cleared.iter().all(|s| s.reason != surfaces::AttentionReason::Error));
     }
 
     #[test]
@@ -7286,6 +7342,7 @@ mod tests {
             credential_denied_counts: HashMap::new(),
             credential_last_access_at: HashMap::new(),
             attention,
+            last_event_at_unix: 0,
         };
         let json = serde_json::to_value(&snap).expect("AgentSnapshot must serialize");
         let arr = json["attention"].as_array().expect("attention field must be present and be an array");

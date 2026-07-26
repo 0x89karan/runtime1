@@ -99,6 +99,15 @@ pub struct AgentTask {
     /// Stable 16-hex fingerprint of the initial task (FNV-1a 64-bit, deterministic).
     /// Embedded in Tier-3 provenance via ToolContext; not checkpointed (recomputed on restore).
     task_fp: String,
+    /// Monotonic time of the last completed progress event (ux.2b) — anchors the read-time
+    /// `Idle` attention signal. Runtime-only, NOT checkpointed: re-seeded to now in both `new()`
+    /// and `from_checkpoint()`, exactly like `last_pressure`. A freshly-restored agent hasn't
+    /// acted yet, so it starts fresh and is never instantly idle; `Instant` (not `SystemTime`)
+    /// keeps it immune to wall-clock jumps. Converted to Unix secs at snapshot build.
+    last_event_at: std::time::Instant,
+    /// Latest tool error while the agent kept running (ux.2b) — drives the `Error` attention
+    /// signal; auto-cleared on the next all-ok tool batch. Runtime-only, not checkpointed.
+    last_error: Option<String>,
 }
 
 impl AgentTask {
@@ -132,7 +141,27 @@ impl AgentTask {
             short_term: vec![],
             last_pressure: MemoryPressure::None,
             task_fp: task_fingerprint(task),
+            last_event_at: std::time::Instant::now(),
+            last_error: None,
         }
+    }
+
+    /// ux.2b: stamp a completed progress event. Called at the scheduler's universal effect
+    /// choke point (`enqueue_or_defer`), so every real step refreshes it and a busy agent
+    /// never false-reads `Idle`.
+    pub fn mark_event(&mut self) {
+        self.last_event_at = std::time::Instant::now();
+    }
+
+    /// ux.2b: seconds since the last completed progress event — converted to a Unix-secs
+    /// anchor at snapshot build for the read-time `AgentSnapshot::idle_signal`.
+    pub fn last_event_elapsed_secs(&self) -> u64 {
+        self.last_event_at.elapsed().as_secs()
+    }
+
+    /// ux.2b: the latest still-running tool error, if any.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     /// Mark whether a scheduler budget-reset window is active (ux.8′ / C1). Set by
@@ -296,6 +325,10 @@ impl AgentTask {
             short_term:      cp.short_term,
             last_pressure:   MemoryPressure::None,
             task_fp:         task_fingerprint(&task_text),
+            // Runtime-only, re-seeded fresh on restore (like last_pressure): a restored agent
+            // hasn't acted yet, so it must not read as idle the instant it comes back (ux.2b).
+            last_event_at:   std::time::Instant::now(),
+            last_error:      None,
         }
     }
 
@@ -402,6 +435,20 @@ impl AgentTask {
                 json!({ "stage": "provide_tool_results", "error": "called on terminal task" }),
             );
             return;
+        }
+        // ux.2b: a tool error while the agent keeps running drives the `Error` attention signal;
+        // a clean batch auto-clears it. Centralized HERE (not at the scheduler dispatch site) so
+        // EVERY tool-result path updates it uniformly — the async `EffectResult::Tools` batch AND
+        // every synthetic `is_error` reject block (spawn-denied, run_job reject, approval reject,
+        // send_message failure, no-control approval), all of which funnel through this method. An
+        // empty batch (turn-advance only) leaves the prior error untouched.
+        if !results.is_empty() {
+            self.last_error = results.iter().find_map(|b| match b {
+                Block::ToolResult { is_error: true, content, .. } => {
+                    Some(content.chars().take(160).collect::<String>())
+                }
+                _ => None,
+            });
         }
         recorder.record(
             &self.agent_id,
@@ -1383,6 +1430,34 @@ mod tests {
     }
 
     // ── State-machine unit tests (sync, no network) ───────────────────────────
+
+    #[test]
+    fn provide_tool_results_sets_and_clears_last_error() {
+        // ux.2b: a tool error in the batch → last_error set (drives Error attention); a clean
+        // batch → cleared (auto-clear); an empty batch → left unchanged. Centralizing here means
+        // every synthetic reject/error path (spawn-denied, run_job reject, …) gets it for free.
+        let (rec, _tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("err-test", "task", &cfg, &model_cfg(), vec![]);
+        assert_eq!(sm.last_error(), None);
+
+        sm.provide_tool_results(
+            vec![Block::ToolResult { tool_use_id: "t1".into(), content: "boom: refused".into(), is_error: true }],
+            &rec,
+        );
+        assert_eq!(sm.last_error(), Some("boom: refused"), "an is_error result must set last_error");
+
+        // Empty batch leaves it unchanged.
+        sm.provide_tool_results(vec![], &rec);
+        assert_eq!(sm.last_error(), Some("boom: refused"), "an empty batch must not clear last_error");
+
+        // Clean batch auto-clears.
+        sm.provide_tool_results(
+            vec![Block::ToolResult { tool_use_id: "t2".into(), content: "ok".into(), is_error: false }],
+            &rec,
+        );
+        assert_eq!(sm.last_error(), None, "an all-ok batch must clear last_error");
+    }
 
     #[test]
     fn step_machine_text_tool_text_cycle() {

@@ -1122,11 +1122,16 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   addresses cos-ux-01, does NOT close it** — see **ux.2b** below. Full plan (superseded
   "Observe" plan preserved for reference): `docs/plans/ux.2-observe.md` →
   `docs/plans/ux.2-attention-evidence.md`.
-- **ux.2b** — Idle + Error attention signals (closes **cos-ux-01** fully): reuses the
-  superseded "Observe" plan's already-designed `last_activity`/`last_error`/`idle_secs`
-  mechanism (new `AgentTask` fields, `CallTools`-dispatch-site fix) — re-verify against
-  current `main` before implementing. Wires into ux.2a's existing `AttentionSignal`/routing
-  mechanism as two additional enum variants, no redesign needed.
+- **ux.2b** — Idle + Error attention signals (closes **cos-ux-01** fully) ✅ **shipped**:
+  two new `AttentionReason` variants on ux.2a's substrate. /autoplan reshaped the mechanism
+  (both eng voices): **Idle is computed READ-TIME** (`AgentSnapshot::idle_signal(now, threshold)`
+  at the FUSE + HTTP surfaces, NOT in `derive_attention` — a build-time computation would freeze
+  in the exact hung-tool wedge it catches); `last_event_at` stamped once at the `enqueue_or_defer`
+  effect choke point (covers `Infer`, the draft's critical miss); Idle allowlist = `status ==
+  Running` only; `Error` scoped to tool-errors on a still-Running agent + auto-clear on next all-ok
+  batch. `last_event_at` is a runtime-only `Instant` (re-seeded on restore, never checkpointed);
+  180s threshold. The landmine-guard test (`idle_is_read_time_advances_on_same_snapshot`) enforces
+  the read-time architecture. Plan: `docs/plans/ux.2b-idle-error-attention.md`.
 - ~~**ux.1** — Converse~~ ✅ **shipped** — permanent chat rail on the Dashboard view (agent
   table `Min(72)` | rail `Length(32)`), honoring the D1 "one unified screen" locked decision
   (not a 10th full-screen tab, as the rough scope originally proposed). `Tab` toggles rail

@@ -74,24 +74,31 @@ pub struct AgentSandbox {
 pub enum AttentionReason {
     ApprovalPending,
     Degraded,
+    /// ux.2b: a tool call errored while the agent kept running (above BudgetRisk in routing).
+    Error,
     BudgetRisk,
     EvaluationUnavailable,
+    /// ux.2b: no completed progress event in the idle threshold — least urgent, routes last.
+    Idle,
 }
 
 impl AttentionReason {
     /// Row-color severity — independent of routing priority (Design Fix 1): `Degraded` is
     /// more severe than `ApprovalPending` but does not win routing, since an approval is more
-    /// actionable than most other signals even when less severe.
+    /// actionable than most other signals even when less severe. `Error` is Critical (red)
+    /// like `Degraded`; `Idle` is a Warning (yellow), not Critical.
     pub fn is_critical(&self) -> bool {
-        matches!(self, AttentionReason::Degraded)
+        matches!(self, AttentionReason::Degraded | AttentionReason::Error)
     }
 
     pub fn label(&self) -> &'static str {
         match self {
             AttentionReason::ApprovalPending       => "approval pending",
             AttentionReason::Degraded              => "degraded",
+            AttentionReason::Error                 => "error",
             AttentionReason::BudgetRisk             => "budget risk",
             AttentionReason::EvaluationUnavailable => "evaluation unavailable",
+            AttentionReason::Idle                  => "idle",
         }
     }
 }

@@ -3,6 +3,29 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.111.0] - 2026-07-26
+
+### Added
+- **ux.2b — Idle + Error attention signals (closes cos-ux-01).** Two new `AttentionReason` variants on
+  ux.2a's substrate, so the operator dashboard finally distinguishes a silently-wedged or errored agent
+  from a healthy one at a glance.
+  - **Idle** is computed **read-time** (`AgentSnapshot::idle_signal(now, threshold)` merged at the FUSE
+    `/agents/<id>/attention` and HTTP `/api/v1/snapshot` surfaces), never at snapshot build — a build-time
+    computation would freeze in the exact hung-tool wedge it exists to catch (the scheduler doesn't even
+    tick `update_snapshot` while a tool future hangs). Allowlist is `status == Running` only; every
+    parked/terminal status is intentionally quiet. Threshold 180s (`surfaces::IDLE_THRESHOLD_SECS`).
+  - `last_event_at` is a runtime-only monotonic `Instant`, stamped once at the `enqueue_or_defer` effect
+    choke point (covers `Infer`/`CallTools`/`SpawnAgent`/`RunJob`/`SendMessage`/`RequestApproval`), and
+    re-seeded fresh on checkpoint restore (never serialized, mirrors `last_pressure`) — a restored agent
+    starts fresh, never instantly idle.
+  - **Error** fires when a tool call returns an error while the agent keeps running (inference errors already
+    terminate → `Failed`); set/cleared centrally in `AgentTask::provide_tool_results` so it covers the async
+    batch AND every synthetic reject path uniformly, auto-clearing on the next all-ok batch.
+  - Reshaped from the original draft at `/autoplan` (both eng voices caught the draft computed idle at
+    snapshot-build and missed the `Infer` stamp), then hardened at `/review` (Codex caught synthetic tool
+    errors bypassing `last_error` and a universal-tier stale-snapshot false-idle). The landmine-guard test
+    `idle_is_read_time_advances_on_same_snapshot` enforces the read-time architecture by construction.
+
 ## [v0.110.0] - 2026-07-26
 
 ### Fixed

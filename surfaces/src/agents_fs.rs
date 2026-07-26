@@ -476,7 +476,17 @@ impl AgentsFs {
             }
             OFF_ATTENTION => {
                 // ux.2a: active attention signals as a JSON array (empty array = clean).
-                let json = serde_json::to_string(&agent.attention).unwrap_or_else(|_| "[]".to_string());
+                // ux.2b: Idle is computed READ-TIME here (not at snapshot build) against the
+                // reader's clock, so it advances between reads without a new scheduler snapshot.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mut signals = agent.attention.clone();
+                if let Some(idle) = agent.idle_signal(now, crate::snapshot::IDLE_THRESHOLD_SECS) {
+                    signals.push(idle);
+                }
+                let json = serde_json::to_string(&signals).unwrap_or_else(|_| "[]".to_string());
                 format!("{json}\n").into_bytes()
             }
             // OFF_MEMORY_DIR and OFF_LONG_TERM_DIR are directories — not served here.
@@ -1500,6 +1510,9 @@ mod tests {
             credential_denied_counts:  std::collections::HashMap::new(),
             credential_last_access_at: std::collections::HashMap::new(),
             attention:                 vec![],
+            // Far-future anchor → never idle in these fixtures (idle is exercised directly in
+            // snapshot.rs's idle_signal tests + the FUSE idle test below with a real old anchor).
+            last_event_at_unix:        u64::MAX,
         }
     }
 
@@ -1791,6 +1804,34 @@ mod tests {
         let s = String::from_utf8_lossy(&result);
         assert!(s.contains("turn_start"), "first valid line must survive non-UTF-8 in flight file");
         assert!(s.contains("turn_end"),   "second valid line must survive non-UTF-8 in flight file");
+    }
+
+    #[test]
+    fn attention_file_merges_read_time_idle() {
+        // ux.2b: a Running agent whose last event was at epoch 0 → (wall now − 0) ≫ 180s → Idle
+        // is merged at READ time in file_content_for_ino, even though the stored attention vec is
+        // empty. This proves the FUSE read-surface merge (not just idle_signal in isolation).
+        let snap = make_snap(vec![AgentSnapshot {
+            last_event_at_unix: 0,
+            ..agent_snap("a", AgentStatus::Running)
+        }]);
+        let mut fs = AgentsFs::new(snap, None, None);
+        fs.alloc_dir("a");
+        let dir_ino = fs.dir_inodes["a"];
+        let content = fs.file_content_for_ino(dir_ino + OFF_ATTENTION).expect("attention file");
+        let s = String::from_utf8_lossy(&content);
+        assert!(s.contains("\"idle\""), "read-time Idle must be merged into the FUSE attention file: {s}");
+
+        // A universal-style agent (u64::MAX anchor) is never idle-eligible, even Running + stale.
+        let snap2 = make_snap(vec![AgentSnapshot {
+            last_event_at_unix: u64::MAX,
+            ..agent_snap("b", AgentStatus::Running)
+        }]);
+        let mut fs2 = AgentsFs::new(snap2, None, None);
+        fs2.alloc_dir("b");
+        let dir2 = fs2.dir_inodes["b"];
+        let c2 = fs2.file_content_for_ino(dir2 + OFF_ATTENTION).expect("attention file");
+        assert!(!String::from_utf8_lossy(&c2).contains("idle"), "u64::MAX anchor must never read Idle");
     }
 
     // ── Memory subtree ────────────────────────────────────────────────────────
