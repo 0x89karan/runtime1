@@ -268,7 +268,56 @@ impl CheckpointStore {
         }
     }
 
+    /// Best-effort sweep of crash-orphaned checkpoint tmp files (audit86-P3-5). `save()` writes to
+    /// `checkpoint.json.<pid>.<nanos>.tmp` then renames; a crash between write and rename leaks the
+    /// tmp forever. Removes stale siblings matching `<basename>.*.tmp` only — STRICT, so it can never
+    /// touch `checkpoint.json`, `.restored`, `.corrupt`, or any unrelated file. Runs at startup (from
+    /// `load()`). Never propagates an error.
+    fn sweep_stale_tmp(&self) {
+        // P3-5 /review (FIX B): only sweep tmp files OLDER than the threshold. A crash-orphan is by
+        // definition old; a live tmp that a second agentd sharing the dir is mid-write on (the
+        // boot-overlap case `tmp_path` guards against) is seconds-fresh — sweeping it would fail
+        // that process's rename. An unreadable mtime is treated as NOT sweepable (conservative).
+        self.sweep_stale_tmp_with(std::time::Duration::from_secs(60));
+    }
+
+    fn sweep_stale_tmp_with(&self, min_age: std::time::Duration) {
+        let dir = self
+            .path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let Some(base) = self.path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        let prefix = format!("{base}.");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !(name.starts_with(&prefix) && name.ends_with(".tmp")) {
+                continue;
+            }
+            // Age gate: sweep only if the file is at least `min_age` old. Unreadable mtime → skip.
+            let old_enough = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .is_some_and(|age| age >= min_age);
+            if old_enough {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+
     pub fn load(&self) -> Result<Option<SchedulerCheckpoint>> {
+        // audit86-P3-5: clear crash-orphaned `checkpoint.json.*.tmp` debris at startup.
+        self.sweep_stale_tmp();
         // Prefer the primary; fall back to the pre-restore copy left by a crash after
         // restore but before the first new save (AUDIT-v0.97 P2-1).
         let src = if self.path.exists() {
@@ -616,6 +665,38 @@ mod tests {
         assert!(store.load().is_err(), "corrupt .restored -> Err");
         assert!(!dir.path().join("checkpoint.json.restored").exists(), "corrupt .restored quarantined away");
         assert!(dir.path().join("checkpoint.json.restored.corrupt").exists(), "renamed to .restored.corrupt");
+    }
+
+    #[test]
+    fn sweep_removes_only_orphaned_tmp_files() {
+        // audit86-P3-5 + /review FIX B: an OLD crash-orphaned `checkpoint.json.*.tmp` is swept, a
+        // FRESH (concurrent-live) tmp survives the age gate, and nothing else is ever touched.
+        let dir = TempDir::new().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        let orphan1 = dir.path().join("checkpoint.json.99999.123.tmp");
+        let orphan2 = dir.path().join("checkpoint.json.1.2.tmp");
+        std::fs::write(&orphan1, b"orphan").unwrap();
+        std::fs::write(&orphan2, b"orphan2").unwrap();
+        // Non-matching siblings — must survive at ANY threshold (strict name predicate).
+        std::fs::write(dir.path().join("checkpoint.json"), b"primary").unwrap();
+        std::fs::write(dir.path().join("checkpoint.json.restored"), b"restored").unwrap();
+        std::fs::write(dir.path().join("checkpoint.json.corrupt"), b"corrupt").unwrap();
+        std::fs::write(dir.path().join("other.txt"), b"unrelated").unwrap();
+
+        // Age gate: with the real 1h threshold the just-created tmps are fresh (like a concurrent
+        // agentd's live in-flight tmp) and must SURVIVE — this is the FIX B protection.
+        store.sweep_stale_tmp_with(std::time::Duration::from_secs(3600));
+        assert!(orphan1.exists(), "fresh tmp survives the age gate (concurrent-live protection)");
+        assert!(orphan2.exists(), "fresh tmp survives the age gate");
+
+        // Name predicate: threshold 0 → the orphan tmps are swept, non-`.tmp` siblings are NOT.
+        store.sweep_stale_tmp_with(std::time::Duration::ZERO);
+        assert!(!orphan1.exists(), "orphaned tmp swept");
+        assert!(!orphan2.exists(), "second orphaned tmp swept");
+        assert!(dir.path().join("checkpoint.json").exists(), "primary NOT swept");
+        assert!(dir.path().join("checkpoint.json.restored").exists(), ".restored NOT swept");
+        assert!(dir.path().join("checkpoint.json.corrupt").exists(), ".corrupt NOT swept");
+        assert!(dir.path().join("other.txt").exists(), "unrelated file NOT swept");
     }
 
     #[test]

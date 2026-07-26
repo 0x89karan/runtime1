@@ -3,6 +3,29 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.109.0] - 2026-07-26
+
+### Fixed
+- **p3.1 — scheduler no longer aborts the whole runtime on a missing-agent effect (audit86-P3-3).**
+  The `EffectResult` handling used `state.agents.get(&id).expect(...)` (and bare `[&id]` indexing) in
+  both the inference and tools arms; under `panic = "abort"`, a future path that removed an agent
+  mid-effect would kill the entire runtime. Every production agent-map access there is now a
+  `let Some(..) else { record an Error event; continue }` (SetCaps returns `Err`) — a missing agent is
+  recorded and skipped, never panics ("the loop never panics on bad input"). A /review catch fixed a
+  subtlety in the mechanical conversion: the inference arm's shared `drain_deferred` is now run
+  unconditionally (via a labeled block) so a slot-deferred agent is still admitted when the result's
+  agent vanished — otherwise, under `max_concurrent_inferences = 1`, a deferred agent could strand.
+- **p3.1 — crash-orphaned checkpoint tmp files are swept (audit86-P3-5).** `save()` writes
+  `checkpoint.json.{pid}.{nanos}.tmp` then renames; a crash between the two leaked the tmp forever.
+  `load()` now sweeps stale sibling tmp files, matching only `checkpoint.json.*.tmp` and only when older
+  than 60s (so it can't disturb a concurrent instance's in-flight tmp).
+
+### Not done (recorded)
+- **audit86-P3-4 (checkpoint `FORMAT_VERSION` bump) struck as a do-not-do.** Bumping would make an old
+  binary refuse a new checkpoint on rollback and discard CoS state; the code already documents that
+  staying at 4 is deliberate (the added fields are additive `#[serde(default)]`, so both directions are
+  already safe). Only bump for a genuinely breaking, non-additive schema change.
+
 ## [v0.108.0] - 2026-07-26
 
 ### Documentation
