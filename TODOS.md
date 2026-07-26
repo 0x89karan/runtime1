@@ -364,12 +364,8 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   secrets file). Char-boundary truncation helper. → `sec.2`/`cap.3`.
 - **audit86-P3-2 (P3) [new] — `oauth_mcp.py:733` interpolates a raw exception** into the error
   response; sibling `:422` correctly scrubs to `type(exc).__name__`. Latent leak channel.
-- **audit86-P3-3 (P3) [new] — `.expect` on EffectResult agent lookup** (`scheduler.rs:687,724`)
-  holds today but `panic = "abort"` in release makes any future break (e.g. a `Kill` command)
-  whole-runtime death. Defensive `let Some(..) else { record; continue }`.
-- **audit86-P3-4 (P3) [new] — cred.7 added `credential_health` without a FORMAT_VERSION bump**
-  (`checkpoint.rs:148`; violates CONVENTIONS:225-226) — silent downgrade drop. Bump to 5 in
-  the next checkpoint-touching PR (`run.1`).
+- ~~**audit86-P3-3 (P3) [new] — `.expect` on EffectResult agent lookup** (`scheduler.rs:687,724`)~~ **[FIXED in p3.1 (v0.109.0): every production agent-map access in BOTH EffectResult arms (not just the `.expect`s — the `[&id]` indexing panics too) is now a `let Some(..) else { record EventKind::Error(site,agent) ; continue/fall-through }`; SetCaps returns `Err`. /review caught + fixed a subtlety: the inference arm's shared `drain_deferred` was restructured OUTSIDE the agent guard (a labeled `'agent:` block) so a slot-deferred agent is still admitted when the result-agent vanished — else a `max_concurrent_inferences=1` deferred agent would strand. Structurally panic-free; effect loop is inline in `select!` so no focused unit seam.]**
+- ~~**audit86-P3-4 (P3) [new] — cred.7 added `credential_health` without a FORMAT_VERSION bump**~~ **[STRUCK as a DO-NOT-DO (p3.1 verification, 2026-07-26): the audit item conflicts with a sound documented decision. `checkpoint.rs:16-23` deliberately stays at 4 because every added field (incl. `credential_health`, already `#[serde(default)]` "Absent in v1–v4 → empty") is PURELY ADDITIVE, so both directions are already safe. Bumping to 5 would make an OLD binary refuse a NEW checkpoint on ROLLBACK (`format_version > FORMAT_VERSION` → rename corrupt → DISCARD all CoS state) — the exact data loss that decision fights. The "silent downgrade drop" the audit feared is graceful degradation (an old binary loses transient cred-health awareness), NOT corruption. Only bump for a genuinely BREAKING non-additive schema change.]**
 - **audit86-P3-5 (P3) [new] — Misc single-source gaps:** crash-orphaned `checkpoint.json.*.tmp`
   never swept (`checkpoint.rs:172-179`); `docker/cockpit.toml` lacks the `[memory]` eviction
   block both cos configs have; port 7999 duplicated across ~10 files (`config.rs:222` is the

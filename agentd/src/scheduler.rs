@@ -865,75 +865,108 @@ impl Scheduler {
                             state.in_flight -= 1;
                             let new_tokens =
                                 u64::from(resp.input_tokens) + u64::from(resp.output_tokens);
-                            let priority = state.agents[&agent_id].priority();
-                            // Provide response, step, then drain mailbox.
-                            // Draining mailbox AFTER step ensures injected messages are
-                            // appended after the assistant turn that was just pushed,
-                            // preserving correct message ordering (F-005).
-                            state
-                                .agents
-                                .get_mut(&agent_id)
-                                .expect("agent_id in EffectResult must be present in agents map")
-                                .provide_inference(resp, &recorder);
-                            let (effect, turn) = {
-                                let sm = state
-                                    .agents
-                                    .get_mut(&agent_id)
-                                    .expect("agent_id must still be present after provide_inference");
-                                let t = sm.turn();
-                                (sm.step(&recorder), t)
+                            // P3-3 (audit86): do the agent-specific work if the agent is present;
+                            // record + skip it if the agent was removed mid-effect. The agent IS
+                            // present today (this result was dispatched from its own step in a
+                            // single-threaded loop) — this is defensive future-proofing so a
+                            // remove-mid-effect under `panic = "abort"` can't abort the runtime.
+                            // CRITICAL (P3-3 /review): the shared `drain_deferred` below MUST run on
+                            // BOTH paths — `in_flight` was decremented above, so a slot-deferred
+                            // agent has to be admitted into the freed slot even if THIS agent vanished.
+                            let to_enqueue = 'agent: {
+                                let Some(sm) = state.agents.get_mut(&agent_id) else {
+                                    recorder.record(&agent_id, None, EventKind::Error,
+                                        json!({ "error": "effect_agent_missing", "site": "inference.provide", "agent": &agent_id }));
+                                    break 'agent None;
+                                };
+                                let priority = sm.priority();
+                                // Provide response, then step. Draining mailbox AFTER step keeps
+                                // injected messages after the assistant turn just pushed (F-005).
+                                sm.provide_inference(resp, &recorder);
+                                let (effect, turn) = {
+                                    let Some(sm) = state.agents.get_mut(&agent_id) else {
+                                        recorder.record(&agent_id, None, EventKind::Error,
+                                            json!({ "error": "effect_agent_missing", "site": "inference.step", "agent": &agent_id }));
+                                        break 'agent None;
+                                    };
+                                    let t = sm.turn();
+                                    (sm.step(&recorder), t)
+                                };
+                                drain_mailbox(&agent_id, &mut state, &recorder);
+                                state.tokens_spent = state.tokens_spent.saturating_add(new_tokens);
+                                // budget.1 / P2-2: republish native lifetime so the egress
+                                // proxy's global window reflects this spend immediately.
+                                state.publish_budget();
+                                let Some(cap_set) = state.agents.get(&agent_id).map(|a| a.cap_set_cloned()) else {
+                                    recorder.record(&agent_id, None, EventKind::Error,
+                                        json!({ "error": "effect_agent_missing", "site": "inference.capset", "agent": &agent_id }));
+                                    break 'agent None;
+                                };
+                                Some((effect, turn, priority, cap_set))
                             };
-                            drain_mailbox(&agent_id, &mut state, &recorder);
-                            state.tokens_spent = state.tokens_spent.saturating_add(new_tokens);
-                            // budget.1 / P2-2: republish native lifetime so the egress
-                            // proxy's global window reflects this spend immediately.
-                            state.publish_budget();
-                            let cap_set = state.agents[&agent_id].cap_set_cloned();
+                            // Shared post-inference cleanup — runs regardless of the agent's fate.
                             // Drain deferred agents first (they were waiting for a slot to open),
-                            // then re-enqueue the completing agent's next step. This gives queued
-                            // agents priority over the agent that just ran — intentional fairness policy.
+                            // then re-enqueue the completing agent's next step IF it survived. This
+                            // gives queued agents priority over the agent that just ran (fairness).
                             drain_deferred(&mut state, &sched, &gateway, &registry, &recorder);
-                            enqueue_or_defer(
-                                effect,
-                                agent_id,
-                                turn,
-                                priority,
-                                cap_set,
-                                &mut state,
-                                &sched,
-                                &gateway,
-                                &registry,
-                                &recorder,
-                            );
+                            if let Some((effect, turn, priority, cap_set)) = to_enqueue {
+                                enqueue_or_defer(
+                                    effect,
+                                    agent_id,
+                                    turn,
+                                    priority,
+                                    cap_set,
+                                    &mut state,
+                                    &sched,
+                                    &gateway,
+                                    &registry,
+                                    &recorder,
+                                );
+                            }
                             update_snapshot(&snapshot, &state);
                         }
                         EffectResult::Tools { agent_id, results } => {
-                            let priority = state.agents[&agent_id].priority();
                             // Provide tool results, then drain mailbox before next step.
-                            state
-                                .agents
-                                .get_mut(&agent_id)
-                                .expect("agent_id in EffectResult must be present in agents map")
-                                .provide_tool_results(results, &recorder);
+                            // P3-3 (audit86): never PANIC on a missing agent — record + skip.
+                            let priority = {
+                                let Some(sm) = state.agents.get_mut(&agent_id) else {
+                                    recorder.record(&agent_id, None, EventKind::Error,
+                                        json!({ "error": "effect_agent_missing", "site": "tools.provide", "agent": &agent_id }));
+                                    update_snapshot(&snapshot, &state);
+                                    continue;
+                                };
+                                let p = sm.priority();
+                                sm.provide_tool_results(results, &recorder);
+                                p
+                            };
                             drain_mailbox(&agent_id, &mut state, &recorder);
 
-                            // Periodic checkpoint at clean turn boundary (best-effort).
+                            // Periodic checkpoint at clean turn boundary (best-effort). A missing
+                            // agent here just skips the checkpoint (never panics).
                             if interval > 0 {
-                                let agent_turn = state.agents[&agent_id].turn();
-                                if agent_turn.is_multiple_of(interval) {
-                                    checkpoint_all(&store, &state, &recorder).await;
+                                if let Some(agent_turn) = state.agents.get(&agent_id).map(|a| a.turn()) {
+                                    if agent_turn.is_multiple_of(interval) {
+                                        checkpoint_all(&store, &state, &recorder).await;
+                                    }
                                 }
                             }
 
                             let (effect, turn) = {
-                                let sm = state
-                                    .agents
-                                    .get_mut(&agent_id)
-                                    .expect("agent_id must still be present after drain_mailbox");
+                                let Some(sm) = state.agents.get_mut(&agent_id) else {
+                                    recorder.record(&agent_id, None, EventKind::Error,
+                                        json!({ "error": "effect_agent_missing", "site": "tools.step", "agent": &agent_id }));
+                                    update_snapshot(&snapshot, &state);
+                                    continue;
+                                };
                                 let t = sm.turn();
                                 (sm.step(&recorder), t)
                             };
-                            let cap_set = state.agents[&agent_id].cap_set_cloned();
+                            let Some(cap_set) = state.agents.get(&agent_id).map(|a| a.cap_set_cloned()) else {
+                                recorder.record(&agent_id, None, EventKind::Error,
+                                    json!({ "error": "effect_agent_missing", "site": "tools.capset", "agent": &agent_id }));
+                                update_snapshot(&snapshot, &state);
+                                continue;
+                            };
                             enqueue_or_defer(
                                 effect,
                                 agent_id,
@@ -2865,13 +2898,19 @@ fn dispatch_control_command(
                     } else {
                         let new_specs = registry.filtered_specs(Some(capabilities.as_slice()));
                         let old_caps = current_caps.clone().unwrap_or_default();
-                        let task = state.agents.get_mut(&agent_id).expect("agent present (checked above)");
-                        let old_len = task.set_capabilities(capabilities.clone(), new_specs);
-                        recorder.record(
-                            &agent_id, None, EventKind::CapabilitiesSet,
-                            json!({ "target": &agent_id, "old": old_caps, "new": &capabilities }),
-                        );
-                        Ok((old_len, capabilities.len()))
+                        // P3-3 (audit86): "checked above", but never PANIC — the agent could have
+                        // terminated between the check and here; return an error instead of aborting.
+                        match state.agents.get_mut(&agent_id) {
+                            Some(task) => {
+                                let old_len = task.set_capabilities(capabilities.clone(), new_specs);
+                                recorder.record(
+                                    &agent_id, None, EventKind::CapabilitiesSet,
+                                    json!({ "target": &agent_id, "old": old_caps, "new": &capabilities }),
+                                );
+                                Ok((old_len, capabilities.len()))
+                            }
+                            None => Err(format!("agent {agent_id} no longer present when applying SetCaps")),
+                        }
                     }
                 }
             };
