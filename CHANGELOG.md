@@ -3,6 +3,33 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.110.0] - 2026-07-26
+
+### Fixed
+- **doc.1 — audit-tail documentation drift (AUDIT-v0.86 P3-6).** Brought the reference docs current with
+  the code shipped across the AUDIT-v0.97 remediation:
+  - `docs/CONVENTIONS.md` — added the 8 event kinds emitted since the taxonomy table was last touched
+    (`capabilities_resolved`, `agent_spawn_denied`, `capabilities_set`, `budget_set`, `budget_reset`,
+    `agent_cancelled`, `runs_unavailable`, `brief_written`) and the FUSE-surface rows for the files added
+    since p5.7 (`windowed_spend`, `tools`, `parent`, `sandbox`, `credentials`, `attention`, `/agents/control`,
+    the `/agents/system/*` pseudofiles). Corrected the status-value row (`awaiting_approval`, not
+    `awaiting_approval:<id>` — only `awaiting_child` carries the id) and rewrote the inode-allocation
+    guidance to the real scheme (`OFF_*` on a `DIR_STEP = 20` stride, invariant `OFF_* < DIR_STEP - 1`;
+    global pseudofiles use explicit low static inodes `INO_KB=9 … INO_SYS_CREDENTIALS=19`).
+  - `docs/THREAT_MODEL.md` — §1.2 rewritten for the credential broker (the gateway holds the raw secret;
+    the sidecar gets only per-request brokered access — a refreshed short-lived bearer for `oauth-bearer`,
+    an injected configured key for `api-key-header`/`api-key-query`) plus the honest `passenv` fallback;
+    §5.2 corrected (`cargo audit` **is** in CI); version pointer made version-agnostic.
+  - `docs/RUNBOOK.md` / `docs/cos-guide.html` — Brave/passenv fix + `mcp_tool_called` → `tool_call`.
+
+### Added
+- **doc.1 — `agentd/tests/conventions_completeness.rs`.** Every `EventKind::ALL` value must appear in the
+  CONVENTIONS event-taxonomy **table** — the check is scoped to that table's rows (not a whole-doc
+  substring match), so a kind documented only in prose no longer false-passes table drift. A drift guard
+  for the reference docs, matching the existing par.1 as_str/ALL guards.
+- **doc.1 — `docker/cockpit.toml [memory]` block** (config P3-5 sub-item): explicit `max_entries_per_segment`
+  / `max_entry_age_days` / `store_path` so the flagship's memory bounds are config-owned, not defaulted.
+
 ## [v0.109.0] - 2026-07-26
 
 ### Fixed

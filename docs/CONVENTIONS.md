@@ -135,6 +135,14 @@ Phase 0 kinds (canonical — do not rename):
 | `orchestrator_turn_complete` | orchestrated agent completed a turn and parked, awaiting next inject (agent_id, answer) (orch.1+) |
 | `orchestrator_exited` | orchestrated agent exited; typically because the target agent was not found (agent_id, reason) (orch.1+) |
 | `isolation_probed` | device-level isolation capabilities probed at startup (tier, arch, runsc: path\|null, landlock: bool, seccomp: bool) (ma.4+) |
+| `capabilities_resolved` | effective capability set computed once at boot from the shared `tier_legality` resolver; descriptive, enforcement unchanged (kind: "agent"\|"mcp_server", name, enforced: [str], inert: [{cap, reason}]) (cap.1+) |
+| `agent_spawn_denied` | a spawn was rejected because the child requested a capability not covered by the parent's set — fail-closed, reject not clamp (cap.2+) |
+| `capabilities_set` | operator narrowed an agent's capabilities at runtime (ux.13 SetCaps) |
+| `budget_set` | operator set a per-agent token budget at runtime (ux.11a SetBudget) |
+| `budget_reset` | budget window rolled over / operator reset the spend window (ux.8′+) |
+| `agent_cancelled` | operator cancelled an agent at runtime; emitted once per cancelled node, including cascaded children (cause: "cascade from <parent>") (ux.13+) |
+| `runs_unavailable` | runs.redb could not be opened; run history unavailable this boot (hint, error) (ux.11b+) |
+| `brief_written` | CoS published a morning brief, authored deterministically from runs.redb (agent_id, brief_id, window_from, window_to, run_count, failed_count, spend_total) (ux.11c+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it
@@ -211,20 +219,34 @@ Each agent appears as a directory; memory and KB surfaces appeared in p5.7.
 
 | Path | Content | Format | Notes |
 |---|---|---|---|
-| `/agents/<id>/status` | agent lifecycle state | `running` \| `waiting` \| `deferred` \| `awaiting_child:<id>` \| `awaiting_approval:<id>` \| `done` \| `failed` | `waiting` = orchestrated agent parked between turns (orch.1+) |
+| `/agents/<id>/status` | agent lifecycle state | `running` \| `waiting` \| `deferred` \| `awaiting_child:<id>` \| `awaiting_approval` \| `done` \| `failed` | `waiting` = orchestrated agent parked between turns (orch.1+) |
 | `/agents/<id>/context_size` | token count | integer | |
 | `/agents/<id>/budget` | token budget | integer or `unlimited` | |
+| `/agents/<id>/windowed_spend` | spend within the current budget window | integer | ux.11a+ |
 | `/agents/<id>/flight` | recent flight events for this agent | JSONL tail (last 20 lines) | |
-| `/agents/<id>/memory/short_term` | in-context conversation previews | one `t{n} {role}: {preview}` per line, ≤20 entries | absent if no memory store configured |
+| `/agents/<id>/memory/short_term` | in-context conversation previews | one `t{n} {role}: {preview}` per line, ≤20 entries | `(empty)` if none; absent if no memory store configured |
 | `/agents/<id>/memory/long_term/<key>` | per-agent Tier-3 KB entry | raw JSON value + provenance | key is nanosecond timestamp; ≤100 keys shown |
-| `/agents/kb/<segment>/<key>` | shared KB segment entry | raw JSON value + provenance | agent-namespaced entries (`agent/…`) excluded; ≤100 keys per segment |
-| `/agents/approvals` | all pending approval requests (all agents) | JSONL one `PendingActionView` JSON per line; `[]\n` when empty (p7.4+) | read-only; write approvals/rejections via `/agents/control` |
+| `/agents/<id>/tools` | tools available to this agent | one tool name per line, or a none-sentinel | |
+| `/agents/<id>/parent` | spawning parent agent id | id, or `(none)` for a root agent | |
+| `/agents/<id>/sandbox` | per-agent sandbox rules | JSON | |
 | `/agents/<id>/tier` | agent tier | `native` or `universal` (p7.6+) | |
 | `/agents/<id>/pid` | OS process ID of universal-tier child | integer, or `(none)` for native agents (p7.6+) | |
+| `/agents/<id>/credentials` | per-agent credential grant | JSON — providers, request/denied counts (cred.5+) | |
+| `/agents/<id>/attention` | active attention signals | JSON (ux.2a+) | |
+| `/agents/kb/<segment>/<key>` | shared KB segment entry | raw JSON value + provenance | agent-namespaced entries (`agent/…`) excluded; ≤100 keys per segment |
+| `/agents/approvals` | all pending approval requests (all agents) | JSONL one `PendingActionView` JSON per line; `[]\n` when empty (p7.4+) | read-only; write approvals/rejections via `/agents/control` |
+| `/agents/control` | **write-only** control channel | `echo '{"task":"…"}' > /agents/control` — spawn/inject/approve verbs (p7.3+) | the only writable node in the surface |
+| `/agents/system/budget` | global budget window state | text | |
+| `/agents/system/queue` | scheduler queue depth | text | |
+| `/agents/system/sandbox` | active sandbox enforcement summary | text | |
+| `/agents/system/provider` | inference provider health | text | |
+| `/agents/system/egress_addr` | bound HTTP egress-proxy URL | URL or `not configured` (p7.5b+) | |
+| `/agents/system/isolation` | device-level isolation tier | JSON (ma.4+) | |
+| `/agents/system/credentials` | credential-gateway health + per-provider status | JSON (cred.5+) | |
 
 Silent truncation: directories with more than 100 entries show the first 100 (no overflow marker). An ENTRIES index per segment (NAMESPACES table) is deferred to p5.8.
 
-When adding a new virtual file to an agent directory, assign it the next inode offset in `agents_fs.rs` (`+8`, `+9`, …) and add a row to this table in the same PR.
+Inode allocation (`agents_fs.rs`): per-agent files are addressed by a fixed `OFF_*` offset added to that agent directory's base inode, on a `DIR_STEP = 20` stride per agent. Offsets `1..=15` are consumed today (`OFF_STATUS` … `OFF_WINDOWED_SPEND`), so a new per-agent file takes the next free offset and **must satisfy the code invariant `OFF_* < DIR_STEP - 1`** (i.e. offset ≤ 18 — compile-time `const _` asserts in `agents_fs.rs` enforce this; `DIR_STEP - 1` leaves the top slot unused as a guard against colliding with the next agent's directory). Global/system pseudofiles instead use the low static inodes, assigned explicitly, not via `OFF_*`: `INO_KB = 9`, `INO_SYSTEM = 10` (the `/agents/system/` dir), `INO_SYS_BUDGET/QUEUE/SANDBOX/PROVIDER = 11–14`, `INO_CONTROL = 15`, `INO_APPROVALS = 16`, then `INO_SYS_EGRESS_ADDR/ISOLATION/CREDENTIALS = 17–19`. A new global file takes the next free static inode. When you add either kind, add a row to this table in the same PR.
 
 ## Checkpoint FORMAT_VERSION migration policy
 

@@ -24,27 +24,45 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.109.0 (shipped 2026-07-26)
+**Current version:** v0.110.0 (shipped 2026-07-26)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** budget.1 (v0.102.0) — **metering completeness** (5th AUDIT-v0.97 increment).
-**P2-2:** universal-tier inference (via the HTTP egress proxy) was excluded from the global $/token
-window — now one shared `EgressProxy`/`GlobalBudgetMeter` folds universal spend into the window
-(`(native−native_anchor) + (universal−universal_anchor)`, separate anchors so restart stays consistent)
-and pre-forward-rejects on global exhaustion, so "cognition is bounded" holds across BOTH tiers.
-**MaxTokens self-brick** (reopened P0-2): gated on `!budget_resettable` so a resident agent parks
-instead of bricking. **universal-cancel** (ux.13 gap): Cancel now reaches universal agents (flag →
-async drain deregisters the egress key); the loop polls control while universal agents are live.
-Codex review caught + fixed 2 (cancel-starvation, restart-suppression). **Sweep remaining:** par.1/2 → P3.
-**Prior (AUDIT-v0.97 sweep):** ci.2 (v0.101.0) test blind-spots (P2-8 packaging guard, P2-7 broker
-happy-path, P2-11 in-image sidecar tests). cap.4 (v0.100.0) auth-consistency — whole-surface gate +
-deny-by-default `/spawn` (P2-3) + tool_override KB scoping (P2-5). run.1 (v0.99.0) durability (P1-2/P1-3/
-P2-6/P2-9). audit.2 (v0.98.0) — arm64 python (P1-1), checkpoint `.restored` (P2-1), ux.13 resurrection
-(P2-4). Full audit: `docs/AUDIT-v0.97.md`.
-**Prior:** ux.13 (v0.97.0) — control verbs, final increment of the "trust after absence" cockpit
-reshape (ux.8′→ux.11→ux.12→ux.13). ux.12 (v0.96.0) — Telegram reach.
-**After the sweep:** the UX tail (ux.2b/ux.3/ux.10 — the last picks up the deferred ux.13 cancel-key),
+**Latest shipped:** doc.1 (v0.110.0) — audit-tail doc-drift fix (P3-6): CONVENTIONS event-taxonomy +
+FUSE-surface tables brought current + a new `conventions_completeness` test that fails on event-table
+drift (scoped to the taxonomy table, not whole-doc), THREAT_MODEL §1.2/§5.2 corrected for the broker +
+CI cargo-audit, RUNBOOK/cos-guide passenv fixes, `cockpit.toml [memory]` block added. /review (Codex)
+caught its own drift — the first inode-guidance rewrite was wrong (real invariant `OFF_* < DIR_STEP - 1`)
+and the completeness test was substring-weak; both fixed. (p3.1 v0.109.0 is TAGGED + deployed.)
+
+**AUDIT-v0.97 remediation — COMPLETE** (sweep + tail, v0.98.0→v0.109.0). Full audit: `docs/AUDIT-v0.97.md`.
+Every increment ran plan→build→review→qa→ship; a holistic cross-model /review + per-increment /autoplan
+reshaped scope in both directions (killed 2 over-scoped refactors, upgraded 1, struck 1 audit item as
+a data-loss do-not-do).
+- **Sweep stack** (v0.98–0.103): audit.2 (arm64 python, checkpoint `.restored`, ux.13 resurrection),
+  run.1 (durability: flight rotation, `short_term` cap, cron catch-up, runs retention), cap.4
+  (auth-consistency: whole-surface :7999 gate + deny-by-default `/spawn` + tool_override KB scoping),
+  ci.2 (test blind-spots), budget.1 (metering completeness — universal spend folded into the global
+  window + MaxTokens self-brick guard + universal-cancel), par.1 (drift guards). The holistic /review
+  then fixed 2 escaped defects (FsRead `/spawn` exfil → privileged; checkpoint corrupt-primary →
+  `.restored` fallback).
+- **par.2** — config-unification RESHAPED to docs-only (`${VAR}` expansion can't express the deliberate +
+  test-pinned structural Docker/QEMU config divergence).
+- **hardening.1** (v0.104.0) — test+safety batch + unbroke `main`'s docker-smoke (ci.2 in-image oauth
+  fixture escaped bug).
+- **Behavioral:** par.1-ar-01 (v0.105.0) operator error view surfaces real tool/inference errors;
+  budget.1-ar-01 (v0.106.0) MaxTokens truncation role-gate — one-shot fails, resident still parks (P0-2
+  preserved) via a new `AgentEffect::CompletedTruncated`.
+- **Design cluster:** cap.3 (v0.107.0) FS-capability matching anchored to startup CWD + closed a p5.8
+  boot containment hole; budget.1-ar-02 (v0.108.0, P-doc) universal soft-cap documented honestly
+  (reservation deferred — dormant path, single-tenant spend guardrail).
+- **P3 tail:** p3.1 (v0.109.0) scheduler never aborts on a missing-agent effect + orphaned-checkpoint-tmp
+  sweep. (audit86-P3-4 struck: bumping FORMAT_VERSION would cause rollback data-loss.)
+
+**Remaining audit tail** (low-priority cleanup): par.3 (`agent)`-mode sed retirement — the risky config
+refactor, autoplan separately), config P3-5 residual (port-7999 shared constant — low-value dedup).
+
+**Next (roadmap):** the UX tail — ux.2b/ux.3/ux.10 (the last picks up the deferred ux.13 cancel-key),
 then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
 
 Full per-increment completion notes: `docs/STATUS.md`.

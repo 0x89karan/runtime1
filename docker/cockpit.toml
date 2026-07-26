@@ -17,3 +17,12 @@ allow_empty_agents = true
 
 [management]
 enabled = true
+
+# Bounded memory store for agents spawned into the cockpit (agentctl watch's Spawn
+# view). Cockpit declares no agents itself, but spawned agents inherit this store;
+# the eviction bounds mirror cos.agents.toml so KB growth is capped either way.
+[memory]
+enabled    = true
+store_path = "/data/memory.redb"
+max_entries_per_segment = 500
+max_entry_age_days      = 90
