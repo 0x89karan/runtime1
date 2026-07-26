@@ -24,16 +24,19 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.110.0 (shipped 2026-07-26)
+**Current version:** v0.111.0 (shipped 2026-07-26)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** doc.1 (v0.110.0) — audit-tail doc-drift fix (P3-6): CONVENTIONS event-taxonomy +
-FUSE-surface tables brought current + a new `conventions_completeness` test that fails on event-table
-drift (scoped to the taxonomy table, not whole-doc), THREAT_MODEL §1.2/§5.2 corrected for the broker +
-CI cargo-audit, RUNBOOK/cos-guide passenv fixes, `cockpit.toml [memory]` block added. /review (Codex)
-caught its own drift — the first inode-guidance rewrite was wrong (real invariant `OFF_* < DIR_STEP - 1`)
-and the completeness test was substring-weak; both fixed. (p3.1 v0.109.0 is TAGGED + deployed.)
+**Latest shipped:** ux.2b (v0.111.0) — Idle + Error attention signals, closes cos-ux-01 (first of the UX
+tail). Two `AttentionReason` variants on ux.2a's substrate. Idle is computed READ-TIME
+(`AgentSnapshot::idle_signal` merged at the FUSE + HTTP surfaces, NOT at snapshot build — a build-time
+computation freezes in the hung-tool wedge it catches); `last_event_at` stamped once at `enqueue_or_defer`,
+a runtime-only `Instant` re-seeded on restore; allowlist `status==Running`; Error scoped to tool-errors on
+a still-running agent + auto-clear, centralized in `provide_tool_results`. /autoplan reshaped the mechanism
+(both eng voices caught the draft would ship broken); /review (Codex) then caught synthetic-tool-error
+bypass + universal stale-idle. The landmine-guard test enforces read-time by construction. (doc.1 v0.110.0
++ p3.1 v0.109.0 TAGGED + deployed.)
 
 **AUDIT-v0.97 remediation — COMPLETE** (sweep + tail, v0.98.0→v0.109.0). Full audit: `docs/AUDIT-v0.97.md`.
 Every increment ran plan→build→review→qa→ship; a holistic cross-model /review + per-increment /autoplan
@@ -66,8 +69,9 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** the UX tail — ux.2b/ux.3/ux.10 (the last picks up the deferred ux.13 cancel-key),
-then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
+**Next (roadmap):** the UX tail continues — **ux.3** (spawn-on-the-fly, closes p7.3-ar-02) → **ux.10**
+(TUI polish); each gets its own draft → /autoplan → build → /review → /qa → /ship (ux.2b done). Then
+evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 
