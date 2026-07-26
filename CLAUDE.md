@@ -24,19 +24,21 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.111.0 (shipped 2026-07-26)
+**Current version:** v0.112.0 (shipped 2026-07-27)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.2b (v0.111.0) — Idle + Error attention signals, closes cos-ux-01 (first of the UX
-tail). Two `AttentionReason` variants on ux.2a's substrate. Idle is computed READ-TIME
-(`AgentSnapshot::idle_signal` merged at the FUSE + HTTP surfaces, NOT at snapshot build — a build-time
-computation freezes in the hung-tool wedge it catches); `last_event_at` stamped once at `enqueue_or_defer`,
-a runtime-only `Instant` re-seeded on restore; allowlist `status==Running`; Error scoped to tool-errors on
-a still-running agent + auto-clear, centralized in `provide_tool_results`. /autoplan reshaped the mechanism
-(both eng voices caught the draft would ship broken); /review (Codex) then caught synthetic-tool-error
-bypass + universal stale-idle. The landmine-guard test enforces read-time by construction. (doc.1 v0.110.0
-+ p3.1 v0.109.0 TAGGED + deployed.)
+**Latest shipped:** ux.3 (v0.112.0) — spawn custom agents on the fly over HTTP (addresses the p7.3-ar-02
+cluster, 2nd of the UX tail). The `agentctl watch` Spawn view now sends the operator's toggled capabilities +
+priority into a running instance via `POST /api/v1/spawn` (the client `SpawnRequest` was silently dropping
+them); one shared resolver makes preview == spawn; routing is inline (matches approve/converse), FUSE
+unchanged; sticky `pending_focus` auto-drops into the new agent. /autoplan reshaped it (preview/spawn
+diverged, an API-key gate would block remote HTTP, focus race); /review (Codex) killed a fabricated-agent_id
+that would pin focus forever. Closes the TUI Spawn-view gap; the CLI-subcommand exec stays a P3 residual.
+
+**UX tail so far:** ux.2b (v0.111.0) idle+error attention (closes cos-ux-01) → ux.3 (v0.112.0, this).
+Next: ux.10 (TUI polish). (v0.109.0/0.110.0/0.111.0 are the doc.1/p3.1-era releases; none tagged past
+v0.109.0 — tags are a manual gate.)
 
 **AUDIT-v0.97 remediation — COMPLETE** (sweep + tail, v0.98.0→v0.109.0). Full audit: `docs/AUDIT-v0.97.md`.
 Every increment ran plan→build→review→qa→ship; a holistic cross-model /review + per-increment /autoplan
@@ -69,9 +71,10 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** the UX tail continues — **ux.3** (spawn-on-the-fly, closes p7.3-ar-02) → **ux.10**
-(TUI polish); each gets its own draft → /autoplan → build → /review → /qa → /ship (ux.2b done). Then
-evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
+**Next (roadmap):** the UX tail's last core item — **ux.10** (TUI polish: `[g]` Logs view + tui-input/
+tui-textarea + color-eyre panic hook); its own draft → /autoplan → build → /review → /qa → /ship (ux.2b +
+ux.3 done). Then ux.3b (`:` palette + modal) + evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9
+eBPF remain the two end-of-queue tracks.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 
