@@ -59,8 +59,12 @@ a data-loss do-not-do).
 - **P3 tail:** p3.1 (v0.109.0) scheduler never aborts on a missing-agent effect + orphaned-checkpoint-tmp
   sweep. (audit86-P3-4 struck: bumping FORMAT_VERSION would cause rollback data-loss.)
 
-**Remaining audit tail** (low-priority cleanup): par.3 (`agent)`-mode sed retirement — the risky config
-refactor, autoplan separately), config P3-5 residual (port-7999 shared constant — low-value dedup).
+**Audit tail — effectively closed.** par.3 (`agent)`-mode sed retirement) **DEFERRED at its /autoplan
+premise gate** (2026-07-26): both CEO voices ranked it below the UX tail with zero user value (Codex STRIKE);
+the guard "blind spot" that might have justified a cheap hardening was code-verified as overstated
+(`entrypoint.sh:369`'s audit.1 ERE already fails the boot closed on a surviving installed-absolute path).
+The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
+Only residual: port-7999 shared constant (trivial low-value config dedup).
 
 **Next (roadmap):** the UX tail — ux.2b/ux.3/ux.10 (the last picks up the deferred ux.13 cancel-key),
 then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
