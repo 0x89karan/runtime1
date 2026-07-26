@@ -1290,13 +1290,17 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 - Fix path: move the `child_seq` increment to after the collision guard, or generate the ID
   without incrementing (probe loop). Deferred — not worth restructuring the lock for this.
 
-**p7.3-ar-02 (P3) — `agentctl spawn` CLI execs a second agentd instead of using /agents/control**
-- The `agentctl spawn <template> --task "…"` CLI path always execs a new agentd binary,
-  even when an agentd scheduler is already running with the FUSE surface mounted.
-- Correct fix: detect `/agents/control` exists → write JSON there → print confirmation.
-  `execute_pending_spawn()` already implements this logic in the TUI watch path; extract
-  it as a shared helper so both the TUI and CLI spawn paths route correctly.
-- Deferred; tracked in memory as p7.3-cli-revisit. Implement before p8.
+**p7.3-ar-02 (P3) — PARTIALLY addressed by ux.3 (spawn-on-the-fly); CLI-subcommand residual still OPEN**
+- **Done (ux.3, the higher-value part):** the `agentctl watch` Spawn view now routes the interactive spawn
+  INLINE through `DataSource::spawn()` → `POST /api/v1/spawn` when the active source is HTTP
+  (`event_stream_url().is_some()`), so a spawn lands in the already-running scheduler and carries the
+  operator's toggled `capabilities` + `priority` (the client `SpawnRequest` was silently dropping both —
+  the load-bearing fix). FUSE mode still writes `/agents/control` via `execute_pending_spawn()`.
+- **Still open (the LITERAL p7.3-ar-02):** the standalone `agentctl spawn <template> --task "…"` **CLI
+  subcommand** still execs a second agentd instead of detecting a running instance and routing to it. ux.3
+  did NOT touch that path. Low value (operators drive spawns through `agentctl watch` / the management API,
+  not the one-shot CLI), so this residual stays a P3 nit — do only if a running-instance CLI route is
+  actually wanted; the extract-shared-helper approach from the original entry still applies.
 
 ## Phase 7 — Open (deferred from p7.2 review)
 

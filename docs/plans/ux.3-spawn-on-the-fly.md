@@ -59,7 +59,7 @@ and `HttpSource::spawn()` all exist — this closes the wiring gap and stops sil
 - **D1 — client `capabilities` type.** Mirror the server `Vec<Capability>` (share the type if agentctl can
   depend on it) vs. carry `serde_json::Value`/`Vec<String>` and let the server parse. Recommend: whatever the
   cap-toggle UI already produces for the preview — reuse it, don't reshape (DRY). Confirm the preview payload
-  and the `/api/v1/spawn` body are byte-identical so "what you preview is what you spawn."
+  and the `/api/v1/spawn` body are semantically identical (same fields+values) so "what you preview is what you spawn."
 - **D2 — where the HTTP-vs-FUSE routing decision lives.** `execute_pending_spawn` currently takes a
   `&Path` (FUSE mountpoint). Routing through `DataSource::spawn()` means it needs the active `DataSource`
   (or a `spawn` closure). Decide: thread the `DataSource` in, vs. branch at the caller and only call

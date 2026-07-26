@@ -386,6 +386,10 @@ pub fn dispatch(
             id:           Some(agent_id.to_string()),
             max_turns:    Some(max_turns),
             token_budget: None,
+            // The chat rail never restricts caps (unchanged from pre-ux.3): None is omitted
+            // via skip_serializing_if, so the wire body is identical to before.
+            priority:     None,
+            capabilities: None,
             orchestrated: true,
         };
         source.spawn(&req)
