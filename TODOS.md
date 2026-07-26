@@ -402,14 +402,23 @@ direction. Claude adversarial pass was SOUND on all 5 focus areas; Codex caught 
   so the recoverable path gates on "resident+parked", not the global window flag — do NOT just revert the
   self-brick fix (reopens audit86-P0-2). Minimum honest interim: mark the completion `truncated:true` so the
   parent isn't misled. → future increment.
-- **budget.1-ar-02 (P3) [new; Codex High + Claude INVESTIGATE, both agree bounded] — universal-tier global
-  ceiling is a soft cap under concurrency.** `egress.rs:479` reads `meter.windowed()` pre-forward but
-  `add_universal` runs post-response (`:591`), and the check isn't atomic with the forward (unlike the
-  per-workload budget's `AcqRel fetch_update` at `:585`). N concurrent universal requests at `windowed ==
-  ceiling−ε` all pass, overshooting by up to `(N−1)×max_tokens`. This is the SAME post-hoc metering shape the
-  native tier already has (not a budget.1 regression); the "cognition is bounded" invariant still holds
-  asymptotically (the next request 429s). Real hard-cap fix = reservation-before-forward (reserve `max_tokens`
-  + input estimate, reconcile on response) across both tiers. → cap.3 / a metering-hardening increment.
+- ~~**budget.1-ar-02 (P3) [new; Codex High + Claude INVESTIGATE, both agree bounded] — universal-tier global
+  ceiling is a soft cap under concurrency.**~~ **[RESOLVED as P-doc in budget.1-ar-02 (v0.108.0), 2026-07-26
+  /autoplan — both review voices said DON'T build reservation machinery, and corrected the premise: (1) the
+  overshoot is NOT `(N−1)×max_tokens` with N≤3 — `max_concurrent_inferences` gates only the native in-process
+  tier; the egress proxy's accept loop is an unbounded `tokio::spawn` per connection, so proxy N is unbounded;
+  (2) the whole surface is DORMANT in prod — cos ships no `tier="universal"` agents and no `[egress] proxy_addr`,
+  so `main.rs` never starts the proxy; (3) a universal-only reservation CANNOT make the combined (native+universal)
+  ceiling hard — the native term stays post-hoc regardless — so P-fix can't achieve its own goal without also
+  reserving the native scheduler path (much bigger). The window is a single-tenant SPEND GUARDRAIL, not a
+  security boundary (constitutional #2); the native tier has the identical pre-check/post-account shape unfixed;
+  "cognition is bounded" holds asymptotically. **Done:** the `egress.rs` gate comment now documents the accepted
+  post-hoc soft-cap semantics honestly, and `global_budget_meter_is_a_posthoc_soft_cap` pins the REAL bound (429
+  on the next request once `windowed >= ceiling`), NOT the false `N×max_tokens` bound. **Follow-up (filed, gated
+  on universal fan-out actually being enabled in prod):** if a hard cap is ever needed, add (a) a proxy-side
+  concurrency semaphore (the real latent hole for future universal configs) and (b) reservation-before-forward
+  on BOTH tiers, with an RAII release-guard capturing the actual-deducted amount (the `saturating_sub` phantom-
+  budget trap) and covering the failure early-returns at egress.rs :499/:539/:552 + await-cancellation.]**
 - **run.1-ar-01 (P3) [new; testing-specialist, holistic review] — durability fixes are helper-tested, not
   call-site-tested.** Three run.1 fixes assert the helper in isolation but not the wiring that invokes it, so
   deleting the call site leaves every test green while the bug returns: `runs/store.rs:309` `close_segment →

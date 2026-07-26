@@ -3,6 +3,22 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.108.0] - 2026-07-26
+
+### Documentation
+- **budget.1-ar-02 — the universal-tier global ceiling is a post-hoc SOFT cap, now documented honestly
+  (not "fixed").** Both /autoplan review voices corrected the premise and recommended against building
+  reservation machinery: the overshoot is not bounded by `max_concurrent_inferences` (that gates only
+  the native in-process tier; the egress proxy accept loop is an unbounded `tokio::spawn` per
+  connection), the whole surface is dormant in prod (cos ships no `universal` agents and no
+  `[egress] proxy_addr`, so the proxy never starts), and a universal-only reservation can't make the
+  *combined* native+universal ceiling hard anyway. The window is a single-tenant spend guardrail (not a
+  security boundary) with the same shape as the native gate. The `egress.rs` pre-forward gate comment now
+  states this accurately, and a new test (`global_budget_meter_is_a_posthoc_soft_cap`) pins the real
+  bound — the tier 429s on the *next* request once `windowed >= ceiling` — instead of the false
+  `N×max_tokens` bound. A hard cap (proxy concurrency semaphore + both-tier reservation) is filed as a
+  follow-up gated on universal fan-out actually being enabled in prod.
+
 ## [v0.107.0] - 2026-07-25
 
 ### Fixed
