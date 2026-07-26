@@ -265,8 +265,13 @@ name = "brave"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-brave-search"]
 capabilities = [ { Net = { hosts = ["api.search.brave.com"], ports = [443] } } ]
-# the server reads BRAVE_API_KEY from ITS env — set it where you launch agentd
+passenv = ["BRAVE_API_KEY"]   # REQUIRED — see note below
 ```
+The server reads `BRAVE_API_KEY` from **its** environment, but agentd spawns every MCP
+subprocess with `env_clear()` (THREAT_MODEL §1.3), so merely exporting it where you launch
+agentd does **nothing** — the child never inherits it. You must forward it explicitly via
+the server's `passenv` allowlist (as above); then set `BRAVE_API_KEY` in agentd's env before
+starting. Each forwarded var is recorded in an `mcp_passenv_forwarded` flight event.
 `Net { ports = [443] }` → Landlock V4 confines outbound to TCP 443 **on kernel ≥ 6.7**.
 On **< 6.7** it falls back to a deny-all network namespace with a `tracing::warn!` (p4.7
 fix for AUDIT F-002 / THREAT_MODEL §6.2 BP-4) — meaning **the search server will have no

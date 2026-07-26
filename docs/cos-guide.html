@@ -870,7 +870,7 @@
       <li><strong><code>agentctl watch</code> can't connect:</strong> confirm the container is running with <code>-p 127.0.0.1:7999:7999</code> — older invocations without this flag won't expose the port. Verify with <code>curl -s http://localhost:7999/healthz</code>.</li>
       <li><strong>Chat rail sends a message but the reply never appears:</strong> you're likely connected via <code>--agents-dir /agents</code> (FUSE) instead of <code>--url http://localhost:7999</code> — the chat rail needs the management API's streaming connection, which FUSE mode doesn't provide. After ~30s you'll see an inline "No response after 30s" hint; reconnect with <code>--url</code> as shown in step 07.</li>
       <li><strong>Browser shows <code>ERR_CONNECTION_REFUSED</code> during auth:</strong> port <code>8585</code> was already in use. Re-run with <code>--port &lt;free-port&gt;</code> — Desktop app clients accept any loopback port automatically.</li>
-      <li><strong>No brief after a few minutes:</strong> check the cron fired — <code>docker compose exec cos jq 'select(.kind=="mcp_tool_called")' /data/flight.jsonl | tail</code>.</li>
+      <li><strong>No brief after a few minutes:</strong> check the cron fired — <code>docker compose exec cos jq 'select(.kind=="tool_call")' /data/flight.jsonl | tail</code>.</li>
       <li><strong>Logs &amp; receipts:</strong> the flight log and evidence chain live in the container at <code>/data</code> (the <code>cos-data</code> volume). Inspect with <code>docker compose exec cos jq . /data/flight.jsonl</code>; verify the signed action-receipt chain with <code>docker compose exec cos agentctl verify /data/evidence.jsonl</code>.</li>
     </ul>
   </div>

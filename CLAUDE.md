@@ -24,11 +24,16 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.109.0 (shipped 2026-07-26)
+**Current version:** v0.110.0 (shipped 2026-07-26)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** p3.1 (v0.109.0) — agentd runtime-safety batch. **v0.109.0 is TAGGED + deployed.**
+**Latest shipped:** doc.1 (v0.110.0) — audit-tail doc-drift fix (P3-6): CONVENTIONS event-taxonomy +
+FUSE-surface tables brought current + a new `conventions_completeness` test that fails on event-table
+drift (scoped to the taxonomy table, not whole-doc), THREAT_MODEL §1.2/§5.2 corrected for the broker +
+CI cargo-audit, RUNBOOK/cos-guide passenv fixes, `cockpit.toml [memory]` block added. /review (Codex)
+caught its own drift — the first inode-guidance rewrite was wrong (real invariant `OFF_* < DIR_STEP - 1`)
+and the completeness test was substring-weak; both fixed. (p3.1 v0.109.0 is TAGGED + deployed.)
 
 **AUDIT-v0.97 remediation — COMPLETE** (sweep + tail, v0.98.0→v0.109.0). Full audit: `docs/AUDIT-v0.97.md`.
 Every increment ran plan→build→review→qa→ship; a holistic cross-model /review + per-increment /autoplan
@@ -54,9 +59,8 @@ a data-loss do-not-do).
 - **P3 tail:** p3.1 (v0.109.0) scheduler never aborts on a missing-agent effect + orphaned-checkpoint-tmp
   sweep. (audit86-P3-4 struck: bumping FORMAT_VERSION would cause rollback data-loss.)
 
-**Remaining audit tail** (low-priority cleanup): par.3 (`agent)`-mode sed retirement), doc.1 (P3-6 doc
-drift + CONVENTIONS-completeness test), config P3-5 sub-items (port-7999 shared constant,
-`cockpit.toml [memory]` block).
+**Remaining audit tail** (low-priority cleanup): par.3 (`agent)`-mode sed retirement — the risky config
+refactor, autoplan separately), config P3-5 residual (port-7999 shared constant — low-value dedup).
 
 **Next (roadmap):** the UX tail — ux.2b/ux.3/ux.10 (the last picks up the deferred ux.13 cancel-key),
 then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.

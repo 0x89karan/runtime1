@@ -1,8 +1,10 @@
 # AgentOS / agentd Threat Model
 
 This document enumerates the security boundaries, threats, controls, and known
-limitations of the `agentd` runtime as of v0.62.0 (cred.3.2). It is the operator
-reference for understanding what the sandbox stops, what it doesn't, and why.
+limitations of the `agentd` runtime. It is the operator reference for
+understanding what the sandbox stops, what it doesn't, and why. Individual
+controls note the increment that introduced them; this document tracks `main`
+(the credential broker landed in cred.3.x–cred.6 — see §1.2).
 
 ---
 
@@ -50,9 +52,23 @@ the Anthropic console and a new one set in the environment.
 
 ### 1.2 Other secrets
 
-There are no other credentials in the current codebase. MCP servers that need
-their own credentials receive them via their own environment (configured at the OS
-level, not by agentd).
+Two paths carry non-`ANTHROPIC_API_KEY` credentials:
+
+- **Credential broker (cred.3.x–cred.6, preferred).** First-party MCP servers hold
+  **no raw credential at rest**: agentd's `CredentialGateway` holds the raw secret
+  and hands the server only per-request brokered access, never the secret itself.
+  What that access is depends on the provider's `auth_style` (`agentd/src/config.rs`):
+  for `oauth-bearer` the gateway refreshes and injects a short-lived bearer (the
+  flagship CoS / `google_oauth` path); for `api-key-header` / `api-key-query` the
+  gateway injects a **configured** API key into the outbound request (that key is
+  long-lived, but it still lives only in the gateway, not in the sidecar).
+- **Raw-env `passenv` (ecosystem fallback).** An unmodified third-party MCP server
+  that expects a credential in its own environment gets it via the server's explicit
+  `passenv` allowlist — agentd forwards named vars into the otherwise `env_clear()`ed
+  subprocess (§1.3) and records an `mcp_passenv_forwarded` event. This forfeits the
+  broker's audit/rotation/scoping; migrating ecosystem servers to the broker is
+  tracked (AUDIT-v0.86 dim-10 / eco.1). Forwarding is allowlisted and blocklisted
+  (`PASSENV_BLOCKLIST`) so `ANTHROPIC_API_KEY` and friends can never be forwarded.
 
 ### 1.3 MCP subprocess environment isolation
 
@@ -204,13 +220,14 @@ security incidents.
 
 ### 5.2 CVE scanning
 
-**Known gap:** `cargo audit` is not installed and CVE scanning is not part of CI.
-This means a known-vulnerable transitive dependency would not be caught
-automatically. Mitigations:
+CVE scanning **is** part of CI: the `audit` job (`.github/workflows/ci.yml`)
+installs `cargo-audit` and runs `cargo audit` on every push and PR, so a
+known-vulnerable transitive dependency fails the build. Complementary mitigations:
 
 - `cargo update` is run before each release to pull patch-level fixes.
-- Dependabot or a scheduled `cargo audit` job should be added to CI in a future
-  increment.
+- **Residual gap:** the `audit` job runs on the default schedule only (push/PR),
+  not on a nightly cron, so a CVE disclosed against an unchanged dependency between
+  commits is caught at the next push rather than immediately.
 
 ### 5.3 Binary verification
 
