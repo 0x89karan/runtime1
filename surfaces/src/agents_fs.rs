@@ -476,7 +476,17 @@ impl AgentsFs {
             }
             OFF_ATTENTION => {
                 // ux.2a: active attention signals as a JSON array (empty array = clean).
-                let json = serde_json::to_string(&agent.attention).unwrap_or_else(|_| "[]".to_string());
+                // ux.2b: Idle is computed READ-TIME here (not at snapshot build) against the
+                // reader's clock, so it advances between reads without a new scheduler snapshot.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let mut signals = agent.attention.clone();
+                if let Some(idle) = agent.idle_signal(now, crate::snapshot::IDLE_THRESHOLD_SECS) {
+                    signals.push(idle);
+                }
+                let json = serde_json::to_string(&signals).unwrap_or_else(|_| "[]".to_string());
                 format!("{json}\n").into_bytes()
             }
             // OFF_MEMORY_DIR and OFF_LONG_TERM_DIR are directories — not served here.
@@ -1500,6 +1510,9 @@ mod tests {
             credential_denied_counts:  std::collections::HashMap::new(),
             credential_last_access_at: std::collections::HashMap::new(),
             attention:                 vec![],
+            // Far-future anchor → never idle in these fixtures (idle is exercised directly in
+            // snapshot.rs's idle_signal tests + the FUSE idle test below with a real old anchor).
+            last_event_at_unix:        u64::MAX,
         }
     }
 

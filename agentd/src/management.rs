@@ -235,13 +235,24 @@ async fn route(
 
         (Method::GET, "/api/v1/snapshot") => {
             // Clone snapshot under read lock, serialize after releasing.
-            let snap = {
+            let mut snap = {
                 let guard = match state.snapshot.read() {
                     Ok(g) => g,
                     Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "snapshot lock poisoned"),
                 };
                 guard.clone()
             };
+            // ux.2b: merge the READ-TIME Idle signal per agent against the reader's clock, so
+            // idle advances between polls without a new scheduler snapshot (mirrors FUSE).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for agent in &mut snap.agents {
+                if let Some(idle) = agent.idle_signal(now, surfaces::IDLE_THRESHOLD_SECS) {
+                    agent.attention.push(idle);
+                }
+            }
             match serde_json::to_value(&snap) {
                 Ok(v) => json_response(StatusCode::OK, v),
                 Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -1009,6 +1020,7 @@ mod tests {
         snap.agents.push(AgentSnapshot {
             id: "a1".to_string(),
             attention: vec![],
+            last_event_at_unix: u64::MAX,
             status: AgentStatus::Running,
             turn: 2,
             context_tokens: 100,
@@ -1042,6 +1054,7 @@ mod tests {
         snap.agents.push(AgentSnapshot {
             id: "a2".to_string(),
             attention: vec![],
+            last_event_at_unix: u64::MAX,
             status: AgentStatus::AwaitingChild("child-1".to_string()),
             turn: 1,
             context_tokens: 0,
@@ -1284,6 +1297,7 @@ mod tests {
         snap.agents.push(AgentSnapshot {
             id: "done-agent".to_string(),
             attention: vec![],
+            last_event_at_unix: u64::MAX,
             status: AgentStatus::Done,
             turn: 5,
             context_tokens: 0,

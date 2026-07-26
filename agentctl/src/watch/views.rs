@@ -128,11 +128,16 @@ fn secs_ago(since: u64) -> u64 {
 /// Codex both independently caught this for the missing-API-key case).
 fn age_display(sig: &reader::AttentionSignal) -> String {
     match sig.reason {
-        reader::AttentionReason::BudgetRisk | reader::AttentionReason::EvaluationUnavailable => {
-            "active".to_string()
-        }
+        // Recomputed-onset signals stamp `since: now` every tick (no tracked onset) — render
+        // "active", never a misleading "0s ago". `Error` (ux.2b) joins these.
+        reader::AttentionReason::BudgetRisk
+        | reader::AttentionReason::EvaluationUnavailable
+        | reader::AttentionReason::Error => "active".to_string(),
         reader::AttentionReason::Degraded if sig.since == 0 => "active".to_string(),
-        reader::AttentionReason::ApprovalPending | reader::AttentionReason::Degraded => {
+        // `Idle` (ux.2b) carries a REAL onset (last_event_at), so its elapsed time is meaningful.
+        reader::AttentionReason::ApprovalPending
+        | reader::AttentionReason::Degraded
+        | reader::AttentionReason::Idle => {
             format!("{}s ago", secs_ago(sig.since))
         }
     }

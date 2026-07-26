@@ -160,18 +160,25 @@ pub struct SchedulerSnapshot {
 ///
 /// Declaration order is also tie-break/routing-priority order (highest first): a row with
 /// both `ApprovalPending` and `Degraded` active always resolves ties toward `ApprovalPending`.
-/// `Error` and `Idle` are deferred to a follow-on increment ("ux.2b") — their prerequisite
-/// fields don't exist on `AgentTask` yet; adding them later is additive (new enum variants),
-/// not a redesign of this one.
+/// `Error` (ux.2b) sits above `BudgetRisk` — a tool error the operator can act on outranks a
+/// budget warning — and `Idle` (ux.2b) is last: least urgent, a "went quiet" liveness hint.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionReason {
     ApprovalPending,
     Degraded,
+    /// A tool call returned an error while the agent kept running (ux.2b). Inference errors
+    /// terminate the agent (→ `Failed` status), so they never surface here; this is the
+    /// "tool errored, agent is still going" case, auto-cleared on the next all-ok tool batch.
+    Error,
     BudgetRisk,
     /// A signal source itself couldn't be read this cycle (e.g. the credential gateway
     /// snapshot was unavailable) — never silently rendered as "clean," always its own signal.
     EvaluationUnavailable,
+    /// No completed progress event in `IDLE_THRESHOLD_SECS` (ux.2b). Computed READ-TIME from
+    /// the carried `last_event_at_unix` (see `AgentSnapshot::idle_signal`), never at snapshot
+    /// build — a build-time computation would freeze in the exact hung-tool wedge this catches.
+    Idle,
 }
 
 /// Row-color severity — a SEPARATE axis from routing priority (`AttentionReason`'s declaration
@@ -191,8 +198,10 @@ impl AttentionReason {
         match self {
             AttentionReason::ApprovalPending       => AttentionSeverity::Info,
             AttentionReason::Degraded              => AttentionSeverity::Critical,
+            AttentionReason::Error                 => AttentionSeverity::Critical,
             AttentionReason::BudgetRisk             => AttentionSeverity::Warning,
             AttentionReason::EvaluationUnavailable => AttentionSeverity::Warning,
+            AttentionReason::Idle                  => AttentionSeverity::Warning,
         }
     }
 
@@ -203,8 +212,10 @@ impl AttentionReason {
         match self {
             AttentionReason::ApprovalPending       => "approval pending",
             AttentionReason::Degraded              => "degraded",
+            AttentionReason::Error                 => "error",
             AttentionReason::BudgetRisk             => "budget risk",
             AttentionReason::EvaluationUnavailable => "evaluation unavailable",
+            AttentionReason::Idle                  => "idle",
         }
     }
 }
@@ -270,6 +281,39 @@ pub struct AgentSnapshot {
     /// Active attention signals (ux.2a) — empty means "evaluated, clean," NOT "not evaluated."
     /// See `AttentionReason::EvaluationUnavailable` for the "couldn't tell" case.
     pub attention: Vec<AttentionSignal>,
+    /// Unix seconds of this agent's last completed progress event (ux.2b), derived at snapshot
+    /// build from the runtime-only `AgentTask.last_event_at` monotonic clock. The `Idle` signal
+    /// is computed READ-TIME from this by `idle_signal`, so it advances between reads without a
+    /// new snapshot (0 for universal-tier agents, which are never idle-evaluated).
+    pub last_event_at_unix: u64,
+}
+
+/// Default seconds of no completed progress event before an agent flags `Idle` (ux.2b). A
+/// tool/inference legitimately running longer than this DOES flag — intended: an operator wants
+/// to see a tool hanging for minutes (the cos-ux-01 wedge). Read-time only; tune here.
+pub const IDLE_THRESHOLD_SECS: u64 = 180;
+
+impl AgentSnapshot {
+    /// READ-TIME `Idle` signal: `Some` when this agent is `Running` and has had no completed
+    /// progress event for more than `threshold_secs` as measured against the reader's `now_unix`.
+    /// Computed per read (not at snapshot build) so idle is never frozen at the last snapshot —
+    /// the load-bearing correctness property for the hung-tool wedge (ux.2b M1). The allowlist is
+    /// `Running` only: every parked status (`Waiting`/`Deferred`/`AwaitingChild`/`AwaitingApproval`)
+    /// is intentionally quiet, and terminal (`Done`/`Failed`) agents aren't "wedged."
+    pub fn idle_signal(&self, now_unix: u64, threshold_secs: u64) -> Option<AttentionSignal> {
+        if self.status != AgentStatus::Running {
+            return None;
+        }
+        if now_unix.saturating_sub(self.last_event_at_unix) > threshold_secs {
+            Some(AttentionSignal {
+                reason:   AttentionReason::Idle,
+                since:    self.last_event_at_unix,
+                evidence: None,
+            })
+        } else {
+            None
+        }
+    }
 }
 
 /// Manual Serialize: emits `status` as the flat string from `as_str()` (matching the FUSE
@@ -287,7 +331,7 @@ impl Serialize for AgentSnapshot {
             AgentStatus::AwaitingChild(s) | AgentStatus::AwaitingApproval(s) => Some(s.as_str()),
             _ => None,
         };
-        let field_count = 19 + usize::from(detail.is_some());
+        let field_count = 20 + usize::from(detail.is_some());
         let mut s = ser.serialize_struct("AgentSnapshot", field_count)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("status", self.status.as_str())?;
@@ -311,6 +355,7 @@ impl Serialize for AgentSnapshot {
         s.serialize_field("credential_denied_counts", &self.credential_denied_counts)?;
         s.serialize_field("credential_last_access_at", &self.credential_last_access_at)?;
         s.serialize_field("attention", &self.attention)?;
+        s.serialize_field("last_event_at_unix", &self.last_event_at_unix)?;
         s.end()
     }
 }
@@ -340,5 +385,82 @@ impl AgentStatus {
             AgentStatus::Done                  => "done",
             AgentStatus::Failed                => "failed",
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Minimal AgentSnapshot for exercising `idle_signal` in isolation.
+    fn snap(status: AgentStatus, last_event_at_unix: u64) -> AgentSnapshot {
+        AgentSnapshot {
+            id: "a".into(), status, turn: 0, context_tokens: 0, token_budget: 0,
+            windowed_spent: 0, task_preview: String::new(), tools: vec![],
+            short_term_previews: vec![], parent_id: None, accessible_server_names: vec![],
+            capabilities_unrestricted: false, tier: None, pid: None,
+            credential_providers: vec![], credential_request_counts: HashMap::new(),
+            credential_denied_counts: HashMap::new(), credential_last_access_at: HashMap::new(),
+            attention: vec![], last_event_at_unix,
+        }
+    }
+
+    /// THE LANDMINE GUARD (ux.2b M1): idle is computed READ-TIME from a carried anchor. Advancing
+    /// `now` on the SAME snapshot flips Idle on — provable only because idle is NOT baked at build.
+    /// If idle were computed inside `derive_attention` with an internal clock, this test could not
+    /// be written (you cannot advance `now` without rebuilding), so its existence enforces the
+    /// read-time architecture.
+    #[test]
+    fn idle_is_read_time_advances_on_same_snapshot() {
+        let t: u64 = 1_000_000;
+        let s = snap(AgentStatus::Running, t);
+        // Just after the last event: not idle.
+        assert!(s.idle_signal(t + 10, 180).is_none(), "10s < 180s threshold must not be idle");
+        // Past the threshold, WITHOUT rebuilding the snapshot: idle appears.
+        let sig = s.idle_signal(t + 200, 180).expect("200s > 180s threshold must be idle");
+        assert_eq!(sig.reason, AttentionReason::Idle);
+        assert_eq!(sig.since, t, "Idle carries the real onset (last_event_at), not now");
+    }
+
+    /// Idle allowlist is `Running` ONLY (ux.2b M4): every parked/terminal status is intentionally
+    /// quiet and must never false-read Idle, even far past the threshold.
+    #[test]
+    fn idle_suppressed_for_every_non_running_status() {
+        let t: u64 = 1_000_000;
+        let far = t + 10_000; // way past any threshold
+        for status in [
+            AgentStatus::Waiting,
+            AgentStatus::Deferred,
+            AgentStatus::AwaitingChild("c".into()),
+            AgentStatus::AwaitingApproval("act_1".into()),
+            AgentStatus::Done,
+            AgentStatus::Failed,
+        ] {
+            let label = status.as_str().to_string();
+            assert!(
+                snap(status, t).idle_signal(far, 180).is_none(),
+                "status {label} must never read Idle",
+            );
+        }
+        // Control: Running with the same age DOES read Idle.
+        assert!(snap(AgentStatus::Running, t).idle_signal(far, 180).is_some());
+    }
+
+    /// Routing precedence is declaration order (`Ord`): ApprovalPending wins ties, Error outranks
+    /// BudgetRisk, and Idle is last. agentctl picks the top signal by `min` over this order, so the
+    /// order here is load-bearing (ux.2b placed Error above BudgetRisk, Idle last).
+    #[test]
+    fn attention_reason_routing_order() {
+        use AttentionReason::*;
+        assert!(ApprovalPending < Degraded);
+        assert!(Degraded < Error);
+        assert!(Error < BudgetRisk);
+        assert!(BudgetRisk < EvaluationUnavailable);
+        assert!(EvaluationUnavailable < Idle);
+        // The min of a mixed set is the highest-priority reason.
+        let mut set = [Idle, BudgetRisk, Error, ApprovalPending];
+        set.sort();
+        assert_eq!(set[0], ApprovalPending, "ApprovalPending always routes first");
     }
 }

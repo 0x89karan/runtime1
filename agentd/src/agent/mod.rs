@@ -99,6 +99,15 @@ pub struct AgentTask {
     /// Stable 16-hex fingerprint of the initial task (FNV-1a 64-bit, deterministic).
     /// Embedded in Tier-3 provenance via ToolContext; not checkpointed (recomputed on restore).
     task_fp: String,
+    /// Monotonic time of the last completed progress event (ux.2b) — anchors the read-time
+    /// `Idle` attention signal. Runtime-only, NOT checkpointed: re-seeded to now in both `new()`
+    /// and `from_checkpoint()`, exactly like `last_pressure`. A freshly-restored agent hasn't
+    /// acted yet, so it starts fresh and is never instantly idle; `Instant` (not `SystemTime`)
+    /// keeps it immune to wall-clock jumps. Converted to Unix secs at snapshot build.
+    last_event_at: std::time::Instant,
+    /// Latest tool error while the agent kept running (ux.2b) — drives the `Error` attention
+    /// signal; auto-cleared on the next all-ok tool batch. Runtime-only, not checkpointed.
+    last_error: Option<String>,
 }
 
 impl AgentTask {
@@ -132,7 +141,33 @@ impl AgentTask {
             short_term: vec![],
             last_pressure: MemoryPressure::None,
             task_fp: task_fingerprint(task),
+            last_event_at: std::time::Instant::now(),
+            last_error: None,
         }
+    }
+
+    /// ux.2b: stamp a completed progress event. Called at the scheduler's universal effect
+    /// choke point (`enqueue_or_defer`), so every real step refreshes it and a busy agent
+    /// never false-reads `Idle`.
+    pub fn mark_event(&mut self) {
+        self.last_event_at = std::time::Instant::now();
+    }
+
+    /// ux.2b: seconds since the last completed progress event — converted to a Unix-secs
+    /// anchor at snapshot build for the read-time `AgentSnapshot::idle_signal`.
+    pub fn last_event_elapsed_secs(&self) -> u64 {
+        self.last_event_at.elapsed().as_secs()
+    }
+
+    /// ux.2b: record (`Some`) or clear (`None`) the latest tool error that fired while the
+    /// agent kept running — drives the `Error` attention signal.
+    pub fn set_last_error(&mut self, err: Option<String>) {
+        self.last_error = err;
+    }
+
+    /// ux.2b: the latest still-running tool error, if any.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 
     /// Mark whether a scheduler budget-reset window is active (ux.8′ / C1). Set by
@@ -296,6 +331,10 @@ impl AgentTask {
             short_term:      cp.short_term,
             last_pressure:   MemoryPressure::None,
             task_fp:         task_fingerprint(&task_text),
+            // Runtime-only, re-seeded fresh on restore (like last_pressure): a restored agent
+            // hasn't acted yet, so it must not read as idle the instant it comes back (ux.2b).
+            last_event_at:   std::time::Instant::now(),
+            last_error:      None,
         }
     }
 

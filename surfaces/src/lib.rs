@@ -1,7 +1,7 @@
 pub mod agents_fs;
 pub mod snapshot;
 
-pub use snapshot::{AgentSnapshot, AgentStatus, AttentionReason, AttentionSeverity, AttentionSignal, CredentialSnapshot, IsolationCapsSummary, PendingActionView, ProviderHealth, SchedulerSnapshot, SandboxSummary, ServerEnforcement, SharedSnapshot};
+pub use snapshot::{AgentSnapshot, AgentStatus, AttentionReason, AttentionSeverity, AttentionSignal, CredentialSnapshot, IsolationCapsSummary, PendingActionView, ProviderHealth, SchedulerSnapshot, SandboxSummary, ServerEnforcement, SharedSnapshot, IDLE_THRESHOLD_SECS};
 
 /// Opaque write-control callback passed to the FUSE handler.
 ///
