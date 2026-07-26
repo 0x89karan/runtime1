@@ -470,11 +470,26 @@ async fn handle_proxy_request(
         ));
     }
 
-    // 7b. Global-window pre-forward reject (budget.1 / P2-2). The per-workload
-    //     check above bounds each universal agent in isolation; this bounds the
-    //     whole universal tier against the SAME global window as native inference,
-    //     so universal work self-throttles once the combined ceiling is reached
-    //     rather than over-spending up to the sum of every workload's budget.
+    // 7b. Global-window pre-forward reject (budget.1 / P2-2). Bounds the whole universal
+    //     tier against the SAME combined global window as native inference.
+    //
+    //     This is a POST-HOC SOFT cap, by design (budget.1-ar-02 /autoplan, 2026-07-26 —
+    //     both review voices: don't build reservation machinery for this). The window is
+    //     checked HERE before forwarding but spend is added AFTER the response (step 11,
+    //     `add_universal`), so N concurrent proxy requests can each pass this gate while
+    //     `windowed()` is just below the ceiling and then all spend — the window overshoots
+    //     by the sum of the in-flight requests' tokens before the NEXT request 429s. The
+    //     overshoot is NOT runtime-bounded here: the proxy accept loop spawns one task per
+    //     connection with no semaphore, and `max_concurrent_inferences` gates only the native
+    //     in-process tier, not this proxy. That is ACCEPTED — the global window is a
+    //     single-tenant SPEND GUARDRAIL for one operator's wallet (constitutional: mutually-
+    //     trusting agents), not a security/fairness boundary; the native tier has the identical
+    //     pre-check/post-account shape; and "cognition is bounded" holds asymptotically (the
+    //     window converges and the next request rejects). A HARD cap would need reservation-
+    //     before-forward on BOTH tiers — a universal-only reservation leaves the combined
+    //     window soft regardless (the native term stays post-hoc) — filed as a follow-up gated
+    //     on universal fan-out actually being enabled in prod (today cos ships no `universal`
+    //     agents and no `[egress] proxy_addr`, so this proxy never starts in production).
     let meter = state.egress.meter();
     let ceiling = meter.ceiling();
     if ceiling != 0 && meter.windowed() >= ceiling {
@@ -1144,6 +1159,48 @@ mod tests {
         assert_eq!(m.windowed(), 0, "reset zeroes BOTH terms of the window");
         m.add_universal(30);
         assert_eq!(m.windowed(), 30, "post-reset universal spend re-accrues");
+    }
+
+    /// budget.1-ar-02 (/autoplan P-doc): pin the REAL semantics of the global pre-forward
+    /// gate — it is a POST-HOC SOFT cap, not a hard cap. The gate (step 7b in
+    /// `handle_proxy_request`) is exactly `ceiling != 0 && windowed() >= ceiling`; spend is
+    /// added AFTER the response. So: (a) a request ALLOWS while windowed < ceiling and REJECTS
+    /// once windowed reaches it — the tier throttles on the NEXT request after the ceiling is
+    /// crossed; (b) a request that passes just under the ceiling then spends pushes the window
+    /// OVER it (the accepted overshoot). This pins the honest bound; it does NOT assert any
+    /// `N × max_tokens` hard bound (there is none — the proxy has no concurrency semaphore).
+    #[test]
+    fn global_budget_meter_is_a_posthoc_soft_cap() {
+        // Replicates the step-7b gate predicate against a meter with a ceiling.
+        let gate_rejects = |m: &GlobalBudgetMeter| {
+            let c = m.ceiling();
+            c != 0 && m.windowed() >= c
+        };
+        let m = GlobalBudgetMeter::default();
+        m.ceiling.store(1_000, Ordering::Release);
+
+        // Below the ceiling → allow.
+        m.publish(900, 0); // native windowed 900 < 1000
+        assert!(!gate_rejects(&m), "under ceiling: request is admitted");
+
+        // A request admitted at windowed=900 then spends 300 (post-hoc add) → window OVERSHOOTS
+        // to 1200 > 1000. The cap did not prevent the overshoot; it prevents the NEXT request.
+        m.add_universal(300);
+        assert_eq!(m.windowed(), 1_200, "post-hoc spend overshoots the soft ceiling");
+        assert!(gate_rejects(&m), "next request 429s once windowed >= ceiling — the real bound");
+
+        // The gate flips exactly at windowed == ceiling (not before): fresh meter, land on it.
+        let m2 = GlobalBudgetMeter::default();
+        m2.ceiling.store(500, Ordering::Release);
+        m2.add_universal(499);
+        assert!(!gate_rejects(&m2), "windowed 499 < 500 → admit");
+        m2.add_universal(1);
+        assert!(gate_rejects(&m2), "windowed 500 >= 500 → reject");
+
+        // ceiling == 0 means "count but never throttle" — never rejects.
+        let m3 = GlobalBudgetMeter::default(); // ceiling 0
+        m3.add_universal(10_000_000);
+        assert!(!gate_rejects(&m3), "ceiling 0 disables throttling");
     }
 
     #[test]
