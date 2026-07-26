@@ -935,17 +935,9 @@ impl Scheduler {
                                     update_snapshot(&snapshot, &state);
                                     continue;
                                 };
-                                // ux.2b: a tool error while the agent keeps running drives the
-                                // Error attention signal; a clean batch auto-clears it (M5). One
-                                // call sets-or-clears. Inference errors terminate elsewhere and
-                                // never reach here, so this is the only Error source.
-                                let tool_err = results.iter().find_map(|b| match b {
-                                    Block::ToolResult { is_error: true, content, .. } => {
-                                        Some(content.chars().take(160).collect::<String>())
-                                    }
-                                    _ => None,
-                                });
-                                sm.set_last_error(tool_err);
+                                // ux.2b: last_error (→ Error attention) is updated inside
+                                // provide_tool_results, so it covers this async batch AND every
+                                // synthetic reject/error path uniformly (see agent/mod.rs).
                                 let p = sm.priority();
                                 sm.provide_tool_results(results, &recorder);
                                 p
@@ -3420,9 +3412,12 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
                 credential_denied_counts:  HashMap::new(),
                 credential_last_access_at: HashMap::new(),
                 attention:                 vec![],
-                // Universal-tier spend/liveness is proxy-tracked, not event-stamped; anchor to
-                // now so these agents are never idle-evaluated (idle_signal → None at 0 elapsed).
-                last_event_at_unix:        now_unix,
+                // Universal-tier liveness is proxy-tracked, not event-stamped — these agents are
+                // never idle-eligible. `u64::MAX` makes `idle_signal`'s saturating_sub → 0 forever,
+                // so a STALE universal snapshot (>threshold old, e.g. scheduler blocked on native
+                // pending effects) can never false-read Idle. Anchoring to `now_unix` instead would
+                // silently break the moment the snapshot stops refreshing (Codex review finding).
+                last_event_at_unix:        u64::MAX,
             }
         })
         .collect();

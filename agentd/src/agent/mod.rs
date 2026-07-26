@@ -159,12 +159,6 @@ impl AgentTask {
         self.last_event_at.elapsed().as_secs()
     }
 
-    /// ux.2b: record (`Some`) or clear (`None`) the latest tool error that fired while the
-    /// agent kept running — drives the `Error` attention signal.
-    pub fn set_last_error(&mut self, err: Option<String>) {
-        self.last_error = err;
-    }
-
     /// ux.2b: the latest still-running tool error, if any.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
@@ -441,6 +435,20 @@ impl AgentTask {
                 json!({ "stage": "provide_tool_results", "error": "called on terminal task" }),
             );
             return;
+        }
+        // ux.2b: a tool error while the agent keeps running drives the `Error` attention signal;
+        // a clean batch auto-clears it. Centralized HERE (not at the scheduler dispatch site) so
+        // EVERY tool-result path updates it uniformly — the async `EffectResult::Tools` batch AND
+        // every synthetic `is_error` reject block (spawn-denied, run_job reject, approval reject,
+        // send_message failure, no-control approval), all of which funnel through this method. An
+        // empty batch (turn-advance only) leaves the prior error untouched.
+        if !results.is_empty() {
+            self.last_error = results.iter().find_map(|b| match b {
+                Block::ToolResult { is_error: true, content, .. } => {
+                    Some(content.chars().take(160).collect::<String>())
+                }
+                _ => None,
+            });
         }
         recorder.record(
             &self.agent_id,
@@ -1422,6 +1430,34 @@ mod tests {
     }
 
     // ── State-machine unit tests (sync, no network) ───────────────────────────
+
+    #[test]
+    fn provide_tool_results_sets_and_clears_last_error() {
+        // ux.2b: a tool error in the batch → last_error set (drives Error attention); a clean
+        // batch → cleared (auto-clear); an empty batch → left unchanged. Centralizing here means
+        // every synthetic reject/error path (spawn-denied, run_job reject, …) gets it for free.
+        let (rec, _tmp) = recorder();
+        let cfg = agent_cfg(5, 1_000_000);
+        let mut sm = AgentTask::new("err-test", "task", &cfg, &model_cfg(), vec![]);
+        assert_eq!(sm.last_error(), None);
+
+        sm.provide_tool_results(
+            vec![Block::ToolResult { tool_use_id: "t1".into(), content: "boom: refused".into(), is_error: true }],
+            &rec,
+        );
+        assert_eq!(sm.last_error(), Some("boom: refused"), "an is_error result must set last_error");
+
+        // Empty batch leaves it unchanged.
+        sm.provide_tool_results(vec![], &rec);
+        assert_eq!(sm.last_error(), Some("boom: refused"), "an empty batch must not clear last_error");
+
+        // Clean batch auto-clears.
+        sm.provide_tool_results(
+            vec![Block::ToolResult { tool_use_id: "t2".into(), content: "ok".into(), is_error: false }],
+            &rec,
+        );
+        assert_eq!(sm.last_error(), None, "an all-ok batch must clear last_error");
+    }
 
     #[test]
     fn step_machine_text_tool_text_cycle() {

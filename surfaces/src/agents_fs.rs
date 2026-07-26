@@ -1806,6 +1806,34 @@ mod tests {
         assert!(s.contains("turn_end"),   "second valid line must survive non-UTF-8 in flight file");
     }
 
+    #[test]
+    fn attention_file_merges_read_time_idle() {
+        // ux.2b: a Running agent whose last event was at epoch 0 → (wall now − 0) ≫ 180s → Idle
+        // is merged at READ time in file_content_for_ino, even though the stored attention vec is
+        // empty. This proves the FUSE read-surface merge (not just idle_signal in isolation).
+        let snap = make_snap(vec![AgentSnapshot {
+            last_event_at_unix: 0,
+            ..agent_snap("a", AgentStatus::Running)
+        }]);
+        let mut fs = AgentsFs::new(snap, None, None);
+        fs.alloc_dir("a");
+        let dir_ino = fs.dir_inodes["a"];
+        let content = fs.file_content_for_ino(dir_ino + OFF_ATTENTION).expect("attention file");
+        let s = String::from_utf8_lossy(&content);
+        assert!(s.contains("\"idle\""), "read-time Idle must be merged into the FUSE attention file: {s}");
+
+        // A universal-style agent (u64::MAX anchor) is never idle-eligible, even Running + stale.
+        let snap2 = make_snap(vec![AgentSnapshot {
+            last_event_at_unix: u64::MAX,
+            ..agent_snap("b", AgentStatus::Running)
+        }]);
+        let mut fs2 = AgentsFs::new(snap2, None, None);
+        fs2.alloc_dir("b");
+        let dir2 = fs2.dir_inodes["b"];
+        let c2 = fs2.file_content_for_ino(dir2 + OFF_ATTENTION).expect("attention file");
+        assert!(!String::from_utf8_lossy(&c2).contains("idle"), "u64::MAX anchor must never read Idle");
+    }
+
     // ── Memory subtree ────────────────────────────────────────────────────────
 
     #[test]

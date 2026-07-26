@@ -157,9 +157,34 @@ read-time build. Plus: suppression per non-Running status (one assert each), Err
 `classify_attention` picks by `Ord`, not vec position; place `Error` above `BudgetRisk`, `Idle` last in the
 `AttentionReason` declaration; `Error`→Critical, `Idle`→Warning severity).
 
+## /review (Codex adversarial) — outcome (2026-07-26)
+Verdict FIX → two Medium must-fixes applied, one Low deferred as documented:
+- **F1 (fixed) — synthetic tool errors bypassed `last_error`.** The scan lived only in the async
+  `EffectResult::Tools` handler, so synthetic `is_error` reject blocks (spawn-denied, run_job reject,
+  approval reject, send_message failure, no-control approval) never set Error. **Fix:** moved the
+  is_error → set/clear logic INTO `AgentTask::provide_tool_results`, through which ALL tool-result paths
+  (real + synthetic) funnel — one place, uniform. Empty batch leaves the prior error untouched. Test:
+  `provide_tool_results_sets_and_clears_last_error`.
+- **F2 (fixed) — universal-tier false-idle.** Universal snapshots anchored `last_event_at_unix = now_unix`,
+  so a STALE universal snapshot (>threshold, scheduler blocked on native effects) would false-read Idle.
+  **Fix:** anchor `u64::MAX` (saturating_sub → 0 forever, staleness-proof — universal liveness is
+  proxy-tracked, never idle-eligible). Test: `attention_file_merges_read_time_idle` covers the u64::MAX
+  never-idle control.
+- **F3 (deferred, Low) — backward wall-clock jump.** The read-time age uses `now_unix.saturating_sub(anchor)`;
+  a backward system-time step can briefly suppress Idle on a wedged agent until wall time catches up
+  (forward jumps → early Idle). Accepted as a known edge for the simple Unix-anchor: idle is a best-effort
+  liveness hint, NTP steps are small/rare and self-correcting, and the monotonic-read alternative (carry
+  `snapshot_built_at: Instant` + age-at-build) adds real complexity for a rare, non-critical drift. Revisit
+  only if it bites in practice.
+- **Sound-per-area (Codex confirmed):** checkpoint omission (no `last_event_at`/`last_error` serialized,
+  re-seeded on restore), manual `Serialize` field_count 20 matches, allowlist correct, no inference
+  double-signal, multibyte-safe `chars().take(160)`, panic-safe `get_mut` stamp.
+- Added FUSE read-time merge test (`attention_file_merges_read_time_idle`) — Codex's coverage-gap note.
+
 ## NOT in scope
 - ux.3 (spawn-on-the-fly) and ux.10 (TUI polish) — later in the tail.
 - Per-agent busy/in-flight tracking (M6 defines Idle to not need it).
+- Monotonic read-time age machinery (F3) — deferred; the Unix anchor is the explicit-over-clever choice.
 - New attention *reasons* beyond Idle/Error (the enum stays at 6).
 - Reworking the routing-precedence model (ux.2a's severity-vs-routing split stays as-is).
 
