@@ -3,6 +3,29 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.113.0] - 2026-07-27
+
+### Changed
+- **ux.10 (sub-part B) — real input widgets in `agentctl watch`.** The 5 hand-rolled `push(c)`/`pop()`
+  text inputs are now `tui-input` (converse rail, memory search, inspector search, approvals
+  reject-reason) and `tui-textarea` (spawn task field, multi-line) — so the operator gets cursor
+  movement (Left/Right/Home/End/Ctrl-A), word-delete, and bracketed paste instead of end-only append.
+  - Deps pinned exactly (`tui-input = "0.14"` + `tui-textarea = "0.7.0"`) to hold a **single ratatui
+    0.29 / crossterm 0.28** — `tui-input` 0.15 would force a ratatui-0.30 bump and 0.10 would link a
+    second ratatui; both avoided.
+  - `step_key` now threads the full crossterm `KeyEvent` to the 5 focused-input handlers, intercepting
+    `Enter`/`Esc`/`Tab` (+ rail Up/Down) before delegating so per-view semantics survive: converse
+    `Enter`=send (busy-guard + reset preserved), spawn `Tab`=focus-cycle / `Enter`=newline / `[r]`=submit.
+    Every other view keeps its `KeyCode` dispatch unchanged.
+  - Bracketed paste enabled in `TermGuard` (paired disable on both `Drop` and the panic hook); `Event::Paste`
+    routes to the focused widget.
+  - The visible cursor now follows the real edit position — a true terminal cursor in the converse rail
+    (`set_cursor_position` + `visual_scroll`) and a char-boundary-safe glyph at `input.cursor()` in the
+    inline fields (multibyte-tested). Reshaped from the 2026-07-16 plan at `/autoplan` (sync-loop, not tokio;
+    dep pins; spawn Enter/Tab) and the cursor defect caught at `/review`.
+  - **Sub-part A (Logs view)** and **sub-part C (color-eyre, struck as redundant)** are not in this release;
+    A is a separate follow-on (`docs/plans/ux.10-tui-polish.md`).
+
 ## [v0.112.0] - 2026-07-27
 
 ### Added
