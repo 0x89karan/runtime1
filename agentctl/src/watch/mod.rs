@@ -8,11 +8,16 @@ use std::{
 
 use anyhow::Context;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+// ux.10: `tui_input` widgets consume a crossterm `Event`; the `EventHandler` trait provides
+// `Input::handle_event`, and `InputRequest::InsertChar` is used to route bracketed-paste text.
+use tui_input::{backend::crossterm::EventHandler, InputRequest};
 
 pub mod app;
 pub mod approvals;
@@ -158,7 +163,9 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> anyhow::Result<Self> {
         enable_raw_mode().context("enabling raw mode")?;
-        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+        // ux.10: EnableBracketedPaste so a terminal paste arrives as one `Event::Paste`
+        // (routed to the focused input widget) instead of a burst of synthetic keystrokes.
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(anyhow::Error::from(e)).context("entering alternate screen");
         }
@@ -171,7 +178,7 @@ impl TermGuard {
         std::panic::set_hook(Box::new(move |info| {
             if std::thread::current().id() == main_id {
                 let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
             }
             prev(info);
         }));
@@ -181,7 +188,7 @@ impl TermGuard {
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
         // Drop our hook (reinstalls the default) — matches the prior post-loop take_hook().
         let _ = std::panic::take_hook();
     }
@@ -249,6 +256,40 @@ fn on_resize(app: &mut App, w: u16, h: u16) {
     }
 }
 
+/// ux.10: insert bracketed-paste text into a `tui_input::Input` char-by-char.
+/// `tui_input`'s crossterm backend does not translate `Event::Paste` on its own, so
+/// the text is fed as a run of `InsertChar` requests (each respects the cursor position).
+fn insert_paste_into_input(input: &mut tui_input::Input, text: &str) {
+    for c in text.chars() {
+        input.handle(InputRequest::InsertChar(c));
+    }
+}
+
+/// ux.10: route bracketed-paste text to whichever input widget currently has focus.
+/// A no-op for any view/focus that has no active text field (the paste is dropped),
+/// mirroring how a stray keystroke is ignored outside an input.
+fn route_paste(app: &mut App, text: &str) {
+    match app.view {
+        View::Dashboard if app.converse_view.rail_focused => {
+            insert_paste_into_input(&mut app.converse_view.input, text);
+        }
+        View::Spawn if app.spawn_view.focus == SpawnFocus::TaskField => {
+            app.spawn_view.task_input.insert_str(text);
+        }
+        View::Memory if app.memory_view.search_active => {
+            insert_paste_into_input(&mut app.memory_view.search_query, text);
+        }
+        View::Inspector if app.inspector_view.search_active => {
+            insert_paste_into_input(&mut app.inspector_view.search_query, text);
+            app.inspector_view.rebuild_view();
+        }
+        View::Approvals if app.approvals_view.mode == ApprovalsMode::RejectReason => {
+            insert_paste_into_input(&mut app.approvals_view.reject_reason, text);
+        }
+        _ => {}
+    }
+}
+
 /// The single event-pushed render loop (Option B). One bounded channel, two detached
 /// producer threads (snapshot + optional SSE), a 30 ms crossterm key poll, and a
 /// coalesced redraw. Replaces the two prior sync poll-render loops (F9). The render
@@ -297,6 +338,12 @@ fn run_tui_loop(
                 Event::Resize(w, h) => {
                     app.term_size = (w, h);
                     on_resize(app, w, h);
+                    app.dirty = true;
+                }
+                // ux.10: bracketed paste — route the pasted text to whichever input widget
+                // currently has focus, then redraw. Non-focused views ignore it.
+                Event::Paste(text) => {
+                    route_paste(app, &text);
                     app.dirty = true;
                 }
                 _ => {}
@@ -416,7 +463,7 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
     let was_dashboard = app.view == View::Dashboard;
     let rail_was_focused = app.converse_view.rail_focused;
     match app.view {
-        View::Dashboard => handle_dashboard_key(key.code, app, source),
+        View::Dashboard => handle_dashboard_key(key, app, source),
         View::AgentDetail | View::System => {
             if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                 app.view = View::Dashboard;
@@ -430,10 +477,10 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
             KeyCode::Down | KeyCode::Char('j') => app.topology_scroll += 1,
             _ => {}
         },
-        View::Memory => handle_memory_key(key.code, app),
-        View::Spawn => handle_spawn_key(key.code, app, source),
-        View::Inspector => handle_inspector_key(key.code, app),
-        View::Approvals => handle_approvals_key(key.code, app, source),
+        View::Memory => handle_memory_key(key, app),
+        View::Spawn => handle_spawn_key(key, app, source),
+        View::Inspector => handle_inspector_key(key, app),
+        View::Approvals => handle_approvals_key(key, app, source),
         View::Credentials => {
             if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                 app.view = View::Dashboard;
@@ -450,7 +497,8 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
     effects
 }
 
-fn handle_memory_key(code: KeyCode, app: &mut App) {
+fn handle_memory_key(key: KeyEvent, app: &mut App) {
+    let code = key.code;
     match code {
         // Search mode: [/] enters, Esc exits + clears query.
         KeyCode::Char('/') if !app.memory_view.search_active => {
@@ -458,14 +506,13 @@ fn handle_memory_key(code: KeyCode, app: &mut App) {
         }
         KeyCode::Esc if app.memory_view.search_active => {
             app.memory_view.search_active = false;
-            app.memory_view.search_query.clear();
+            app.memory_view.search_query.reset();
         }
-        // Typed characters → query while in search mode.
-        KeyCode::Char(c) if app.memory_view.search_active => {
-            app.memory_view.search_query.push(c);
-        }
-        KeyCode::Backspace if app.memory_view.search_active => {
-            app.memory_view.search_query.pop();
+        // ux.10: while searching, every other key is edited into the tui_input widget
+        // (chars, Backspace, cursor movement, Ctrl-W/U, …). The apply_snapshot tick reads
+        // `search_query.value()` to refilter, so no explicit rebuild is needed here.
+        _ if app.memory_view.search_active => {
+            app.memory_view.search_query.handle_event(&Event::Key(key));
         }
         // Pane cycling (true-tab model — each pane keeps its own scroll).
         KeyCode::Tab if !app.memory_view.search_active => {
@@ -495,7 +542,8 @@ fn handle_memory_key(code: KeyCode, app: &mut App) {
 /// app.spawn_view.focus.clone(); match (&focus, code)`) — focus is read from `App` state
 /// internally, not threaded in by the caller, so `step_key`'s Dashboard call site and
 /// every existing test call site are unaffected by this retrofit's signature.
-fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
+fn handle_dashboard_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
+    let code = key.code;
     let rail_focused = app.converse_view.rail_focused;
 
     // Rail-focused: captures all input (Spawn's TaskField Esc-capture idiom, mod.rs:518-526)
@@ -520,8 +568,12 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
                 if is_busy {
                     return;
                 }
-                let text = std::mem::take(&mut app.converse_view.input);
+                // ux.10: read the tui_input value, then reset() the widget (replacing the
+                // old std::mem::take of a String). Reset happens inside the non-empty
+                // block so an empty Enter is a no-op and the widget state is untouched.
+                let text = app.converse_view.input.value().to_string();
                 if !text.is_empty() {
+                    app.converse_view.input.reset();
                     let state = app.converse_view.targets.entry(target.clone()).or_default();
                     // Optimistic echo: the sent message appears instantly, before the
                     // network round-trip completes (Hour 1 narrative, CEO Step 0E).
@@ -604,13 +656,14 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
                     state.re_follow();
                 }
             }
-            KeyCode::Backspace => {
-                app.converse_view.input.pop();
+            // ux.10: every other key (printable chars, Backspace, Left/Right/Home cursor
+            // movement, Ctrl-W/U word/line edits) is edited into the tui_input widget.
+            // Enter/Esc/Tab/Up/Down/End above are intercepted first so rail semantics
+            // (send / defocus / transcript scroll) survive — see the ux.1 note that
+            // scroll/follow must use non-printable keys only while the rail captures text.
+            _ => {
+                app.converse_view.input.handle_event(&Event::Key(key));
             }
-            KeyCode::Char(c) => {
-                app.converse_view.input.push(c);
-            }
-            _ => {}
         }
         return;
     }
@@ -678,7 +731,7 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
             app.memory_view.long_term_scroll  = 0;
             app.memory_view.kb_scroll         = 0;
             app.memory_view.pane              = MemoryPane::ShortTerm;
-            app.memory_view.search_query.clear();
+            app.memory_view.search_query.reset();
             app.memory_view.search_active     = false;
         }
         KeyCode::Char('n') => {
@@ -703,22 +756,24 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
     }
 }
 
-fn handle_spawn_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
+fn handle_spawn_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
     let focus = app.spawn_view.focus.clone();
+    let code = key.code;
+    // ux.10: the task field is a multi-line tui_textarea. Tab (focus-cycle) and Esc
+    // (defocus) MUST be intercepted BEFORE delegating, or the textarea would swallow
+    // them; every other key — including Enter (=newline) and printable chars like 'r'/'g'
+    // that are spawn/generate shortcuts elsewhere — is edited into the field.
+    if focus == SpawnFocus::TaskField {
+        match code {
+            KeyCode::Tab => app.spawn_view.focus_next(),
+            KeyCode::Esc => app.spawn_view.focus = SpawnFocus::TemplatePicker,
+            _ => {
+                app.spawn_view.task_input.input(Event::Key(key));
+            }
+        }
+        return;
+    }
     match (&focus, code) {
-        // TaskField captures all char input; Esc defocuses, Enter tabs forward.
-        (SpawnFocus::TaskField, KeyCode::Char(c)) => {
-            app.spawn_view.task_input.push(c);
-        }
-        (SpawnFocus::TaskField, KeyCode::Backspace) => {
-            app.spawn_view.task_input.pop();
-        }
-        (SpawnFocus::TaskField, KeyCode::Esc) => {
-            app.spawn_view.focus = SpawnFocus::TemplatePicker;
-        }
-        (SpawnFocus::TaskField, KeyCode::Enter) => {
-            app.spawn_view.focus_next();
-        }
         // Global: Tab cycles focus.
         (_, KeyCode::Tab) => {
             app.spawn_view.focus_next();
@@ -808,7 +863,8 @@ fn do_spawn_action(app: &mut App, source: &dyn DataSource) {
     }
 }
 
-fn handle_inspector_key(code: KeyCode, app: &mut App) {
+fn handle_inspector_key(key: KeyEvent, app: &mut App) {
+    let code = key.code;
     match code {
         // Search mode: [/] enters, Esc exits + clears query.
         KeyCode::Char('/') if !app.inspector_view.search_active => {
@@ -816,15 +872,13 @@ fn handle_inspector_key(code: KeyCode, app: &mut App) {
         }
         KeyCode::Esc if app.inspector_view.search_active => {
             app.inspector_view.search_active = false;
-            app.inspector_view.search_query.clear();
+            app.inspector_view.search_query.reset();
             app.inspector_view.rebuild_view();
         }
-        KeyCode::Char(c) if app.inspector_view.search_active => {
-            app.inspector_view.search_query.push(c);
-            app.inspector_view.rebuild_view();
-        }
-        KeyCode::Backspace if app.inspector_view.search_active => {
-            app.inspector_view.search_query.pop();
+        // ux.10: delegate all other search-mode keys to the tui_input widget, then
+        // rebuild the filtered line list (the Inspector filters eagerly, not per-tick).
+        _ if app.inspector_view.search_active => {
+            app.inspector_view.search_query.handle_event(&Event::Key(key));
             app.inspector_view.rebuild_view();
         }
         // [Tab] cycles the filter.
@@ -867,7 +921,8 @@ fn handle_inspector_key(code: KeyCode, app: &mut App) {
     }
 }
 
-fn handle_approvals_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
+fn handle_approvals_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
+    let code = key.code;
     match app.approvals_view.mode {
         // ── Typing a reject reason ────────────────────────────────────────────
         ApprovalsMode::RejectReason => {
@@ -878,7 +933,7 @@ fn handle_approvals_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
                         app.approvals_items.iter().find(|i| i.id == id).map(|i| i.id.clone())
                     });
                     app.approvals_view.result_msg = if let Some(found_id) = found_id {
-                        let reason = app.approvals_view.reject_reason.clone();
+                        let reason = app.approvals_view.reject_reason.value().to_string();
                         let reason_opt = if reason.is_empty() { None } else { Some(reason.as_str()) };
                         match source.deny(&found_id, reason_opt) {
                             Ok(()) => {
@@ -892,19 +947,16 @@ fn handle_approvals_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
                     };
                     app.approvals_view.mode         = ApprovalsMode::List;
                     app.approvals_view.confirmed_id = None;
-                    app.approvals_view.reject_reason.clear();
+                    app.approvals_view.reject_reason.reset();
                 }
                 KeyCode::Esc => {
                     app.approvals_view.mode = ApprovalsMode::Confirm;
-                    app.approvals_view.reject_reason.clear();
+                    app.approvals_view.reject_reason.reset();
                 }
-                KeyCode::Char(c) => {
-                    app.approvals_view.reject_reason.push(c);
+                // ux.10: all other keys edit the tui_input reject-reason field.
+                _ => {
+                    app.approvals_view.reject_reason.handle_event(&Event::Key(key));
                 }
-                KeyCode::Backspace => {
-                    app.approvals_view.reject_reason.pop();
-                }
-                _ => {}
             }
         }
 
@@ -952,7 +1004,7 @@ fn handle_approvals_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
                 }
                 KeyCode::Char('r') => {
                     app.approvals_view.mode = ApprovalsMode::RejectReason;
-                    app.approvals_view.reject_reason.clear();
+                    app.approvals_view.reject_reason.reset();
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     app.approvals_view.mode         = ApprovalsMode::List;
@@ -1068,11 +1120,12 @@ fn execute_pending_spawn(agents_dir: &Path, pending: PendingSpawn) -> anyhow::Re
 mod tests {
     use std::path::PathBuf;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
         do_spawn_action, drain_events, handle_approvals_key, handle_dashboard_key,
-        handle_memory_key, handle_spawn_key, on_resize, step, step_key, App, Effect, View,
+        handle_inspector_key, handle_memory_key, handle_spawn_key, on_resize, route_paste, step,
+        step_key, App, Effect, View,
     };
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
@@ -1162,7 +1215,7 @@ mod tests {
     #[test]
     fn dashboard_key_down_arrow_advances_selection() {
         let mut app = app_with_agents(&["a", "b", "c"]);
-        handle_dashboard_key(KeyCode::Down, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &TestSource);
 
         assert_eq!(app.selected_id.as_deref(), Some("b"));
     }
@@ -1170,7 +1223,7 @@ mod tests {
     #[test]
     fn dashboard_key_j_advances_selection() {
         let mut app = app_with_agents(&["a", "b"]);
-        handle_dashboard_key(KeyCode::Char('j'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('j')), &mut app, &TestSource);
         assert_eq!(app.selected_id.as_deref(), Some("b"));
     }
 
@@ -1178,7 +1231,7 @@ mod tests {
     fn dashboard_key_up_arrow_decrements_selection() {
         let mut app = app_with_agents(&["a", "b", "c"]);
         app.selected_id = Some("b".to_string());
-        handle_dashboard_key(KeyCode::Up, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Up), &mut app, &TestSource);
 
         assert_eq!(app.selected_id.as_deref(), Some("a"));
     }
@@ -1187,7 +1240,7 @@ mod tests {
     fn dashboard_key_k_decrements_selection() {
         let mut app = app_with_agents(&["a", "b"]);
         app.selected_id = Some("b".to_string());
-        handle_dashboard_key(KeyCode::Char('k'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('k')), &mut app, &TestSource);
         assert_eq!(app.selected_id.as_deref(), Some("a"));
     }
 
@@ -1195,7 +1248,7 @@ mod tests {
     fn dashboard_key_enter_switches_to_agent_detail_when_selection_present() {
         let mut app = app_with_agents(&["a"]);
         assert_eq!(app.view, View::Dashboard);
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
         assert_eq!(app.view, View::AgentDetail);
     }
@@ -1210,7 +1263,7 @@ mod tests {
             since: 10,
             evidence: Some("act_1".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
         assert_eq!(app.view, View::Approvals);
     }
@@ -1223,7 +1276,7 @@ mod tests {
             since: 10,
             evidence: Some("google".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
         assert_eq!(app.view, View::Credentials);
     }
@@ -1236,7 +1289,7 @@ mod tests {
             since: 10,
             evidence: Some("92%".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
         assert_eq!(app.view, View::AgentDetail);
     }
@@ -1256,7 +1309,7 @@ mod tests {
             since: 10,
             evidence: Some("act_1".to_string()),
         });
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
         assert_eq!(app.view, View::Approvals);
     }
@@ -1264,7 +1317,7 @@ mod tests {
     #[test]
     fn dashboard_key_enter_does_not_switch_view_when_no_agents() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
         assert_eq!(app.view, View::Dashboard,
             "Enter with no agents must not navigate to AgentDetail");
@@ -1273,14 +1326,14 @@ mod tests {
     #[test]
     fn dashboard_key_s_switches_to_system_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('s'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('s')), &mut app, &TestSource);
         assert_eq!(app.view, View::System);
     }
 
     #[test]
     fn dashboard_key_t_switches_to_topology_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('t'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('t')), &mut app, &TestSource);
         assert_eq!(app.view, View::Topology);
     }
 
@@ -1288,7 +1341,7 @@ mod tests {
     fn dashboard_key_other_is_noop() {
         let mut app = app_with_agents(&["a"]);
         let original_id = app.selected_id.clone();
-        handle_dashboard_key(KeyCode::F(1), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::F(1)), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard);
         assert_eq!(app.selected_id, original_id);
     }
@@ -1299,9 +1352,9 @@ mod tests {
     fn tab_toggles_rail_focus_both_directions() {
         let mut app = app_with_agents(&["a"]);
         assert!(!app.converse_view.rail_focused);
-        handle_dashboard_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert!(app.converse_view.rail_focused, "Tab should focus the rail from the table");
-        handle_dashboard_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert!(!app.converse_view.rail_focused, "Tab should return focus to the table from the rail");
     }
 
@@ -1312,7 +1365,7 @@ mod tests {
         // input box the operator can't even see on a narrow/short terminal.
         let mut app = app_with_agents(&["a"]);
         app.term_size = (80, 24); // below MIN_TOTAL_WIDTH_FOR_RAIL (115)
-        handle_dashboard_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert!(!app.converse_view.rail_focused, "Tab must not focus a rail that isn't visible");
     }
 
@@ -1340,7 +1393,7 @@ mod tests {
     fn esc_returns_focus_to_table_from_rail() {
         let mut app = app_with_agents(&["a"]);
         app.converse_view.rail_focused = true;
-        handle_dashboard_key(KeyCode::Esc, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Esc), &mut app, &TestSource);
         assert!(!app.converse_view.rail_focused);
     }
 
@@ -1348,31 +1401,31 @@ mod tests {
     fn rail_focused_char_input_does_not_trigger_view_shortcut() {
         let mut app = app_with_agents(&["a"]);
         app.converse_view.rail_focused = true;
-        handle_dashboard_key(KeyCode::Char('s'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('s')), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard, "'s' must be captured as chat input, not a view switch, while the rail has focus");
-        assert_eq!(app.converse_view.input, "s");
+        assert_eq!(app.converse_view.input.value(), "s");
     }
 
     #[test]
     fn r_retargets_only_when_table_focused() {
         let mut app = app_with_agents(&["a", "b"]);
         app.select_next(); // select "b"
-        handle_dashboard_key(KeyCode::Char('r'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('r')), &mut app, &TestSource);
         assert_eq!(app.converse_view.active_target, "b", "r should retarget to the selected row while the table has focus");
 
         // While rail-focused, 'r' is literal input, not a retarget.
         app.converse_view.rail_focused = true;
         app.converse_view.active_target = "orch-default".to_string();
-        handle_dashboard_key(KeyCode::Char('r'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('r')), &mut app, &TestSource);
         assert_eq!(app.converse_view.active_target, "orch-default", "r must not retarget while the rail has focus");
-        assert_eq!(app.converse_view.input, "r");
+        assert_eq!(app.converse_view.input.value(), "r");
     }
 
     #[test]
     fn enter_routes_to_chat_send_when_rail_focused_vs_existing_routing_when_table_focused() {
         // Table-focused: Enter keeps its existing AgentDetail/Approvals/Credentials routing.
         let mut app = app_with_agents(&["a"]);
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
         assert_eq!(app.view, View::AgentDetail, "existing Enter routing must be unchanged when the table has focus");
 
         // Rail-focused: Enter sends the typed input as a chat message instead.
@@ -1383,10 +1436,10 @@ mod tests {
         // no-SSE-support behavior.
         let mut app2 = app_with_agents(&["a"]);
         app2.converse_view.rail_focused = true;
-        app2.converse_view.input = "hello".to_string();
-        handle_dashboard_key(KeyCode::Enter, &mut app2, &TestSource);
+        app2.converse_view.input = tui_input::Input::new("hello".to_string());
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app2, &TestSource);
         assert_eq!(app2.view, View::Dashboard, "sending a chat message must not change the view");
-        assert!(app2.converse_view.input.is_empty(), "input box clears after send");
+        assert!(app2.converse_view.input.value().is_empty(), "input box clears after send");
         let state = app2.converse_view.targets.get(&app2.converse_view.active_target).unwrap();
         assert_eq!(state.history.front().unwrap().text, "hello", "optimistic echo must show the sent message immediately");
         assert_eq!(state.history.front().unwrap().role, super::converse::TurnRole::Operator);
@@ -1402,10 +1455,10 @@ mod tests {
         // "no SSE support" case here.
         let mut app = app_with_agents(&["a"]);
         app.converse_view.rail_focused = true;
-        app.converse_view.input = "hello".to_string();
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        app.converse_view.input = tui_input::Input::new("hello".to_string());
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
-        assert!(app.converse_view.input.is_empty(), "input box clears after send");
+        assert!(app.converse_view.input.value().is_empty(), "input box clears after send");
         let state = app.converse_view.targets.get(&app.converse_view.active_target).unwrap();
         assert_eq!(state.history.len(), 2, "the echo plus the gate's explanation, nothing more");
         assert_eq!(state.history[0].role, super::converse::TurnRole::Operator, "the echo must still show what was typed");
@@ -1426,11 +1479,11 @@ mod tests {
         app.converse_view.rail_focused = true;
         app.converse_view.retarget("orch-default");
         app.converse_view.targets.get_mut("orch-default").unwrap().phase = super::converse::ConversePhase::Dispatching;
-        app.converse_view.input = "second message".to_string();
+        app.converse_view.input = tui_input::Input::new("second message".to_string());
 
-        handle_dashboard_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
 
-        assert_eq!(app.converse_view.input, "second message", "input must be preserved, not cleared, while busy");
+        assert_eq!(app.converse_view.input.value(), "second message", "input must be preserved, not cleared, while busy");
         let state = app.converse_view.targets.get("orch-default").unwrap();
         assert!(state.history.is_empty(), "no dispatch (and no optimistic echo) must happen while busy");
     }
@@ -1462,9 +1515,9 @@ mod tests {
         let mut app = app_with_agents(&["a"]);
         app.converse_view.rail_focused = true;
         app.converse_view.retarget("requested-id");
-        app.converse_view.input = "hello".to_string();
+        app.converse_view.input = tui_input::Input::new("hello".to_string());
 
-        handle_dashboard_key(KeyCode::Enter, &mut app, &ResolvesDifferentIdSource);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &ResolvesDifferentIdSource);
 
         assert_eq!(app.converse_view.active_target, "operator-agent", "rail must follow the server-resolved id");
         assert!(
@@ -1498,10 +1551,10 @@ mod tests {
         let mut app = app_with_agents(&["a"]);
         app.converse_view.rail_focused = true;
         app.converse_view.retarget("orch-default");
-        handle_dashboard_key(KeyCode::Up, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Up), &mut app, &TestSource);
         let state = app.converse_view.targets.get("orch-default").unwrap();
         assert_eq!(state.scroll_up_lines, 1, "Up must scroll, not type, while the rail has focus");
-        assert!(app.converse_view.input.is_empty(), "Up must not be captured as text input");
+        assert!(app.converse_view.input.value().is_empty(), "Up must not be captured as text input");
     }
 
     #[test]
@@ -1512,9 +1565,9 @@ mod tests {
         let mut app = app_with_agents(&["a"]);
         app.converse_view.rail_focused = true;
         for c in ['j', 'k', 'G'] {
-            handle_dashboard_key(KeyCode::Char(c), &mut app, &TestSource);
+            handle_dashboard_key(kev(KeyCode::Char(c)), &mut app, &TestSource);
         }
-        assert_eq!(app.converse_view.input, "jkG", "j/k/G must be captured as literal chat text while the rail has focus");
+        assert_eq!(app.converse_view.input.value(), "jkG", "j/k/G must be captured as literal chat text while the rail has focus");
     }
 
     #[test]
@@ -1527,7 +1580,7 @@ mod tests {
             state.scroll_up();
             state.push_history(super::converse::TurnRole::Assistant, "msg".to_string());
         }
-        handle_dashboard_key(KeyCode::End, &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::End), &mut app, &TestSource);
         let state = app.converse_view.targets.get("orch-default").unwrap();
         assert!(state.follow, "End must re-arm follow");
         assert_eq!(state.new_since_scroll, 0, "End must clear the unread counter");
@@ -1536,14 +1589,14 @@ mod tests {
     #[test]
     fn dashboard_key_m_switches_to_memory_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('m'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('m')), &mut app, &TestSource);
         assert_eq!(app.view, View::Memory);
     }
 
     #[test]
     fn dashboard_key_n_switches_to_spawn_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('n'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('n')), &mut app, &TestSource);
         assert_eq!(app.view, View::Spawn,
             "[n] must switch to Spawn view");
         assert!(app.spawn_view.loaded,
@@ -1556,7 +1609,7 @@ mod tests {
     fn memory_key_slash_enters_search_mode() {
         let mut app = App::new(PathBuf::from("/agents"));
         assert!(!app.memory_view.search_active);
-        handle_memory_key(KeyCode::Char('/'), &mut app);
+        handle_memory_key(kev(KeyCode::Char('/')), &mut app);
         assert!(app.memory_view.search_active, "/ must activate search mode");
     }
 
@@ -1564,39 +1617,39 @@ mod tests {
     fn memory_key_esc_exits_search_mode_and_clears_query() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.memory_view.search_active = true;
-        app.memory_view.search_query  = "foo".to_string();
-        handle_memory_key(KeyCode::Esc, &mut app);
+        app.memory_view.search_query  = tui_input::Input::new("foo".to_string());
+        handle_memory_key(kev(KeyCode::Esc), &mut app);
         assert!(!app.memory_view.search_active, "Esc must exit search mode");
-        assert!(app.memory_view.search_query.is_empty(), "Esc must clear query");
+        assert!(app.memory_view.search_query.value().is_empty(), "Esc must clear query");
     }
 
     #[test]
     fn memory_key_char_appends_to_query_when_searching() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.memory_view.search_active = true;
-        app.memory_view.search_query  = "fo".to_string();
-        handle_memory_key(KeyCode::Char('o'), &mut app);
-        assert_eq!(app.memory_view.search_query, "foo");
+        app.memory_view.search_query  = tui_input::Input::new("fo".to_string());
+        handle_memory_key(kev(KeyCode::Char('o')), &mut app);
+        assert_eq!(app.memory_view.search_query.value(), "foo");
     }
 
     #[test]
     fn memory_key_backspace_pops_query_char() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.memory_view.search_active = true;
-        app.memory_view.search_query  = "foo".to_string();
-        handle_memory_key(KeyCode::Backspace, &mut app);
-        assert_eq!(app.memory_view.search_query, "fo");
+        app.memory_view.search_query  = tui_input::Input::new("foo".to_string());
+        handle_memory_key(kev(KeyCode::Backspace), &mut app);
+        assert_eq!(app.memory_view.search_query.value(), "fo");
     }
 
     #[test]
     fn memory_key_tab_cycles_shortterm_longterm_kb() {
         let mut app = App::new(PathBuf::from("/agents"));
         assert_eq!(app.memory_view.pane, MemoryPane::ShortTerm);
-        handle_memory_key(KeyCode::Tab, &mut app);
+        handle_memory_key(kev(KeyCode::Tab), &mut app);
         assert_eq!(app.memory_view.pane, MemoryPane::LongTerm);
-        handle_memory_key(KeyCode::Tab, &mut app);
+        handle_memory_key(kev(KeyCode::Tab), &mut app);
         assert_eq!(app.memory_view.pane, MemoryPane::Kb);
-        handle_memory_key(KeyCode::Tab, &mut app);
+        handle_memory_key(kev(KeyCode::Tab), &mut app);
         assert_eq!(app.memory_view.pane, MemoryPane::ShortTerm, "tab must wrap around");
     }
 
@@ -1604,7 +1657,7 @@ mod tests {
     fn memory_key_up_decrements_active_pane_scroll() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.memory_view.short_term_scroll = 3;
-        handle_memory_key(KeyCode::Up, &mut app);
+        handle_memory_key(kev(KeyCode::Up), &mut app);
         assert_eq!(app.memory_view.short_term_scroll, 2);
     }
 
@@ -1612,14 +1665,14 @@ mod tests {
     fn memory_key_scroll_saturates_at_zero() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.memory_view.short_term_scroll = 0;
-        handle_memory_key(KeyCode::Char('k'), &mut app);
+        handle_memory_key(kev(KeyCode::Char('k')), &mut app);
         assert_eq!(app.memory_view.short_term_scroll, 0, "scroll must not underflow");
     }
 
     #[test]
     fn memory_key_j_increments_active_pane_scroll() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_memory_key(KeyCode::Char('j'), &mut app);
+        handle_memory_key(kev(KeyCode::Char('j')), &mut app);
         assert_eq!(app.memory_view.short_term_scroll, 1);
     }
 
@@ -1627,7 +1680,7 @@ mod tests {
     fn memory_key_q_returns_to_dashboard() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Memory;
-        handle_memory_key(KeyCode::Char('q'), &mut app);
+        handle_memory_key(kev(KeyCode::Char('q')), &mut app);
         assert_eq!(app.view, View::Dashboard);
     }
 
@@ -1635,7 +1688,7 @@ mod tests {
     fn memory_key_esc_returns_to_dashboard_when_not_searching() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Memory;
-        handle_memory_key(KeyCode::Esc, &mut app);
+        handle_memory_key(kev(KeyCode::Esc), &mut app);
         assert_eq!(app.view, View::Dashboard);
     }
 
@@ -1646,13 +1699,13 @@ mod tests {
         app.memory_view.short_term_scroll = 10;
         app.memory_view.long_term_scroll  = 5;
         app.memory_view.kb_scroll         = 3;
-        app.memory_view.search_query      = "old query".to_string();
+        app.memory_view.search_query      = tui_input::Input::new("old query".to_string());
         app.memory_view.search_active     = true;
-        handle_dashboard_key(KeyCode::Char('m'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('m')), &mut app, &TestSource);
         assert_eq!(app.memory_view.short_term_scroll, 0, "short_term_scroll must reset");
         assert_eq!(app.memory_view.long_term_scroll,  0, "long_term_scroll must reset");
         assert_eq!(app.memory_view.kb_scroll,         0, "kb_scroll must reset");
-        assert!(app.memory_view.search_query.is_empty(), "search_query must clear");
+        assert!(app.memory_view.search_query.value().is_empty(), "search_query must clear");
         assert!(!app.memory_view.search_active,           "search_active must clear");
         assert_eq!(app.memory_view.pane, crate::watch::app::MemoryPane::ShortTerm,
             "pane must reset to ShortTerm");
@@ -1665,7 +1718,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
-        handle_spawn_key(KeyCode::Esc, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Esc), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard);
     }
 
@@ -1674,7 +1727,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::ActionGenerate;
-        handle_spawn_key(KeyCode::Char('q'), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char('q')), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard);
     }
 
@@ -1683,9 +1736,9 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Char('q'), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char('q')), &mut app, &TestSource);
         assert_eq!(app.view, View::Spawn, "view must stay Spawn while in task field");
-        assert_eq!(app.spawn_view.task_input, "q", "char must append to task input");
+        assert_eq!(app.spawn_view.task_input.lines().join("\n"), "q", "char must append to task input");
     }
 
     #[test]
@@ -1693,7 +1746,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Esc, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Esc), &mut app, &TestSource);
         assert_eq!(app.view, View::Spawn, "Esc in task field must not exit spawn view");
         assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker,
             "Esc in task field must defocus to TemplatePicker");
@@ -1710,15 +1763,15 @@ mod tests {
             true,
         )];
         assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker);
-        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::TaskField);
-        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::CapToggles);
-        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::ActionGenerate);
-        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::ActionSpawn);
-        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Tab), &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker, "must wrap");
     }
 
@@ -1726,9 +1779,13 @@ mod tests {
     fn spawn_key_backspace_removes_last_char_from_task() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
-        app.spawn_view.task_input = "hello".to_string();
-        handle_spawn_key(KeyCode::Backspace, &mut app, &TestSource);
-        assert_eq!(app.spawn_view.task_input, "hell");
+        // Type into the textarea so the cursor sits at the end (a freshly-constructed
+        // TextArea parks the cursor at the start, where Backspace is a no-op).
+        for c in ['h', 'e', 'l', 'l', 'o'] {
+            handle_spawn_key(kev(KeyCode::Char(c)), &mut app, &TestSource);
+        }
+        handle_spawn_key(kev(KeyCode::Backspace), &mut app, &TestSource);
+        assert_eq!(app.spawn_view.task_input.lines().join("\n"), "hell");
     }
 
     #[test]
@@ -1741,18 +1798,25 @@ mod tests {
             true,
         )];
         app.spawn_view.cap_idx = 0;
-        handle_spawn_key(KeyCode::Char(' '), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char(' ')), &mut app, &TestSource);
         assert!(!app.spawn_view.cap_toggles[0].2, "space must toggle cap off");
     }
 
     #[test]
-    fn spawn_key_enter_in_task_field_cycles_focus_forward() {
+    fn spawn_key_enter_in_task_field_inserts_newline_not_focus_advance() {
+        // ux.10: with the multi-line tui_textarea, Enter inserts a newline IN-FIELD and
+        // must NOT advance focus (Tab cycles focus instead; submit is [r]/ActionSpawn).
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
-        // No cap_toggles — TaskField Enter skips to ActionGenerate.
-        handle_spawn_key(KeyCode::Enter, &mut app, &TestSource);
-        assert_eq!(app.spawn_view.focus, SpawnFocus::ActionGenerate,
-            "Enter in TaskField must advance focus (not exit view)");
+        for c in ['a', 'b'] {
+            handle_spawn_key(kev(KeyCode::Char(c)), &mut app, &TestSource);
+        }
+        handle_spawn_key(kev(KeyCode::Enter), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char('c')), &mut app, &TestSource);
+        assert_eq!(app.spawn_view.focus, SpawnFocus::TaskField,
+            "Enter in TaskField must NOT advance focus (it inserts a newline)");
+        assert_eq!(app.spawn_view.task_input.lines(), &["ab".to_string(), "c".to_string()],
+            "Enter must split the task into two lines");
     }
 
     #[test]
@@ -1768,7 +1832,7 @@ mod tests {
                             description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
         ];
         app.spawn_view.template_idx = 1;
-        handle_spawn_key(KeyCode::Up, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Up), &mut app, &TestSource);
         assert_eq!(app.spawn_view.template_idx, 0, "Up in TemplatePicker must decrement index");
     }
 
@@ -1785,7 +1849,7 @@ mod tests {
                             description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
         ];
         app.spawn_view.template_idx = 0;
-        handle_spawn_key(KeyCode::Down, &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Down), &mut app, &TestSource);
         assert_eq!(app.spawn_view.template_idx, 1, "Down in TemplatePicker must increment index");
     }
 
@@ -1798,7 +1862,7 @@ mod tests {
             (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
         ];
         app.spawn_view.cap_idx = 1;
-        handle_spawn_key(KeyCode::Char('k'), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char('k')), &mut app, &TestSource);
         assert_eq!(app.spawn_view.cap_idx, 0, "'k' in CapToggles must call cap_prev");
     }
 
@@ -1811,7 +1875,7 @@ mod tests {
             (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
         ];
         app.spawn_view.cap_idx = 0;
-        handle_spawn_key(KeyCode::Char('j'), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char('j')), &mut app, &TestSource);
         assert_eq!(app.spawn_view.cap_idx, 1, "'j' in CapToggles must call cap_next");
     }
 
@@ -1820,7 +1884,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
         // No templates loaded — do_generate sets an error result_msg.
-        handle_spawn_key(KeyCode::Char('g'), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char('g')), &mut app, &TestSource);
         assert!(app.spawn_view.result_msg.is_some(),
             "'g' outside TaskField must invoke do_generate (result_msg set)");
     }
@@ -1830,7 +1894,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
         // No templates loaded — do_spawn sets an error result_msg.
-        handle_spawn_key(KeyCode::Char('r'), &mut app, &TestSource);
+        handle_spawn_key(kev(KeyCode::Char('r')), &mut app, &TestSource);
         assert!(app.spawn_view.result_msg.is_some(),
             "'r' outside TaskField must invoke do_spawn (result_msg set)");
     }
@@ -1839,8 +1903,8 @@ mod tests {
     fn spawn_key_r_appends_to_task_when_task_field_focused() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Char('r'), &mut app, &TestSource);
-        assert_eq!(app.spawn_view.task_input, "r",
+        handle_spawn_key(kev(KeyCode::Char('r')), &mut app, &TestSource);
+        assert_eq!(app.spawn_view.task_input.lines().join("\n"), "r",
             "Char('r') in TaskField must append to task input, not trigger do_spawn");
         assert!(app.spawn_view.pending_exec.is_none(),
             "Char('r') in TaskField must not set pending_exec");
@@ -1852,8 +1916,8 @@ mod tests {
     fn spawn_key_g_appends_to_task_when_task_field_focused() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Char('g'), &mut app, &TestSource);
-        assert_eq!(app.spawn_view.task_input, "g",
+        handle_spawn_key(kev(KeyCode::Char('g')), &mut app, &TestSource);
+        assert_eq!(app.spawn_view.task_input.lines().join("\n"), "g",
             "Char('g') in TaskField must append to task input, not trigger do_generate");
         assert!(app.spawn_view.preview.is_none(),
             "Char('g') in TaskField must not trigger do_generate");
@@ -1901,7 +1965,7 @@ mod tests {
             .expect("scout must be present in a non-empty repo catalogue");
         app.spawn_view.template_idx = idx;
         app.spawn_view.rebuild_cap_toggles();
-        app.spawn_view.task_input = "list /workspace".to_string();
+        app.spawn_view.task_input = tui_textarea::TextArea::new(vec!["list /workspace".to_string()]);
         Some(app)
     }
 
@@ -1986,7 +2050,7 @@ mod tests {
     #[test]
     fn dashboard_key_a_switches_to_approvals_view() {
         let mut app = App::new(PathBuf::from("/agents"));
-        handle_dashboard_key(KeyCode::Char('a'), &mut app, &TestSource);
+        handle_dashboard_key(kev(KeyCode::Char('a')), &mut app, &TestSource);
         assert_eq!(app.view, View::Approvals, "[a] must switch to Approvals view");
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "entering Approvals view must reset mode to List");
@@ -2020,7 +2084,7 @@ mod tests {
     #[test]
     fn approvals_key_q_returns_to_dashboard_from_list() {
         let mut app = app_with_approvals(&[]);
-        handle_approvals_key(KeyCode::Char('q'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('q')), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard,
             "'q' in Approvals list mode must return to Dashboard");
     }
@@ -2028,7 +2092,7 @@ mod tests {
     #[test]
     fn approvals_key_esc_returns_to_dashboard_from_list() {
         let mut app = app_with_approvals(&[]);
-        handle_approvals_key(KeyCode::Esc, &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Esc), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard,
             "Esc in Approvals list mode must return to Dashboard");
     }
@@ -2036,7 +2100,7 @@ mod tests {
     #[test]
     fn approvals_key_enter_enters_confirm_when_items_present() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
-        handle_approvals_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Enter), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::Confirm,
             "Enter with pending items must enter Confirm mode");
         assert_eq!(app.view, View::Approvals,
@@ -2046,7 +2110,7 @@ mod tests {
     #[test]
     fn approvals_key_enter_is_noop_when_no_items() {
         let mut app = app_with_approvals(&[]);
-        handle_approvals_key(KeyCode::Enter, &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Enter), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "Enter with no items must stay in List mode");
     }
@@ -2054,7 +2118,7 @@ mod tests {
     #[test]
     fn approvals_key_j_advances_selection() {
         let mut app = app_with_approvals(&[("act_0", "w"), ("act_1", "w")]);
-        handle_approvals_key(KeyCode::Char('j'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('j')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 1, "'j' must advance selection");
     }
 
@@ -2062,7 +2126,7 @@ mod tests {
     fn approvals_key_k_decrements_selection() {
         let mut app = app_with_approvals(&[("act_0", "w"), ("act_1", "w")]);
         app.approvals_view.selected_idx = 1;
-        handle_approvals_key(KeyCode::Char('k'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('k')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 0, "'k' must decrement selection");
     }
 
@@ -2070,14 +2134,14 @@ mod tests {
     fn approvals_key_k_saturates_at_zero() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.selected_idx = 0;
-        handle_approvals_key(KeyCode::Char('k'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('k')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 0, "k at 0 must not underflow");
     }
 
     #[test]
     fn approvals_key_j_saturates_at_last() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
-        handle_approvals_key(KeyCode::Char('j'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('j')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.selected_idx, 0, "j at last must not overflow");
     }
 
@@ -2085,10 +2149,10 @@ mod tests {
     fn approvals_confirm_r_enters_reject_reason_mode() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Char('r'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('r')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::RejectReason,
             "'r' in Confirm mode must switch to RejectReason mode");
-        assert!(app.approvals_view.reject_reason.is_empty(),
+        assert!(app.approvals_view.reject_reason.value().is_empty(),
             "reject_reason must be cleared when entering RejectReason mode");
     }
 
@@ -2096,7 +2160,7 @@ mod tests {
     fn approvals_confirm_esc_returns_to_list() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Esc, &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Esc), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "Esc in Confirm mode must return to List mode (not Dashboard)");
         assert_eq!(app.view, View::Approvals);
@@ -2106,28 +2170,28 @@ mod tests {
     fn approvals_reject_reason_char_appends_to_reason() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
-        handle_approvals_key(KeyCode::Char('x'), &mut app, &TestSource);
-        assert_eq!(app.approvals_view.reject_reason, "x");
+        handle_approvals_key(kev(KeyCode::Char('x')), &mut app, &TestSource);
+        assert_eq!(app.approvals_view.reject_reason.value(), "x");
     }
 
     #[test]
     fn approvals_reject_reason_backspace_pops_char() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
-        app.approvals_view.reject_reason = "foo".to_string();
-        handle_approvals_key(KeyCode::Backspace, &mut app, &TestSource);
-        assert_eq!(app.approvals_view.reject_reason, "fo");
+        app.approvals_view.reject_reason = tui_input::Input::new("foo".to_string());
+        handle_approvals_key(kev(KeyCode::Backspace), &mut app, &TestSource);
+        assert_eq!(app.approvals_view.reject_reason.value(), "fo");
     }
 
     #[test]
     fn approvals_reject_reason_esc_cancels_to_confirm() {
         let mut app = app_with_approvals(&[("act_0", "w")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
-        app.approvals_view.reject_reason = "partial".to_string();
-        handle_approvals_key(KeyCode::Esc, &mut app, &TestSource);
+        app.approvals_view.reject_reason = tui_input::Input::new("partial".to_string());
+        handle_approvals_key(kev(KeyCode::Esc), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::Confirm,
             "Esc in RejectReason mode must return to Confirm (not List)");
-        assert!(app.approvals_view.reject_reason.is_empty(),
+        assert!(app.approvals_view.reject_reason.value().is_empty(),
             "reject_reason must be cleared on Esc cancel");
     }
 
@@ -2136,8 +2200,8 @@ mod tests {
         // TestSource.deny() returns Err("mock: no control") → result_msg is set.
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::RejectReason;
-        app.approvals_view.reject_reason = "too risky".to_string();
-        handle_approvals_key(KeyCode::Enter, &mut app, &TestSource);
+        app.approvals_view.reject_reason = tui_input::Input::new("too risky".to_string());
+        handle_approvals_key(kev(KeyCode::Enter), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after Enter in RejectReason mode must return to List");
         // result_msg is set (either success or error — we're testing the error path here).
@@ -2149,7 +2213,7 @@ mod tests {
     fn approvals_confirm_approve_with_no_control_file_sets_error_msg() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Char('a'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('a')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after Approve must return to List mode");
         assert!(app.approvals_view.result_msg.is_some(),
@@ -2160,7 +2224,7 @@ mod tests {
     fn approvals_confirm_dont_ask_again_with_no_control_file_sets_error_msg() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
         app.approvals_view.mode = ApprovalsMode::Confirm;
-        handle_approvals_key(KeyCode::Char('d'), &mut app, &TestSource);
+        handle_approvals_key(kev(KeyCode::Char('d')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after 'don't ask again' must return to List mode");
         assert!(app.approvals_view.result_msg.is_some(),
@@ -2170,6 +2234,13 @@ mod tests {
     // ── ux.0: step() / event pump ────────────────────────────────────────────
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    // ux.10: the focused-input handlers now take a full `KeyEvent` (so tui-input /
+    // tui-textarea widgets receive real crossterm events). This wraps a bare `KeyCode`
+    // for the many existing key-dispatch tests.
+    fn kev(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     #[test]
@@ -2222,7 +2293,7 @@ mod tests {
         app.converse_view.rail_focused = true;
         let effects = step_key(&mut app, key('q'), &TestSource);
         assert!(!effects.contains(&Effect::Quit), "'q' must not quit while the rail has text focus");
-        assert_eq!(app.converse_view.input, "q", "'q' must be captured as literal chat input");
+        assert_eq!(app.converse_view.input.value(), "q", "'q' must be captured as literal chat input");
         assert_eq!(app.view, View::Dashboard);
     }
 
@@ -2310,5 +2381,101 @@ mod tests {
         // 16 events remain in the channel for the next tick.
         let remaining = std::iter::from_fn(|| rx.try_recv().ok()).count();
         assert_eq!(remaining, 16, "cap left the rest for the next tick");
+    }
+
+    // ── ux.10: input-widget integration (behavior preservation) ──────────────
+
+    #[test]
+    fn ux10_tui_input_reflects_char_event_in_value() {
+        // Smoke test: a tui_input::Input fed a crossterm char event reflects it in .value().
+        use tui_input::backend::crossterm::EventHandler;
+        let mut input = tui_input::Input::default();
+        input.handle_event(&Event::Key(kev(KeyCode::Char('z'))));
+        assert_eq!(input.value(), "z");
+    }
+
+    #[test]
+    fn ux10_converse_rail_typing_then_enter_sends_and_resets() {
+        // The rail's message input is a tui_input widget: typed chars route through
+        // handle_event into .value(); Enter dispatches a send (echo pushed) and reset()s
+        // the widget — Enter is a send, never a literal newline in the field.
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        for c in ['h', 'i'] {
+            handle_dashboard_key(kev(KeyCode::Char(c)), &mut app, &TestSource);
+        }
+        assert_eq!(app.converse_view.input.value(), "hi", "chars must edit the tui_input value");
+
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
+        assert!(app.converse_view.input.value().is_empty(),
+            "Enter sends and resets the input (never inserts a newline)");
+        let state = app.converse_view.targets.get(&app.converse_view.active_target).unwrap();
+        assert_eq!(state.history.front().unwrap().text, "hi",
+            "the optimistic echo proves Enter dispatched a send");
+    }
+
+    #[test]
+    fn ux10_converse_rail_busy_guard_preserves_input_and_blocks_second_send() {
+        // A second Enter while the target is mid-turn must be a no-op: input preserved
+        // (not reset), no new echo — the double-submit guard survives the widget swap.
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("orch-default");
+        app.converse_view.targets.get_mut("orch-default").unwrap().phase =
+            super::converse::ConversePhase::Dispatching;
+        app.converse_view.input = tui_input::Input::new("queued".to_string());
+
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &TestSource);
+        assert_eq!(app.converse_view.input.value(), "queued",
+            "input must be preserved (not reset) while the target is busy");
+        assert!(app.converse_view.targets.get("orch-default").unwrap().history.is_empty(),
+            "no echo/dispatch may happen while busy");
+    }
+
+    #[test]
+    fn ux10_inspector_search_typing_updates_value_and_esc_resets() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Inspector;
+        app.inspector_view.search_active = true;
+        handle_inspector_key(kev(KeyCode::Char('e')), &mut app);
+        handle_inspector_key(kev(KeyCode::Char('r')), &mut app);
+        assert_eq!(app.inspector_view.search_query.value(), "er",
+            "typing must edit the inspector search value (which rebuild_view consumes)");
+
+        handle_inspector_key(kev(KeyCode::Esc), &mut app);
+        assert!(!app.inspector_view.search_active, "Esc exits search mode");
+        assert!(app.inspector_view.search_query.value().is_empty(),
+            "Esc must reset() the search value");
+    }
+
+    #[test]
+    fn ux10_memory_search_typing_updates_value_via_widget() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Memory;
+        app.memory_view.search_active = true;
+        handle_memory_key(kev(KeyCode::Char('k')), &mut app);
+        handle_memory_key(kev(KeyCode::Char('b')), &mut app);
+        assert_eq!(app.memory_view.search_query.value(), "kb",
+            "memory search typing must land in the tui_input value (read by apply_snapshot)");
+    }
+
+    #[test]
+    fn ux10_route_paste_inserts_into_focused_spawn_task_field() {
+        // Bracketed paste routes to the focused textarea via route_paste (insert_str).
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        app.spawn_view.focus = SpawnFocus::TaskField;
+        route_paste(&mut app, "pasted task");
+        assert_eq!(app.spawn_view.task_input.lines().join("\n"), "pasted task",
+            "paste must be inserted into the focused spawn task textarea");
+    }
+
+    #[test]
+    fn ux10_route_paste_into_focused_converse_rail() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        route_paste(&mut app, "clip");
+        assert_eq!(app.converse_view.input.value(), "clip",
+            "paste must be inserted into the focused converse rail input");
     }
 }

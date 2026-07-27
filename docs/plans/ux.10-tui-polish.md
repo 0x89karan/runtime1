@@ -176,3 +176,94 @@ threatened, but verify with `make check-size` after build.
 This increment can land before or after ux.8 (budget control) — no dependency either way.
 Recommended: land ux.10 first since it's self-contained polish with no new API surface, then
 ux.8 (which requires a new management API endpoint for live budget writes).
+
+---
+
+## DECIDED at the /autoplan gate (2026-07-27)
+- **Sub-part C (color-eyre) STRUCK** — redundant (TermGuard already restores on panic; producer panics are
+  `catch_unwind`'d). No anyhow→eyre migration.
+- **Scope: ux.10 = B + A, built + shipped in order B → A** (B contained; A is the heavy pump-refactor; A's
+  `/` search reuses B's tui-input widget). Splitting A into its own PR is fine if it lands separately.
+- All CONFIRMED reshape corrections below are LOCKED. `[l]` for Logs; `tui-input =0.14` + `tui-textarea
+  =0.7.0` (no ratatui bump); std-thread subprocess + `child.kill()` on `Drop`; event plumbing + spawn
+  Enter/Tab + bracketed-paste per the eng consensus.
+
+## Re-grounding addendum (2026-07-27, post-ux.2b/ux.3 — corrections to the 2026-07-16 spec)
+
+The spec above stands, with these current-state corrections (the UX tail shipped ux.2b v0.111.0 + ux.3
+v0.112.0 since it was written; `mod.rs` line numbers shifted):
+
+- **LANDMINE — the `[g]` Logs key COLLIDES.** `[g]` is now bound to the Spawn view's "generate preview"
+  (`mod.rs:752`). Key dispatch is per-view, so `[g]`-opens-Logs-from-Dashboard and `[g]`-generates-in-Spawn
+  do not *technically* clash — BUT autoplan/eng-review must confirm the Logs key is dispatched only where
+  it's free (and update the legend). **Decision D-key:** either keep `[g]` as a Dashboard-scoped open (if
+  verified free from the Dashboard) or pick another free global key (e.g. `[l]`). Resolve at eng review;
+  state the chosen key in acceptance. (Do NOT assume the bare `[g]` of the old spec is still free.)
+- **`make check-size` does NOT exist** (acceptance #6 + D-size). The 6 MB guard lives only in CI (`ci.yml`)
+  and measures the RELEASE binary. Verify release size at build; drop the `make check-size` acceptance line
+  or add the target — do not reference a non-existent target.
+- **The 5 hand-rolled input sites, current `mod.rs` key-dispatch lines** (the STATE lives in the per-view
+  modules per the "Files touched" list, but the `push(c)`/`pop()` KEY HANDLING is in `mod.rs` — both need
+  the swap): memory search `:465`/`:468`, converse rail `:608`/`:611`, spawn task `:711`/`:714`, inspector
+  search `:823`/`:827`, approvals reject-reason `:902`/`:905`.
+- **Deps confirmed ABSENT** today (only `ratatui 0.29`): `tui-input`, `tui-textarea`, `color-eyre` all to
+  add. **D3 (new):** confirm the `tui-input`/`tui-textarea` versions that support **ratatui 0.29** and pin
+  them; if a version forces a ratatui major bump, FLAG it (bigger blast radius) — do NOT silently bump ratatui.
+- **D2 subprocess model:** the old spec says `tokio::process` + an `AppEvent` pump. Confirm `agentctl watch`
+  actually has a tokio runtime + an AppEvent pump today (the watch loop may be sync `reqwest::blocking` +
+  crossterm poll — ux.3's inline-mutation precedent suggests a sync main loop). If the loop is sync, the
+  compose-logs child must be read on a background THREAD → `mpsc` → drained in the crossterm poll tick, NOT
+  a tokio task. Resolve the runtime model at eng review before building P1.
+
+These corrections are the delta; the D1–D8 / B1–B3 / C substance above is otherwise intact.
+
+---
+
+## /autoplan eng consensus (2026-07-27) — reshape (both voices: BUILD with named changes)
+
+Both eng voices confirmed the sync-loop grounding and reshaped the *how*. CONFIRMED-by-both corrections
+(fold in at build):
+
+- **A — subprocess model:** `std::process::Command` (piped stdout) read on a background `std::thread` →
+  `try_send` a new `AppEvent::LogLine` into the existing `sync_channel` (mirror `pump.rs`'s `stream_once` +
+  the `catch_unwind`→`ProducerDied` guard). **Strike D2's tokio body** — there is no tokio runtime.
+- **A2 (HIGH, must-fix) — orphan-child leak:** `docker compose logs --follow` never EOFs, and the reader
+  thread is never joined, so on exit the child ORPHANS. `Producers` must own the `Child` and
+  `child.kill()` it in `Drop` (that EOFs the pipe + unblocks the reader). Acceptance + a manual "no orphan
+  `docker compose logs` after quit" QA step.
+- **A3 — tx wiring:** `spawn_producers` consumes the sender internally. Simplest: spawn the log producer
+  EAGERLY at loop entry, gated on the startup docker-detect bool (Drop-kill from A2 handles teardown); OR
+  return a `tx` clone. Pick eager-gated.
+- **A — `--no-log-prefix` breaks service filtering:** keep the compose prefix (+ `--no-color`) so lines
+  carry the service name to parse/filter; the plan's `{service,ts,text}` needs it.
+- **A — batching:** `CHANNEL_CAP=256` + a 256-drain-per-tick cap will drop/starve under high log volume →
+  `AppEvent::LogLines(Vec<..>)` batches + a visible "N dropped" accounting.
+- **Key → `[l]`** (not `[g]`): `[g]` is technically free from the Dashboard but reusing the letter across
+  views is a footgun; `[l]` is free everywhere. `g`/`G` stay as in-view top/bottom scroll.
+- **B2 (HIGH) — dep pins, verified empirically against ratatui 0.29 / unicode-width 0.2.0:**
+  `tui-input = { version = "0.14", features = ["ratatui-crossterm"] }` (0.15 needs ratatui 0.30 → conflict;
+  0.10 drags a SECOND ratatui 0.28) and `tui-textarea = "0.7.0"`. **No ratatui bump needed** with these pins.
+- **B — event plumbing:** the 5 sites handle bare `KeyCode`; tui-input consumes crossterm `Event`. Pass
+  `KeyEvent`/`Event` to the focused-input handlers; intercept Enter/Esc/Tab (and rail Up/Down) BEFORE
+  delegating, so per-view semantics survive.
+- **B3 (HIGH) — spawn Enter/Tab:** today `Enter`=focus-advance and there is **no** `Ctrl-S`/`F5` binding
+  (acceptance #4's "existing Ctrl-S/F5" is phantom — delete it). tui-textarea `Enter`=newline collides →
+  intercept `Tab`/`Esc` before the textarea, `Enter`=newline in-field, submit stays `[r]`/ActionSpawn-Enter.
+  Don't rely on `Ctrl-Enter` (indistinguishable from Enter without kitty-keyboard).
+- **B5 — paste:** `Ctrl-V` is not clipboard; needs `EnableBracketedPaste` in `TermGuard::enter` + an
+  `Event::Paste` arm routed to the focused input, or DROP acceptance #3's paste clause.
+- **Size:** no `make check-size` — the 6 MB guard is CI-only (`ci.yml:77`) on the **musl release** binary
+  (local native release ~2.6 MB; ~3 MB+ headroom, comfortable). Verify with `cargo build --release`.
+
+**DISAGREE → recommend STRIKE — Sub-part C (color-eyre).** Claude (code-grounded, decisive): the stated
+rationale is FALSE — `TermGuard` (mod.rs:171-187) already installs a chained, terminal-restoring panic hook
+with a deliberate main-thread gate, and producer-thread panics are caught by `catch_unwind`→`ProducerDied`
+(pump.rs:93-108) and never reach the process hook. So the "non-main-thread panic corrupts the terminal" gap
+C claims to close does not exist. "eyre formatting throughout" is an unscoped `anyhow`→`eyre` migration, not
+"pure cockpit polish." Codex said build-with-changes (compose via `HookBuilder::into_hooks()`), but did not
+refute the redundancy. → **Recommend striking C** (or reducing to a bare `install()` before `TermGuard` for
+prettier backtraces — marginal value). Do NOT migrate anyhow→eyre here.
+
+**Scope observation:** A (Logs) is a pump-refactoring increment with a real orphan-leak correctness risk; B
+(inputs) is contained; C is redundant. Eng-recommended order: **B → A** (A's `/` search then reuses B's
+tui-input widget). Splitting A into its own increment is defensible given its blast radius. → gate decision.

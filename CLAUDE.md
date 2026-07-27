@@ -24,17 +24,23 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.112.0 (shipped 2026-07-27)
+**Current version:** v0.113.0 (shipped 2026-07-27)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.3 (v0.112.0) — spawn custom agents on the fly over HTTP (addresses the p7.3-ar-02
-cluster, 2nd of the UX tail). The `agentctl watch` Spawn view now sends the operator's toggled capabilities +
-priority into a running instance via `POST /api/v1/spawn` (the client `SpawnRequest` was silently dropping
-them); one shared resolver makes preview == spawn; routing is inline (matches approve/converse), FUSE
-unchanged; sticky `pending_focus` auto-drops into the new agent. /autoplan reshaped it (preview/spawn
-diverged, an API-key gate would block remote HTTP, focus race); /review (Codex) killed a fabricated-agent_id
-that would pin focus forever. Closes the TUI Spawn-view gap; the CLI-subcommand exec stays a P3 residual.
+**Latest shipped:** ux.10 sub-part B (v0.113.0) — real input widgets in `agentctl watch` (3rd of the UX
+tail). The 5 hand-rolled text inputs are now `tui-input`/`tui-textarea` (cursor movement, word-delete,
+bracketed paste); deps pinned to hold a single ratatui 0.29; `step_key` threads the full `KeyEvent` with
+per-view Enter/Esc/Tab interception (converse Enter=send, spawn Tab=focus/Enter=newline preserved). /autoplan
+reshaped it (sync-loop not tokio, dep pins, spawn Enter/Tab) + STRUCK sub-part C (color-eyre — redundant,
+`TermGuard` already restores on panic); /review (Codex) caught a cursor drawn at end-of-value instead of at
+the edit position. **Sub-part A (Logs view) is the remaining ux.10 follow-on** (heavy: pump-refactor +
+subprocess/orphan-kill; `docs/plans/ux.10-tui-polish.md`).
+
+**Prev:** ux.3 (v0.112.0) — spawn custom agents on the fly over HTTP (p7.3-ar-02 cluster): the Spawn view
+sends toggled caps + priority into a running instance via `POST /api/v1/spawn` (was silently dropped); one
+shared resolver makes preview == spawn; inline routing; sticky `pending_focus` auto-drop. /review killed a
+fabricated-agent_id. Closes the TUI Spawn-view gap; CLI-subcommand exec stays a P3 residual.
 
 **UX tail so far:** ux.2b (v0.111.0) idle+error attention (closes cos-ux-01) → ux.3 (v0.112.0, this).
 Next: ux.10 (TUI polish). (v0.109.0/0.110.0/0.111.0 are the doc.1/p3.1-era releases; none tagged past
@@ -71,10 +77,10 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** the UX tail's last core item — **ux.10** (TUI polish: `[g]` Logs view + tui-input/
-tui-textarea + color-eyre panic hook); its own draft → /autoplan → build → /review → /qa → /ship (ux.2b +
-ux.3 done). Then ux.3b (`:` palette + modal) + evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9
-eBPF remain the two end-of-queue tracks.
+**Next (roadmap):** **ux.10 sub-part A** — the `[l]` Logs view (tail `docker compose logs` via a std-thread
+subprocess → mpsc; `child.kill()` on Drop to avoid orphaning; docker-context-gated). Heavy (pump-refactor);
+plan reshaped + locked in `docs/plans/ux.10-tui-polish.md`. Then ux.3b (`:` palette + modal) +
+evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

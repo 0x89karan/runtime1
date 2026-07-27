@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
 use agentd::capability::Capability;
+use tui_input::Input;
+use tui_textarea::TextArea;
 
 use super::approvals::ApprovalsViewState;
 use super::inspector::InspectorState;
@@ -77,8 +79,9 @@ pub struct SpawnViewState {
     pub focus:          SpawnFocus,
     /// Index of the highlighted capability toggle (when focus = CapToggles).
     pub cap_idx:        usize,
-    /// Task text entered by the operator.
-    pub task_input:     String,
+    /// Task text entered by the operator (ux.10: multi-line `tui_textarea` — Enter
+    /// inserts a newline; Tab/Esc are intercepted upstream for focus/nav).
+    pub task_input:     TextArea<'static>,
     /// Per-capability toggle state: (cap, display_string, enabled).
     pub cap_toggles:    Vec<(Capability, String, bool)>,
     /// Generated `agent.toml` preview text (set by Generate action).
@@ -88,6 +91,19 @@ pub struct SpawnViewState {
     /// Pending exec action.  When set, `run_tui` cleans up the terminal and
     /// execs agentd.
     pub pending_exec:   Option<PendingSpawn>,
+}
+
+/// Build a task `TextArea` from `text` (ux.10), applying the shared placeholder so an
+/// empty field still reads "(empty — Tab to focus …)". `TextArea::new` panics on an empty
+/// line vector, so an empty `text` falls back to `TextArea::default()` (a single blank line).
+fn new_task_area(text: &str) -> TextArea<'static> {
+    let mut ta = if text.is_empty() {
+        TextArea::default()
+    } else {
+        TextArea::new(text.lines().map(String::from).collect())
+    };
+    ta.set_placeholder_text("(empty — Tab to focus, type task description)");
+    ta
 }
 
 impl SpawnViewState {
@@ -112,7 +128,7 @@ impl SpawnViewState {
                 .get(self.template_idx)
                 .and_then(|t| t.sample_tasks.first())
             {
-                self.task_input = sample.clone();
+                self.task_input = new_task_area(sample);
             }
         }
     }
@@ -147,10 +163,11 @@ impl SpawnViewState {
         self.rebuild_cap_toggles();
         self.preview    = None;
         self.result_msg = None;
-        let is_unchanged = self.task_input.is_empty()
-            || prev_sample.is_some_and(|s| self.task_input == s);
+        let current = self.task_input.lines().join("\n");
+        let is_unchanged = current.is_empty()
+            || prev_sample.is_some_and(|s| current == s);
         if is_unchanged {
-            self.task_input.clear();
+            self.task_input = new_task_area("");
             self.prefill_task_if_empty();
         }
     }
@@ -243,10 +260,11 @@ impl SpawnViewState {
     fn resolve_config(&self) -> Result<agentd::config::Config, String> {
         let template = self.selected_template()
             .ok_or_else(|| "No template selected.".to_string())?;
-        let task = if self.task_input.is_empty() {
+        let task_str = self.task_input.lines().join("\n");
+        let task = if task_str.is_empty() {
             None
         } else {
-            Some(self.task_input.as_str())
+            Some(task_str.as_str())
         };
         let resolver = crate::build_resolver(None, None);
         let (cfg, _) = resolver.resolve(&template.name)
@@ -318,7 +336,8 @@ impl SpawnViewState {
             Some(t) => t.name.clone(),
             None    => { self.result_msg = Some("No template selected.".to_string()); return; }
         };
-        if self.task_input.is_empty() {
+        let task_str = self.task_input.lines().join("\n");
+        if task_str.is_empty() {
             // Check if template has a default task; if not, force Generate first.
             let resolver = crate::build_resolver(None, None);
             let has_default = resolver
@@ -344,7 +363,7 @@ impl SpawnViewState {
         self.result_msg  = Some("Spawning agentd — TUI will exit...".to_string());
         self.pending_exec = Some(PendingSpawn {
             template_name,
-            task:          self.task_input.clone(),
+            task:          task_str,
             extra_caps:    extra,
             disabled_caps: disabled,
         });
@@ -402,8 +421,8 @@ pub struct MemoryPaneState {
     pub agent_memory:      Option<AgentMemory>,
     /// All shared KB segments.
     pub kb_segments:       Vec<KbSegment>,
-    /// Current search query (empty = no filter).
-    pub search_query:      String,
+    /// Current search query (empty = no filter). ux.10: `tui_input` backed.
+    pub search_query:      Input,
     /// True while the user is typing into the search box.
     pub search_active:     bool,
     /// Per-pane scroll offsets — only the active pane is rendered (true-tab).
@@ -638,7 +657,7 @@ impl App {
         // Read memory only while the Memory view is active to avoid FUSE I/O on
         // every tick when the user is not looking at memory data.
         if self.view == View::Memory {
-            let q = self.memory_view.search_query.clone();
+            let q = self.memory_view.search_query.value().to_string();
             self.memory_view.agent_memory = self.selected_id
                 .as_deref()
                 .and_then(|id| read_agent_memory(&self.agents_dir, id, &q));
@@ -1036,12 +1055,14 @@ mod tests {
 
     #[test]
     fn memory_search_query_cleared_on_esc() {
-        let mut state = MemoryPaneState::default();
-        state.search_query.push_str("arch");
-        state.search_active = true;
+        let mut state = MemoryPaneState {
+            search_query: Input::new("arch".to_string()),
+            search_active: true,
+            ..Default::default()
+        };
         state.search_active = false;
-        state.search_query.clear();
-        assert!(state.search_query.is_empty());
+        state.search_query.reset();
+        assert!(state.search_query.value().is_empty());
         assert!(!state.search_active);
     }
 
@@ -1245,7 +1266,7 @@ mod tests {
         state.select_template_next(); // navigate to journaler
         assert_eq!(state.template_idx, 1, "must be on journaler");
         assert_eq!(
-            state.task_input,
+            state.task_input.lines().join("\n"),
             "Record today's findings.",
             "task_input must be pre-filled from sample_tasks[0]"
         );
@@ -1273,12 +1294,12 @@ mod tests {
                 make_spawn_template_with_tasks("journaler", vec!["default sample".into()]),
             ],
             template_idx: 0,
-            task_input: "user typed this".to_string(),
+            task_input: new_task_area("user typed this"),
             ..Default::default()
         };
         state.prefill_task_if_empty();
         assert_eq!(
-            state.task_input, "user typed this",
+            state.task_input.lines().join("\n"), "user typed this",
             "prefill_task_if_empty must not overwrite non-empty task_input"
         );
     }
@@ -1296,7 +1317,7 @@ mod tests {
         state.select_template_prev();
         assert_eq!(state.template_idx, 0, "must be on journaler after prev");
         assert_eq!(
-            state.task_input,
+            state.task_input.lines().join("\n"),
             "Record today's findings.",
             "task_input must be pre-filled from sample_tasks[0] after select_template_prev"
         );
@@ -1411,7 +1432,7 @@ mod tests {
 
         let mut state = SpawnViewState {
             templates:  vec![make_spawn_template("scout")],
-            task_input: "test task".to_string(),
+            task_input: new_task_area("test task"),
             cap_toggles: vec![(
                 agentd::capability::Capability::FsRead { prefix: "/workspace".into() },
                 "FsRead /workspace".to_string(),
@@ -1469,7 +1490,7 @@ mod tests {
 
         let mut state = SpawnViewState {
             templates:  vec![make_spawn_template("scout")],
-            task_input: "test task".to_string(),
+            task_input: new_task_area("test task"),
             ..Default::default()
         };
         state.do_spawn();
