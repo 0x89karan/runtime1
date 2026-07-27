@@ -16,8 +16,9 @@ pub struct ApprovalsViewState {
     pub selected_idx:   usize,
     /// Current interaction mode.
     pub mode:           ApprovalsMode,
-    /// Reject reason typed by the operator (empty = no reason).
-    pub reject_reason:  String,
+    /// Reject reason typed by the operator (empty = no reason). ux.10: `tui_input`
+    /// backed for cursor movement / word-edit / paste.
+    pub reject_reason:  tui_input::Input,
     /// Feedback shown after a write (approve / reject result or error).
     pub result_msg:     Option<String>,
     /// ID of the approval item that entered Confirm/RejectReason mode.
@@ -39,15 +40,17 @@ mod tests {
         let s = ApprovalsViewState::default();
         assert_eq!(s.selected_idx, 0);
         assert_eq!(s.mode, ApprovalsMode::List);
-        assert!(s.reject_reason.is_empty());
+        assert!(s.reject_reason.value().is_empty());
         assert!(s.result_msg.is_none());
     }
 
     #[test]
     fn approvals_view_state_can_accumulate_reason() {
-        let mut s = ApprovalsViewState::default();
-        s.reject_reason.push_str("too risky");
-        assert_eq!(s.reject_reason, "too risky");
+        let s = ApprovalsViewState {
+            reject_reason: tui_input::Input::new("too risky".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(s.reject_reason.value(), "too risky");
     }
 
     #[test]

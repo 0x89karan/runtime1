@@ -257,7 +257,9 @@ pub struct ConverseView {
     pub active_target: String,
     /// True when the rail (not the agent table) has keyboard focus. Toggled by `Tab`.
     pub rail_focused: bool,
-    pub input: String,
+    /// ux.10: single-line message input backed by `tui_input` (cursor movement,
+    /// word-jump, Ctrl-A/E/W/U, paste) instead of hand-rolled push/pop.
+    pub input: tui_input::Input,
 }
 
 impl ConverseView {
@@ -266,7 +268,7 @@ impl ConverseView {
             targets: HashMap::new(),
             active_target: default_target.to_string(),
             rail_focused: false,
-            input: String::new(),
+            input: tui_input::Input::default(),
         }
     }
 

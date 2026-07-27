@@ -90,8 +90,8 @@ pub struct InspectorState {
     pub raw_lines:      Vec<String>,
     /// Active filter.
     pub filter:         InspectorFilter,
-    /// Current search query.
-    pub search_query:   String,
+    /// Current search query (ux.10: backed by `tui_input` for cursor/word-edit/paste).
+    pub search_query:   tui_input::Input,
     /// True while user is typing a search query.
     pub search_active:  bool,
     /// Vertical scroll offset.
@@ -128,7 +128,7 @@ impl InspectorState {
     pub fn rebuild_view(&mut self) {
         self.lines = self.raw_lines
             .iter()
-            .filter(|l| self.filter.matches(l, &self.search_query))
+            .filter(|l| self.filter.matches(l, self.search_query.value()))
             .cloned()
             .collect();
         // Cap scroll to new line count.

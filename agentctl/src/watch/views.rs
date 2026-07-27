@@ -459,6 +459,23 @@ fn wrapped_row_count(line: &Line, width: u16) -> u16 {
 /// ux.1: the Dashboard chat rail — a permanent pane beside the agent table (not a
 /// separate `View`), honoring the project's locked "one unified screen" decision
 /// (docs/ROADMAP.md:1089) rather than a 10th full-screen tab.
+/// ux.10: render a single-line `tui_input` value into a label string with the cursor
+/// glyph drawn at the input's ACTUAL cursor position (not appended at the end), so
+/// Left/Right/Home/End/Ctrl-A movement is reflected on screen. The split point is the
+/// char-index cursor (`Input::cursor()`) — always a valid char boundary — so this is
+/// width-/multibyte-safe and never panics (empty value → glyph at col 0; cursor at end →
+/// glyph at the tail, matching the old look). Used for the inline label-style search /
+/// reason fields; the converse rail uses a real terminal cursor via `set_cursor_position`.
+fn input_with_cursor_glyph(input: &tui_input::Input, glyph: char) -> String {
+    let value    = input.value();
+    let byte_idx = value
+        .char_indices()
+        .nth(input.cursor())
+        .map_or(value.len(), |(i, _)| i);
+    let (head, tail) = value.split_at(byte_idx);
+    format!("{head}{glyph}{tail}")
+}
+
 fn render_converse_rail(f: &mut Frame, app: &App, area: Rect) {
     let target = &app.converse_view.active_target;
     let label = truncate_target_label(target, 20);
@@ -541,16 +558,24 @@ fn render_converse_rail(f: &mut Frame, app: &App, area: Rect) {
 
     // Input box: fixed 3-row height (border top, text line, border bottom) — same
     // idiom as header_footer_layout's Constraint::Length usage elsewhere in this file.
-    let input_display = if app.converse_view.rail_focused {
-        format!("{}█", app.converse_view.input) // simple block cursor while typing
-    } else {
-        app.converse_view.input.clone()
-    };
+    // ux.10: draw the plain value (horizontally scrolled so a long line keeps the cursor
+    // in view), then place the REAL terminal cursor at the input's actual column while the
+    // rail is focused. Codex /review caught the prior `{value}█` glyph-append: once cursor
+    // movement (Left/Home/Ctrl-A) was possible, the appended glyph lied about the edit
+    // position. `visual_cursor`/`visual_scroll` are width-aware; an unfocused rail draws no
+    // cursor.
+    let inner_width = input_area.width.saturating_sub(2).max(1) as usize; // minus borders
+    let scroll = app.converse_view.input.visual_scroll(inner_width);
     f.render_widget(
-        Paragraph::new(input_display)
+        Paragraph::new(app.converse_view.input.value())
+            .scroll((0, scroll as u16))
             .block(Block::default().borders(Borders::ALL).border_style(border_style)),
         input_area,
     );
+    if app.converse_view.rail_focused {
+        let cursor_col = app.converse_view.input.visual_cursor().saturating_sub(scroll) as u16;
+        f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1));
+    }
 }
 
 fn render_agent_detail(f: &mut Frame, app: &App) {
@@ -877,9 +902,9 @@ fn render_memory(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(tab_line), tab_area);
 
     // Search bar
-    let sq = &app.memory_view.search_query;
+    let sq = app.memory_view.search_query.value();
     let search_line = if app.memory_view.search_active {
-        format!("Search: {sq}_")
+        format!("Search: {}", input_with_cursor_glyph(&app.memory_view.search_query, '_'))
     } else if sq.is_empty() {
         " [/] search ".to_string()
     } else {
@@ -914,7 +939,7 @@ fn render_memory_short_term_pane(f: &mut Frame, app: &App, area: Rect) {
             return;
         }
     };
-    let q      = &app.memory_view.search_query;
+    let q      = app.memory_view.search_query.value();
     let items  = filter_short_term(&mem.short_term, q);
     let total  = mem.short_term.len();
     let title  = if q.is_empty() {
@@ -954,7 +979,7 @@ fn render_memory_long_term_pane(f: &mut Frame, app: &App, area: Rect) {
             return;
         }
     };
-    let q       = &app.memory_view.search_query;
+    let q       = app.memory_view.search_query.value();
     let entries = filter_entries(&mem.long_term, q);
     let total   = mem.long_term.len();
     let cap_note = if mem.long_term_truncated {
@@ -1005,7 +1030,7 @@ fn render_memory_kb_pane(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let q      = &app.memory_view.search_query;
+    let q      = app.memory_view.search_query.value();
     let scroll = app.memory_view.kb_scroll;
     let height = area.height.saturating_sub(2) as usize;
 
@@ -1128,14 +1153,12 @@ fn render_spawn(f: &mut Frame, app: &App) {
         } else {
             Style::default()
         });
-    let task_text = if task_focus {
-        format!("{}_", sv.task_input)
-    } else if sv.task_input.is_empty() {
-        "(empty — Tab to focus, type task description)".to_string()
-    } else {
-        sv.task_input.clone()
-    };
-    f.render_widget(Paragraph::new(task_text).block(task_block), task_area);
+    // ux.10: render the multi-line `tui_textarea` inside the bordered block. The
+    // textarea owns its own cursor + placeholder ("(empty — Tab to focus …)") and
+    // scrolls internally, so the block just supplies the border + focus color.
+    let task_inner = task_block.inner(task_area);
+    f.render_widget(task_block, task_area);
+    f.render_widget(&sv.task_input, task_inner);
 
     // Split mid area: left = cap toggles, right = preview
     let mid_chunks = Layout::default()
@@ -1208,7 +1231,7 @@ fn render_inspector(f: &mut Frame, app: &App) {
 
     let filter_label = app.inspector_view.filter.label();
     let search_hint  = if app.inspector_view.search_active {
-        format!(" › search: {}_", app.inspector_view.search_query)
+        format!(" › search: {}", input_with_cursor_glyph(&app.inspector_view.search_query, '_'))
     } else {
         String::new()
     };
@@ -1434,7 +1457,7 @@ fn render_approvals(f: &mut Frame, app: &App) {
                 Line::from(""),
                 Line::from("  Enter rejection reason (optional, press Enter to submit):"),
                 Line::from(""),
-                Line::from(format!("  > {}_", av.reject_reason)),
+                Line::from(format!("  > {}", input_with_cursor_glyph(&av.reject_reason, '_'))),
             ];
 
             f.render_widget(
@@ -1731,6 +1754,54 @@ mod tests {
     use super::*;
     use crate::watch::app::App;
     use crate::watch::reader::{AgentInfo, BudgetKind, Snapshot, SysBudget, SysProvider, SysQueue};
+
+    // ── ux.10: cursor glyph is drawn at the input's actual position ──────────
+    // (Codex /review: appending the glyph at .value()'s end lied about the edit
+    // position once Left/Home/Ctrl-A cursor movement became possible.)
+
+    #[test]
+    fn input_cursor_glyph_at_end_by_default() {
+        let input = tui_input::Input::new("abc".to_string()); // cursor parks at end
+        assert_eq!(input_with_cursor_glyph(&input, '_'), "abc_");
+    }
+
+    #[test]
+    fn input_cursor_glyph_empty_value_is_glyph_only() {
+        let input = tui_input::Input::default();
+        assert_eq!(input_with_cursor_glyph(&input, '_'), "_", "no panic on empty; glyph at col 0");
+    }
+
+    #[test]
+    fn input_cursor_glyph_follows_left_and_home_movement() {
+        use tui_input::backend::crossterm::EventHandler;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut input = tui_input::Input::new("abc".to_string());
+        let before = input.visual_cursor();
+
+        // One Left: cursor moves before 'c' → glyph is drawn between 'b' and 'c'.
+        input.handle_event(&Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        assert_eq!(input.visual_cursor(), before - 1, "Left must move the cursor left");
+        assert_eq!(input_with_cursor_glyph(&input, '_'), "ab_c",
+            "glyph must render at the cursor position, not appended at the end");
+
+        // Home: cursor to col 0 → glyph leads the value.
+        input.handle_event(&Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        assert_eq!(input.visual_cursor(), 0, "Home must move the cursor to column 0");
+        assert_eq!(input_with_cursor_glyph(&input, '_'), "_abc");
+    }
+
+    #[test]
+    fn input_cursor_glyph_multibyte_split_is_char_safe() {
+        // Wide/multibyte chars: splitting by char index (not display column) must stay
+        // on a valid char boundary and never panic.
+        let mut input = tui_input::Input::new("héllo".to_string());
+        // Move Left twice from the end: cursor sits before "lo" (after "hél").
+        use tui_input::backend::crossterm::EventHandler;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        input.handle_event(&Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        input.handle_event(&Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        assert_eq!(input_with_cursor_glyph(&input, '_'), "hél_lo");
+    }
 
     fn make_agent(id: &str, status: &str, ctx: u64, tools: Vec<String>) -> AgentInfo {
         AgentInfo {
@@ -2329,16 +2400,16 @@ mod tests {
         // Structural: search_active flag is independent state from search_query.
         let mut state = MemoryPaneState {
             search_active: true,
-            search_query: "arch".to_string(),
+            search_query: tui_input::Input::new("arch".to_string()),
             ..Default::default()
         };
         assert!(state.search_active);
-        assert_eq!(state.search_query, "arch");
+        assert_eq!(state.search_query.value(), "arch");
         // Closing search leaves query in place (user can re-open and see it).
         // Pressing [/] again would set search_active=true again.
         state.search_active = false;
         assert!(!state.search_active);
-        assert_eq!(state.search_query, "arch", "query must persist after closing search mode");
+        assert_eq!(state.search_query.value(), "arch", "query must persist after closing search mode");
     }
 
     // ── render_plain: isolation tier ────────────────────────────────────────
