@@ -6,6 +6,7 @@ use super::approvals::ApprovalsViewState;
 use super::inspector::InspectorState;
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
 use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue, SysSandbox};
+use super::source::{DataSource, SpawnRequest};
 use super::spawn::{load_spawn_templates, SpawnTemplate};
 use super::topology::{build_graph, TopologyGraph};
 
@@ -234,84 +235,78 @@ impl SpawnViewState {
         };
     }
 
-    /// Generate a preview from the current form state.
-    ///
-    /// When `/agents/control` is present (live agentd running), the preview is
-    /// the JSON payload that will be injected. Otherwise it falls back to the
-    /// full `agent.toml` TOML that will be exec'd.
-    pub fn do_generate(&mut self, agents_dir: Option<&std::path::Path>) {
-        let Some(template) = self.selected_template() else {
-            self.result_msg = Some("No template selected.".to_string());
-            return;
-        };
+    /// Resolve the current form selection (template + task + cap toggles) into the lowered
+    /// `Config`, stripping the caps the operator explicitly unchecked. The SINGLE source of
+    /// truth shared by the JSON preview, the TOML preview, and the HTTP `SpawnRequest`
+    /// (ux.3 M2) — so what the operator previews is semantically identical (same fields + values;
+    /// the preview is pretty-printed for readability, the wire body compact) to what gets spawned.
+    fn resolve_config(&self) -> Result<agentd::config::Config, String> {
+        let template = self.selected_template()
+            .ok_or_else(|| "No template selected.".to_string())?;
         let task = if self.task_input.is_empty() {
             None
         } else {
             Some(self.task_input.as_str())
         };
-        // Re-resolve the full template config to call `to_agent_config`.
         let resolver = crate::build_resolver(None, None);
-        match resolver.resolve(&template.name) {
-            Err(e) => {
-                self.result_msg = Some(format!("resolve error: {e:#}"));
+        let (cfg, _) = resolver.resolve(&template.name)
+            .map_err(|e| format!("resolve error: {e:#}"))?;
+        let extra    = self.enabled_caps();
+        let disabled = self.disabled_caps();
+        let mut config = cfg.to_agent_config(task, extra)
+            .map_err(|e| format!("config error: {e:#}"))?;
+        // Strip caps the user explicitly disabled from the template baseline so unchecking
+        // a baseline cap revokes it (matches execute_pending_spawn's FUSE path).
+        if let Some(agent) = config.agent.as_mut() {
+            if let Some(caps) = agent.capabilities.as_mut() {
+                caps.retain(|c| !disabled.contains(c));
             }
-            Ok((cfg, _)) => {
-                let extra    = self.enabled_caps();
-                let disabled = self.disabled_caps();
-                match cfg.to_agent_config(task, extra) {
-                    Err(e) => {
-                        self.result_msg = Some(format!("config error: {e:#}"));
+        }
+        Ok(config)
+    }
+
+    /// Build the typed `SpawnRequest` that BOTH the JSON preview and the HTTP POST use
+    /// (ux.3 M2). Resolves the current form via `resolve_config`, then lowers the
+    /// `[agent]` section into the request.
+    pub fn build_spawn_request(&self) -> Result<SpawnRequest, String> {
+        let config = self.resolve_config()?;
+        spawn_request_from_config(&config)
+    }
+
+    /// Generate a preview from the current form state (ux.3 M2).
+    ///
+    /// The JSON-vs-TOML choice is by the ACTIVE SOURCE, not local-FUSE presence: an HTTP
+    /// source (`event_stream_url().is_some()`) previews the exact `SpawnRequest` that will
+    /// be POSTed to `/api/v1/spawn`; a FUSE source previews the `agent.toml` that will be
+    /// exec'd. Both are serialized from the SAME `resolve_config` output.
+    pub fn do_generate(&mut self, source: &dyn DataSource) {
+        let config = match self.resolve_config() {
+            Ok(c)  => c,
+            Err(e) => { self.result_msg = Some(e); return; }
+        };
+        if source.event_stream_url().is_some() {
+            // HTTP mode: preview the same SpawnRequest do_spawn_action POSTs (same struct → same
+            // fields/values; pretty here, compact on the wire).
+            match spawn_request_from_config(&config) {
+                Err(e) => { self.result_msg = Some(e); }
+                Ok(req) => match serde_json::to_string_pretty(&req) {
+                    Err(e)       => { self.result_msg = Some(format!("json error: {e:#}")); }
+                    Ok(json_str) => {
+                        self.preview    = Some(json_str);
+                        self.result_msg = Some(
+                            "JSON preview (management API spawn). Press [r] to spawn.".to_string()
+                        );
                     }
-                    Ok(mut config) => {
-                        // Strip caps the user explicitly disabled from the template
-                        // baseline so the preview matches what execute_pending_spawn
-                        // will actually exec.
-                        if let Some(agent) = config.agent.as_mut() {
-                            if let Some(caps) = agent.capabilities.as_mut() {
-                                caps.retain(|c| !disabled.contains(c));
-                            }
-                        }
-                        let use_control = agents_dir
-                            .map(|d| d.join("control").exists())
-                            .unwrap_or(false);
-                        if use_control {
-                            // JSON preview matches the OperatorSpawnRequest payload
-                            // that execute_pending_spawn writes to /agents/control.
-                            let agent_id = config.agent.as_ref()
-                                .map(|a| a.id.clone())
-                                .unwrap_or_else(|| "operator".to_string());
-                            let capabilities = config.agent.as_ref()
-                                .and_then(|a| a.capabilities.clone());
-                            let payload = serde_json::json!({
-                                "task":         self.task_input,
-                                "id":           agent_id,
-                                "capabilities": capabilities,
-                            });
-                            match serde_json::to_string_pretty(&payload) {
-                                Err(e) => {
-                                    self.result_msg = Some(format!("json error: {e:#}"));
-                                }
-                                Ok(json_str) => {
-                                    self.preview    = Some(json_str);
-                                    self.result_msg = Some(
-                                        "JSON preview (live inject). Press [r] to send.".to_string()
-                                    );
-                                }
-                            }
-                        } else {
-                            match toml::to_string_pretty(&config) {
-                                Err(e) => {
-                                    self.result_msg = Some(format!("toml error: {e:#}"));
-                                }
-                                Ok(toml_str) => {
-                                    self.preview    = Some(toml_str);
-                                    self.result_msg = Some(
-                                        "TOML preview (exec fallback). Press [r] to spawn.".to_string()
-                                    );
-                                }
-                            }
-                        }
-                    }
+                },
+            }
+        } else {
+            match toml::to_string_pretty(&config) {
+                Err(e) => { self.result_msg = Some(format!("toml error: {e:#}")); }
+                Ok(toml_str) => {
+                    self.preview    = Some(toml_str);
+                    self.result_msg = Some(
+                        "TOML preview (exec fallback). Press [r] to spawn.".to_string()
+                    );
                 }
             }
         }
@@ -336,6 +331,10 @@ impl SpawnViewState {
                 return;
             }
         }
+        // ux.3 M4: this gate is correct ONLY for the FUSE/exec path (do_spawn queues a
+        // local-agentd exec, which reads the key from this process's env). The HTTP path
+        // (do_spawn_action in mod.rs) never calls do_spawn — creds live server-side there,
+        // so it must not require a local key.
         if std::env::var("ANTHROPIC_API_KEY").is_err() {
             self.result_msg = Some("ANTHROPIC_API_KEY is not set — required by agentd.".to_string());
             return;
@@ -350,6 +349,31 @@ impl SpawnViewState {
             disabled_caps: disabled,
         });
     }
+}
+
+/// Lower a resolved `Config`'s `[agent]` section into the typed `SpawnRequest` used by both
+/// the JSON preview and the HTTP `/api/v1/spawn` POST (ux.3 M2/M7). Pulls
+/// `max_turns`/`token_budget`/`priority`/`capabilities` from the lowered config so the
+/// preview and the spawn can never drift. `orchestrated = false` is set DELIBERATELY: a
+/// one-shot template Spawn-view spawn runs to completion (the converse rail forces `true`;
+/// this must not inherit that). Errors when the template has no `[agent]` section
+/// (multi-agent templates aren't spawnable through this view).
+pub(crate) fn spawn_request_from_config(
+    config: &agentd::config::Config,
+) -> Result<SpawnRequest, String> {
+    let agent = config.agent.as_ref().ok_or_else(|| {
+        "template has no [agent] section (multi-agent templates can't be spawned here)"
+            .to_string()
+    })?;
+    Ok(SpawnRequest {
+        task:         agent.task.clone(),
+        id:           Some(agent.id.clone()),
+        max_turns:    Some(agent.max_turns),
+        token_budget: Some(agent.token_budget),
+        priority:     Some(agent.priority),
+        capabilities: agent.capabilities.clone(),
+        orchestrated: false,
+    })
 }
 
 /// Which pane is active in the Memory view (true-tab model).
@@ -439,6 +463,13 @@ pub struct App {
     /// Shown as a green banner on the Dashboard after a successful live injection
     /// via /agents/control; cleared on the next keypress.
     pub spawn_banner:    Option<String>,
+    /// ux.3 M5: id of a just-HTTP-spawned agent to auto-focus (auto-drop). Setting
+    /// `selected_id` directly races the snapshot poll — `apply_snapshot` clears unknown
+    /// selections then auto-selects row 0, and an in-flight poll predating the scheduler
+    /// insertion can land first. This sticky marker survives that: `apply_snapshot` binds
+    /// it to `selected_id` (and clears it) once the agent appears, and refuses to wipe a
+    /// selection equal to it in the meantime.
+    pub pending_focus:   Option<String>,
     /// ux.0: set when state changed and a redraw is due; the render loop draws
     /// once per tick after draining all pending events (coalescing).
     pub dirty:           bool,
@@ -495,6 +526,7 @@ impl App {
             approvals_items: vec![],
             approvals_view:  ApprovalsViewState::default(),
             spawn_banner:    None,
+            pending_focus:   None,
             dirty:           true,
             events:          std::collections::VecDeque::new(),
             dropped_events:  0,
@@ -528,7 +560,13 @@ impl App {
         // Preserve selected_id stability: if the selected agent is still present,
         // keep it selected; otherwise clear the selection.
         if let Some(ref id) = self.selected_id {
-            if !snap.agents.iter().any(|a| &a.id == id) {
+            let present   = snap.agents.iter().any(|a| &a.id == id);
+            // ux.3 M5: never wipe a selection equal to pending_focus. A just-HTTP-spawned
+            // agent won't appear until the scheduler inserts it, and an in-flight poll can
+            // land first — clearing the selection here would drop the operator off the
+            // agent they just spawned before it ever shows up.
+            let is_pending = self.pending_focus.as_deref() == Some(id.as_str());
+            if !present && !is_pending {
                 self.selected_id = None;
                 // If the agent we were inspecting is gone, go back to the
                 // dashboard so the user isn't left in a stale AgentDetail view
@@ -536,6 +574,15 @@ impl App {
                 if self.view == View::AgentDetail {
                     self.view = View::Dashboard;
                 }
+            }
+        }
+        // ux.3 M5: once the pending-focus agent materializes in a snapshot, bind it as the
+        // selection and drop the marker (auto-drop). Done before the auto-select-first
+        // fallback so it wins.
+        if let Some(ref pid) = self.pending_focus {
+            if snap.agents.iter().any(|a| &a.id == pid) {
+                self.selected_id  = Some(pid.clone());
+                self.pending_focus = None;
             }
         }
         // Auto-select first agent on first load.
@@ -655,9 +702,22 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::watch::reader::{AgentInfo, BudgetKind, Snapshot};
+    use crate::watch::reader::{AgentInfo, BudgetKind, PendingAction, Snapshot};
 
     use crate::ENV_MUTEX;
+
+    /// FUSE-like DataSource: `event_stream_url()` is None, so the Spawn view routes to the
+    /// exec/control path. Used to exercise `do_generate`'s TOML/error branch.
+    struct FuseLikeSource;
+    impl DataSource for FuseLikeSource {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None,
+                       provider: None, isolation: None, credentials: None, error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+        fn deny(&self, _id: &str, _reason: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+    }
 
     fn make_agent(id: &str) -> AgentInfo {
         AgentInfo {
@@ -1381,8 +1441,9 @@ mod tests {
     #[test]
     fn spawn_view_do_generate_sets_error_when_no_templates_loaded() {
         let mut state = SpawnViewState::default();
-        // No templates — do_generate must set an error result_msg.
-        state.do_generate(None);
+        // No templates — do_generate must set an error result_msg. Source is FUSE-like
+        // (event_stream_url None), but resolution fails before the branch matters.
+        state.do_generate(&FuseLikeSource);
         assert_eq!(state.result_msg.as_deref(), Some("No template selected."),
             "do_generate with no templates must set error result_msg");
         assert!(state.preview.is_none(), "preview must stay None on error");
@@ -1423,5 +1484,86 @@ mod tests {
         );
         assert!(state.pending_exec.is_none(),
             "pending_exec must stay None when ANTHROPIC_API_KEY is absent");
+    }
+
+    // ── ux.3: spawn_request_from_config (M1/M2/M7) ────────────────────────────
+
+    #[test]
+    fn spawn_request_from_config_carries_caps_priority_and_matches_preview() {
+        // A lowered Config with an explicit cap list + priority (what a resolved template
+        // produces). Build the SpawnRequest and assert the wire shape AND that the preview
+        // (pretty-printed) reparses to the SAME value as the POST body — semantic identity,
+        // the guarantee that matters (whitespace differs; fields/values can't drift because
+        // both serialize the one SpawnRequest). The M2 single-source-of-truth guard.
+        let config: agentd::config::Config = serde_json::from_value(serde_json::json!({
+            "agent": {
+                "id":           "my-agent",
+                "task":         "do the thing",
+                "max_turns":    7,
+                "token_budget": 12345u64,
+                "priority":     3,
+                "capabilities": [
+                    {"FsRead": {"prefix": "/workspace"}},
+                    "Spawn"
+                ]
+            }
+        })).expect("config must deserialize");
+
+        let req = spawn_request_from_config(&config).expect("request must build");
+        assert_eq!(req.priority, Some(3));
+        assert_eq!(req.max_turns, Some(7));
+        assert_eq!(req.token_budget, Some(12345));
+        assert_eq!(req.task, "do the thing");
+        assert_eq!(req.id.as_deref(), Some("my-agent"));
+        assert!(!req.orchestrated, "one-shot Spawn-view spawn must set orchestrated=false (M7)");
+
+        let body = serde_json::to_value(&req).unwrap();
+        // Capabilities use the Capability serde shape (externally-tagged PascalCase).
+        assert_eq!(
+            body["capabilities"],
+            serde_json::json!([{"FsRead": {"prefix": "/workspace"}}, "Spawn"]),
+            "caps array must match the Capability serde shape"
+        );
+        assert_eq!(body["priority"], serde_json::json!(3));
+
+        // The [g] preview serializes the SAME SpawnRequest — reparsing it must equal the
+        // POST body exactly (what you preview is what you spawn).
+        let preview = serde_json::to_string_pretty(&req).unwrap();
+        let reparsed: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(reparsed, body,
+            "the JSON preview must equal the POST body — single source of truth (M2)");
+    }
+
+    #[test]
+    fn spawn_request_from_config_errors_without_agent_section() {
+        // A multi-agent (or agent-less) config can't be spawned through the Spawn view.
+        let config: agentd::config::Config =
+            serde_json::from_value(serde_json::json!({})).expect("config must deserialize");
+        let err = spawn_request_from_config(&config).unwrap_err();
+        assert!(err.contains("[agent]"), "error must explain the missing [agent] section: {err}");
+    }
+
+    // ── ux.3 M5: sticky auto-focus survives the snapshot race ─────────────────
+
+    #[test]
+    fn pending_focus_survives_snapshot_without_agent_then_binds_when_present() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        // Simulate a successful HTTP spawn: selection + sticky focus set to the new id.
+        app.selected_id   = Some("new-agent".to_string());
+        app.pending_focus = Some("new-agent".to_string());
+
+        // In-flight poll predating scheduler insertion: the agent isn't in the snapshot
+        // yet (other agents are). The selection equal to pending_focus must NOT be wiped.
+        app.apply_snapshot(make_snapshot(&["other"]));
+        assert_eq!(app.selected_id.as_deref(), Some("new-agent"),
+            "a selection equal to pending_focus must not be wiped before the agent appears");
+        assert_eq!(app.pending_focus.as_deref(), Some("new-agent"),
+            "pending_focus must survive a snapshot that lacks the agent");
+
+        // Next snapshot includes it → bind to selected_id and clear the marker.
+        app.apply_snapshot(make_snapshot(&["other", "new-agent"]));
+        assert_eq!(app.selected_id.as_deref(), Some("new-agent"),
+            "pending_focus must bind to selected_id once the agent materializes");
+        assert!(app.pending_focus.is_none(), "pending_focus must clear once bound");
     }
 }

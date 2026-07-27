@@ -431,7 +431,7 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
             _ => {}
         },
         View::Memory => handle_memory_key(key.code, app),
-        View::Spawn => handle_spawn_key(key.code, app),
+        View::Spawn => handle_spawn_key(key.code, app, source),
         View::Inspector => handle_inspector_key(key.code, app),
         View::Approvals => handle_approvals_key(key.code, app, source),
         View::Credentials => {
@@ -703,7 +703,7 @@ fn handle_dashboard_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
     }
 }
 
-fn handle_spawn_key(code: KeyCode, app: &mut App) {
+fn handle_spawn_key(code: KeyCode, app: &mut App, source: &dyn DataSource) {
     let focus = app.spawn_view.focus.clone();
     match (&focus, code) {
         // TaskField captures all char input; Esc defocuses, Enter tabs forward.
@@ -747,22 +747,64 @@ fn handle_spawn_key(code: KeyCode, app: &mut App) {
             app.spawn_view.toggle_cap_at(idx);
         }
         // Generate action: [g] shortcut (outside TaskField) or Enter on button.
+        // ux.3 M2: the preview branch (JSON vs TOML) is chosen by the active source, so the
+        // operator previews the exact SpawnRequest (same fields/values) a spawn will send.
         (_, KeyCode::Char('g')) => {
-            let dir = app.agents_dir.clone();
-            app.spawn_view.do_generate(Some(&dir));
+            app.spawn_view.do_generate(source);
         }
         (SpawnFocus::ActionGenerate, KeyCode::Enter | KeyCode::Char(' ')) => {
-            let dir = app.agents_dir.clone();
-            app.spawn_view.do_generate(Some(&dir));
+            app.spawn_view.do_generate(source);
         }
         // Spawn action: [r] shortcut (outside TaskField) or Enter on button.
         (_, KeyCode::Char('r')) => {
-            app.spawn_view.do_spawn();
+            do_spawn_action(app, source);
         }
         (SpawnFocus::ActionSpawn, KeyCode::Enter | KeyCode::Char(' ')) => {
-            app.spawn_view.do_spawn();
+            do_spawn_action(app, source);
         }
         _ => {}
+    }
+}
+
+/// Route the confirmed Spawn action (ux.3 M3). When the active source is HTTP
+/// (`event_stream_url().is_some()` → `HttpSource`), resolve the form into a typed
+/// `SpawnRequest` and POST it to `/api/v1/spawn` INLINE on the main thread (matching the
+/// approve/deny/converse `reqwest::blocking` precedent) — the TUI stays alive, no second
+/// agentd is exec'd, and the FUSE `spawn()` stub (which always errors) is unreachable from
+/// this view. On success: set the banner + `pending_focus` (M5 auto-drop) and drop into the
+/// Dashboard. On failure: surface the server's reason verbatim in the Spawn view's result
+/// line (M6) and stay put. When the active source is FUSE, fall through to the unchanged
+/// `do_spawn()` → `pending_exec` → `execute_pending_spawn` (`/agents/control` write) path,
+/// which keeps the local `ANTHROPIC_API_KEY` gate (M4).
+fn do_spawn_action(app: &mut App, source: &dyn DataSource) {
+    if source.event_stream_url().is_some() {
+        let req = match app.spawn_view.build_spawn_request() {
+            Ok(r)  => r,
+            Err(e) => { app.spawn_view.result_msg = Some(e); return; }
+        };
+        match source.spawn(&req) {
+            Ok(agent_id) => {
+                app.spawn_view.result_msg =
+                    Some(format!("Spawned '{agent_id}' via management API."));
+                app.spawn_banner =
+                    Some(format!("Agent '{agent_id}' spawned via management API"));
+                // M5: sticky auto-focus + selection; apply_snapshot binds it once the
+                // agent shows up and refuses to wipe it before then.
+                app.selected_id   = Some(agent_id.clone());
+                app.pending_focus = Some(agent_id);
+                // Auto-drop: return to the Dashboard to watch the new agent.
+                app.view = View::Dashboard;
+            }
+            Err(e) => {
+                // M6: the server body (e.g. cap.4's 400 "spawn refused … privileged")
+                // arrives verbatim from HttpSource::spawn — surface it, stay in the view,
+                // set no banner/focus.
+                app.spawn_view.result_msg = Some(format!("Spawn failed: {e}"));
+            }
+        }
+    } else {
+        // FUSE/exec path unchanged (keeps the local API-key gate — M4).
+        app.spawn_view.do_spawn();
     }
 }
 
@@ -1029,14 +1071,14 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        drain_events, handle_approvals_key, handle_dashboard_key, handle_memory_key,
-        handle_spawn_key, on_resize, step, step_key, App, Effect, View,
+        do_spawn_action, drain_events, handle_approvals_key, handle_dashboard_key,
+        handle_memory_key, handle_spawn_key, on_resize, step, step_key, App, Effect, View,
     };
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
     use crate::watch::pump::AppEvent;
     use crate::watch::reader::{self, AgentInfo, BudgetKind, PendingAction, Snapshot};
-    use crate::watch::source::DataSource;
+    use crate::watch::source::{DataSource, HttpSource, SpawnRequest};
 
     struct TestSource;
     impl DataSource for TestSource {
@@ -1623,7 +1665,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
-        handle_spawn_key(KeyCode::Esc, &mut app);
+        handle_spawn_key(KeyCode::Esc, &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard);
     }
 
@@ -1632,7 +1674,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::ActionGenerate;
-        handle_spawn_key(KeyCode::Char('q'), &mut app);
+        handle_spawn_key(KeyCode::Char('q'), &mut app, &TestSource);
         assert_eq!(app.view, View::Dashboard);
     }
 
@@ -1641,7 +1683,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Char('q'), &mut app);
+        handle_spawn_key(KeyCode::Char('q'), &mut app, &TestSource);
         assert_eq!(app.view, View::Spawn, "view must stay Spawn while in task field");
         assert_eq!(app.spawn_view.task_input, "q", "char must append to task input");
     }
@@ -1651,7 +1693,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.view = View::Spawn;
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Esc, &mut app);
+        handle_spawn_key(KeyCode::Esc, &mut app, &TestSource);
         assert_eq!(app.view, View::Spawn, "Esc in task field must not exit spawn view");
         assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker,
             "Esc in task field must defocus to TemplatePicker");
@@ -1668,15 +1710,15 @@ mod tests {
             true,
         )];
         assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker);
-        handle_spawn_key(KeyCode::Tab, &mut app);
+        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::TaskField);
-        handle_spawn_key(KeyCode::Tab, &mut app);
+        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::CapToggles);
-        handle_spawn_key(KeyCode::Tab, &mut app);
+        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::ActionGenerate);
-        handle_spawn_key(KeyCode::Tab, &mut app);
+        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::ActionSpawn);
-        handle_spawn_key(KeyCode::Tab, &mut app);
+        handle_spawn_key(KeyCode::Tab, &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::TemplatePicker, "must wrap");
     }
 
@@ -1685,7 +1727,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
         app.spawn_view.task_input = "hello".to_string();
-        handle_spawn_key(KeyCode::Backspace, &mut app);
+        handle_spawn_key(KeyCode::Backspace, &mut app, &TestSource);
         assert_eq!(app.spawn_view.task_input, "hell");
     }
 
@@ -1699,7 +1741,7 @@ mod tests {
             true,
         )];
         app.spawn_view.cap_idx = 0;
-        handle_spawn_key(KeyCode::Char(' '), &mut app);
+        handle_spawn_key(KeyCode::Char(' '), &mut app, &TestSource);
         assert!(!app.spawn_view.cap_toggles[0].2, "space must toggle cap off");
     }
 
@@ -1708,7 +1750,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
         // No cap_toggles — TaskField Enter skips to ActionGenerate.
-        handle_spawn_key(KeyCode::Enter, &mut app);
+        handle_spawn_key(KeyCode::Enter, &mut app, &TestSource);
         assert_eq!(app.spawn_view.focus, SpawnFocus::ActionGenerate,
             "Enter in TaskField must advance focus (not exit view)");
     }
@@ -1726,7 +1768,7 @@ mod tests {
                             description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
         ];
         app.spawn_view.template_idx = 1;
-        handle_spawn_key(KeyCode::Up, &mut app);
+        handle_spawn_key(KeyCode::Up, &mut app, &TestSource);
         assert_eq!(app.spawn_view.template_idx, 0, "Up in TemplatePicker must decrement index");
     }
 
@@ -1743,7 +1785,7 @@ mod tests {
                             description: String::new(), showcases: String::new(), suggested_caps: vec![], sample_tasks: vec![] },
         ];
         app.spawn_view.template_idx = 0;
-        handle_spawn_key(KeyCode::Down, &mut app);
+        handle_spawn_key(KeyCode::Down, &mut app, &TestSource);
         assert_eq!(app.spawn_view.template_idx, 1, "Down in TemplatePicker must increment index");
     }
 
@@ -1756,7 +1798,7 @@ mod tests {
             (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
         ];
         app.spawn_view.cap_idx = 1;
-        handle_spawn_key(KeyCode::Char('k'), &mut app);
+        handle_spawn_key(KeyCode::Char('k'), &mut app, &TestSource);
         assert_eq!(app.spawn_view.cap_idx, 0, "'k' in CapToggles must call cap_prev");
     }
 
@@ -1769,7 +1811,7 @@ mod tests {
             (agentd::capability::Capability::Spawn, "Spawn2".to_string(), true),
         ];
         app.spawn_view.cap_idx = 0;
-        handle_spawn_key(KeyCode::Char('j'), &mut app);
+        handle_spawn_key(KeyCode::Char('j'), &mut app, &TestSource);
         assert_eq!(app.spawn_view.cap_idx, 1, "'j' in CapToggles must call cap_next");
     }
 
@@ -1778,7 +1820,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
         // No templates loaded — do_generate sets an error result_msg.
-        handle_spawn_key(KeyCode::Char('g'), &mut app);
+        handle_spawn_key(KeyCode::Char('g'), &mut app, &TestSource);
         assert!(app.spawn_view.result_msg.is_some(),
             "'g' outside TaskField must invoke do_generate (result_msg set)");
     }
@@ -1788,7 +1830,7 @@ mod tests {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TemplatePicker;
         // No templates loaded — do_spawn sets an error result_msg.
-        handle_spawn_key(KeyCode::Char('r'), &mut app);
+        handle_spawn_key(KeyCode::Char('r'), &mut app, &TestSource);
         assert!(app.spawn_view.result_msg.is_some(),
             "'r' outside TaskField must invoke do_spawn (result_msg set)");
     }
@@ -1797,7 +1839,7 @@ mod tests {
     fn spawn_key_r_appends_to_task_when_task_field_focused() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Char('r'), &mut app);
+        handle_spawn_key(KeyCode::Char('r'), &mut app, &TestSource);
         assert_eq!(app.spawn_view.task_input, "r",
             "Char('r') in TaskField must append to task input, not trigger do_spawn");
         assert!(app.spawn_view.pending_exec.is_none(),
@@ -1810,13 +1852,133 @@ mod tests {
     fn spawn_key_g_appends_to_task_when_task_field_focused() {
         let mut app = App::new(PathBuf::from("/agents"));
         app.spawn_view.focus = SpawnFocus::TaskField;
-        handle_spawn_key(KeyCode::Char('g'), &mut app);
+        handle_spawn_key(KeyCode::Char('g'), &mut app, &TestSource);
         assert_eq!(app.spawn_view.task_input, "g",
             "Char('g') in TaskField must append to task input, not trigger do_generate");
         assert!(app.spawn_view.preview.is_none(),
             "Char('g') in TaskField must not trigger do_generate");
         assert!(app.spawn_view.result_msg.is_none(),
             "Char('g') in TaskField must not set result_msg");
+    }
+
+    // ── ux.3: do_spawn_action routing (M3/M5/M6) ──────────────────────────────
+
+    /// FUSE-mode source whose `spawn()` panics — proves the Spawn view never reaches the
+    /// FUSE `spawn()` stub (M3 gates strictly on `event_stream_url().is_some()`).
+    struct FuseSpawnGuard;
+    impl DataSource for FuseSpawnGuard {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None,
+                       provider: None, isolation: None, credentials: None, error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+        fn deny(&self, _id: &str, _r: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+        fn spawn(&self, _req: &SpawnRequest) -> Result<String, String> {
+            panic!("FUSE-mode Spawn view must never call source.spawn() (M3 gate)");
+        }
+        // event_stream_url() defaults to None → FUSE mode.
+    }
+
+    /// Load the repo template catalogue and select `scout` (read-only, non-privileged
+    /// caps) into a Spawn-view App with a task filled in. Shared by the HTTP-mode tests.
+    ///
+    /// Returns `None` when the catalogue is EMPTY — which happens only where the repo's
+    /// `templates/` dir isn't present in the filesystem at all, e.g. the aarch64 QEMU-cross
+    /// CI rootfs (the cross harness doesn't copy `templates/` into the emulated image, and
+    /// `default_repo_dir`'s exe-walk can't find it). Callers skip-with-notice in that case;
+    /// the routing/body logic under test is arch-independent and fully covered on x86_64 +
+    /// macOS (native) + the live runtime /qa. A NON-empty catalogue missing `scout` is a real
+    /// regression and still panics.
+    fn spawn_app_on_scout() -> Option<App> {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        app.spawn_view.load();
+        if app.spawn_view.templates.is_empty() {
+            return None; // catalogue fixture absent (e.g. QEMU-cross) — caller skips
+        }
+        let idx = app.spawn_view.templates.iter().position(|t| t.name == "scout")
+            .expect("scout must be present in a non-empty repo catalogue");
+        app.spawn_view.template_idx = idx;
+        app.spawn_view.rebuild_cap_toggles();
+        app.spawn_view.task_input = "list /workspace".to_string();
+        Some(app)
+    }
+
+    #[test]
+    fn http_mode_spawn_routes_to_management_api_with_caps_and_priority() {
+        let server = httpmock::MockServer::start();
+        // The route matcher asserts the POST body carries `priority` AND a real toggled
+        // cap (`FsRead`, from scout's fs_read = ["/workspace"]) — the load-bearing M1 fix.
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/v1/spawn")
+                .body_contains("\"priority\"")
+                .body_contains("FsRead");
+            then.status(201).json_body(serde_json::json!({"agent_id": "scout-1"}));
+        });
+        let source = HttpSource::new(server.base_url());
+
+        let Some(mut app) = spawn_app_on_scout() else {
+            eprintln!("SKIP http_mode_spawn_routes_to_management_api_with_caps_and_priority: \
+                       repo template catalogue not present (e.g. QEMU-cross rootfs); \
+                       arch-independent routing is covered on x86_64/macOS");
+            return;
+        };
+        do_spawn_action(&mut app, &source);
+
+        mock.assert(); // exactly one matching POST — no 2nd agentd exec'd
+        assert_eq!(app.pending_focus.as_deref(), Some("scout-1"),
+            "success must set sticky auto-focus (M5)");
+        assert_eq!(app.selected_id.as_deref(), Some("scout-1"),
+            "success must set the selection to the new agent (M5)");
+        assert!(app.spawn_banner.is_some(), "success must set the confirmed banner");
+        assert_eq!(app.view, View::Dashboard, "auto-drop into the Dashboard on success");
+        assert!(app.spawn_view.pending_exec.is_none(),
+            "HTTP path must NOT queue a local agentd exec");
+    }
+
+    #[test]
+    fn http_mode_spawn_privileged_refusal_surfaces_reason_no_focus() {
+        let server = httpmock::MockServer::start();
+        // cap.4's deny-by-default gate returns 400 (NOT 403 — M6) with the reason + remedy.
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/v1/spawn");
+            then.status(400).body(
+                "spawn refused: unrestricted (all capabilities) is privileged; \
+                 set AGENTOS_ALLOW_PRIVILEGED_SPAWN=1 to allow operator-driven privileged spawns");
+        });
+        let source = HttpSource::new(server.base_url());
+
+        let Some(mut app) = spawn_app_on_scout() else {
+            eprintln!("SKIP http_mode_spawn_privileged_refusal_surfaces_reason_no_focus: \
+                       repo template catalogue not present (e.g. QEMU-cross rootfs); \
+                       arch-independent routing is covered on x86_64/macOS");
+            return;
+        };
+        do_spawn_action(&mut app, &source);
+
+        let msg = app.spawn_view.result_msg.as_deref().unwrap_or("");
+        assert!(msg.contains("privileged"),
+            "the server's refusal reason must land in the Spawn view's result line (M6): {msg}");
+        assert!(app.pending_focus.is_none(), "a refused spawn must NOT set auto-focus");
+        assert!(app.spawn_banner.is_none(), "a refused spawn must NOT set a banner");
+        assert_eq!(app.view, View::Spawn, "must stay in the Spawn view on failure (no teardown)");
+    }
+
+    #[test]
+    fn fuse_mode_spawn_never_calls_source_spawn_stub() {
+        // FUSE mode (event_stream_url None) must fall through to do_spawn()/pending_exec —
+        // NOT source.spawn() (whose FUSE stub always errors). FuseSpawnGuard panics if the
+        // stub is reached. No templates loaded → do_spawn short-circuits before any exec.
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.view = View::Spawn;
+        app.spawn_view.focus = SpawnFocus::ActionSpawn;
+        do_spawn_action(&mut app, &FuseSpawnGuard);
+        assert!(app.pending_focus.is_none(), "FUSE path must not set HTTP auto-focus");
+        assert!(app.spawn_banner.is_none(), "FUSE path must not set the HTTP banner");
+        assert_eq!(app.spawn_view.result_msg.as_deref(), Some("No template selected."),
+            "FUSE path routes to do_spawn(), not the HTTP spawn");
     }
 
     // ── handle_dashboard_key: [a] opens Approvals view ───────────────────────

@@ -1158,10 +1158,16 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   non-functional over FUSE (the default local mode on AgentOS's actual target platform) —
   see CHANGELOG.md for the complete list. Full plan + dual-voice review:
   `docs/plans/ux.1-converse.md`.
-- **ux.3** — Spawn custom on the fly (closes **p7.3-ar-02**): repoint the Spawn view from
-  exec-a-2nd-agentd to `POST /api/v1/spawn` into the running instance; `⟨custom⟩` mode (deny-by-default
-  caps + tool/connector select); modal-over-live-dashboard; preview before launch; auto-drop into the
-  new agent; `:` command palette.
+- ✅ **ux.3** — Spawn custom on the fly (**addresses the p7.3-ar-02 cluster** — closes the TUI Spawn-view
+  gap; the standalone `agentctl spawn` CLI-subcommand exec residual stays a P3 nit, see TODOS): CORE + auto-drop shipped. The client
+  `SpawnRequest` now carries typed `capabilities` + `priority` (shared `agentd::capability::Capability`),
+  the interactive Spawn action routes INLINE through `DataSource::spawn()` → `POST /api/v1/spawn` when the
+  active source is HTTP (no second agentd exec'd; FUSE mode still writes `/agents/control`), one shared
+  resolver makes the preview semantically identical to the spawn, the local `ANTHROPIC_API_KEY` gate is off the HTTP
+  path, and a sticky `pending_focus` auto-drops into the new agent across the snapshot race. Privileged-cap
+  refusal (cap.4, **400** not 403) surfaces the server reason verbatim in the Spawn view — reject-not-clamp.
+  Built per REVISED MECHANISM M1–M7. **DEFERRED → ux.3b**: the `:` command palette + modal-over-live-dashboard
+  overlay (net-new UI subsystems, no reusable infra).
 
 **The reshape (2026-07-18, office-hours — plan of record).** Framing: *trust after absence* — the
 operator wakes up, understands the night, unblocks from anywhere, and can stop a runaway. Four core

@@ -12,12 +12,27 @@ use super::reader::{
 };
 
 /// Spawn request sent to the management API (orch.1+).
+///
+/// Mirrors the server's `OperatorSpawnRequest` wire shape (`agentd/src/control.rs`).
+/// `priority` + `capabilities` were added in ux.3 (closes p7.3-ar-02): without them the
+/// HTTP path silently dropped the operator's toggled caps + priority. `capabilities` uses
+/// the SAME `agentd::capability::Capability` type the Spawn UI already produces, so the
+/// preview payload and the POST body are semantically identical (same fields + values).
+/// NOTE: `None`/omitted capabilities
+/// mean **unrestricted ≡ privileged** on the server (`management.rs`), not "safe".
 #[derive(Debug, serde::Serialize)]
 pub struct SpawnRequest {
     pub task:         String,
     pub id:           Option<String>,
     pub max_turns:    Option<u32>,
     pub token_budget: Option<u64>,
+    /// Scheduling priority (config-sourced; no UI in ux.3). Omitted when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority:     Option<u32>,
+    /// Capabilities to grant the spawned agent. Omitted when None (≡ unrestricted on the
+    /// server). Typed so the preview and the POST body can never drift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<agentd::capability::Capability>>,
     /// When true, agent parks after each response awaiting next inject.
     pub orchestrated: bool,
 }
@@ -310,8 +325,13 @@ impl DataSource for HttpSource {
             });
         }
         let val: serde_json::Value = resp.json().map_err(|e| format!("JSON decode error: {e}"))?;
-        // Server returns 201 + {"agent_id": "..."} after confirmation (ar-02).
-        let id = val["agent_id"].as_str().unwrap_or("operator-agent").to_string();
+        // Server returns 201 + {"agent_id": "..."} after confirmation (ar-02). Error rather than
+        // fabricate an id: ux.3 pins auto-focus (pending_focus) to the returned id, and an invented
+        // one would stick the selection to a non-existent agent forever (Codex review).
+        let id = val["agent_id"]
+            .as_str()
+            .ok_or_else(|| "spawn succeeded but response had no agent_id".to_string())?
+            .to_string();
         Ok(id)
     }
 

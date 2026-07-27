@@ -3,6 +3,32 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.112.0] - 2026-07-27
+
+### Added
+- **ux.3 — spawn custom agents on the fly over HTTP (addresses the p7.3-ar-02 cluster).** The `agentctl
+  watch` Spawn view can now spawn a custom-capability agent into an already-running instance over the
+  management API. The load-bearing bug: the client `SpawnRequest` never carried `capabilities`/`priority`,
+  so over `--url`/HTTP the operator's toggled caps + priority were **silently dropped** (a custom-cap spawn
+  became a default privileged spawn or a second exec'd agentd).
+  - Client `SpawnRequest` now carries typed `Option<Vec<Capability>>` + `Option<u32>` priority (the shared
+    `agentd::capability::Capability`, `skip_serializing_if`), so the wire body matches the server's
+    `OperatorSpawnRequest`.
+  - One shared resolver (`resolve_config`/`spawn_request_from_config`) makes the Spawn-view preview and the
+    POST body semantically identical (same fields + values); the JSON-vs-TOML preview keys off the active
+    source, not local FUSE presence.
+  - The Spawn action routes **inline** through `DataSource::spawn()` → `POST /api/v1/spawn` when the source
+    is HTTP (matches the approve/converse precedent — no second `agentd` exec'd, no terminal teardown, errors
+    shown in the Spawn view); FUSE mode still writes `/agents/control`, and the always-erroring FUSE `spawn()`
+    stub is unreachable from the Spawn view.
+  - A sticky `pending_focus` auto-drops the operator into the new agent across the snapshot-insertion race;
+    a privileged-cap refusal (cap.4, **400**) surfaces the server's reason verbatim (reject-not-clamp).
+  - Reshaped from the draft at `/autoplan` (both eng voices: the preview and spawn payload diverged, a local
+    `ANTHROPIC_API_KEY` gate would block remote HTTP, auto-focus had a race) and hardened at `/review` (Codex:
+    `HttpSource::spawn` no longer fabricates an `agent_id` on a malformed response, which would have pinned
+    focus to a non-existent agent forever). Scope: closes the TUI Spawn-view gap; the standalone `agentctl
+    spawn` CLI-subcommand exec (the literal p7.3-ar-02) remains a P3 residual (operators use the TUI/API).
+
 ## [v0.111.0] - 2026-07-26
 
 ### Added

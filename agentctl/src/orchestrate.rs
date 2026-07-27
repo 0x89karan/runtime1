@@ -85,6 +85,9 @@ pub fn run(args: OrchestrateArgs) -> anyhow::Result<()> {
             id:           Some(args.agent_id.clone()),
             max_turns:    Some(args.max_turns),
             token_budget: None,
+            // orchestrate REPL never restricts caps (unchanged from pre-ux.3).
+            priority:     None,
+            capabilities: None,
             orchestrated: true,
         };
         let resolved_id = source.spawn(&req)
