@@ -1,7 +1,13 @@
 # AgentOS — Completed Increments
 
-Detailed per-increment completion notes. Updated after every shipped PR.
+Detailed per-increment completion notes.
 The roadmap (with acceptance criteria and what's next) lives in `docs/ROADMAP.md`.
+
+> **Coverage gap, be honest about it:** this file is complete through **v0.88.0** and then
+> jumps to **v0.115.0**. The 26 releases in between (v0.89.0–v0.114.0 — the AUDIT-v0.97
+> remediation stack, the cap cluster, and the UX tail) were written up in `CHANGELOG.md`
+> and summarised in `CLAUDE.md`'s "Current status", but never backfilled here. For anything
+> in that range, `CHANGELOG.md` is the record. Backfilling is tracked as documentation debt.
 
 ---
 
@@ -531,3 +537,64 @@ guard refusal with remediation, the required-status-check setup (`build-and-test
 `docker-smoke`, `sidecar-tests`, `harness-tests`), and the release operating rules (linear
 versioning, tag spacing, safe re-run paths). 1430 workspace tests.
 
+
+**ux.13-TUI complete (v0.115.0).** Row-scoped control verbs in `agentctl watch` — the ux.3b reshape
+(`docs/plans/ux.13-tui-verbs.md`; the `:` command palette was STRUCK at the /autoplan CEO gate on 6/6
+adverse consensus and the overlay half redirected here). ux.13 (v0.97.0) shipped `Cancel`/`SetBudget`/
+`SetCaps` across the management API, FUSE control, and the CLI but left `docs/ROADMAP.md` recording
+"**TUI keys deferred**", so the operator could not stop a runaway agent from the screen showing it to
+them. `[x]` on a Dashboard row now opens a graded row-action overlay (`agentctl/src/watch/overlay.rs`,
+new module; `App.pending_verb` + `drain_pending_verb` in `watch/app.rs`).
+- **Park** = `set_budget` at the spend already recorded, double-gated: `park_limit()` returns `None`
+  below a 1 000-token floor (`0` ≡ UNLIMITED and `set_token_budget` writes the CHECKPOINTED config, so
+  parking a zero-spend agent would have un-capped it permanently across restart — in Park's primary use
+  case), and `park_would_widen()` refuses when the recorded spend EXCEEDS the current cap (the normal
+  post-exhaustion state, where capping at spend RAISES the ceiling). Its label states which of two
+  things it is, because neither is a reversible pause: with `budget_reset_interval > 0` the park expires
+  by itself at the next rollover (`maybe_roll_budget_window` rebases windowed spend, `drain_deferred`
+  re-admits); with no window, exhaustion ends the agent.
+- **Set budget** = numeric field prefilled with the current limit, `0 = unlimited` stated on the field,
+  a second gate for any removal or raise, and a typo rejected in place rather than parsed as `0`.
+- **Cancel** = its own confirm showing "at least N" from a cycle-safe `descendants()` walk
+  (`watch/topology.rs`) and reporting the SERVER's count (native subtree + universal agents parented
+  in); `agentctl cancel` prints the same count in the same words. `DataSource::cancel` became
+  `Result<u64, String>`.
+- **`SetCaps` stayed CLI-only** — no snapshot data stands behind it (absent from `AgentSnapshot`,
+  `AgentInfo`, and the FUSE surface) and `SetCaps` REPLACES the whole set, so revoking one cap means
+  transmitting all the others. Its own increment when someone asks.
+- **Verbs are performed by the event loop, never the key handler.** `HttpSource`'s confirm client blocks
+  up to 3 s, so the confirm keypress writes `App.pending_verb` + an `InFlight` frame and returns; the
+  loop draws, then `drain_pending_verb` makes the call. `handle_overlay_key` takes no `source` argument,
+  making that a compile-time property. Measured on a real pty: frame on the wire 0.02 s after Enter
+  against a 2.5 s server. Keystrokes buffered during the call are discarded (Resize applied, Ctrl-C
+  honoured) so two impatient presses cannot dismiss the result and then quit the cockpit. The chat
+  rail's `converse::dispatch` moved onto the same slot.
+- **New honesty methods on `DataSource`** (`watch/source.rs`): `confirms_mutations()` (false on
+  `FuseSource` — a FUSE write is fire-and-forget, so past-tense copy becomes "cannot confirm the
+  scheduler accepted it"), `supports_auto_approve_kind()` (true on FUSE only, since `auto_approve_kind`
+  rides the `approve` control command and no HTTP route carries it — `[d]` stopped claiming a standing
+  rule over `--url`), and `cli_connection_flags()` (every printed `Equivalent: agentctl …` carries the
+  flags that reach THIS daemon, because `run_cancel`/`run_set_budget` re-resolve the source from scratch).
+- **`budget_resettable: bool`** on `SchedulerSnapshot` (`surfaces/src/snapshot.rs`), `GET
+  /api/v1/snapshot`, and FUSE `system/budget` (now `{"spent":N,"total":0,"resettable":BOOL}`), set from
+  `init_budget_window` in `scheduler.rs`. `agentctl` reads either wire name and defaults to `false` —
+  the cautious reading and the config default.
+- **`?` — the first help key this cockpit ever had**, rendering from the same `DASHBOARD_KEYS` table as
+  the footer so the two cannot drift, and documenting the keys the footer has no room for
+  (`Ctrl-c`, `Esc`).
+- **A client-side `cancelling…` row marker**, since no `AgentStatus::Cancelling` exists and a cancelled
+  row otherwise reads `running` for a turn and then presents as a bare red `failed`. Escalates to
+  `NOT CANCELLED` for anything the source could not confirm, settles to `cancelled by you` on
+  confirmation.
+- **/review fixes:** the Approvals confirm dialog rendered by INDEX while acting on a pinned id
+  (`update_approvals` replaces the list in Confirm mode and clamps only the index, so an approval
+  resolving out of band could show one item's id/kind/**risk**/summary while `[a]` approved another) —
+  one resolver, `App::confirm_item`, now serves the renderer and all three write paths; the Dashboard
+  footer clipped its own resize hint (measured 162 columns with `[l]ogs` present) — now bounded per
+  state and asserted against a rendered 80x24 frame; agent ids that would re-point a mutation URL
+  (`/ \ ? # %`, control characters) refused at the `DataSource` boundary and every id in a dialog or
+  printed command sanitized and shell-quoted.
+- **/qa fixes:** a cancelled row read `failed` with nothing saying the operator did it, and
+  `agentctl cancel|set-budget|set-caps` printed raw HTTP errors while the cockpit explained them — both
+  now share `explain_verb_error` in surface-neutral wording.
+- 1816 workspace tests (+103 over v0.114.0's 1 713).

@@ -200,7 +200,13 @@ GBrain. Required by prompt §6.
 
 ## 8. TUI surfaces
 
-`agentctl watch` is read-only (dashboard/topology/memory/spawn). The ops harness needs
+> **Stale as written (ux.13-TUI, 2026-07-28).** `agentctl watch` is no longer read-only:
+> Track UX added the approvals pane (p7.4), the chat rail (ux.1), the interactive Spawn
+> view (ux.3), and the `[x]` row verbs park/set-budget/cancel (ux.13-TUI). The gap this
+> section describes is now the *ops-specific* panes below (brief, people, open items,
+> customer summaries), not interactivity itself.
+
+`agentctl watch` was read-only when this was written (dashboard/topology/memory/spawn). The ops harness needs
 a **richer, partly-interactive** mode — recommend `agentctl ops` (or new tabs), reading
 existing FUSE surfaces + a new approvals surface:
 

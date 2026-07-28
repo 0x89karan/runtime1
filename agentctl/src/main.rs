@@ -123,3 +123,40 @@ fn default_repo_dir() -> PathBuf {
     }
     PathBuf::from("/etc/agentd/templates")
 }
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    /// ux.13-TUI: the overlay PRINTS an `agentctl …` command for every verb ("Equivalent: agentctl
+    /// cancel scout-2") so the operator learns the fallback path and can paste it into an incident
+    /// note. A printed command that does not parse is worse than none — it teaches a CLI that does not
+    /// exist. This caught exactly that: the first draft printed `set-budget --agent X --limit N`, but
+    /// `SetBudgetArgs` takes POSITIONAL args, so the copy would have failed for anyone who tried it.
+    ///
+    /// The guard runs the real clap parser over the real generated strings, so the two cannot drift.
+    #[test]
+    fn every_printed_equivalent_cli_actually_parses() {
+        use crate::watch::overlay::PendingVerb;
+        use clap::Parser as _;
+
+        let verbs = [
+            PendingVerb::Cancel { agent_id: "scout-2".to_string() },
+            PendingVerb::SetBudget { agent_id: "scout-2".to_string(), limit: 47_000, park: true },
+            PendingVerb::SetBudget { agent_id: "scout-2".to_string(), limit: 0, park: false },
+        ];
+        // Both forms: bare, and carrying the connection flags the TUI actually prints when attached
+        // over HTTP. The flag-bearing form is the one an operator pastes, and /review found it was
+        // ALSO the one that had never been parsed.
+        for (verb, conn) in verbs.iter().flat_map(|v| {
+            ["", " --url http://127.0.0.1:7999", " --agents-dir /tmp/agents"]
+                .into_iter().map(move |c| (v, c))
+        }) {
+            let cmd = verb.equivalent_cli(conn);
+            let argv: Vec<&str> = cmd.split_whitespace().collect();
+            Cli::try_parse_from(&argv)
+                .map(|_| ())
+                .unwrap_or_else(|e| panic!("the overlay prints an unparseable command '{cmd}': {e}"));
+        }
+    }
+}

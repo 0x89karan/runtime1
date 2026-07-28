@@ -113,6 +113,48 @@ pub fn status_badge(status: &str) -> &'static str {
     }
 }
 
+/// Every descendant of `root` in the spawn tree, sorted, each id once, excluding `root` itself.
+///
+/// ux.13-TUI: the row-action overlay shows this before confirming a Cancel, because
+/// `ControlCommand::Cancel` walks `parent_map` and flags the whole subtree — on this repo's own
+/// `coordinator-demo.agents.toml` fixture, cancelling the coordinator stops THREE agents. Confirming
+/// a blast radius nobody showed you is the design phase's C4.
+///
+/// **Cycle-safe by construction.** A `parent_id` cycle is a tested reality in this tree (the
+/// `render_tree` cycle guard exists because it happened), and this walk runs on the RENDER thread, so
+/// a naive frontier would hang the cockpit rather than merely print nonsense. The guard is the
+/// scheduler's own: never enqueue an id already in the set (`scheduler.rs`'s `!subtree.contains(child)`).
+///
+/// The result is a FLOOR, not the truth: the snapshot is up to a poll interval stale and carries no
+/// universal-tier parentage, so the server's own count can legitimately be higher. Callers must label
+/// it "at least N".
+pub fn descendants(graph: &TopologyGraph, root: &str) -> Vec<String> {
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for node in &graph.nodes {
+        if let Some(pid) = node.parent_id.as_deref() {
+            children.entry(pid).or_default().push(node.id.as_str());
+        }
+    }
+    // No per-parent sort: traversal order is not part of the contract (the result is sorted once at the
+    // end), and sorting here implied a guarantee the LIFO walk does not make (/review).
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    seen.insert(root);
+    let mut frontier: Vec<&str> = vec![root];
+    while let Some(id) = frontier.pop() {
+        for child in children.get(id).into_iter().flatten() {
+            // The cycle guard: `seen` already holds `root`, so a child pointing back at its own
+            // ancestor is skipped instead of re-expanded forever.
+            if seen.insert(child) {
+                out.push((*child).to_string());
+                frontier.push(child);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Render the topology graph as a list of text lines.
 /// The caller handles scrolling by slicing `render_tree(...)[scroll..]`.
 pub fn render_tree(graph: &TopologyGraph) -> Vec<String> {
@@ -433,5 +475,50 @@ mod tests {
         // From b's perspective, a sent to b => b received from a
         assert!(all.contains("←╌"), "received edge indicator must appear for recipient");
         assert!(all.contains("received 2"), "received count must appear");
+    }
+
+    // ── ux.13-TUI: the Cancel blast-radius walk ───────────────────────────────
+
+    fn graph_of(agents: &[(&str, Option<&str>)]) -> TopologyGraph {
+        let list: Vec<AgentInfo> = agents.iter()
+            .map(|(id, parent)| make_agent(id, *parent, "running"))
+            .collect();
+        build_graph(&list, None)
+    }
+
+    /// C4: this is the number the confirm dialog shows. On this repo's own
+    /// `coordinator-demo.agents.toml` shape, `x` on the coordinator stops THREE agents, and a dialog
+    /// naming one id understates the blast radius by two.
+    #[test]
+    fn descendants_walks_the_whole_subtree_not_just_direct_children() {
+        let g = graph_of(&[
+            ("cos-coordinator", None),
+            ("scout-1", Some("cos-coordinator")),
+            ("scout-2", Some("cos-coordinator")),
+            ("scout-2-helper", Some("scout-2")),   // a grandchild: cascade is not one level
+            ("unrelated", None),
+        ]);
+        assert_eq!(descendants(&g, "cos-coordinator"), ["scout-1", "scout-2", "scout-2-helper"]);
+        assert_eq!(descendants(&g, "scout-2"), ["scout-2-helper"]);
+        assert!(descendants(&g, "unrelated").is_empty());
+        assert!(descendants(&g, "nonexistent").is_empty(), "an unknown id is empty, not a panic");
+    }
+
+    /// E7: a `parent_id` cycle is a TESTED reality here (see `render_tree_cycle_guard_does_not_panic`,
+    /// which exists because it happened), and this walk runs on the RENDER thread — a naive frontier
+    /// would hang the cockpit mid-incident rather than merely print nonsense. The test is written to
+    /// FAIL BY TIMEOUT if the guard is removed, which is the only way a hang can be asserted.
+    #[test]
+    fn descendants_terminates_on_a_parent_cycle() {
+        let mut g = TopologyGraph::default();
+        g.nodes.push(NodeInfo { id: "a".into(), parent_id: Some("c".into()), status: "running".into() });
+        g.nodes.push(NodeInfo { id: "b".into(), parent_id: Some("a".into()), status: "running".into() });
+        g.nodes.push(NodeInfo { id: "c".into(), parent_id: Some("b".into()), status: "running".into() });
+        let found = descendants(&g, "a");
+        assert_eq!(found, ["b", "c"], "each node once, and the walk must end");
+        // Self-parenthood is the degenerate case.
+        let mut g2 = TopologyGraph::default();
+        g2.nodes.push(NodeInfo { id: "s".into(), parent_id: Some("s".into()), status: "running".into() });
+        assert!(descendants(&g2, "s").is_empty(), "an agent is not its own descendant");
     }
 }

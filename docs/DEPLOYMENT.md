@@ -232,11 +232,17 @@ routes are unauthenticated on the Docker bridge (THREAT_MODEL §9.2/§9.6). Repl
 `deny <id> [reason]` to a pushed approval. If the bridge or Telegram is down, nothing blocks —
 approvals just stay pending in the TUI.
 
-**⚠ If you set `AGENTOS_APPROVAL_SECRET`, host-side `agentctl` needs it too.** The gate applies to
-every HTTP caller of the approve/deny routes, so `agentctl watch --url …` / `agentctl approve --url …`
-run from your Mac must have `AGENTOS_APPROVAL_SECRET` exported in *that* shell, or they get
-`HTTP 401 — action stays pending`. (FUSE-mode `agentctl watch` inside the container is unaffected —
-it writes the `/agents/control` file, which is not gated.)
+**⚠ If you set `AGENTOS_APPROVAL_SECRET`, host-side `agentctl` needs it too.** The gate is not just
+approve/deny: cap.4 put it on the whole **mutating** surface — every `POST`, which today means
+`/spawn`, `/agents/:id/inject`, `/agents/:id/cancel`, `/agents/:id/caps`, `/budget/set`,
+`/budget/reset`, and `/credentials/:provider/reset-attention`
+(`management.rs`'s `is_mutating_route`). So `agentctl watch --url …`, `agentctl approve --url …`,
+`agentctl cancel --url …` and the cockpit's `[x]` row actions run from your Mac all need
+`AGENTOS_APPROVAL_SECRET` exported in *that* shell, or they get `HTTP 401` (the TUI says: "Action
+refused: approval token missing or wrong … Export the same AGENTOS_APPROVAL_SECRET used by agentd,
+then restart agentctl watch"). Read-only routes (`/snapshot`, `/healthz`, `/brief`, `/runs`) are
+ungated. (FUSE-mode `agentctl watch` inside the container is unaffected — it writes the
+`/agents/control` file, which is deliberately not gated, since `:7999` is the boundary that is.)
 
 **Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed action-receipt
 chain with `agentctl verify ~/.agentos-data/evidence.jsonl`.
@@ -514,6 +520,26 @@ spend drop reads as a scheduled rollover, not data loss.
 
 **Set a per-agent budget at runtime** (ux.11a — raise a ceiling without a respawn;
 raising revives a deferred agent immediately, and the change survives a restart):
+
+```bash
+agentctl set-budget cos-orchestrator 50000000 --url http://localhost:7999
+#   limit 0 = UNLIMITED (it removes the cap — it does not mean "stop")
+```
+
+From the cockpit, `agentctl watch` → select the row → **`[x]`** → *Set budget* does the same thing,
+and the overlay prints the equivalent CLI line (with the `--url` flag for this session) so an incident
+note is copy-pasteable. `[x]` also offers:
+
+- **Park** — cap the budget at the spend already recorded. Read the label, because it means two
+  different things and neither is "held until you say otherwise":
+  - **`budget_reset_interval > 0`** (the CoS configs, 86400): the agent is deferred and then
+    **resumes by itself at the next window rollover**, because the rollover rebases every agent's
+    windowed spend to 0. Raising the limit revives it sooner. A pause with a deadline you did not pick.
+  - **`budget_reset_interval = 0`** (the default): exhaustion terminates the agent. Park **ends it**.
+- **Cancel** — irreversible, cascades to the spawned subtree, and the confirm shows how many agents
+  that is (`agentctl cancel <id>` prints the same count).
+
+The raw route is still there if you need it — it takes the same `{target, limit}` body the CLI sends:
 
 ```bash
 curl -sX POST localhost:7999/api/v1/budget/set \

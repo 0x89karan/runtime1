@@ -24,38 +24,42 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.114.0 (shipped 2026-07-27)
+**Current version:** v0.115.0 (shipped 2026-07-28)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.10 sub-part A (v0.114.0) — the `[l]` **Logs view** in `agentctl watch`, which
-**completes ux.10** and the core UX tail. Tails `docker compose logs --follow --timestamps --no-color
---tail 500` via a `std::process::Command` read on a background std-thread → batched
-`AppEvent::LogLines(Vec<LogLine>)` into a bounded 2 000-line ring (no tokio runtime exists in the sync
-crossterm loop). Per-service `Tab` filter, `/` search (highlight + `n`/`N`), follow mode, `[t]` rel↔abs
-timestamps. `[l]` not `[g]` (Spawn's generate); `g`/`G` stay in-view scroll. Docker-context gated on a
-3 s-bounded `docker compose ps --all --quiet` probe — one flag gates key AND legend, so no advertised
-dead key. **Orphan-kill went a process deeper than planned:** `docker compose` is a CLI plugin, so
-`Producers::drop` kills the whole PROCESS GROUP (`process_group(0)` + `kill(-pid)` + `wait`) — killing
-only the direct child would strand `docker-compose` holding the pipe.
-- **/review (4 Codex rounds) fixed:** substring service-matching mislabeled every `cos` line as `agent`
-  in *this repo's own* project (`agentos-cos-1`); unbounded `read_line` (newline-less-record OOM) +
-  non-UTF-8 killing the tail permanently → bounded lossy reader with truncate-and-resync; unbounded
-  startup probe (+ Ctrl-C swallowed by the signal handler installed too early); `n`/`N` deadlock on a
-  final-viewport match; DEL/C1 sanitizing; per-frame search allocation.
-- **/qa (runtime, real pty + a fake `docker` that forks a grandchild) fixed:** batching alone dropped
-  **4 479 of 5 000 lines (~90%)** because compose writes line-by-line — a full channel is now waited out
-  (60 ms) before anything counts as loss; the same burst now lands 2 000/2 000 with zero drops. Runtime
-  proof of gate on/off, ring bound, filter/search/follow, 12 KB-record truncation, and **no orphaned
-  tail process after any clean quit**.
-- **Second /review round (5 specialist subagents + red team + `codex review`) fixed:** an unconditional
-  `Effect::Redraw` on log events rebuilt the **Dashboard** at 33 Hz while the tail ran (now gated on the
-  Logs view being visible — measured 150 vs 2 556 bytes/4 s); bracketed paste was O(n²) per char on the
-  render thread and could freeze the loop with Ctrl-C inert (now capped + spliced — also fixes sub-part
-  B's four other input sites); the 250 ms backpressure window starved the drop-on-full authoritative
-  producers (cut to 60 ms); `--tail` is per CONTAINER so a flat 500 replayed the entire ring on a
-  4-service project; plus a bounded quit-path reap, a min-height guard, cursor-windowed query display,
-  and the project name in the title (the tail follows the CWD, not `--url`). +24 tests → **1 713**.
+**Latest shipped:** ux.13-TUI (v0.115.0) — **row-scoped control verbs in `agentctl watch`**. ux.13 had
+shipped Cancel/SetBudget/SetCaps end to end with **no view invoking them** (`ROADMAP.md` said "TUI keys
+deferred"), so the operator could not stop a runaway from the screen showing it. `[x]` opens a graded
+row-action overlay (Park / Set budget / Cancel), `?` is the first help key this cockpit ever had, and the
+measured footer clip (162 → ≤114 cols, with the narrow variant bounded at 80) is fixed. Was ux.3b — the
+`:` palette is **STRUCK** (6/6 adverse CEO consensus; lazygit/htop answer this shape with `?`, and k9s
+only needs `:` because its noun space is runtime-discovered). Plan: `docs/plans/ux.13-tui-verbs.md`.
+- **Verbs run on the LOOP, never the key handler** (`App.pending_verb` + `drain_pending_verb`, placed
+  after the shutdown check and before `event::poll`): `HttpSource`'s confirm client blocks up to 3 s, so a
+  call during key dispatch froze the cockpit with no frame drawn. `handle_overlay_key` takes no `source`
+  parameter, making it a compile-time property. The chat rail migrated onto the same slot (TODOS P2 → P3).
+- **Park is guarded twice, and its LABEL carries the truth.** `park_limit()` → `None` below a 1 000-token
+  floor (`0` ≡ UNLIMITED and `set_token_budget` writes the CHECKPOINTED config, so a zero-spend park
+  un-capped the runaway permanently), and `park_would_widen()` blocks the normal post-exhaustion state
+  (`windowed_spent > token_budget`, since the admission gate is pre-turn) where capping at the spend would
+  RAISE the ceiling. New `budget_resettable` on snapshot + FUSE decides the wording, because with a window
+  the park **self-expires at the next rollover** and without one it **ends the agent** — "reversible" was
+  true of neither. **Both halves proven against a real agentd in /qa.**
+- **/review (6 specialists + red team + a fix-review round) found 5 CRITICALs**, three in code this
+  increment wrote and two in the review's own fixes: the Approvals dialog rendered by INDEX while acting on
+  a pinned id (the approval gate IS the authority boundary); the footer clip was still shipping at 80 cols
+  with a green test; a destructive verb could be armed below the overlay's size floor with nothing on
+  screen; `park_would_widen` (above); and an appended cancel marker that regressed at the narrow widths the
+  same commit had just claimed to support.
+- **/qa drove the real TUI against a REAL agentd** (fake `/v1/messages` keeping agents genuinely alive via
+  `ANTHROPIC_BASE_URL`), which is what proved semantics rather than frames: `budget_set` in the flight log,
+  `running → deferred`, turns frozen 1699 → 1699; and with no reset window the parked agent really ends up
+  `failed`. Found QA-1 — a cancelled row read a bare red `failed` with nothing attributing it to the
+  operator (now `⨯ cancelled by you`).
+
+**Prev:** ux.10 sub-part A (v0.114.0) — the `[l]` Logs view, completing ux.10. Its worst defect (90% of a
+log burst dropped) was invisible to 1 689 passing tests and only appeared when the real binary was driven.
 
 **Prev:** ux.10 sub-part B (v0.113.0) — real input widgets (`tui-input`/`tui-textarea` across the 5
 hand-rolled inputs; single ratatui 0.29 held by exact pins; `step_key` threads the full `KeyEvent`).
@@ -97,11 +101,15 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** the core UX tail is CLOSED (ux.2b → ux.3 → ux.10-B → ux.10-A). Next is **ux.3b**
-(`:` command palette + modal), then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain
-the two end-of-queue tracks. Residuals: port-7999 shared constant (trivial), agentctl `spawn`
-CLI-subcommand exec (P3), and Logs-view follow-ons nobody has asked for yet (no horizontal scroll, no
-in-view restart of a dead tail).
+**Next (roadmap):** ux.3b is CLOSED as ux.13-TUI (the palette struck). Next per the plan's CEO
+sequencing: **ux.6 evidence** (the only queue item serving two products — cockpit + mv governance, EU AI
+Act Art.12), then evidence-gated ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue
+tracks. Also open: **audit86-P1-9** needs a standalone 20-minute scope decision (are inert wrong-tier
+capability grants the intended declare-then-lint design, or a gap?) — now the only live P1 in `TODOS.md`.
+Residuals: port-7999 shared constant (trivial), agentctl `spawn` CLI-subcommand exec (P3), SetCaps has no
+TUI (no snapshot data behind it, and it REPLACES the whole set), and the four P3s ux.13-TUI's reviews
+opened (blocking verb on the loop thread, Park's rollover deadline, an HTTP route for `[d]`,
+`pending_focus` stickiness).
 
 Full per-increment completion notes: `docs/STATUS.md`.
 

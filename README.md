@@ -29,7 +29,9 @@ shared KB with mutability classes, BM25 search, eviction + summarization, FUSE
 memory surface, and a hardening pass covering the OV-1 startup invariant and
 inode pruning). Phase 6 added the template schema + on-disk catalogue
 (`agentd::template`, `templates/` directory, `TemplateResolver`), the
-`agentctl` operator CLI (`list-templates`, `spawn`, `watch`), a live TUI
+`agentctl` operator CLI (`list-templates`, `spawn`, `watch`, plus the ux.13 control
+verbs `cancel` / `set-budget` / `set-caps` and `inject` / `approve` / `deny` /
+`brief` / `orchestrate` / `auth` / `verify`), a live TUI
 dashboard (Dashboard / AgentDetail / System / Topology / Memory / Spawn /
 Inspector views), and the sandbox-enforcement surface. Phase 7 adds connectivity
 and streaming: Streamable HTTP MCP transport, SSE streaming inference, FUSE write
@@ -64,7 +66,7 @@ agentos/                   ← run `claude` here
 │   ├── agent.toml         single-agent example
 │   └── agents.toml        multi-agent example (p1.2+)
 ├── templates/             Phase 6: agent template catalogue (p6.1+)
-├── agentctl/              Phase 6+: operator CLI — list-templates, spawn, watch, inject, orchestrate, approve, deny, verify (p6.2+)
+├── agentctl/              Phase 6+: operator CLI — list-templates, spawn, watch, inject, orchestrate, approve, deny, cancel, set-budget, set-caps, brief, auth, verify (p6.2+)
 ├── surfaces/              Phase 3: /agents FUSE virtual filesystem (p3.1+)
 ├── sandbox/               Phase 3: Landlock LSM + seccomp-bpf sandbox (p3.3+)
 └── distro/                Phase 2: Buildroot external tree + QEMU boot

@@ -25,6 +25,7 @@ pub mod converse;
 pub mod inspector;
 pub mod logs;
 pub mod memory;
+pub mod overlay;
 pub mod pump;
 pub mod reader;
 pub mod source;
@@ -33,6 +34,7 @@ pub mod topology;
 pub mod views;
 
 use app::{App, MemoryPane, PendingSpawn, SpawnFocus, View};
+use overlay::{budget_prefill, budget_needs_second_gate, menu_items, DashboardOverlay, MenuAction, OverlayMode, PendingVerb};
 use approvals::ApprovalsMode;
 use pump::{spawn_producers, AppEvent};
 use source::{detect_source, DataSource};
@@ -312,6 +314,21 @@ fn insert_paste_into_input(input: &mut tui_input::Input, text: &str) {
 /// mirroring how a stray keystroke is ignored outside an input.
 fn route_paste(app: &mut App, text: &str) {
     match app.view {
+        // ux.13-TUI: the overlay's budget field, and it is FIRST — the rail arm below matches on
+        // `View::Dashboard` too, and an overlay open over a focused rail would otherwise send the
+        // paste to the rail underneath it (design finding M6: without this arm a pasted token count
+        // silently vanishes).
+        View::Dashboard if matches!(
+            app.dashboard_overlay.as_ref().map(|o| &o.mode),
+            Some(OverlayMode::Budget { .. })
+        ) => {
+            if let Some(ov) = app.dashboard_overlay.as_mut() {
+                if let OverlayMode::Budget { input, error } = &mut ov.mode {
+                    insert_paste_into_input(input, text);
+                    *error = None;
+                }
+            }
+        }
         View::Dashboard if app.converse_view.rail_focused => {
             insert_paste_into_input(&mut app.converse_view.input, text);
         }
@@ -365,11 +382,32 @@ fn run_tui_loop(
     if let Ok(size) = crossterm::terminal::size() {
         app.term_size = size;
     }
+    // ux.13-TUI: seeded HERE, next to `term_size`, and from the SAME source object this loop uses — so
+    // the overlay's printed `Equivalent: agentctl …` line names this daemon rather than whatever the CLI
+    // would re-resolve. In `run_tui` it was missed by the post-inject re-enter path, which builds a
+    // SECOND `App` and copied only `log_path`/`logs_view` (the fix-review pass). Every App that reaches
+    // the loop passes through here.
+    app.cli_conn = source.cli_connection_flags();
     loop {
         // Checked every tick (~30ms) so an out-of-band SIGTERM/SIGINT unwinds
         // normally instead of hitting the default signal disposition — see
         // install_shutdown_signal_handlers().
         if SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        // ux.13-TUI: perform a confirmed row verb here — AFTER the shutdown check and BEFORE
+        // `event::poll` (eng finding E8). The poll ordering is the load-bearing half: after it, a
+        // keystroke queued during the blocking call is dispatched FIRST, so a second Enter arms a second
+        // cancel and a `q` returns `Effect::Quit` — the loop exits, the verb never sends, and the last
+        // frame still claims it is in flight. The `InFlight` frame was already flushed by the previous
+        // iteration's `term.draw`, which is the point of the two-phase split.
+        //
+        // What this placement does NOT do (corrected at /review — the earlier comment overclaimed): the
+        // call runs on the loop thread, so a shutdown requested DURING it is not noticed until the next
+        // iteration. Checking first means the delay is at most one verb rather than one verb plus a
+        // tick, not that SIGTERM/Ctrl-C is unaffected. Removing that delay needs the verb off this
+        // thread — see TODOS.md's P3 entry.
+        if apply_effects(drain_pending_verb(app, source.as_ref()), app, &wake_tx) {
             return Ok(());
         }
         // Drain up to MAX_DRAIN_PER_TICK events, then always yield to key poll + draw
@@ -483,6 +521,11 @@ fn step(app: &mut App, ev: AppEvent, source: &dyn DataSource) -> Vec<Effect> {
             // the operator is on Topology/Memory/etc. (Eng Phase 1 "dashboard behind
             // stays live" requirement). No-op for any agent_id not already tracked.
             app.converse_view.on_flight_event(&value);
+            // ux.13-TUI: the scheduler's own confirmation that a cancel landed. Clearing the
+            // "cancelling…" marker here (as well as on row disappearance) is what keeps the marker from
+            // outliving the fact — an `agent_cancelled` event can arrive a whole poll interval before
+            // the row leaves the snapshot.
+            app.note_cancel_confirmation(&value);
             app.push_event(value);
             vec![Effect::Redraw]
         }
@@ -553,6 +596,12 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
     // capture discipline as `was_dashboard` itself, for the same reason).
     let was_dashboard = app.view == View::Dashboard;
     let rail_was_focused = app.converse_view.rail_focused;
+    // ux.13-TUI: same "capture BEFORE dispatch" discipline, for the same reason. The app TEACHES `q`
+    // as dismiss (Approvals' Confirm mode binds `Esc | Char('q')`), so an operator who learned that
+    // would press `q` in a Cancel overlay and lose the whole cockpit mid-incident — the ux.1 chat-rail
+    // bug class exactly. Captured before dispatch because the overlay may CLOSE during dispatch, and
+    // the keypress that closed it must not also quit.
+    let overlay_was_open = app.dashboard_overlay.is_some();
     match app.view {
         View::Dashboard => handle_dashboard_key(key, app, source),
         View::AgentDetail | View::System => {
@@ -580,7 +629,11 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
         View::Logs => handle_logs_key(key, app),
     }
     let mut effects = vec![Effect::Redraw];
-    if matches!(key.code, KeyCode::Char('q')) && was_dashboard && !rail_was_focused {
+    if matches!(key.code, KeyCode::Char('q'))
+        && was_dashboard
+        && !rail_was_focused
+        && !overlay_was_open
+    {
         effects.push(Effect::Quit);
     }
     if app.spawn_view.pending_exec.is_some() {
@@ -636,6 +689,18 @@ fn handle_memory_key(key: KeyEvent, app: &mut App) {
 /// every existing test call site are unaffected by this retrofit's signature.
 fn handle_dashboard_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
     let code = key.code;
+
+    // ux.13-TUI: while a row-action overlay is open it owns the ENTIRE keyboard, and unmapped keys
+    // are no-ops rather than falling through. Intercepting only Enter/Esc/Tab/q would leave
+    // `s`/`t`/`m`/`n`/`a`/`c`/`i`/`l` changing `app.view` with the overlay still `Some` — and since
+    // `step_key` dispatches on `app.view`, the next key would land in a different view's handler
+    // underneath a modal. `j`/`k` would also desync the highlight from the pinned target. Same
+    // unconditional-early-return idiom as the Logs search field and Spawn's TaskField below.
+    if app.dashboard_overlay.is_some() {
+        handle_overlay_key(key, app);
+        return;
+    }
+
     let rail_focused = app.converse_view.rail_focused;
 
     // Rail-focused: captures all input (Spawn's TaskField Esc-capture idiom, mod.rs:518-526)
@@ -687,44 +752,21 @@ fn handle_dashboard_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
                         );
                         return;
                     }
-                    match converse::dispatch(source, &target, &text, converse::DEFAULT_MAX_TURNS) {
-                        Ok(resolved_id) => {
-                            // If the server resolved a different id than requested (e.g.
-                            // HttpSource::spawn's "operator-agent" fallback when the response
-                            // omits `agent_id`), the just-pushed echo lives under the stale
-                            // `target` key, which will never receive the real agent's events
-                            // (those are tagged with `resolved_id`). Move it across rather
-                            // than orphaning it (found by /ship's Step 9 testing +
-                            // maintainability specialists — two views of the same bug).
-                            if resolved_id != target {
-                                if let Some(abandoned) = app.converse_view.targets.remove(&target) {
-                                    let dest =
-                                        app.converse_view.targets.entry(resolved_id.clone()).or_default();
-                                    for turn in abandoned.history {
-                                        dest.push_history(turn.role, turn.text);
-                                    }
-                                }
-                            }
-                            app.converse_view.active_target = resolved_id.clone();
-                            // entry().or_default(), not get_mut(): resolved_id's entry may not
-                            // exist yet even after the move above (e.g. `target` had no prior
-                            // state to move). get_mut on a fresh resolved_id would silently
-                            // no-op, dropping this state update and, since every subsequent
-                            // event for the real agent is looked up by this same key, wedging
-                            // the conversation forever.
-                            let state = app.converse_view.targets.entry(resolved_id).or_default();
-                            state.phase = converse::ConversePhase::Dispatching;
-                            state.last_event_at = Some(std::time::Instant::now());
-                        }
-                        Err(e) => {
-                            if let Some(state) = app.converse_view.targets.get_mut(&target) {
-                                state.push_history(
-                                    converse::TurnRole::System,
-                                    format!("Spawn rejected: {e} — press Enter to retry"),
-                                );
-                            }
-                        }
-                    }
+                    // ux.13-TUI: park the turn for the LOOP instead of calling `dispatch` here.
+                    // `dispatch` does a `load_snapshot` (5 s client) plus a spawn (3 s), so this arm
+                    // used to freeze the whole cockpit — including Ctrl-C — for up to ~8 s on the
+                    // most frequent interaction in the app (TODOS.md's ranked P2). Same slot and
+                    // same discipline as the row verbs; the difference is that the rail's own
+                    // `Dispatching…` phase is the in-flight frame, so no overlay is involved.
+                    //
+                    // The phase is set BEFORE arming, which is also what keeps the double-submit
+                    // guard above correct across the gap: a second Enter while the call is in
+                    // flight sees a non-Idle phase and is a no-op. `drain_pending_verb` resets it
+                    // to Idle on failure, or Enter would never work again.
+                    let state = app.converse_view.targets.entry(target.clone()).or_default();
+                    state.phase = converse::ConversePhase::Dispatching;
+                    state.last_event_at = Some(std::time::Instant::now());
+                    app.pending_verb = Some(PendingVerb::Chat { target, text });
                 }
             }
             // ux.1: while the rail is focused it captures all printable characters as
@@ -844,6 +886,21 @@ fn handle_dashboard_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
         KeyCode::Char('c') => {
             app.view = View::Credentials;
         }
+        // ux.13-TUI: `x` opens the row-action overlay for the SELECTED agent, pinning its id at open
+        // time. One key -> graded menu -> confirm, which is what lazygit/k9s/htop actually do (`x`
+        // there opens a menu; k9s uses Ctrl-D/Ctrl-K; htop's `k` is a signal picker) — it keeps the
+        // irreversible action the one you travel to, and costs one footer hint instead of three.
+        KeyCode::Char('x') => {
+            if let Some(agent) = app.selected_agent() {
+                let id = agent.id.clone();
+                app.dashboard_overlay = Some(DashboardOverlay::menu(id));
+            }
+        }
+        // ux.13-TUI: `?` opens the key map. It is bound HERE and not globally because the key table it
+        // renders is the Dashboard's; other views own their own footers.
+        KeyCode::Char('?') => {
+            app.dashboard_overlay = Some(DashboardOverlay::help());
+        }
         // ux.10-A: [l] opens the compose log tail. `[l]`, not `[g]` — `[g]` is Spawn's
         // "generate preview" and, although key dispatch is per-view, reusing the letter
         // across views is a footgun the /autoplan eng consensus explicitly rejected.
@@ -853,6 +910,489 @@ fn handle_dashboard_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
             app.view = View::Logs;
         }
         _ => {}
+    }
+}
+
+
+/// ux.13-TUI: overlay key handling. The overlay owns every key while it is open — see the
+/// early-return comment in `handle_dashboard_key`. Unmapped keys are deliberate no-ops.
+///
+/// **No `source` parameter, on purpose.** A verb's blocking call must never happen during key
+/// dispatch (eng finding H1: `HttpSource`'s confirm client blocks up to 3 s, which would freeze the
+/// cockpit with no frame drawn and no spinner possible). Confirming a verb writes
+/// `app.pending_verb` + an `InFlight` frame and returns; `drain_pending_verb` performs the call from
+/// the loop on the next iteration. Keeping the source out of this signature makes that a compile-time
+/// property rather than a convention the next contributor has to notice.
+fn handle_overlay_key(key: KeyEvent, app: &mut App) {
+    let Some(ov) = app.dashboard_overlay.as_ref() else { return };
+
+    // /review (maintainability specialist, CRITICAL): the RENDER path degrades below the box floor to a
+    // single line that ignores `ov.mode` entirely, but this handler used to keep running the whole state
+    // machine underneath it. On a terminal narrower than 34 cols or shorter than 7 rows the operator saw
+    // only " action: <id> — Esc/q dismiss " while Enter still armed Park (a CHECKPOINTED set_budget) and
+    // Enter→Enter still armed Cancel — a destructive mutation with no menu, no confirm text, and no
+    // visible result, since InFlight/Result collapse into that same line. Fail closed: when the box does
+    // not fit, the only live keys are the ones that get you out.
+    if !views::overlay_fits_dashboard(app.term_size) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.dashboard_overlay = None;
+        }
+        return;
+    }
+    // Resolve-at-use against the PINNED id: `apply_snapshot` retargets `selected_id` from a producer
+    // thread, so anything reading the live selection here could act on a different agent than the one
+    // the operator opened this overlay against.
+    //
+    // This is a FLOOR, not a guarantee, and deliberately so: a snapshot can land in the channel after
+    // `drain_events` and before this keypress is read, so `app.agents` is up to one poll interval stale
+    // and the vanished-target guards below can only catch a row that has already been folded away
+    // (Codex's adversarial pass). The remaining window is closed server-side — a cancel for an unknown
+    // agent is a 404, which `explain_verb_error` renders as "may have already finished" — not here.
+    let target    = ov.target(&app.agents).cloned();
+    let target_id = ov.target_id.clone();
+    let cursor    = ov.cursor;
+
+    match &ov.mode {
+        // ── the graded menu ───────────────────────────────────────────────────────────
+        OverlayMode::Menu => {
+            // Built HERE, not above the match: only this arm reads it, and every keystroke in the budget
+            // field was paying for a menu nobody rendered (/review's performance specialist). The
+            // renderer builds the same list from the same accessor — `menu_items`' contract is that the
+            // two agree, or Enter arms an item the operator was shown as something else.
+            let items = target.as_ref()
+                .map(|t| menu_items(t, app.budget_resettable()))
+                .unwrap_or_default();
+            match key.code {
+            // `q` dismisses here and does NOT quit — the outer guard in `step_key` is gated on
+            // `overlay_was_open` so this cannot fall through to Effect::Quit.
+            KeyCode::Esc | KeyCode::Char('q') => app.dashboard_overlay = None,
+            KeyCode::Up | KeyCode::Char('k') => set_cursor(app, cursor.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => {
+                set_cursor(app, (cursor + 1).min(items.len().saturating_sub(1)));
+            }
+            KeyCode::Enter => {
+                // A blocked item's reason is rendered under the highlighted row, so Enter on it is a
+                // no-op rather than an error state the operator then has to dismiss.
+                // `items` is empty when the pinned target is gone, so this early return is also the
+                // vanished-target gate for the menu's own verbs.
+                let Some(item) = items.get(cursor).filter(|i| i.enabled()) else { return };
+                match item.action {
+                    // Reversible and a single call, so it arms straight off the menu. `limit` came
+                    // from `park_limit`, which is what keeps a zero-spend Park from writing the
+                    // checkpointed "0 = unlimited" and un-capping the runaway for good (E1).
+                    MenuAction::Park { limit } => arm_verb(
+                        app,
+                        PendingVerb::SetBudget { agent_id: target_id, limit, park: true },
+                    ),
+                    MenuAction::SetBudget => {
+                        let prefill = target.as_ref()
+                            .map(|t| budget_prefill(&t.budget))
+                            .unwrap_or_default();
+                        set_mode(app, OverlayMode::Budget {
+                            input: tui_input::Input::new(prefill),
+                            error: None,
+                        });
+                    }
+                    MenuAction::Cancel => set_mode(app, OverlayMode::ConfirmCancel),
+                }
+            }
+            _ => {}
+            }
+        }
+
+        // ── the irreversible verb's own gate ──────────────────────────────────────────
+        OverlayMode::ConfirmCancel => match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => set_mode(app, OverlayMode::Menu),
+            // /review (security specialist): fail closed when the pin has vanished. The box already
+            // renders "No action sent: <id> is no longer in the snapshot" in that state, but this arm
+            // used to send the cancel anyway — and agent ids are REUSED here (CoS agents have fixed
+            // config ids and cron respawns them), so a confirm keypress landing after the pinned
+            // instance finished could cancel a fresh agent of the same name while the frame said
+            // nothing was sent. The Menu arm was already safe (no target ⇒ no items ⇒ early return).
+            KeyCode::Enter | KeyCode::Char('y') if target.is_none() => {
+                set_mode(app, OverlayMode::Result { text: target_gone_text(&target_id), ok: false });
+            }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                arm_verb(app, PendingVerb::Cancel { agent_id: target_id });
+            }
+            _ => {}
+        },
+
+        // ── the numeric field ─────────────────────────────────────────────────────────
+        OverlayMode::Budget { input, .. } => match key.code {
+            KeyCode::Esc => set_mode(app, OverlayMode::Menu),
+            KeyCode::Enter => {
+                let raw = input.value().trim().to_string();
+                match parse_budget(&raw) {
+                    Err(e) => set_mode(app, OverlayMode::Budget {
+                        input: input.clone(),
+                        error: Some(e),
+                    }),
+                    Ok(limit) => {
+                        let needs_gate = target.as_ref()
+                            .map(|t| budget_needs_second_gate(limit, &t.budget))
+                            // No target to compare against: gate it. The unknown case is the one
+                            // where a silent un-cap is likeliest to slip through.
+                            .unwrap_or(true);
+                        if needs_gate {
+                            set_mode(app, OverlayMode::ConfirmBudget { limit });
+                        } else {
+                            arm_verb(app, PendingVerb::SetBudget {
+                                agent_id: target_id, limit, park: false,
+                            });
+                        }
+                    }
+                }
+            }
+            // Everything else edits the widget in place (cursor movement, word-delete, Ctrl-U, …).
+            // Paste is routed here too — see `route_paste`. In place rather than clone-then-writeback:
+            // the field accepts pasted text up to MAX_PASTE_CHARS, and copying it per keystroke is the
+            // shape of the O(n²) paste path a prior increment already had to fix.
+            _ => {
+                if let Some(ov) = app.dashboard_overlay.as_mut() {
+                    if let OverlayMode::Budget { input, error } = &mut ov.mode {
+                        input.handle_event(&Event::Key(key));
+                        *error = None;
+                    }
+                }
+            }
+        },
+
+        // ── the second gate for a removal or a raise (M2) ─────────────────────────────
+        OverlayMode::ConfirmBudget { limit } => {
+            let limit = *limit;
+            match key.code {
+                // Back to the FIELD, not the menu: the operator who declines the gate almost always
+                // wants to correct the number they just typed.
+                KeyCode::Esc | KeyCode::Char('q') => set_mode(app, OverlayMode::Budget {
+                    input: tui_input::Input::new(limit.to_string()),
+                    error: None,
+                }),
+                // Same fail-closed rule as ConfirmCancel: a budget written against a reused id lands on
+                // a different instance than the dialog was opened on.
+                KeyCode::Enter | KeyCode::Char('y') if target.is_none() => {
+                    set_mode(app, OverlayMode::Result { text: target_gone_text(&target_id), ok: false });
+                }
+                KeyCode::Enter | KeyCode::Char('y') => arm_verb(app, PendingVerb::SetBudget {
+                    agent_id: target_id, limit, park: false,
+                }),
+                _ => {}
+            }
+        }
+
+        // The verb is armed and the loop is about to perform it; there is nothing a key could mean
+        // here that would be true. Every key is a no-op, including `q` — see the `overlay_was_open`
+        // guard in `step_key`.
+        OverlayMode::InFlight { .. } => {}
+
+        // Explicit dismissal only. Any-key-dismisses is the `spawn_banner` behaviour design finding M3
+        // rejected: the operator taps a key while reading and loses the only report of what happened.
+        OverlayMode::Result { .. } => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+                app.dashboard_overlay = None;
+            }
+        }
+
+        // Help closes on its own key too — pressing `?` twice should not leave the operator holding a
+        // modal they have to guess their way out of.
+        OverlayMode::Help => {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::Char('?')) {
+                app.dashboard_overlay = None;
+            }
+        }
+    }
+}
+
+/// The DX phase's replacement copy for a target that resolved away, shared by every arm that refuses
+/// to write because of it.
+fn target_gone_text(target_id: &str) -> String {
+    format!(
+        "No action sent: {target_id} is no longer in the snapshot. It may have finished or been \
+         removed; dismiss and select another running agent."
+    )
+}
+
+fn set_mode(app: &mut App, mode: OverlayMode) {
+    if let Some(ov) = app.dashboard_overlay.as_mut() {
+        ov.mode = mode;
+    }
+}
+
+fn set_cursor(app: &mut App, cursor: usize) {
+    if let Some(ov) = app.dashboard_overlay.as_mut() {
+        ov.cursor = cursor;
+    }
+}
+
+/// Park the verb for the loop and show the in-flight frame. The two must happen together: an armed
+/// verb with no `InFlight` frame is a silent 3 s freeze, and an `InFlight` frame with no armed verb is
+/// a spinner that never resolves.
+fn arm_verb(app: &mut App, verb: PendingVerb) {
+    set_mode(app, OverlayMode::InFlight { label: verb.in_flight_label() });
+    app.pending_verb = Some(verb);
+}
+
+/// Parse a typed budget. Rejects anything non-numeric rather than saturating: `set_budget` is a
+/// security-adjacent number, and a typo silently becoming `0` (≡ unlimited) is the M2 footgun.
+fn parse_budget(raw: &str) -> Result<u64, String> {
+    if raw.is_empty() {
+        return Err("Enter a number of tokens (0 = unlimited).".to_string());
+    }
+    // `_` and `,` are how humans write 200_000 / 200,000; accept both, reject everything else.
+    let cleaned: String = raw.chars().filter(|c| *c != '_' && *c != ',').collect();
+    cleaned.parse::<u64>().map_err(|_| {
+        format!("'{raw}' is not a token count. Enter digits only (0 = unlimited).")
+    })
+}
+
+/// Cap on the buffered events inspected after a blocking verb. Generous (a human cannot out-type this in
+/// 3 s) but finite, so a wedged stdin can never spin the loop here.
+const MAX_DISCARDED_KEYS_PER_VERB: usize = 256;
+
+/// Perform the armed verb from the LOOP, after the in-flight frame has been flushed.
+///
+/// Called once per tick from `run_tui_loop`, after the shutdown check and BEFORE `event::poll`.
+/// Placement is load-bearing (eng finding E8): after the poll, a keystroke queued during the blocking
+/// call is dispatched FIRST, so a second Enter arms a second cancel and a `q` returns `Effect::Quit` —
+/// the loop exits, the verb never sends, and the last frame the operator saw claimed it was in flight.
+///
+/// Extracted rather than inlined because `run_tui_loop` needs a real `Terminal` and therefore has zero
+/// test coverage (the same reason `on_resize` was extracted).
+fn drain_pending_verb(app: &mut App, source: &dyn DataSource) -> Vec<Effect> {
+    // `.take()` FIRST, before the call. Any early return or panic path that left the slot filled
+    // would re-arm the same verb on the next 30 ms tick — a cancel storm against the scheduler.
+    let Some(verb) = app.pending_verb.take() else { return vec![] };
+
+    // `count` is the SERVER's answer for Cancel (native subtree + universal agents parented into it),
+    // which the client cannot compute; 0 means "this source cannot know", as over FUSE.
+    let outcome = match &verb {
+        PendingVerb::Cancel { agent_id } => source.cancel(agent_id),
+        PendingVerb::SetBudget { agent_id, limit, .. } => source.set_budget(agent_id, *limit).map(|()| 0),
+        // The chat turn has no overlay and no count, so it returns straight out of the match rather
+        // than being routed by an earlier statement — an `unreachable!()` guarded by statement order is
+        // a panic waiting for the next edit (/review's maintainability specialist).
+        PendingVerb::Chat { target, text } => return drain_chat_turn(app, source, target, text),
+    };
+
+    // Mark the row BEFORE reading the outcome text: on the confirming source the agent may already be
+    // gone from the next snapshot, and on the queued source this marker is the only feedback there is.
+    //
+    // Deliberately NOT marked on an Err — including the timeout, whose copy says the write "may still
+    // have been applied". A row reading "cancelling…" is a claim that a cancel is on its way; on an
+    // error the honest surface is the result frame, which stays on screen and says exactly how much is
+    // unknown. The marker's own escalation path is for cancels that WERE accepted and then went quiet.
+    //
+    // On a NON-confirming source (FUSE) `Ok` means only "queued", so the marker outruns what the source
+    // can prove (Codex's adversarial pass). It is still the honest signal: the operator DID ask, and the
+    // marker self-corrects either way — if the scheduler rejected because the agent is gone the row
+    // disappears and the marker with it, and if it rejected for any other reason the row survives and
+    // the 60 s escalation turns it into "cancel not confirmed". The result frame carries the
+    // "cannot confirm" caveat in the same frame.
+    if let (PendingVerb::Cancel { agent_id }, Ok(_)) = (&verb, &outcome) {
+        app.mark_cancel_requested(agent_id, source.confirms_mutations());
+    }
+    // Discard whatever the operator TYPED while the call blocked. The tty buffers those keys; the loop
+    // replays them one per iteration against whatever mode is current when it gets there — so two
+    // impatient presses during a 3 s cancel would dismiss the Result frame (losing the only report of
+    // what a destructive verb did, the exact `spawn_banner` behaviour design finding M3 rejected) and
+    // then, with `overlay_was_open` now false, QUIT the cockpit mid-incident (/review's red team). The
+    // InFlight hint promises keys are ignored; this is what makes that true.
+    //
+    // KEYS only. The first version of this drained the whole queue, which ate `Event::Resize` — and
+    // since the box-vs-degraded-line decision now reads `app.term_size`, a swallowed resize would leave
+    // BOTH the renderer and the key gate deciding against stale dimensions (Codex, reviewing the review
+    // fixes: two of them interacting). Resize is applied, not dropped; Ctrl-C is honoured, because "I
+    // pressed Ctrl-C during the freeze and it did nothing" is the failure this whole two-phase split
+    // exists to avoid; paste is dropped like any other input typed at a frame that no longer exists.
+    let mut quit = false;
+    for _ in 0..MAX_DISCARDED_KEYS_PER_VERB {
+        match event::poll(Duration::ZERO) {
+            Ok(true) => match event::read() {
+                Ok(Event::Resize(w, h)) => {
+                    app.term_size = (w, h);
+                    on_resize(app, w, h);
+                    app.dirty = true;
+                }
+                Ok(Event::Key(k))
+                    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    quit = true;
+                }
+                Ok(_) => {}   // a key or paste aimed at the in-flight frame: deliberately dropped
+                Err(_) => break,
+            },
+            _ => break,
+        }
+    }
+
+    // Self-heal, in case an event was lost some other way: the gate that decides whether a verb can be
+    // armed now depends on `term_size`, and it is otherwise only ever updated by `Event::Resize`. One
+    // query per verb, not per tick — the repo deliberately avoids ad-hoc size queries on the hot path
+    // (they made a test fail under `cargo test`'s no-TTY environment), and this path already did I/O.
+    if let Ok(size) = crossterm::terminal::size() {
+        if size != app.term_size {
+            app.term_size = size;
+            on_resize(app, size.0, size.1);
+            app.dirty = true;
+        }
+    }
+
+    let resettable = app.budget_resettable();
+    let (text, ok) = match outcome {
+        // Requested, not done — even on the confirming source, since the scheduler acts at the next
+        // step boundary. `agentctl cancel` prints the same tense: the CLI and the TUI must not
+        // describe one write two ways (DX finding).
+        Ok(count) if source.confirms_mutations() => (
+            format!("{} — {}", verb_requested_text(&verb, count, resettable), verb.equivalent_cli(&app.cli_conn)),
+            true,
+        ),
+        // C5: over FUSE the ONLY signal is that `close(2)` succeeded, i.e. the command was queued.
+        // "agent not found", "SetCaps is narrow-only" and "capability is inert" all arrive here as
+        // `Ok(())`, so claiming the verb took effect would be a lie the operator cannot check. Say
+        // what actually happened, and where the real verdict shows up.
+        Ok(_) => (
+            format!(
+                "Request queued over FUSE; this path cannot confirm the scheduler accepted it. \
+                 Watch {}, or check Inspector for fuse_control_error. — {}",
+                verb_target(&verb),
+                verb.equivalent_cli(&app.cli_conn),
+            ),
+            true,
+        ),
+        Err(e) => (explain_verb_error(&e), false),
+    };
+    set_mode(app, OverlayMode::Result { text, ok });
+    // Reconcile: poke the snapshot producer so the row's new state arrives on the next frame rather
+    // than up to a full interval later. A Ctrl-C seen during the freeze still quits — after the result
+    // is recorded, so the flight log and the frame agree on what happened before the exit.
+    if quit {
+        return vec![Effect::Redraw, Effect::Quit];
+    }
+    vec![Effect::Redraw, Effect::Reconcile]
+}
+
+/// Perform one chat-rail turn from the LOOP (ux.13-TUI; closes TODOS.md's ~8 s-freeze P2).
+///
+/// Everything here was previously inline in `handle_dashboard_key`'s rail `Enter` arm and is moved
+/// unchanged, including the resolved-id reconciliation, which is the subtle part.
+fn drain_chat_turn(
+    app:    &mut App,
+    source: &dyn DataSource,
+    target: &str,
+    text:   &str,
+) -> Vec<Effect> {
+    match converse::dispatch(source, target, text, converse::DEFAULT_MAX_TURNS) {
+        Ok(resolved_id) => {
+            // If the server resolved a different id than requested (e.g. HttpSource::spawn's
+            // "operator-agent" fallback when the response omits `agent_id`), the already-pushed echo
+            // lives under the stale `target` key, which will never receive the real agent's events
+            // (those are tagged with `resolved_id`). Move it across rather than orphaning it (found by
+            // /ship's Step 9 testing + maintainability specialists — two views of the same bug).
+            if resolved_id != target {
+                if let Some(abandoned) = app.converse_view.targets.remove(target) {
+                    let dest = app.converse_view.targets.entry(resolved_id.clone()).or_default();
+                    for turn in abandoned.history {
+                        dest.push_history(turn.role, turn.text);
+                    }
+                }
+            }
+            app.converse_view.active_target = resolved_id.clone();
+            // entry().or_default(), not get_mut(): resolved_id's entry may not exist yet even after the
+            // move above (e.g. `target` had no prior state to move). get_mut on a fresh resolved_id
+            // would silently no-op, dropping this state update and, since every subsequent event for
+            // the real agent is looked up by this same key, wedging the conversation forever.
+            let state = app.converse_view.targets.entry(resolved_id).or_default();
+            state.phase = converse::ConversePhase::Dispatching;
+            state.last_event_at = Some(std::time::Instant::now());
+            // Reconcile: a spawn just created an agent, so poke the snapshot producer rather than
+            // waiting up to a full interval for the row to appear.
+            vec![Effect::Redraw, Effect::Reconcile]
+        }
+        Err(e) => {
+            if let Some(state) = app.converse_view.targets.get_mut(target) {
+                state.push_history(
+                    converse::TurnRole::System,
+                    format!("Spawn rejected: {e} — press Enter to retry"),
+                );
+                // Back to Idle, or the double-submit guard blocks the retry the message just invited.
+                // The phase was set optimistically at arm time so the rail could draw `Dispatching…`
+                // before the blocking call — this is the other half of that trade.
+                state.phase = converse::ConversePhase::Idle;
+                state.last_event_at = None;
+            }
+            vec![Effect::Redraw]
+        }
+    }
+}
+
+/// Rewrite a raw transport/HTTP error into WHAT happened, WHY, and WHAT TO DO.
+///
+/// Shared with `verbs.rs` so `agentctl cancel` and the cockpit's `[x]` explain a failure the same way
+/// (the DX phase's one-vocabulary finding; /qa found the error paths still diverged). Keep the wording
+/// surface-NEUTRAL for that reason: no "dismiss", no "press", nothing that assumes an overlay.
+///
+/// Pure and string-based on purpose. E10 killed the alternative (a startup auth probe): there is no
+/// unauthenticated way to learn whether agentd has an approval secret — the gate list is exactly the
+/// mutating routes, and `/healthz`/`/snapshot` reveal nothing. So the response IS the discovery
+/// mechanism, and classifying it after the fact is the only option.
+///
+/// Unrecognised errors pass through verbatim: inventing an explanation for an error nobody has seen is
+/// how a cockpit teaches the wrong fix.
+pub fn explain_verb_error(raw: &str) -> String {
+    if raw.contains("HTTP 401") || raw.contains("HTTP 403") {
+        return "Action refused: approval token missing or wrong (HTTP 401/403). Export the same \
+                AGENTOS_APPROVAL_SECRET used by agentd, then run this again — and restart \
+                `agentctl watch` if it is open, since it reads the secret once at startup."
+            .to_string();
+    }
+    if raw.contains("HTTP 503") {
+        return format!(
+            "Action not sent: agentd's control channel is unavailable or busy ({}). Wait a second and \
+             retry; if it persists, restart agentd.",
+            raw.trim(),
+        );
+    }
+    if raw.contains("HTTP 404") {
+        return format!(
+            "Action not sent: agentd does not know this agent or route ({}). It may have already \
+             finished — check the agent list.",
+            raw.trim(),
+        );
+    }
+    raw.to_string()
+}
+
+fn verb_target(verb: &PendingVerb) -> &str {
+    match verb {
+        PendingVerb::Cancel { agent_id } | PendingVerb::SetBudget { agent_id, .. } => agent_id,
+        PendingVerb::Chat { target, .. } => target,
+    }
+}
+
+/// `count` is the server's cascade size for Cancel; `0` means the source could not report one, in
+/// which case the copy says nothing about how many agents were affected rather than guessing.
+fn verb_requested_text(verb: &PendingVerb, count: u64, resettable: bool) -> String {
+    match verb {
+        PendingVerb::Cancel { agent_id } if count > 0 => format!(
+            "Cancel requested for {agent_id} — {count} agent{} flagged, taking effect at the next \
+             step boundary",
+            if count == 1 { "" } else { "s" },
+        ),
+        PendingVerb::Cancel { agent_id } =>
+            format!("Cancel requested for {agent_id} — takes effect at its next step boundary"),
+        // The result frame must not contradict the menu the operator just used. `budget_resettable`
+        // decides which is true, and BOTH readings are worse than "reversible": with a window the park
+        // expires by itself at the next rollover; without one, exhaustion terminates the agent.
+        PendingVerb::SetBudget { agent_id, limit, park: true } if resettable =>
+            format!("Park requested for {agent_id} at {limit} tokens — it resumes by itself at the \
+                     next budget-window rollover; raise the limit to revive it sooner"),
+        PendingVerb::SetBudget { agent_id, limit, park: true } =>
+            format!("Park requested for {agent_id} at {limit} tokens — there is no reset window, so \
+                     this ENDS the agent at its next admission check"),
+        PendingVerb::SetBudget { agent_id, limit, park: false } =>
+            format!("Budget for {agent_id} set to {limit} tokens"),
+        // Never rendered: the chat turn reports through the rail transcript, not an overlay result.
+        PendingVerb::Chat { target, .. } => format!("Sent to {target}"),
     }
 }
 
@@ -1079,10 +1619,7 @@ fn handle_approvals_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
         ApprovalsMode::RejectReason => {
             match code {
                 KeyCode::Enter => {
-                    let id_opt   = app.approvals_view.confirmed_id.clone();
-                    let found_id = id_opt.as_deref().and_then(|id| {
-                        app.approvals_items.iter().find(|i| i.id == id).map(|i| i.id.clone())
-                    });
+                    let found_id = app.confirm_item().map(|i| i.id.clone());
                     app.approvals_view.result_msg = if let Some(found_id) = found_id {
                         let reason = app.approvals_view.reject_reason.value().to_string();
                         let reason_opt = if reason.is_empty() { None } else { Some(reason.as_str()) };
@@ -1115,10 +1652,9 @@ fn handle_approvals_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
         ApprovalsMode::Confirm => {
             match code {
                 KeyCode::Char('a') => {
-                    let id_opt   = app.approvals_view.confirmed_id.clone();
-                    let found_id = id_opt.as_deref().and_then(|id| {
-                        app.approvals_items.iter().find(|i| i.id == id).map(|i| i.id.clone())
-                    });
+                    // Resolve through the same pinned-id helper the renderer uses, so what the dialog
+                    // showed is exactly what this key acts on (C2/E12).
+                    let found_id = app.confirm_item().map(|i| i.id.clone());
                     app.approvals_view.result_msg = if let Some(found_id) = found_id {
                         match source.approve(&found_id) {
                             Ok(()) => {
@@ -1135,16 +1671,23 @@ fn handle_approvals_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
                 KeyCode::Char('d') => {
                     // "Don't ask again for this kind" — sends auto_approve_kind via FUSE;
                     // HTTP path inherits the default which falls back to plain approve.
-                    let id_opt  = app.approvals_view.confirmed_id.clone();
-                    let found   = id_opt.as_deref().and_then(|id| {
-                        app.approvals_items.iter().find(|i| i.id == id)
-                            .map(|i| (i.id.clone(), i.kind.clone()))
-                    });
+                    let found = app.confirm_item().map(|i| (i.id.clone(), i.kind.clone()));
                     app.approvals_view.result_msg = if let Some((found_id, found_kind)) = found {
                         match source.approve_with_kind(&found_id, &found_kind) {
                             Ok(()) => {
                                 app.approvals_items.retain(|i| i.id != found_id);
-                                Some(format!("Approved {found_id} (auto for '{found_kind}')"))
+                                // Report the effect the SOURCE actually had. HTTP has no route for the
+                                // standing rule and silently degrades to a plain approve, so claiming
+                                // "auto for '<kind>'" there told the operator a policy existed on the one
+                                // surface that IS an authority boundary (/review's security specialist).
+                                if source.supports_auto_approve_kind() {
+                                    Some(format!("Approved {found_id} (auto for '{found_kind}')"))
+                                } else {
+                                    Some(format!(
+                                        "Approved {found_id} — but 'don't ask again' is FUSE-only, so \
+                                         no auto-approve rule for '{found_kind}' was registered."
+                                    ))
+                                }
                             }
                             Err(e) => Some(format!("Error: {e}")),
                         }
@@ -1274,11 +1817,12 @@ mod tests {
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
     use super::{
-        do_spawn_action, drain_events, handle_approvals_key, handle_dashboard_key,
-        handle_inspector_key, handle_logs_key, handle_memory_key, handle_spawn_key, logs,
-        on_resize, route_paste, step, step_key, App, Effect, View, MAX_PASTE_CHARS,
+        do_spawn_action, drain_events, drain_pending_verb, explain_verb_error, handle_approvals_key,
+        handle_dashboard_key, handle_inspector_key, handle_logs_key, handle_memory_key,
+        handle_spawn_key, logs, on_resize, overlay, parse_budget, route_paste, set_mode, step,
+        step_key, App, Effect, View, MAX_PASTE_CHARS,
     };
-    use crate::watch::app::{MemoryPane, SpawnFocus};
+    use crate::watch::app::{CancelMarker, MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
     use crate::watch::pump::AppEvent;
     use crate::watch::reader::{self, AgentInfo, BudgetKind, PendingAction, Snapshot};
@@ -1659,6 +2203,10 @@ mod tests {
         fn event_stream_url(&self) -> Option<String> {
             Some("http://test/api/v1/events".to_string())
         }
+        /// This double impersonates the HTTP source (it answers `event_stream_url`), so it must
+        /// impersonate the confirm behaviour too — inheriting the `false` default would silently make
+        /// it a FUSE-like source and mask the tense split (eng finding E9's trap).
+        fn confirms_mutations(&self) -> bool { true }
     }
 
     #[test]
@@ -1669,6 +2217,27 @@ mod tests {
         app.converse_view.input = tui_input::Input::new("hello".to_string());
 
         handle_dashboard_key(kev(KeyCode::Enter), &mut app, &ResolvesDifferentIdSource);
+
+        // ux.13-TUI: the keypress ARMS the turn; the loop performs it. `dispatch` does a
+        // `load_snapshot` (5 s client) plus a spawn (3 s), so doing it here froze the cockpit — Ctrl-C
+        // included — for up to ~8 s on the app's most frequent interaction (TODOS.md's ranked P2).
+        assert_eq!(
+            app.pending_verb,
+            Some(overlay::PendingVerb::Chat {
+                target: "requested-id".to_string(), text: "hello".to_string(),
+            }),
+            "Enter must park the turn for the loop, not send it from the key handler"
+        );
+        assert_eq!(app.converse_view.active_target, "requested-id",
+            "nothing is resolved yet — the server has not been asked");
+        assert_eq!(
+            app.converse_view.targets.get("requested-id").map(|s| s.phase.clone()),
+            Some(super::converse::ConversePhase::Dispatching),
+            "the rail must already show Dispatching…, which is this verb's in-flight frame"
+        );
+
+        let effects = drain_pending_verb(&mut app, &ResolvesDifferentIdSource);
+        assert!(effects.contains(&Effect::Reconcile), "a spawn should poke the snapshot producer");
 
         assert_eq!(app.converse_view.active_target, "operator-agent", "rail must follow the server-resolved id");
         assert!(
@@ -1695,6 +2264,67 @@ mod tests {
             "hi",
             "delta for the server-resolved id must not be silently discarded"
         );
+    }
+
+    /// The failure half of the same migration: the phase is set optimistically at ARM time so the rail
+    /// can draw `Dispatching…` before the blocking call, so a rejected dispatch MUST put it back to
+    /// Idle — otherwise the double-submit guard blocks the retry the error message itself invites, and
+    /// the rail is wedged for the rest of the session.
+    #[test]
+    fn a_rejected_chat_turn_returns_the_rail_to_idle_so_enter_works_again() {
+        /// Looks like HTTP (so the rail's fail-fast gate passes) but rejects the spawn.
+        struct ChatRejectSource;
+        impl DataSource for ChatRejectSource {
+            fn load_snapshot(&self) -> Snapshot {
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            }
+            fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+            fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+            fn deny(&self, _id: &str, _r: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+            fn spawn(&self, _req: &crate::watch::source::SpawnRequest) -> Result<String, String> {
+                Err("HTTP 429: too many agents".to_string())
+            }
+            fn event_stream_url(&self) -> Option<String> { Some("http://test/api/v1/events".into()) }
+            fn confirms_mutations(&self) -> bool { true }
+        }
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("orch-default");
+        app.converse_view.input = tui_input::Input::new("hello".to_string());
+
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &ChatRejectSource);
+        assert!(app.pending_verb.is_some());
+        drain_pending_verb(&mut app, &ChatRejectSource);
+
+        let state = app.converse_view.targets.get("orch-default").expect("state");
+        assert_eq!(state.phase, super::converse::ConversePhase::Idle,
+            "a rejected turn must not leave the rail permanently busy");
+        assert!(state.history.back().is_some_and(|t| t.text.contains("press Enter to retry")),
+            "and must say so: {:?}", state.history.back());
+
+        // Proof it is actually retryable: a second Enter arms again.
+        app.converse_view.input = tui_input::Input::new("again".to_string());
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &ChatRejectSource);
+        assert!(app.pending_verb.is_some(), "Enter must work after a rejection");
+    }
+
+    /// The double-submit guard has to survive the new gap between arming and sending: while the call is
+    /// in flight the phase is non-Idle, so a second Enter is a no-op instead of arming a second spawn of
+    /// the SAME agent id (which the server would treat as a fresh spawn, corrupting turn order).
+    #[test]
+    fn a_second_enter_while_a_chat_turn_is_in_flight_is_a_no_op() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        app.converse_view.retarget("orch-default");
+        app.converse_view.input = tui_input::Input::new("first".to_string());
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &ResolvesDifferentIdSource);
+        let armed = app.pending_verb.clone();
+
+        app.converse_view.input = tui_input::Input::new("second".to_string());
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &ResolvesDifferentIdSource);
+        assert_eq!(app.pending_verb, armed, "the armed turn must not be replaced mid-flight");
+        assert_eq!(app.converse_view.input.value(), "second",
+            "and the operator's text must be preserved, not eaten");
     }
 
     #[test]
@@ -2363,23 +2993,119 @@ mod tests {
     #[test]
     fn approvals_confirm_approve_with_no_control_file_sets_error_msg() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
-        app.approvals_view.mode = ApprovalsMode::Confirm;
+        app.approvals_view.mode         = ApprovalsMode::Confirm;
+        // Pin the id the way `Enter` does. Without it this test silently exercised the
+        // "already resolved" branch instead of the approve call it names (ux.13-TUI step 4).
+        app.approvals_view.confirmed_id = Some("act_0".to_string());
         handle_approvals_key(kev(KeyCode::Char('a')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after Approve must return to List mode");
-        assert!(app.approvals_view.result_msg.is_some(),
-            "result_msg must be set after approve attempt");
+        assert_eq!(app.approvals_view.result_msg.as_deref(), Some("Error: mock: no control"),
+            "the source's failure must surface, not a fabricated success");
     }
 
     #[test]
     fn approvals_confirm_dont_ask_again_with_no_control_file_sets_error_msg() {
         let mut app = app_with_approvals(&[("act_0", "write_file")]);
-        app.approvals_view.mode = ApprovalsMode::Confirm;
+        app.approvals_view.mode         = ApprovalsMode::Confirm;
+        app.approvals_view.confirmed_id = Some("act_0".to_string());
         handle_approvals_key(kev(KeyCode::Char('d')), &mut app, &TestSource);
         assert_eq!(app.approvals_view.mode, ApprovalsMode::List,
             "after 'don't ask again' must return to List mode");
         assert!(app.approvals_view.result_msg.is_some(),
             "result_msg must be set after don't-ask-again attempt");
+    }
+
+    // ── ux.13-TUI step 4: what the dialog acts on is what the dialog showed (C2/E12) ──────
+    //
+    // The approval gate is the one real authority boundary in the cockpit, so both directions of
+    // the pinned-id resolution get a test: a pin that is still pending must reach the source with
+    // the PINNED id, and a pin that resolved out-of-band must reach the source not at all.
+
+    /// Records every id the view sends, so "did not call the source" is an assertion rather than
+    /// an inference from a message string.
+    #[derive(Default)]
+    struct RecordingApprovalSource {
+        approved: std::sync::Mutex<Vec<String>>,
+        denied:   std::sync::Mutex<Vec<String>>,
+    }
+    impl DataSource for RecordingApprovalSource {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, id: &str) -> Result<(), String> {
+            self.approved.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+        fn deny(&self, id: &str, _reason: Option<&str>) -> Result<(), String> {
+            self.denied.lock().unwrap().push(id.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn approvals_approve_sends_the_pinned_id_even_when_the_list_reordered() {
+        let src = RecordingApprovalSource::default();
+        let mut app = app_with_approvals(&[("act_9", "kb_write"), ("act_1", "shell_exec")]);
+        app.approvals_view.mode         = ApprovalsMode::Confirm;
+        app.approvals_view.confirmed_id = Some("act_1".to_string());
+        app.approvals_view.selected_idx = 0; // highlight drifted to the other item
+
+        handle_approvals_key(kev(KeyCode::Char('a')), &mut app, &src);
+
+        assert_eq!(src.approved.lock().unwrap().as_slice(), ["act_1"],
+            "must approve the PINNED id, never the highlighted row");
+        assert_eq!(app.approvals_view.result_msg.as_deref(), Some("Approved act_1"));
+        assert!(!app.approvals_items.iter().any(|i| i.id == "act_1"),
+            "the resolved item must leave the list");
+        assert!(app.approvals_items.iter().any(|i| i.id == "act_9"),
+            "and the untouched item must remain");
+    }
+
+    #[test]
+    fn approvals_approve_on_an_already_resolved_pin_calls_nothing_and_says_so() {
+        let src = RecordingApprovalSource::default();
+        // The pinned approval was resolved out-of-band (Telegram / `agentctl approve` / expiry) and
+        // the next `update_approvals` replaced the list. Only `act_9` survives.
+        let mut app = app_with_approvals(&[("act_9", "kb_write")]);
+        app.approvals_view.mode         = ApprovalsMode::Confirm;
+        app.approvals_view.confirmed_id = Some("act_1".to_string());
+
+        handle_approvals_key(kev(KeyCode::Char('a')), &mut app, &src);
+
+        assert!(src.approved.lock().unwrap().is_empty(),
+            "a vanished pin must never fall through to the surviving item: {:?}", src.approved.lock().unwrap());
+        assert_eq!(app.approvals_view.result_msg.as_deref(),
+            Some("Approval already resolved — refreshed list."));
+        assert_eq!(app.approvals_view.mode, ApprovalsMode::List);
+        assert!(app.approvals_items.iter().any(|i| i.id == "act_9"),
+            "and nothing may be removed from the list on the no-op path");
+    }
+
+    #[test]
+    fn approvals_reject_sends_the_pinned_id_and_no_op_when_it_vanished() {
+        // Direction 1: still pending → the pinned id is denied.
+        let src = RecordingApprovalSource::default();
+        let mut app = app_with_approvals(&[("act_9", "kb_write"), ("act_1", "shell_exec")]);
+        app.approvals_view.mode         = ApprovalsMode::RejectReason;
+        app.approvals_view.confirmed_id = Some("act_1".to_string());
+        app.approvals_view.selected_idx = 0;
+        app.approvals_view.reject_reason = tui_input::Input::new("too risky".to_string());
+        handle_approvals_key(kev(KeyCode::Enter), &mut app, &src);
+        assert_eq!(src.denied.lock().unwrap().as_slice(), ["act_1"], "reject must use the pinned id");
+        assert_eq!(app.approvals_view.result_msg.as_deref(), Some("Rejected act_1"));
+        assert!(app.approvals_view.confirmed_id.is_none(), "the pin is released after resolving");
+
+        // Direction 2: resolved out-of-band → nothing is sent.
+        let src2 = RecordingApprovalSource::default();
+        let mut app2 = app_with_approvals(&[("act_9", "kb_write")]);
+        app2.approvals_view.mode         = ApprovalsMode::RejectReason;
+        app2.approvals_view.confirmed_id = Some("act_1".to_string());
+        handle_approvals_key(kev(KeyCode::Enter), &mut app2, &src2);
+        assert!(src2.denied.lock().unwrap().is_empty(), "a vanished pin must not deny a different approval");
+        assert_eq!(app2.approvals_view.result_msg.as_deref(),
+            Some("Approval already resolved — refreshed list."));
     }
 
     // ── ux.0: step() / event pump ────────────────────────────────────────────
@@ -2680,6 +3406,1010 @@ mod tests {
         app.logs_view.search_active = true;
         route_paste(&mut app, "needle");
         assert_eq!(app.logs_view.search_query.value(), "needle");
+    }
+
+
+    // ── ux.13-TUI: row-action overlay (safety fixes before any verb is wired) ──
+
+    #[test]
+    fn dashboard_key_x_opens_the_overlay_pinned_to_the_selected_agent() {
+        let mut app = app_with_agents(&["a", "b", "c"]);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &TestSource); // select "b"
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        let ov = app.dashboard_overlay.as_ref().expect("overlay opened");
+        assert_eq!(ov.target_id, "b");
+        assert_eq!(ov.mode.kind(), "menu");
+    }
+
+    #[test]
+    fn dashboard_key_x_is_a_noop_with_no_selection() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        assert!(app.dashboard_overlay.is_none(), "no row selected -> nothing to act on");
+    }
+
+    /// C1/E5: the pinned target must survive a snapshot that retargets the SELECTION. `apply_snapshot`
+    /// clears a vanished selection and auto-selects row 0, from a producer thread — so without the pin
+    /// the operator's confirm would land on whatever row 0 happens to be, and Cancel cascades.
+    #[test]
+    fn overlay_target_survives_a_snapshot_that_retargets_the_selection() {
+        let mut app = app_with_agents(&["cos-coordinator", "scout-2"]);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &TestSource); // select scout-2
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        assert_eq!(app.dashboard_overlay.as_ref().unwrap().target_id, "scout-2");
+
+        // scout-2 finishes; the snapshot drops it and apply_snapshot auto-selects row 0.
+        app.apply_snapshot(make_snapshot(&["cos-coordinator"]));
+        assert_eq!(app.selected_id.as_deref(), Some("cos-coordinator"), "selection moved (expected)");
+        let ov = app.dashboard_overlay.as_ref().unwrap();
+        assert_eq!(ov.target_id, "scout-2", "but the overlay target did NOT move");
+        assert!(
+            ov.target(&app.agents).is_none(),
+            "and it resolves to None rather than falling back to row 0"
+        );
+    }
+
+    /// C3: `q` inside the overlay must dismiss, NOT quit. Driven through `step_key` on purpose — a
+    /// `handle_dashboard_key`-level test cannot see the `Effect::Quit` push and would pass with the
+    /// gate reverted.
+    #[test]
+    fn step_key_q_inside_the_overlay_dismisses_and_does_not_quit() {
+        let mut app = app_with_agents(&["a"]);
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        assert!(app.dashboard_overlay.is_some());
+
+        let effects = step_key(&mut app, key('q'), &TestSource);
+        assert!(
+            !effects.contains(&Effect::Quit),
+            "q must dismiss the overlay, not kill the cockpit mid-incident"
+        );
+        assert!(app.dashboard_overlay.is_none(), "and the overlay closed");
+        assert_eq!(app.view, View::Dashboard);
+
+        // The NEXT q, with no overlay, quits as before — the gate must not be sticky.
+        assert!(step_key(&mut app, key('q'), &TestSource).contains(&Effect::Quit));
+    }
+
+    #[test]
+    fn step_key_ctrl_c_still_quits_from_inside_the_overlay() {
+        let mut app = app_with_agents(&["a"]);
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        let ev = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(step_key(&mut app, ev, &TestSource), vec![Effect::Quit]);
+    }
+
+    /// E4: the overlay owns the WHOLE keyboard. Intercepting only Enter/Esc/Tab/q would let these
+    /// change `app.view` with the overlay still open, so the next key would land in another view's
+    /// handler underneath a modal. Asserts BOTH `view` and `selected_id` — asserting only `view`
+    /// passes while `j`/`k` still desyncs the highlight from the pinned target.
+    #[test]
+    fn overlay_swallows_view_switches_and_row_navigation() {
+        let mut app = app_with_agents(&["a", "b", "c"]);
+        // /review (testing specialist): `[l]` is inert in the base handler unless a compose project was
+        // detected, so without this the 'l' row proved nothing about the overlay. And 'r' retargets the
+        // CHAT RAIL, which none of the originally-asserted fields would have caught — a fall-through was
+        // invisible. Both are now real rows.
+        app.logs_view.available = true;
+        let rail_target = app.converse_view.active_target.clone();
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        let pinned = app.dashboard_overlay.as_ref().unwrap().target_id.clone();
+
+        for k in ['s', 't', 'm', 'n', 'a', 'c', 'i', 'l', 'r', 'j', 'k'] {
+            handle_dashboard_key(key(k), &mut app, &TestSource);
+            assert_eq!(app.view, View::Dashboard, "'{k}' must not switch views from inside the overlay");
+            assert_eq!(app.selected_id.as_deref(), Some("a"), "'{k}' must not move the selection");
+            assert_eq!(
+                app.dashboard_overlay.as_ref().map(|o| o.target_id.clone()),
+                Some(pinned.clone()),
+                "'{k}' must not change the pinned target"
+            );
+            assert_eq!(app.converse_view.active_target, rail_target,
+                "'{k}' must not retarget the chat rail underneath the modal");
+        }
+        // Tab must not focus the chat rail underneath the modal either.
+        handle_dashboard_key(kev(KeyCode::Tab), &mut app, &TestSource);
+        assert!(!app.converse_view.rail_focused, "Tab must not reach the rail under a modal");
+    }
+
+    /// `x` while the rail has text focus must TYPE an x, not open an overlay — the rail captures
+    /// printable keys, and this test fails if the overlay gate is ever placed before the rail's
+    /// early return.
+    #[test]
+    fn x_while_rail_focused_types_instead_of_opening_the_overlay() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        assert!(app.dashboard_overlay.is_none(), "rail focus wins over the verb key");
+        assert_eq!(app.converse_view.input.value(), "x");
+    }
+
+    #[test]
+    fn overlay_menu_cursor_moves_and_saturates_at_both_ends() {
+        let mut app = app_with_agents(&["a"]);
+        handle_dashboard_key(key('x'), &mut app, &TestSource);
+        let cursor = |app: &App| app.dashboard_overlay.as_ref().unwrap().cursor;
+        assert_eq!(cursor(&app), 0);
+        handle_dashboard_key(kev(KeyCode::Up), &mut app, &TestSource);
+        assert_eq!(cursor(&app), 0, "saturates at the top");
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &TestSource);
+        assert_eq!(cursor(&app), 1);
+        // Past the last item: the cursor must clamp to the item COUNT, or Enter indexes past the end
+        // of `menu_items` and the menu silently does nothing on its own bottom row.
+        for _ in 0..10 {
+            handle_dashboard_key(kev(KeyCode::Down), &mut app, &TestSource);
+        }
+        let last = overlay::menu_items(app.selected_agent().unwrap(), false).len() - 1;
+        assert_eq!(cursor(&app), last, "must clamp to the last item, not run off the list");
+    }
+
+    // ── ux.13-TUI step 5: arming a verb, and the loop that performs it ────────────────
+
+    /// Records what actually reached the `DataSource`, which is the only way to assert both halves of
+    /// the two-phase split: nothing during key dispatch, exactly once from the loop.
+    #[derive(Default)]
+    struct VerbSource {
+        cancels: std::sync::Mutex<Vec<String>>,
+        budgets: std::sync::Mutex<Vec<(String, u64)>>,
+        fail:    Option<String>,
+    }
+    impl VerbSource {
+        fn failing(msg: &str) -> Self {
+            Self { fail: Some(msg.to_string()), ..Default::default() }
+        }
+        fn calls(&self) -> usize {
+            self.cancels.lock().unwrap().len() + self.budgets.lock().unwrap().len()
+        }
+    }
+    impl DataSource for VerbSource {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+        fn deny(&self, _id: &str, _r: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+        fn cancel(&self, agent_id: &str) -> Result<u64, String> {
+            self.cancels.lock().unwrap().push(agent_id.to_string());
+            // 3 = the server's cascade count (target + 2 children), the number the client cannot know.
+            match &self.fail { Some(e) => Err(e.clone()), None => Ok(3) }
+        }
+        /// Confirming, like HTTP: the past-tense/queued split is asserted separately, by a double that
+        /// deliberately does NOT confirm.
+        fn confirms_mutations(&self) -> bool { true }
+        fn set_budget(&self, agent_id: &str, limit: u64) -> Result<(), String> {
+            self.budgets.lock().unwrap().push((agent_id.to_string(), limit));
+            match &self.fail { Some(e) => Err(e.clone()), None => Ok(()) }
+        }
+    }
+
+    /// An agent list with real spend, so Park is available (`menu_items` disables it at zero).
+    fn app_with_spend(ids: &[&str], spent: u64, budget: BudgetKind) -> App {
+        let mut snap = make_snapshot(ids);
+        for a in &mut snap.agents {
+            a.windowed_spent = spent;
+            a.budget = budget.clone();
+        }
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(snap);
+        app
+    }
+
+    fn mode_kind(app: &App) -> &'static str {
+        app.dashboard_overlay.as_ref().expect("overlay open").mode.kind()
+    }
+
+    /// H1: the confirm keypress must NOT perform the call. `HttpSource`'s confirm client blocks up to
+    /// 3 s, so a call made here freezes the cockpit with no frame drawn — the operator sees a dead
+    /// terminal at the exact moment they are stopping a runaway.
+    #[test]
+    fn park_arms_the_verb_and_the_keypress_calls_nothing() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src); // cursor 0 = Park
+
+        assert_eq!(src.calls(), 0, "the key handler must never touch the DataSource");
+        assert_eq!(mode_kind(&app), "in_flight", "the operator must see a frame saying so");
+        assert_eq!(
+            app.pending_verb,
+            Some(overlay::PendingVerb::SetBudget {
+                agent_id: "scout-2".to_string(), limit: 47_000, park: true,
+            }),
+            "Park must arm set_budget at the RECORDED spend, never 0"
+        );
+    }
+
+    /// E1 again, at the level the operator meets it: with no recorded spend the item is inert.
+    /// `set_budget(0)` would mean UNLIMITED and would be checkpointed — a permanent un-cap.
+    #[test]
+    fn park_is_inert_at_zero_spend() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 0, BudgetKind::Unlimited);
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        assert!(app.pending_verb.is_none(), "a blocked item must arm nothing");
+        assert_eq!(mode_kind(&app), "menu", "and must not leave the menu");
+        assert_eq!(src.calls(), 0);
+    }
+
+    /// The irreversible verb is two gates deep, and the first gate arms nothing.
+    #[test]
+    fn cancel_takes_two_confirmations_and_the_first_arms_nothing() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src); // → Cancel
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        assert_eq!(mode_kind(&app), "confirm_cancel");
+        assert!(app.pending_verb.is_none(), "the menu must not arm the irreversible verb directly");
+
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        assert_eq!(
+            app.pending_verb,
+            Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".to_string() })
+        );
+        assert_eq!(src.calls(), 0, "still not from the key handler");
+    }
+
+    /// Esc backs out of the confirm to the menu, on the row it came from.
+    #[test]
+    fn esc_backs_out_of_each_gate_preserving_the_menu_row() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src); // → Set budget
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        assert_eq!(mode_kind(&app), "budget");
+        handle_dashboard_key(kev(KeyCode::Esc), &mut app, &src);
+        assert_eq!(mode_kind(&app), "menu");
+        assert_eq!(app.dashboard_overlay.as_ref().unwrap().cursor, 1,
+            "Esc must return to the row the operator opened, not to the top");
+        assert!(app.pending_verb.is_none());
+    }
+
+    /// E8, the drain-once property. A single-iteration test passes with a re-arming bug: the slot is
+    /// `.take()`n BEFORE the call precisely so an early return cannot re-fire the same verb every
+    /// 30 ms — a cancel storm against the scheduler.
+    #[test]
+    fn drain_performs_the_verb_exactly_once_across_repeated_ticks() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src); // armed
+
+        let first = drain_pending_verb(&mut app, &src);
+        assert_eq!(first, vec![Effect::Redraw, Effect::Reconcile]);
+        for _ in 0..3 {
+            assert!(drain_pending_verb(&mut app, &src).is_empty(), "an empty slot must be a no-op");
+        }
+        assert_eq!(src.cancels.lock().unwrap().as_slice(), ["scout-2"],
+            "exactly one cancel must reach the scheduler");
+        assert_eq!(mode_kind(&app), "result");
+    }
+
+    /// The success copy is the CLI's tense, not "cancelled": the scheduler acts at the next step
+    /// boundary, and `agentctl cancel` already says so. Two vocabularies for one write is how the
+    /// operator ends up trusting neither (DX finding).
+    #[test]
+    fn drain_reports_requested_not_done_and_names_the_cli_equivalent() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        app.dashboard_overlay = Some(overlay::DashboardOverlay::menu("scout-2"));
+        app.pending_verb = Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".into() });
+        drain_pending_verb(&mut app, &src);
+        let overlay::OverlayMode::Result { text, ok } = &app.dashboard_overlay.as_ref().unwrap().mode
+        else { panic!("expected a Result frame, got {}", mode_kind(&app)) };
+        assert!(*ok);
+        assert!(text.contains("Cancel requested"), "must not claim the agent is already stopped: {text}");
+        assert!(text.contains("next step boundary"), "must say when it takes effect: {text}");
+        // E6: the SERVER's count (3 here), which the client cannot compute — the route has always
+        // returned it and `HttpSource::cancel` used to throw the body away.
+        assert!(text.contains("3 agents flagged"), "must report the server's cascade count: {text}");
+        assert!(text.contains("agentctl cancel scout-2"), "must name the CLI equivalent: {text}");
+    }
+
+    /// A CONFIRMING source whose reply carries no `count` (an older agentd, or a body that fails to
+    /// parse) must make the copy say nothing about how many agents were hit, rather than printing a
+    /// guessed "0 agents".
+    #[test]
+    fn drain_omits_the_cascade_count_when_the_source_cannot_report_one() {
+        struct NoCountSource;
+        impl DataSource for NoCountSource {
+            fn confirms_mutations(&self) -> bool { true }
+            fn load_snapshot(&self) -> Snapshot {
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            }
+            fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+            fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+            fn deny(&self, _id: &str, _r: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+            fn cancel(&self, _id: &str) -> Result<u64, String> { Ok(0) }
+        }
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        app.dashboard_overlay = Some(overlay::DashboardOverlay::menu("scout-2"));
+        app.pending_verb = Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".into() });
+        drain_pending_verb(&mut app, &NoCountSource);
+        let overlay::OverlayMode::Result { text, ok } = &app.dashboard_overlay.as_ref().unwrap().mode
+        else { panic!("expected a Result frame") };
+        assert!(*ok);
+        assert!(!text.contains("0 agent"), "must not report a count it does not have: {text}");
+        assert!(text.contains("Cancel requested"), "{text}");
+    }
+
+    /// C5: over FUSE, `Ok(())` means "the command was queued", nothing more — "agent not found" and
+    /// "SetCaps is narrow-only" arrive as `Ok(())` too. So the result copy must not use past tense, and
+    /// must point at where the scheduler's real verdict shows up. Asserted on a double that inherits
+    /// the `false` default, which is exactly what a FUSE source does.
+    #[test]
+    fn drain_says_queued_not_accepted_on_a_source_that_cannot_confirm() {
+        struct FuseLikeVerbSource;
+        impl DataSource for FuseLikeVerbSource {
+            fn load_snapshot(&self) -> Snapshot {
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            }
+            fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+            fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+            fn deny(&self, _id: &str, _r: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+            fn cancel(&self, _id: &str) -> Result<u64, String> { Ok(0) }
+        }
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        app.dashboard_overlay = Some(overlay::DashboardOverlay::menu("scout-2"));
+        app.pending_verb = Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".into() });
+        drain_pending_verb(&mut app, &FuseLikeVerbSource);
+        let overlay::OverlayMode::Result { text, .. } = &app.dashboard_overlay.as_ref().unwrap().mode
+        else { panic!("expected a Result frame") };
+        assert!(text.contains("queued over FUSE"), "must say what actually happened: {text}");
+        assert!(text.contains("cannot confirm"), "{text}");
+        assert!(text.contains("fuse_control_error"), "must point at the real verdict: {text}");
+        assert!(!text.contains("Cancel requested for"),
+            "must not borrow the confirming source's copy: {text}");
+    }
+
+    /// `?` was bound by NO key anywhere before this increment — which was the CEO phase's own argument
+    /// for striking the `:` palette ("the keys are on screen") coming due.
+    #[test]
+    fn question_mark_opens_the_help_overlay_and_closes_on_itself() {
+        let mut app = app_with_agents(&["a"]);
+        handle_dashboard_key(key('?'), &mut app, &TestSource);
+        assert_eq!(mode_kind(&app), "help");
+        // Pressing it again closes: a modal you open with `?` and cannot close with `?` is a trap.
+        handle_dashboard_key(key('?'), &mut app, &TestSource);
+        assert!(app.dashboard_overlay.is_none());
+    }
+
+    /// Help owns the keyboard like every other overlay mode — E4's rule is not per-mode.
+    #[test]
+    fn the_help_overlay_swallows_view_switches() {
+        let mut app = app_with_agents(&["a", "b"]);
+        app.logs_view.available = true; // else the 'l' row is vacuous (/review)
+        let rail_target = app.converse_view.active_target.clone();
+        handle_dashboard_key(key('?'), &mut app, &TestSource);
+        for k in ['s', 't', 'm', 'n', 'a', 'c', 'i', 'l', 'j', 'k', 'r', 'x'] {
+            handle_dashboard_key(key(k), &mut app, &TestSource);
+            assert_eq!(app.view, View::Dashboard, "'{k}' must not switch views under the help modal");
+            assert_eq!(app.selected_id.as_deref(), Some("a"), "'{k}' must not move the selection");
+            assert_eq!(app.converse_view.active_target, rail_target, "'{k}' must not retarget the rail");
+            assert_eq!(mode_kind(&app), "help", "'{k}' must not replace the help modal (incl. 'x')");
+        }
+        handle_dashboard_key(kev(KeyCode::Tab), &mut app, &TestSource);
+        assert!(!app.converse_view.rail_focused, "Tab must not reach the rail under the help modal");
+    }
+
+    /// `?` while the chat rail has text focus must TYPE it, not open help — the rail-capture rule
+    /// (ux.1's bug class) applies to every new printable key.
+    #[test]
+    fn question_mark_while_the_rail_is_focused_types_instead_of_opening_help() {
+        let mut app = app_with_agents(&["a"]);
+        app.converse_view.rail_focused = true;
+        handle_dashboard_key(key('?'), &mut app, &TestSource);
+        assert!(app.dashboard_overlay.is_none());
+        assert_eq!(app.converse_view.input.value(), "?");
+    }
+
+    /// `q` must dismiss help, not quit the cockpit. Through `step_key`, because
+    /// `handle_dashboard_key` never pushes `Effect::Quit`.
+    #[test]
+    fn step_key_q_inside_help_dismisses_without_quitting() {
+        let mut app = app_with_agents(&["a"]);
+        handle_dashboard_key(key('?'), &mut app, &TestSource);
+        let effects = step_key(&mut app, key('q'), &TestSource);
+        assert!(!effects.contains(&Effect::Quit), "q inside help must not kill the cockpit");
+        assert!(app.dashboard_overlay.is_none(), "but it must dismiss");
+    }
+
+    // ── M8: the row has to SAY a cancel is in flight ──────────────────────────────────
+
+    /// There is no `AgentStatus::Cancelling` and `cancel_requested` is scheduler-private, so without a
+    /// client-side marker a successfully-cancelled row reads `running` for a whole turn and then
+    /// vanishes — indistinguishable from a keypress that did nothing.
+    #[test]
+    fn a_confirmed_cancel_marks_the_row_and_its_subtree() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["cos-coordinator", "scout-2"], 47_000, BudgetKind::Unlimited);
+        // scout-2 is a child, so the cascade covers it too.
+        app.agents[1].parent_id = Some("cos-coordinator".to_string());
+        app.topology = crate::watch::topology::build_graph(&app.agents, None);
+        app.dashboard_overlay = Some(overlay::DashboardOverlay::menu("cos-coordinator"));
+        app.pending_verb = Some(overlay::PendingVerb::Cancel { agent_id: "cos-coordinator".into() });
+
+        drain_pending_verb(&mut app, &src);
+
+        assert_eq!(app.cancel_marker("cos-coordinator"), Some(CancelMarker::InFlight));
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::InFlight),
+            "Cancel cascades, so the child row must not keep reading 'running' either");
+    }
+
+    #[test]
+    fn a_failed_cancel_marks_nothing() {
+        let src = VerbSource::failing("HTTP 503: busy");
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        app.dashboard_overlay = Some(overlay::DashboardOverlay::menu("scout-2"));
+        app.pending_verb = Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".into() });
+        drain_pending_verb(&mut app, &src);
+        assert_eq!(app.cancel_marker("scout-2"), None,
+            "a cancel that never reached the scheduler must not show as in flight");
+    }
+
+    /// The scheduler's own confirmation, which can arrive a whole poll interval before the row leaves
+    /// the snapshot.
+    #[test]
+    fn the_agent_cancelled_event_marks_the_row_as_cancelled_by_the_operator() {
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        app.mark_cancel_requested("scout-2", true);
+        assert!(app.cancel_marker("scout-2").is_some());
+
+        // An unrelated event must not clear it.
+        step(&mut app, AppEvent::Flight(serde_json::json!({
+            "agent": "scout-2", "kind": "agent_step", "data": {}
+        })), &TestSource);
+        assert!(app.cancel_marker("scout-2").is_some(), "only agent_cancelled clears the marker");
+
+        // …and one for a DIFFERENT agent must not clear this one.
+        step(&mut app, AppEvent::Flight(serde_json::json!({
+            "agent": "other", "kind": "agent_cancelled", "data": {}
+        })), &TestSource);
+        assert!(app.cancel_marker("scout-2").is_some(), "must match on the agent id");
+
+        step(&mut app, AppEvent::Flight(serde_json::json!({
+            "agent": "scout-2", "kind": "agent_cancelled", "data": {}
+        })), &TestSource);
+        // /qa (real agentd): NOT cleared — a cancelled agent's row reads `failed`, so dropping the marker
+        // here left the operator staring at a red failure with nothing saying it was their own stop.
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::Landed),
+            "the confirmation must ATTRIBUTE the failure, not vanish");
+    }
+
+    // ── DX: the five error strings ────────────────────────────────────────────────────
+
+    /// Every one of these replaced a string that failed WHAT / WHY / WHAT-TO-DO. The 401/403 case is the
+    /// one that cannot be discovered any other way: there is no unauthenticated route that reveals
+    /// whether agentd has an approval secret (E10 killed the startup probe), so the response is the only
+    /// teacher the operator gets.
+    #[test]
+    fn verb_errors_are_rewritten_into_what_why_and_what_to_do() {
+        let auth = explain_verb_error("HTTP 401");
+        assert!(auth.contains("approval token"), "{auth}");
+        assert!(auth.contains("AGENTOS_APPROVAL_SECRET"), "must name the env var: {auth}");
+        assert!(auth.contains("run this again"), "the CLI's own next step must be there: {auth}");
+        assert!(auth.contains("restart `agentctl watch`"),
+            "and the TUI's, which differs because it reads the secret once at startup: {auth}");
+        // Surface-neutral: this copy is now shared with the CLI, so it must not assume an overlay
+        // (/qa found "dismiss and check the table" printed by `agentctl cancel`).
+        for msg in [&auth, &explain_verb_error("HTTP 404"), &explain_verb_error("HTTP 503: busy")] {
+            assert!(!msg.contains("dismiss"), "TUI-only vocabulary leaked into shared copy: {msg}");
+        }
+        assert_eq!(explain_verb_error("HTTP 403: forbidden"), auth, "403 is the same problem");
+
+        let busy = explain_verb_error("HTTP 503: control channel full");
+        assert!(busy.contains("Wait a second and retry"), "503 is retryable and must say so: {busy}");
+        assert!(busy.contains("control channel full"), "must keep the server's own detail: {busy}");
+
+        let gone = explain_verb_error("HTTP 404: no such agent");
+        assert!(gone.contains("may have already finished"), "{gone}");
+        assert!(gone.contains("check the agent list"), "{gone}");
+
+        // Anything unrecognised passes through verbatim: inventing an explanation for an error nobody
+        // has seen is how a cockpit teaches the wrong fix.
+        assert_eq!(explain_verb_error("kernel exploded"), "kernel exploded");
+    }
+
+    /// The failure the pty drive exposed: `reqwest::Error`'s Display drops the cause chain, so the
+    /// confirm client's 3 s timeout reached the operator as "HTTP error: error sending request for url
+    /// (…)" — no mention of a timeout, and no hint that the mutation may STILL land.
+    #[test]
+    fn a_transport_timeout_says_it_timed_out_and_that_the_write_may_still_apply() {
+        use crate::watch::source::describe_send_error;
+        // A real reqwest timeout, produced rather than mocked, because `is_timeout()` is the thing under
+        // test. The holder thread is JOINED (it used to outlive the test by 3 s) and the connect half no
+        // longer depends on an ephemeral port staying free — /review flagged both as flake sources.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let held: Vec<_> = listener.incoming().take(1).filter_map(Result::ok).collect();
+            let _ = release_rx.recv(); // hold the connection open, replying nothing, until released
+            drop(held);
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(150))
+            .build()
+            .unwrap();
+        let err = client.post(format!("http://{addr}/api/v1/agents/a/cancel")).send()
+            .expect_err("must time out");
+        let msg = describe_send_error(&err);
+        let _ = release_tx.send(());
+        server.join().expect("holder thread");
+        assert!(msg.contains("Timed out"), "{msg}");
+        assert!(msg.contains("may still have been applied"),
+            "a delivered-but-unanswered mutation is NOT known to have failed: {msg}");
+
+        // The opposite case — nothing was sent — must not say "may still". Port 1 is privileged and
+        // never listening, so this needs no port bookkeeping.
+        let err = client.post("http://127.0.0.1:1/api/v1/agents/a/cancel").send()
+            .expect_err("must fail to connect");
+        let msg = describe_send_error(&err);
+        assert!(msg.contains("nothing was sent"), "{msg}");
+        assert!(msg.contains("--url"), "must point at the likely misconfiguration: {msg}");
+    }
+
+
+    // ── /review findings: the budget verb's own drain, and the two fail-closed gates ───
+
+    /// E1's LAST MILE, and the gap /review's testing specialist caught: every drain test used Cancel, so
+    /// replacing `source.set_budget(agent_id, *limit)` with `set_budget(agent_id, 0)` — the exact un-cap
+    /// footgun this increment exists to prevent, since 0 means UNLIMITED and is CHECKPOINTED — passed the
+    /// entire suite. This asserts the number that actually reaches the wire.
+    #[test]
+    fn drain_sends_the_parked_limit_not_zero_and_marks_no_cancel() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src); // Park
+        drain_pending_verb(&mut app, &src);
+
+        assert_eq!(src.budgets.lock().unwrap().as_slice(), [("scout-2".to_string(), 47_000)],
+            "0 here would mean UNLIMITED and would be written to the checkpoint");
+        assert!(src.cancels.lock().unwrap().is_empty(), "Park is a set_budget, not a cancel");
+        assert_eq!(app.cancel_marker("scout-2"), None,
+            "and a budget verb must not borrow the cancel marker");
+    }
+
+    /// The typed-budget path to the wire, same reason.
+    #[test]
+    fn drain_sends_the_typed_budget_limit() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        open_budget_field(&mut app, &src);
+        set_mode(&mut app, overlay::OverlayMode::Budget {
+            input: tui_input::Input::new("100000".to_string()), error: None,
+        });
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        drain_pending_verb(&mut app, &src);
+        assert_eq!(src.budgets.lock().unwrap().as_slice(), [("scout-2".to_string(), 100_000)]);
+    }
+
+    /// The Park RESULT copy must not contradict the menu the operator just used. Before /review it
+    /// hardcoded "raise the limit to revive it" in BOTH deployments — so on the config default, where the
+    /// menu correctly says the park ENDS the agent, the very next frame promised a revival.
+    #[test]
+    fn the_park_result_copy_matches_the_deployment_it_ran_against() {
+        for (resettable, must, must_not) in [
+            (true,  "resumes by itself", "ENDS the agent"),
+            (false, "ENDS the agent",    "resumes by itself"),
+        ] {
+            let src = VerbSource::default();
+            let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+            app.budget = Some(reader::SysBudget { spent: 47_000, total: 0, resettable });
+            handle_dashboard_key(key('x'), &mut app, &src);
+            handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+            drain_pending_verb(&mut app, &src);
+            let overlay::OverlayMode::Result { text, .. } =
+                &app.dashboard_overlay.as_ref().unwrap().mode else { panic!("expected Result") };
+            assert!(text.contains(must), "resettable={resettable}: {text}");
+            assert!(!text.contains(must_not), "resettable={resettable}: {text}");
+        }
+    }
+
+    /// /review (security specialist): the confirm gates used to write against a pin the snapshot had
+    /// already dropped, while the SAME box rendered "No action sent … no longer in the snapshot". Agent
+    /// ids are reused here — CoS agents have fixed config ids and cron respawns them — so that write
+    /// could land on a fresh agent of the same name. Both gates now fail closed.
+    #[test]
+    fn a_confirm_gate_sends_nothing_once_the_pinned_target_is_gone() {
+        for gate in ["cancel", "budget"] {
+            let src = VerbSource::default();
+            let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+            handle_dashboard_key(key('x'), &mut app, &src);
+            // Reach the gate while the target still exists…
+            if gate == "cancel" {
+                handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+                handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+                handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+                assert_eq!(mode_kind(&app), "confirm_cancel");
+            } else {
+                handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+                handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+                set_mode(&mut app, overlay::OverlayMode::Budget {
+                    input: tui_input::Input::new("0".to_string()), error: None,
+                });
+                handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+                assert_eq!(mode_kind(&app), "confirm_budget");
+            }
+            // …then it finishes, through the real snapshot fold, and a DIFFERENT agent takes row 0.
+            app.apply_snapshot(make_snapshot(&["cos-coordinator"]));
+
+            handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+            assert!(app.pending_verb.is_none(), "{gate}: nothing may be armed against a vanished pin");
+            drain_pending_verb(&mut app, &src);
+            assert_eq!(src.calls(), 0, "{gate}: and nothing may reach the scheduler");
+            let overlay::OverlayMode::Result { text, ok } =
+                &app.dashboard_overlay.as_ref().unwrap().mode
+            else { panic!("{gate}: expected the refusal to be REPORTED, not silent") };
+            assert!(!*ok);
+            assert!(text.contains("No action sent"), "{gate}: {text}");
+        }
+    }
+
+    /// Below the box floor the render collapses to one line that cannot show a menu, a confirm, or a
+    /// result — so no verb may be armed there. /review (maintainability) found the handler running the
+    /// full state machine under that line: Enter armed Park (a checkpointed `set_budget`) invisibly.
+    #[test]
+    fn no_verb_can_be_armed_on_a_terminal_too_small_to_show_the_overlay() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        app.term_size = (40, 8); // content area is far below the 34x7 box floor
+        assert!(!crate::watch::views::overlay_fits_dashboard(app.term_size), "precondition");
+        handle_dashboard_key(key('x'), &mut app, &src);
+        assert!(app.dashboard_overlay.is_some(), "the overlay still OPENS — it degrades, it is not absent");
+
+        for k in [KeyCode::Enter, KeyCode::Down, KeyCode::Enter, KeyCode::Char('y'), KeyCode::Enter] {
+            handle_dashboard_key(kev(k), &mut app, &src);
+            assert!(app.pending_verb.is_none(), "{k:?} must not arm a verb the operator cannot see");
+        }
+        assert_eq!(src.calls(), 0);
+        assert_eq!(mode_kind(&app), "menu", "and the mode must not advance under the degraded line");
+
+        // Esc still works — a modal with no visible exit is the other half of the bug.
+        handle_dashboard_key(kev(KeyCode::Esc), &mut app, &src);
+        assert!(app.dashboard_overlay.is_none());
+    }
+
+    /// Both destructive aliases, plus the negative control that `y` is inert in the LANDING state — the
+    /// assertion that catches a future reorder putting the irreversible verb one keypress from the menu.
+    #[test]
+    fn y_is_inert_in_the_menu_and_only_confirms_from_a_gate() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(key('y'), &mut app, &src);
+        assert_eq!(mode_kind(&app), "menu", "y must not be a shortcut from the landing state");
+        assert!(app.pending_verb.is_none());
+
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        handle_dashboard_key(key('q'), &mut app, &src);
+        assert_eq!(mode_kind(&app), "menu", "q backs out of the gate rather than dismissing");
+        assert_eq!(app.dashboard_overlay.as_ref().unwrap().cursor, 2, "on the row it came from");
+
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        handle_dashboard_key(key('y'), &mut app, &src);
+        assert_eq!(app.pending_verb,
+            Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".to_string() }),
+            "y confirms from the gate — the alias every other test reached via Enter");
+    }
+
+    /// The budget field driven through REAL keystrokes. Every other budget test injects the value with
+    /// `set_mode`, so the clone-edit-writeback arm — the only way an operator gets a number in — had no
+    /// coverage at all, including whether the prefill can be cleared.
+    #[test]
+    fn typing_edits_the_budget_field_through_the_real_key_path() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        open_budget_field(&mut app, &src);
+        assert_eq!(budget_input(&app), "200000");
+
+        // The prefill MUST be clearable, or prefilling is a trap: a naive operator typing 5000 would
+        // submit 2000005000.
+        handle_dashboard_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL), &mut app, &src);
+        assert_eq!(budget_input(&app), "", "Ctrl-U must clear the prefilled limit");
+        for c in ['5', '0', '0', '0'] {
+            handle_dashboard_key(key(c), &mut app, &src);
+        }
+        assert_eq!(budget_input(&app), "5000", "digits must reach the widget");
+        handle_dashboard_key(kev(KeyCode::Backspace), &mut app, &src);
+        assert_eq!(budget_input(&app), "500");
+
+        // A bad submit leaves an error; the next keystroke clears it rather than leaving stale red text.
+        set_mode(&mut app, overlay::OverlayMode::Budget {
+            input: tui_input::Input::new("x".to_string()), error: None,
+        });
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        match &app.dashboard_overlay.as_ref().unwrap().mode {
+            overlay::OverlayMode::Budget { error, .. } => assert!(error.is_some()),
+            other => panic!("expected the field, got {}", other.kind()),
+        }
+        handle_dashboard_key(kev(KeyCode::Backspace), &mut app, &src);
+        match &app.dashboard_overlay.as_ref().unwrap().mode {
+            overlay::OverlayMode::Budget { error, input } => {
+                assert!(error.is_none(), "editing must clear the stale error");
+                assert_eq!(input.value(), "");
+            }
+            other => panic!("expected the field, got {}", other.kind()),
+        }
+    }
+
+    /// /review (security): the `[d]` message must describe what the SOURCE did. HTTP has no
+    /// auto-approve-kind route and inherits a plain approve, so the old copy told the operator a
+    /// standing policy existed when nothing was registered — on the approval gate, the one real
+    /// authority boundary here. Both real impls, and both messages.
+    #[test]
+    fn dont_ask_again_only_claims_a_standing_rule_where_one_is_registered() {
+        use crate::watch::source::FuseSource;
+        assert!(FuseSource { agents_dir: PathBuf::from("/agents") }.supports_auto_approve_kind(),
+            "the FUSE control command carries auto_approve_kind");
+        assert!(!HttpSource::new("http://127.0.0.1:7999".to_string()).supports_auto_approve_kind(),
+            "there is no HTTP route for it — it degrades to a plain approve");
+
+        // A double that approves successfully but does NOT support the standing rule (i.e. HTTP-shaped).
+        #[derive(Default)]
+        struct PlainApproveSource(std::sync::Mutex<Vec<String>>);
+        impl DataSource for PlainApproveSource {
+            fn load_snapshot(&self) -> Snapshot {
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            }
+            fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+            fn approve(&self, id: &str) -> Result<(), String> {
+                self.0.lock().unwrap().push(id.to_string());
+                Ok(())
+            }
+            fn deny(&self, _id: &str, _r: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+        }
+        let src = PlainApproveSource::default();
+        let mut app = app_with_approvals(&[("act_1", "shell_exec")]);
+        app.approvals_view.mode         = ApprovalsMode::Confirm;
+        app.approvals_view.confirmed_id = Some("act_1".to_string());
+        handle_approvals_key(kev(KeyCode::Char('d')), &mut app, &src);
+
+        let msg = app.approvals_view.result_msg.as_deref().unwrap();
+        assert!(msg.contains("Approved act_1"), "the approval itself DID happen: {msg}");
+        assert!(msg.contains("FUSE-only"), "and the operator must be told the rule was not registered: {msg}");
+        assert!(!msg.contains("(auto for"), "must not claim a standing policy: {msg}");
+    }
+
+    /// Both REAL implementations, not one double: a single double inherits the `false` default and
+    /// passes with the whole gate reverted (eng finding E9).
+    #[test]
+    fn only_the_http_source_claims_to_confirm_mutations() {
+        use crate::watch::source::FuseSource;
+        assert!(HttpSource::new("http://127.0.0.1:7999".to_string()).confirms_mutations(),
+            "HTTP holds the connection until the scheduler answers");
+        assert!(!FuseSource { agents_dir: PathBuf::from("/agents") }.confirms_mutations(),
+            "FUSE learns only that close(2) succeeded — the scheduler's verdict goes to the flight log");
+    }
+
+    #[test]
+    fn drain_surfaces_a_failure_verbatim_and_holds_the_overlay_open() {
+        let src = VerbSource::failing("HTTP 503: control channel busy");
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        app.dashboard_overlay = Some(overlay::DashboardOverlay::menu("scout-2"));
+        app.pending_verb = Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".into() });
+        drain_pending_verb(&mut app, &src);
+        let overlay::OverlayMode::Result { text, ok } = &app.dashboard_overlay.as_ref().unwrap().mode
+        else { panic!("expected a Result frame") };
+        assert!(!*ok, "a failed verb must not render as success");
+        assert!(text.contains("503"), "the operator needs the real error: {text}");
+        assert!(app.dashboard_overlay.is_some(), "the failure must stay on screen until dismissed");
+    }
+
+    /// C1, the retarget hazard, driven through a REAL snapshot fold: `apply_snapshot` runs from a
+    /// producer thread every ~30 ms and moves `selected_id`. A test that never folds a snapshot passes
+    /// with the pinning removed, because the selection never changes.
+    #[test]
+    fn a_snapshot_that_moves_the_selection_cannot_move_the_verb_target() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["cos-coordinator", "scout-2"], 47_000, BudgetKind::Unlimited);
+        app.selected_id = Some("scout-2".to_string());
+        handle_dashboard_key(key('x'), &mut app, &src);
+
+        // A snapshot lands in which scout-2 is gone: `apply_snapshot` clears the dead selection and
+        // auto-selects row 0 — the coordinator, whose cancel would cascade to its whole subtree.
+        let mut snap = make_snapshot(&["cos-coordinator"]);
+        snap.agents[0].windowed_spent = 47_000;
+        // A real budget on the survivor, deliberately: it makes every menu item on the COORDINATOR
+        // armable, so if this handler ever read the live selection instead of the pin, the keypresses
+        // below would succeed in acting on it. With `Unlimited` here the mutation is masked by a
+        // prefill parse error — verified by running that negative control.
+        snap.agents[0].budget = BudgetKind::Tokens(200_000);
+        app.apply_snapshot(snap);
+        assert_eq!(app.selected_id.as_deref(), Some("cos-coordinator"), "precondition: it retargeted");
+        assert_eq!(app.dashboard_overlay.as_ref().unwrap().target_id, "scout-2",
+            "the pin must not follow the selection");
+
+        // Everything the operator could press next must refuse to act on the coordinator.
+        for _ in 0..4 {
+            handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+            handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        }
+        assert!(app.pending_verb.is_none(), "a vanished target must arm nothing");
+        drain_pending_verb(&mut app, &src);
+        assert_eq!(src.calls(), 0, "and must never reach the coordinator");
+    }
+
+    /// The same hazard with the target still ALIVE: the selection moved, the verb must not.
+    #[test]
+    fn the_armed_verb_carries_the_pinned_id_not_the_current_selection() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["cos-coordinator", "scout-2"], 47_000, BudgetKind::Unlimited);
+        app.selected_id = Some("scout-2".to_string());
+        handle_dashboard_key(key('x'), &mut app, &src);
+        // The selection drifts while the overlay is up (what apply_snapshot's row-0 auto-select does).
+        app.selected_id = Some("cos-coordinator".to_string());
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Down), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        assert_eq!(
+            app.pending_verb,
+            Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".to_string() }),
+            "the confirm must act on the pinned agent, not whatever row is highlighted now"
+        );
+    }
+
+    // ── the budget field (M2) ─────────────────────────────────────────────────────────
+
+    fn open_budget_field(app: &mut App, src: &VerbSource) {
+        handle_dashboard_key(key('x'), app, src);
+        handle_dashboard_key(kev(KeyCode::Down), app, src); // → Set budget
+        handle_dashboard_key(kev(KeyCode::Enter), app, src);
+    }
+
+    fn budget_input(app: &App) -> String {
+        match &app.dashboard_overlay.as_ref().unwrap().mode {
+            overlay::OverlayMode::Budget { input, .. } => input.value().to_string(),
+            other => panic!("expected the budget field, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn budget_field_opens_on_the_current_limit() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        open_budget_field(&mut app, &src);
+        assert_eq!(budget_input(&app), "200000",
+            "an empty field plus Enter would submit 'unlimited' — the inverse of the intent (M2)");
+    }
+
+    #[test]
+    fn tightening_the_budget_arms_without_a_second_gate() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        open_budget_field(&mut app, &src);
+        set_mode(&mut app, overlay::OverlayMode::Budget {
+            input: tui_input::Input::new("100000".to_string()), error: None,
+        });
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        assert_eq!(mode_kind(&app), "in_flight", "a tightening needs no extra ceremony");
+        assert_eq!(
+            app.pending_verb,
+            Some(overlay::PendingVerb::SetBudget {
+                agent_id: "scout-2".into(), limit: 100_000, park: false,
+            })
+        );
+    }
+
+    /// M2: `0` REMOVES the cap. It must never be one keypress from a field that opens prefilled.
+    #[test]
+    fn zero_and_raises_go_through_a_second_gate() {
+        for (typed, current) in [("0", BudgetKind::Tokens(200_000)), ("300000", BudgetKind::Tokens(200_000))] {
+            let src = VerbSource::default();
+            let mut app = app_with_spend(&["scout-2"], 47_000, current);
+            open_budget_field(&mut app, &src);
+            set_mode(&mut app, overlay::OverlayMode::Budget {
+                input: tui_input::Input::new(typed.to_string()), error: None,
+            });
+            handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+            assert_eq!(mode_kind(&app), "confirm_budget", "'{typed}' must be gated");
+            assert!(app.pending_verb.is_none(), "'{typed}' must not arm on the first Enter");
+
+            // Declining returns to the FIELD with the number intact, so it can be corrected.
+            handle_dashboard_key(kev(KeyCode::Esc), &mut app, &src);
+            assert_eq!(budget_input(&app), typed);
+
+            handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src); // gate again
+            handle_dashboard_key(kev(KeyCode::Char('y')), &mut app, &src);
+            assert_eq!(mode_kind(&app), "in_flight");
+            assert_eq!(app.pending_verb.as_ref().map(|v| matches!(
+                v, overlay::PendingVerb::SetBudget { limit, park: false, .. } if *limit == typed.parse::<u64>().unwrap()
+            )), Some(true));
+        }
+    }
+
+    #[test]
+    fn a_non_numeric_budget_is_rejected_in_place_not_silently_zeroed() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        open_budget_field(&mut app, &src);
+        set_mode(&mut app, overlay::OverlayMode::Budget {
+            input: tui_input::Input::new("20o000".to_string()), error: None,
+        });
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src);
+        match &app.dashboard_overlay.as_ref().unwrap().mode {
+            overlay::OverlayMode::Budget { error, input } => {
+                assert!(error.is_some(), "a typo must be reported, never parsed as 0 (= unlimited)");
+                assert_eq!(input.value(), "20o000", "and the operator's text must survive to be fixed");
+            }
+            other => panic!("must stay in the field, got {}", other.kind()),
+        }
+        assert!(app.pending_verb.is_none());
+    }
+
+    #[test]
+    fn budget_accepts_human_digit_grouping() {
+        assert_eq!(parse_budget("200_000"), Ok(200_000));
+        assert_eq!(parse_budget("200,000"), Ok(200_000));
+        assert_eq!(parse_budget("0"), Ok(0));
+        assert!(parse_budget("").is_err(), "an empty field must not submit 'unlimited'");
+        assert!(parse_budget("-5").is_err());
+        assert!(parse_budget("1e6").is_err());
+    }
+
+    /// M6: without an overlay arm in `route_paste`, a pasted token count goes to the chat rail
+    /// underneath the modal — or nowhere — and the operator retypes it under time pressure.
+    #[test]
+    fn a_pasted_budget_reaches_the_field_not_the_rail_underneath() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Tokens(200_000));
+        open_budget_field(&mut app, &src);
+        set_mode(&mut app, overlay::OverlayMode::Budget {
+            input: tui_input::Input::default(), error: None,
+        });
+        // The rail arm also matches `View::Dashboard`, so ordering inside `route_paste` decides this:
+        // with the overlay arm second, the paste would land in the rail under the modal.
+        app.converse_view.rail_focused = true;
+        route_paste(&mut app, "150000");
+        assert_eq!(budget_input(&app), "150000");
+        assert!(app.converse_view.input.value().is_empty(), "must not leak into the chat rail");
+    }
+
+    // ── the in-flight and result frames ───────────────────────────────────────────────
+
+    /// While a verb is in flight every key is a no-op — including `q`, which must not quit. Driven
+    /// through `step_key`, because `handle_dashboard_key` never pushes `Effect::Quit`, so a
+    /// handler-level test passes with the `overlay_was_open` guard reverted.
+    #[test]
+    fn step_key_q_during_a_verb_does_not_quit() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        handle_dashboard_key(key('x'), &mut app, &src);
+        handle_dashboard_key(kev(KeyCode::Enter), &mut app, &src); // Park → in flight
+        assert_eq!(mode_kind(&app), "in_flight");
+
+        let effects = step_key(&mut app, key('q'), &src);
+        assert!(!effects.contains(&Effect::Quit), "q must not kill the cockpit mid-verb");
+        assert_eq!(mode_kind(&app), "in_flight", "and must not dismiss the frame either");
+        assert!(app.pending_verb.is_some(), "the armed verb must survive the keypress");
+    }
+
+    /// M3: the result is not `spawn_banner`. Any-key-dismisses loses the only report of what a
+    /// destructive verb did, to a keystroke the operator did not mean as an acknowledgement.
+    #[test]
+    fn the_result_frame_dismisses_only_on_an_explicit_key() {
+        let src = VerbSource::default();
+        let mut app = app_with_spend(&["scout-2"], 47_000, BudgetKind::Unlimited);
+        app.dashboard_overlay = Some(overlay::DashboardOverlay::menu("scout-2"));
+        app.pending_verb = Some(overlay::PendingVerb::Cancel { agent_id: "scout-2".into() });
+        drain_pending_verb(&mut app, &src);
+        assert_eq!(mode_kind(&app), "result");
+
+        for k in ['z', 'j', 'x', 'a'] {
+            handle_dashboard_key(key(k), &mut app, &src);
+            assert!(app.dashboard_overlay.is_some(), "'{k}' must not dismiss the result");
+        }
+        handle_dashboard_key(kev(KeyCode::Esc), &mut app, &src);
+        assert!(app.dashboard_overlay.is_none(), "Esc dismisses");
     }
 
     #[test]

@@ -15,6 +15,17 @@ pub struct SysBudget {
     // Reserved for when the FUSE system/budget file emits the real total.
     #[allow(dead_code)]
     pub total: u64,
+    /// ux.13-TUI: does `[scheduler] budget_reset_interval > 0` on the connected agentd?
+    ///
+    /// `false` means per-agent budget exhaustion TERMINATES the agent rather than deferring it to the
+    /// next window — so the row-action overlay's Park is a kill, not a pause, and must not be labelled
+    /// reversible. `#[serde(default)]` so an older agentd (whose `system/budget` file has no such key)
+    /// reads as NOT resettable: the cautious direction, since it is also the config default.
+    /// `alias` because the same datum has two wire names: the FUSE `system/budget` file (already scoped
+    /// to budget) emits `resettable`, while the flat HTTP snapshot needs the `budget_` prefix. Accepting
+    /// both means a rename on either surface cannot silently degrade this to `false` (/review).
+    #[serde(default, alias = "budget_resettable")]
+    pub resettable: bool,
 }
 
 /// Parsed content of /agents/system/queue

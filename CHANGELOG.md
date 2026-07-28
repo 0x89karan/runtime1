@@ -3,6 +3,74 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.115.0] - 2026-07-28
+
+### Added
+- **ux.13-TUI — row-scoped control verbs in `agentctl watch`.** ux.13 shipped `Cancel`/`SetBudget`/
+  `SetCaps` end to end (management API, FUSE control, CLI, and `DataSource` methods) but no view invoked
+  them: `docs/ROADMAP.md` recorded "**TUI keys deferred**". So the operator could not stop a runaway agent
+  from the screen showing it to them, which is friction #1 of the approved design doc and the inverse of
+  the track's north star ("you can act on what you see"). `[x]` on a Dashboard row now opens a graded
+  row-action overlay.
+  - **Park** — `set_budget` at the spend already recorded. Its label states which of two things it is,
+    because neither is "a reversible pause": with `budget_reset_interval > 0` the park **expires by
+    itself** at the next window rollover (`maybe_roll_budget_window` rebases every task's windowed spend,
+    then `drain_deferred` re-admits), and with no window configured exhaustion **ends the agent**. Gated
+    twice: `park_limit()` returns `None` below a 1 000-token floor (`0` means UNLIMITED and
+    `set_token_budget` writes the CHECKPOINTED config, so parking a zero-spend agent would have un-capped
+    it permanently, across restart, in Park's primary use case), and `park_would_widen()` blocks it when
+    the recorded spend EXCEEDS the current cap — the normal post-exhaustion state, since the admission
+    gate is checked before the turn, where capping at the spend would have RAISED the operator's ceiling.
+  - **Set budget** — numeric field prefilled with the current limit, `0 = unlimited` stated on the field,
+    and a second gate for any removal or raise. A typo is rejected in place, never parsed as `0`.
+  - **Cancel** — its own confirm, showing "at least N" of the cascade from a cycle-safe `descendants()`
+    walk, and reporting the SERVER's count (native subtree plus universal agents parented in) rather than
+    the client's floor. `agentctl cancel` prints the same count in the same words.
+  - **Verbs are performed by the loop, never the key handler.** `HttpSource`'s confirm client blocks up to
+    3 s, so the confirm keypress writes `App.pending_verb` plus an `InFlight` frame and returns; the loop
+    draws, then `drain_pending_verb` makes the call. Measured on a real pty: the frame is on the wire
+    0.02 s after Enter against a server taking 2.5 s to answer. `handle_overlay_key` takes no `source`
+    parameter, so that is a compile-time property. Buffered keystrokes typed during the call are
+    discarded (Resize applied, Ctrl-C honoured) so two impatient presses cannot dismiss the result and
+    then quit the cockpit.
+  - **`?` — the first help key this cockpit ever had**, rendering from the same `DASHBOARD_KEYS` table as
+    the footer so the two cannot drift, and documenting the keys the footer has no room for.
+  - **`budget_resettable`** on the scheduler snapshot, HTTP `/api/v1/snapshot`, and FUSE
+    `system/budget` (`{"spent":N,"total":0,"resettable":BOOL}`), because the cockpit cannot otherwise
+    know what Park means. `agentctl` reads either wire name and defaults to `false` — the cautious
+    reading, and the config default.
+  - **A client-side `cancelling…` row marker** on its own line beside the attention idiom, since no
+    `AgentStatus::Cancelling` exists and a cancelled row otherwise reads `running` for a whole turn and
+    then vanishes. It escalates to `NOT CANCELLED` for anything the source could not confirm (FUSE
+    writes, inferred descendants) and settles to `cancelled by you` once the scheduler confirms —
+    without which a cancelled agent presents as a bare red `failed`, indistinguishable from a crash.
+
+### Fixed
+- **The Approvals confirm dialog rendered by INDEX while acting on a pinned id.** `update_approvals`
+  replaces the whole list in Confirm mode and clamps only the index, so an approval resolving out of band
+  (Telegram, `agentctl approve`, expiry) could leave the dialog showing one item's id/kind/**risk**/summary
+  while `[a]` approved another. Cancel is not a security boundary; the approval gate is. One resolver
+  (`App::confirm_item`) now serves the renderer and all three write paths, and a vanished pin reads as
+  "already resolved" instead of a live-looking field set of `?`.
+- **The Dashboard footer clipped its own resize hint.** Measured 162 columns with `[l]ogs` present, so
+  `q quit` began at column 114 and `(resize to 115+ cols…)` at 122 — on the only widths where that branch
+  renders. Now bounded per state (the narrow footer is drawn below 115 columns, so it gets its own 80-col
+  budget) and asserted against a rendered 80x24 frame, which no string-length check can fake.
+- **`agentctl cancel|set-budget|set-caps` printed raw HTTP errors** while the cockpit explained them.
+  Both now share `explain_verb_error`, in surface-neutral wording.
+- Agent ids that would re-point a mutation URL (`/ \ ? # %`, control characters) are refused at the
+  `DataSource` boundary, and every id rendered in a dialog or printed command is sanitized and shell-quoted.
+
+### Changed
+- `DataSource::cancel` returns the server's cascade count; new `confirms_mutations()`,
+  `supports_auto_approve_kind()`, and `cli_connection_flags()` let the cockpit stop claiming effects a
+  source cannot deliver: over FUSE a queued command reads "cannot confirm the scheduler accepted it",
+  `[d]` no longer claims a standing auto-approve rule where no HTTP route registers one, and every
+  printed `Equivalent: agentctl …` carries the flags that reach THIS daemon.
+- The chat rail's `converse::dispatch` moved onto the same `pending_verb` slot (TODOS.md's ranked P2,
+  downgraded to P3): the echo and `Dispatching…` are drawn before the call, though the call still runs on
+  the loop thread.
+
 ## [v0.114.0] - 2026-07-27
 
 ### Added

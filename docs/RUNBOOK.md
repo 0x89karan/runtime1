@@ -373,10 +373,12 @@ Per-agent tiers, the shared KB, lexical search, and eviction land across p5.2–
 (`PHASE-5-PLAN.md`).
 
 ### The interface *(lands in p6.x)*
-A `ratatui` TUI shipped as a **separate `agentctl` binary** (read-only over `/agents`
+A `ratatui` TUI shipped as a **separate `agentctl` binary** (reads `/agents`
 + `flight.jsonl`; `agentctl spawn <template>` to launch from a catalogue). It is an
 *optional* second binary in the QEMU rootfs — the minimal boot stays `agentd`-only.
-Full design + the seven views: `INTERFACE.md`.
+Full design + the seven views: `INTERFACE.md`. Read-only at p6.x; Track UX added write
+paths on top of the same surfaces — spawn/inject (p7.3), approvals (p7.4), the chat rail
+(ux.1), and the `[x]` row verbs park/set-budget/cancel (ux.13-TUI, v0.115.0). See §11.8.
 
 ---
 
@@ -775,11 +777,55 @@ Key views:
   **Chat requires the management API with SSE support** — it does *not* work over the
   plain FUSE surface, so the `docker compose exec cos agentctl watch --agents-dir /agents`
   invocation above will show an inline "Chat requires the management API" message instead
-  of a reply. Use the `--url http://localhost:7999` invocation below for a working chat rail.
+  of a reply. Use the `--url http://localhost:7999` invocation above for a working chat rail.
 - **Topology** (`[t]`): spawn tree — orchestrator → inbox-YYYY-MM-DD + curator-YYYY-MM-DD.
 - **Approvals** (`[a]`): approve/deny pending requests (OAuth URL on first run; L1 send drafts).
+  `[d]` = "don't ask again for this kind" — a standing rule only over FUSE (see
+  `CONTROL_SURFACE.md`); over `--url` it approves just the one action.
 - **Inspector** (`[i]`): flight log with filter for Sandbox/CapDenied events.
 - **Memory** (`[m]`): browse `ops:briefs` and `ops:entities` KB content.
+- **System** (`[s]`): queue depth, global budget window, provider health, sandbox
+  enforcement, isolation tier. **Credentials** (`[c]`): per-provider token freshness.
+- **Logs** (`[l]`): tails `docker compose logs` for the project in the current directory
+  (v0.114.0 — Docker contexts only; the key and its footer hint are both hidden otherwise).
+- **Row actions** (`[x]`, v0.115.0): park / set budget / cancel the *selected* agent —
+  see §11.8a. `?` opens the full key map, which is the authoritative list; this one is a
+  summary and the footer only shows what fits.
+
+#### 11.8a Stopping a runaway agent
+
+Select the row, press `[x]`, and pick:
+
+| Action | What it does | Reversible? |
+|---|---|---|
+| **Park** | `set_budget` at the spend already recorded, so the next admission check defers it | **Only with `budget_reset_interval > 0`** — the CoS configs set 86400, so a parked agent resumes by itself at the next window rollover. With the default `0`, exhaustion *terminates* the agent: Park is a kill. The overlay's label tells you which one you are about to get, read from the `budget_resettable` snapshot field. |
+| **Set budget** | Prefilled with the current limit. `0` = **UNLIMITED**, not "stop" — that and any raise sit behind a second confirm | Yes |
+| **Cancel** | Stops at the next step boundary and cascades to the whole spawned subtree; the confirm shows how many agents that is | **No** |
+
+Park is refused on a zero-spend agent (capping at `0` would write the checkpointed
+`0` ≡ UNLIMITED and permanently *un-cap* it) and when the recorded spend already exceeds
+the cap (the normal post-exhaustion state, where capping at spend would *raise* the ceiling).
+
+Every overlay prints the equivalent `agentctl` line, with the flags that reach *this*
+daemon, so an incident note is copy-pasteable:
+
+```bash
+agentctl cancel     cos-inbox-2026-07-28 --url http://localhost:7999
+agentctl set-budget cos-orchestrator 50000000 --url http://localhost:7999
+```
+
+Two caveats:
+
+- **A cancelled row is marked client-side.** There is no `AgentStatus::Cancelling`, so the
+  TUI shows `cancelling…` beside the row until the scheduler confirms (`cancelled by you`),
+  or `NOT CANCELLED` for anything it could not confirm. Without the marker a cancelled agent
+  reads `running` for a whole turn and then presents as a bare red `failed`.
+- **Over FUSE nothing can be confirmed** (`docker compose exec cos agentctl watch
+  --agents-dir /agents`) — the write is fire-and-forget. Use `--url http://localhost:7999`
+  when you need the verdict.
+
+If `AGENTOS_APPROVAL_SECRET` is set, these routes are gated like approve/deny — export it in
+the shell running `agentctl`, or every verb returns `HTTP 401` (see `DEPLOYMENT.md`).
 
 ### 11.9 Known limits and operational notes
 
@@ -814,6 +860,8 @@ Events that would have fired during downtime are not replayed.
 | Second cron cycle spawns no children | Child ID collision | Verify orchestrator uses date-stamped child IDs |
 | `budget_exceeded` in flight.jsonl | Lifetime token budget exhausted | `docker compose exec cos rm /data/checkpoint.json` and restart |
 | `agent_admission_denied` in flight.jsonl | Child ID collision guard fired | Child ID is already in outcomes map; confirm date-stamping |
+| An agent is looping / burning tokens with nothing to show | Runaway task prompt or a tool that never settles | `agentctl watch` → select the row → `[x]` → Cancel (cascades to its children), or `agentctl cancel <id> --url http://localhost:7999`. See §11.8a |
+| `[x]` verbs return `HTTP 401` | `AGENTOS_APPROVAL_SECRET` set on `agentd` but not exported to the shell running `agentctl` | Export the same value, then restart `agentctl watch` (cap.4 gates every mutating route, not just approve/deny) |
 
 ### 11.11 Credential broker operations (cred.3.2+)
 

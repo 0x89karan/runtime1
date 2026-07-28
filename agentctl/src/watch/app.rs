@@ -8,6 +8,7 @@ use super::approvals::ApprovalsViewState;
 use super::inspector::InspectorState;
 use super::logs::LogsState;
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
+use super::overlay::{DashboardOverlay, PendingVerb};
 use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue, SysSandbox};
 use super::source::{DataSource, SpawnRequest};
 use super::spawn::{load_spawn_templates, SpawnTemplate};
@@ -509,6 +510,40 @@ pub struct App {
     pub event_gaps:      usize,
     /// ux.1: per-target chat state for the Dashboard chat rail.
     pub converse_view:   super::converse::ConverseView,
+    /// ux.13-TUI: the Dashboard row-action overlay, when one is open. Deliberately Dashboard-owned
+    /// rather than a global `App.overlay`: a global forces every key/paste/resize/render path to ask
+    /// "is there an overlay?", which is how the `q`-quits-the-cockpit bug happened in the first place
+    /// (a Dashboard sub-mode `step_key` did not model).
+    pub dashboard_overlay: Option<DashboardOverlay>,
+    /// ux.13-TUI: the `agentctl` flags that point a fresh invocation at the source this session is
+    /// attached to (e.g. `" --url http://127.0.0.1:7999"`), captured once at startup.
+    ///
+    /// The overlay prints a copy-pasteable equivalent command; without these flags it names a DIFFERENT
+    /// daemon than the frame it is printed on, because the CLI re-resolves the source from scratch
+    /// (/review's api-contract specialist). Empty when the CLI defaults already resolve here.
+    pub cli_conn:          String,
+    /// ux.13-TUI: agents the operator has asked to cancel, and when they asked.
+    ///
+    /// There is no `Cancelling` state anywhere in the system to read: `cancel_requested` is
+    /// scheduler-private and no `AgentStatus` variant exists for it, so a successfully-cancelled row
+    /// keeps rendering `running` for a whole turn and then simply vanishes. That is indistinguishable
+    /// from "my keypress did nothing", which is the worst possible ambiguity for a stop button
+    /// (design finding M8). Client-side, therefore — cleared when the row disappears (the cancel
+    /// landed) or on the `agent_cancelled` flight event, and ESCALATED rather than forgotten if neither
+    /// happens: a marker that quietly ages out would let a lost cancel look handled.
+    ///
+    /// Escalation applies to entries the source could not confirm — every FUSE write, and every INFERRED
+    /// descendant on any source. A confirmed target does not escalate: a running agent is only funneled
+    /// when its in-flight inference returns, which routinely outlasts the window.
+    pub pending_cancel:    std::collections::HashMap<String, CancelRequest>,
+    /// ux.13-TUI: a confirmed row verb waiting for the LOOP to perform it.
+    ///
+    /// The key handler never calls the `DataSource` for a verb: `HttpSource`'s confirm client blocks
+    /// up to 3 s, so a call made during key dispatch freezes the cockpit with no frame drawn and no
+    /// spinner possible (eng finding H1). Instead the confirm keypress parks the work here plus an
+    /// `InFlight` overlay frame, the loop draws, and `drain_pending_verb` performs the call on the next
+    /// iteration. Same shape as `spawn_view.pending_exec`.
+    pub pending_verb:      Option<PendingVerb>,
     /// ux.1: last-known terminal size `(cols, rows)`, refreshed once per tick in
     /// `run_tui_loop` (NOT queried ad-hoc from key-handling logic — that broke a test
     /// under `cargo test`'s no-TTY environment and would be equally fragile in any
@@ -524,6 +559,70 @@ pub const DEFAULT_CONVERSE_TARGET: &str = "orch-default";
 /// comfortably above `views::MIN_TOTAL_WIDTH_FOR_RAIL`/`MIN_RAIL_HEIGHT` so tests and the
 /// very first frame don't spuriously see the rail as hidden.
 pub const DEFAULT_TERM_SIZE: (u16, u16) = (200, 50);
+
+/// A cancel the operator asked for, and what we know about it.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelRequest {
+    pub asked_at:  std::time::Instant,
+    /// Has the scheduler reported it DONE (`agent_cancelled`)?
+    ///
+    /// The claim this licenses is narrow, and worth stating because the marker outlives the row's own
+    /// status: `agent_cancelled` proves the operator's cancel TOOK EFFECT on this agent, not that the
+    /// agent's `failed` status has no other contributing cause. An agent that had already died of its
+    /// own error terminates down a different path and never emits this event, so it is never labelled —
+    /// but a cancel accepted moments before an unrelated failure would still read "cancelled by you"
+    /// (Codex, reviewing the /qa fixes). Left as is: the attribution is about the operator's ACTION
+    /// landing, which is exactly what is otherwise invisible.
+    ///
+    /// /qa against a real agentd: a cancelled agent's row reads `failed`, because
+    /// `handle_agent_terminal` takes an `Err`. Clearing the marker on `agent_cancelled` therefore left
+    /// the operator looking at a red `failed` row with nothing saying they caused it — "did my cancel
+    /// work, or did it crash?", which is the same ambiguity M8 exists to remove, one transition later.
+    pub landed:    bool,
+    /// Did the SOURCE confirm the scheduler accepted it (`DataSource::confirms_mutations`)?
+    ///
+    /// Decides whether the marker may escalate. `ControlCommand::Cancel` funnels PARKED nodes at once
+    /// but leaves a RUNNING one flagged until its in-flight inference returns — routinely longer than
+    /// the grace window on a long tool chain. Escalating an ACCEPTED cancel to "cancel not confirmed"
+    /// would contradict the same session's own "N agents flagged" result frame (/review's red team).
+    pub confirmed: bool,
+}
+
+/// State of a requested cancel, for the Status column.
+///
+/// A TYPE, not the display string: the renderer picks the escalation style from the variant. Matching
+/// on the prose (`marker.starts_with("cancel not")`) meant rewording operator-facing copy — the likeliest
+/// future edit — would silently downgrade a LOST cancel from bold red to "in flight" yellow, with the
+/// render test still green because it only asserts the text (/review's maintainability specialist).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelMarker {
+    /// Requested, within the grace window.
+    InFlight,
+    /// Requested, and neither confirmed nor followed by the row disappearing. The stop did not take.
+    Unconfirmed,
+    /// The scheduler reported it done. Named so the operator can tell their own stop apart from a crash:
+    /// a cancelled agent's status is `failed`, which on its own reads like something went wrong (/qa).
+    Landed,
+}
+
+impl CancelMarker {
+    pub fn label(self) -> &'static str {
+        match self {
+            CancelMarker::InFlight    => "cancelling…",
+            CancelMarker::Landed      => "cancelled by you",
+            // Says the operator-relevant FACT, and short enough that "<status> · <marker>" fits the
+            // Status cell down to the 115-col rail floor, where the column is squeezed to 24 (measured on
+            // real frames, not counted by hand: "cancel not confirmed" rendered as "cancel not confirme",
+            // and "cancel UNCONFIRMED" clipped at the floor). A status longer than `awaiting_child` plus
+            // a marker still clips there — the leading words survive, which is the signal.
+            CancelMarker::Unconfirmed => "NOT CANCELLED",
+        }
+    }
+}
+
+/// How long a requested cancel may sit unconfirmed before the row says so. Generous on purpose: a
+/// cancel takes effect at the agent's next STEP boundary, and a step can be a long inference call.
+pub const CANCEL_CONFIRM_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// ux.0: cap on the in-memory event ring (tail-drop), mirroring MAX_DISPLAY_ENTRIES
 /// discipline elsewhere. Bounds memory regardless of SSE event rate.
@@ -559,6 +658,10 @@ impl App {
             dropped_events:  0,
             event_gaps:      0,
             converse_view:   super::converse::ConverseView::new(DEFAULT_CONVERSE_TARGET),
+            dashboard_overlay: None,
+            cli_conn:          String::new(),
+            pending_cancel:    std::collections::HashMap::new(),
+            pending_verb:      None,
             term_size:       DEFAULT_TERM_SIZE,
         }
     }
@@ -616,7 +719,21 @@ impl App {
         if self.selected_id.is_none() {
             self.selected_id = snap.agents.first().map(|a| a.id.clone());
         }
+        // Captured before the moves below: `self.error` is not updated until further down, so reading it
+        // there would test the PREVIOUS poll's outcome, not this one's.
+        let poll_failed = snap.error.is_some();
         self.agents    = snap.agents;
+        // ux.13-TUI: a row that is gone has been cancelled — drop its marker rather than showing
+        // "cancelling…" against an agent that no longer exists.
+        //
+        // Only against a snapshot that actually OBSERVED the fleet. `HttpSource::load_snapshot` returns
+        // `agents: vec![]` plus an error on any failure — an agentd restart, a 503, a dropped connection
+        // — and treating that as "every cancel landed" would erase every marker on one bad poll, leaving
+        // the rows to come back reading plain `running` with no history: the exact ambiguity M8 exists to
+        // remove, and with the entry gone a genuinely lost cancel could never escalate (/review's red team).
+        if !self.pending_cancel.is_empty() && !poll_failed {
+            self.pending_cancel.retain(|id, _| self.agents.iter().any(|a| &a.id == id));
+        }
         self.budget    = snap.budget;
         self.queue     = snap.queue;
         self.sandbox     = snap.sandbox;
@@ -681,6 +798,78 @@ impl App {
         }
     }
 
+    /// ux.13-TUI: mark `agent_id` and its known descendants as cancel-requested.
+    ///
+    /// The descendants are included because Cancel CASCADES: every row in the subtree is on its way
+    /// out, and leaving them reading `running` reproduces M8's ambiguity one level down. The client's
+    /// list is a floor (no universal-tier parentage), which is fine — an unmarked row that vanishes
+    /// still reads correctly, whereas a marked row that never goes away escalates.
+    /// `confirmed` is `DataSource::confirms_mutations()` — see [`CancelRequest::confirmed`]. It applies
+    /// to the TARGET only: the descendants are the client's own inference from a snapshot that is
+    /// explicitly a floor (no universal-tier parentage, up to a poll stale), so the server may never have
+    /// flagged them. Inheriting the root's confirmation would have suppressed escalation on exactly the
+    /// rows most likely to be wrong — a child the scheduler never touched would read "cancelling…"
+    /// forever (the fix-review pass). Marked unconfirmed, they escalate to "NOT CANCELLED" after the
+    /// grace window, which is the truth.
+    pub fn mark_cancel_requested(&mut self, agent_id: &str, confirmed: bool) {
+        let now = std::time::Instant::now();
+        self.pending_cancel.insert(
+            agent_id.to_string(),
+            CancelRequest { asked_at: now, confirmed, landed: false },
+        );
+        for child in super::topology::descendants(&self.topology, agent_id) {
+            self.pending_cancel.insert(
+                child,
+                CancelRequest { asked_at: now, confirmed: false, landed: false },
+            );
+        }
+    }
+
+    /// Record that the scheduler says the cancel LANDED (`agent_cancelled` flight event).
+    ///
+    /// Marks, does not clear: the row survives the cancel (as `failed`), and the operator needs to see
+    /// that the red status is the stop they asked for rather than a crash. The entry is dropped when the
+    /// row itself leaves the snapshot. Only ids the operator asked about are in the map, so attributing
+    /// it to them is accurate even though `agent_cancelled` also fires for cascades and CLI callers.
+    pub fn note_cancel_confirmation(&mut self, event: &serde_json::Value) {
+        if self.pending_cancel.is_empty() {
+            return;
+        }
+        // The FlightRecorder wraps its payload under "data"; the agent id is at the top level as
+        // "agent" (the shape `converse::on_flight_event` also relies on).
+        if event.get("kind").and_then(|k| k.as_str()) != Some("agent_cancelled") {
+            return;
+        }
+        if let Some(id) = event.get("agent").and_then(|a| a.as_str()) {
+            if let Some(req) = self.pending_cancel.get_mut(id) {
+                req.landed = true;
+            }
+        }
+    }
+
+    /// What the Status column should read for `agent_id`, or `None` to render the snapshot's status.
+    ///
+    /// Escalates instead of expiring: a cancel that neither confirmed nor removed the row within
+    /// [`CANCEL_CONFIRM_GRACE`] is a LOST cancel, and the operator has to know that their stop did not
+    /// take — silently reverting to "running" would read as "I never pressed the key".
+    pub fn cancel_marker(&self, agent_id: &str) -> Option<CancelMarker> {
+        let req = self.pending_cancel.get(agent_id)?;
+        // Landed is terminal: the scheduler said it is done, and the row's own status is about to read
+        // `failed` — so the marker's job flips from "this is in flight" to "that failure is your stop".
+        if req.landed {
+            return Some(CancelMarker::Landed);
+        }
+        // An ACCEPTED cancel never escalates: a running agent is only funneled when its in-flight
+        // inference returns, which routinely outlasts the grace window, and calling that "not confirmed"
+        // would contradict the result frame that reported it accepted. Escalation exists for the
+        // unconfirmable path — FUSE, where `Ok` means only "queued" (/review's red team).
+        Some(if !req.confirmed && req.asked_at.elapsed() >= CANCEL_CONFIRM_GRACE {
+            CancelMarker::Unconfirmed
+        } else {
+            CancelMarker::InFlight
+        })
+    }
+
     /// Update the pending approvals list. Called every tick from run_tui/run_plain
     /// via `source.load_approvals()`, replacing the old FUSE-direct call in apply_snapshot.
     pub fn update_approvals(&mut self, items: Vec<PendingAction>) {
@@ -690,6 +879,31 @@ impl App {
         {
             self.approvals_view.selected_idx = self.approvals_items.len() - 1;
         }
+    }
+
+    /// Does the connected agentd have a budget-reset window (`[scheduler] budget_reset_interval > 0`)?
+    ///
+    /// One accessor, because the renderer and the key handler MUST agree: `menu_items` builds Park's
+    /// label from this, and a divergence would let Enter arm an item the operator was shown as
+    /// something else. `false` when the field is absent (an older agentd) — the config default, and the
+    /// reading that describes Park as terminal rather than as a pause.
+    pub fn budget_resettable(&self) -> bool {
+        self.budget.as_ref().is_some_and(|b| b.resettable)
+    }
+
+    /// The approval item the Confirm / RejectReason dialog is acting on, resolved from the PINNED
+    /// `confirmed_id` against the current list — never by index.
+    ///
+    /// ux.13-TUI step 4 (design C2 / eng E12, the highest-security item in that increment). The write
+    /// path always resolved by pinned id, but the renderer read `approvals_items[selected_idx]` while
+    /// `update_approvals` replaces the whole list in Confirm mode and clamps only the index. So when an
+    /// item resolved out-of-band — Telegram (ux.12), `agentctl approve`, another approval finishing —
+    /// the dialog could display item B's id/kind/**risk**/summary while `[a]` approved item A. Cancel
+    /// is not a security boundary; the approval gate is. One resolver, used by BOTH the renderer and
+    /// the key handler, is the fix: `None` is an honest "already resolved", not a fallback row.
+    pub fn confirm_item(&self) -> Option<&PendingAction> {
+        let id = self.approvals_view.confirmed_id.as_deref()?;
+        self.approvals_items.iter().find(|i| i.id == id)
     }
 
     /// Index of the selected agent in the current list, or None.
@@ -1594,5 +1808,135 @@ mod tests {
         assert_eq!(app.selected_id.as_deref(), Some("new-agent"),
             "pending_focus must bind to selected_id once the agent materializes");
         assert!(app.pending_focus.is_none(), "pending_focus must clear once bound");
+    }
+
+    // ── ux.13-TUI: the cancel marker's lifecycle ─────────────────────────────
+
+    /// The row is gone ⇒ the cancel landed. Keeping the marker would show "cancelling…" against an
+    /// agent that no longer exists.
+    #[test]
+    fn a_vanished_row_drops_its_cancel_marker() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(make_snapshot(&["scout-2", "keeper"]));
+        app.mark_cancel_requested("scout-2", true);
+        assert!(app.cancel_marker("scout-2").is_some());
+
+        app.apply_snapshot(make_snapshot(&["keeper"]));
+        assert_eq!(app.cancel_marker("scout-2"), None, "a gone row must not stay 'cancelling…'");
+    }
+
+    /// The marker ESCALATES rather than expiring. A cancel that neither confirmed nor removed the row
+    /// within the grace period is a LOST cancel; silently reverting the row to "running" would read as
+    /// "I never pressed the key", which is the same ambiguity M8 exists to remove.
+    #[test]
+    fn an_unconfirmed_cancel_escalates_instead_of_reverting() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(make_snapshot(&["scout-2"]));
+        let stale = std::time::Instant::now()
+            .checked_sub(CANCEL_CONFIRM_GRACE + std::time::Duration::from_secs(1))
+            .expect("monotonic clock far enough from its origin");
+        // UNCONFIRMED (a FUSE-style queued write) is the only case that escalates.
+        app.pending_cancel.insert("scout-2".to_string(),
+            CancelRequest { asked_at: stale, confirmed: false, landed: false });
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::Unconfirmed),
+            "an aged unconfirmable marker must say so, not fall back to the snapshot status");
+
+        // An ACCEPTED cancel of the same age must NOT escalate: `ControlCommand::Cancel` leaves a running
+        // agent flagged until its in-flight inference returns, which routinely outlasts the grace window,
+        // and "cancel not confirmed" would contradict the result frame that reported it accepted
+        // (/review's red team).
+        app.pending_cancel.insert("scout-2".to_string(),
+            CancelRequest { asked_at: stale, confirmed: true, landed: false });
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::InFlight),
+            "a confirmed cancel stays 'cancelling…' however long the step takes");
+    }
+
+    /// A failed poll must not be read as "every cancel landed": `HttpSource::load_snapshot` returns an
+    /// empty agent list plus an error on any failure, so one 503 would have erased every marker
+    /// (/review's red team).
+    /// The fix-review pass: `confirmed` describes the TARGET's write, not the client's guess about its
+    /// children. A descendant the server never flagged must still be able to escalate, or the rows most
+    /// likely to be wrong are the ones that can never say so.
+    #[test]
+    fn inferred_descendants_do_not_inherit_the_targets_confirmation() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        let mut snap = make_snapshot(&["cos-coordinator", "scout-2"]);
+        snap.agents[1].parent_id = Some("cos-coordinator".to_string());
+        app.apply_snapshot(snap);
+        app.mark_cancel_requested("cos-coordinator", true);
+
+        let stale = CANCEL_CONFIRM_GRACE + std::time::Duration::from_secs(1);
+        let backdate = |app: &mut App, id: &str| {
+            let req = app.pending_cancel.get_mut(id).expect("marked");
+            req.asked_at = std::time::Instant::now().checked_sub(stale).expect("monotonic origin");
+        };
+        backdate(&mut app, "cos-coordinator");
+        backdate(&mut app, "scout-2");
+
+        assert_eq!(app.cancel_marker("cos-coordinator"), Some(CancelMarker::InFlight),
+            "the confirmed target does not escalate — its step can outlast the window");
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::Unconfirmed),
+            "an inferred child the server may never have flagged must escalate");
+    }
+
+    /// Regression: QA-1 — a cancelled agent's row read `failed` with nothing attributing it to the
+    /// operator, because the `agent_cancelled` event cleared the marker.
+    /// Found by /qa on 2026-07-28, driving the real TUI against a REAL agentd: `[x] → Cancel` on a
+    /// running agent left the row as a red `failed` indistinguishable from a crash.
+    /// Report: .gstack/qa-reports/qa-report-agentctl-watch-2026-07-28.md
+    #[test]
+    fn a_landed_cancel_attributes_the_failure_to_the_operator() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(make_snapshot(&["scout-2"]));
+        app.mark_cancel_requested("scout-2", true);
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::InFlight));
+
+        app.note_cancel_confirmation(&serde_json::json!({
+            "agent": "scout-2", "kind": "agent_cancelled", "data": {}
+        }));
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::Landed),
+            "the scheduler's confirmation must ATTRIBUTE the row's failure, not vanish and leave a \
+             red `failed` the operator cannot tell apart from a crash");
+        assert_eq!(CancelMarker::Landed.label(), "cancelled by you");
+
+        // Terminal: it does not decay into the "your stop did not take" escalation, whose meaning is the
+        // opposite. A landed cancel is the success case.
+        let stale = std::time::Instant::now()
+            .checked_sub(CANCEL_CONFIRM_GRACE + std::time::Duration::from_secs(1))
+            .expect("monotonic origin");
+        let req = app.pending_cancel.get_mut("scout-2").unwrap();
+        req.asked_at = stale;
+        req.confirmed = false; // even the unconfirmable path, once landed, is landed
+        assert_eq!(app.cancel_marker("scout-2"), Some(CancelMarker::Landed));
+
+        // And it is pruned with the row, like every other marker.
+        app.apply_snapshot(make_snapshot(&["other"]));
+        assert_eq!(app.cancel_marker("scout-2"), None);
+    }
+
+    #[test]
+    fn a_failed_poll_does_not_erase_the_cancel_markers() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(make_snapshot(&["scout-2"]));
+        app.mark_cancel_requested("scout-2", true);
+
+        let failed = Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
+            isolation: None, credentials: None, error: Some("HTTP error: connection refused".into()),
+        };
+        app.apply_snapshot(failed);
+        assert!(app.cancel_marker("scout-2").is_some(),
+            "an unreachable agentd is not evidence that the cancel took");
+
+        // A SUCCESSFUL poll without the row is that evidence.
+        app.apply_snapshot(make_snapshot(&["other"]));
+        assert_eq!(app.cancel_marker("scout-2"), None);
+    }
+
+    #[test]
+    fn cancel_marker_is_none_for_an_unmarked_agent() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(make_snapshot(&["scout-2"]));
+        assert_eq!(app.cancel_marker("scout-2"), None);
     }
 }

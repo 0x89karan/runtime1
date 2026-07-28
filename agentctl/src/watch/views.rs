@@ -3,19 +3,20 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
 };
 
-use super::app::{App, MemoryAbsence, MemoryPane, SpawnFocus, View};
+use super::app::{App, CancelMarker, MemoryAbsence, MemoryPane, SpawnFocus, View};
 use super::approvals::ApprovalsMode;
 use super::converse::{ConversePhase, TurnRole};
 use super::logs::{clip_payload, format_ts, logs_viewport_rows};
+use super::overlay::{menu_items, overlay_fits, overlay_rect, overlay_text_width, DashboardOverlay, OverlayMode, PendingVerb};
 use super::memory::{
     filter_entries, filter_short_term, read_agent_memory, read_kb_segments, MAX_DISPLAY_ENTRIES,
     MAX_SEARCH_ENTRIES,
 };
 use super::reader;
-use super::topology::render_tree;
+use super::topology::{descendants, render_tree, TopologyGraph};
 
 /// Strip control characters from a string before rendering it in a TUI widget or plain-text
 /// output. Guards against ANSI escape sequences embedded in OS error messages — and, since
@@ -359,22 +360,43 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         // Stacked reason line, per the top-priority (most actionable) active signal — rendered
         // as line 2 of the Agent ID cell (ratatui `Table` cells don't span columns; this is the
         // widest column, `Constraint::Min(20)`, so the reason text has room to be readable).
-        let id_text: ratatui::text::Text = if let Some(sig) = top_attention_signal(&a.attention) {
+        // ux.13-TUI (M8): a requested cancel has nothing to read in the snapshot — no
+        // `AgentStatus::Cancelling` exists — so the row would keep saying "running" for a whole turn and
+        // then vanish, which is indistinguishable from "my keypress did nothing". The marker gets its OWN
+        // line in this column, not the Status cell.
+        //
+        // Two review rounds converged here. Substituting it into Status hid the row's real state for as
+        // long as the marker lived (red team). Appending it there — "running · cancelling…" — then
+        // regressed at exactly the widths this branch newly claims to support: measured on real frames,
+        // ratatui gives Status 24 cols at the 115-col rail floor and 21 at 80, so
+        // "awaiting_approval · NOT CANCELLED" rendered with no cancel signal at all (the fix-review
+        // pass). This column is `Constraint::Min(20)`, the widest, and already carries a second line for
+        // attention reasons — so the marker goes beside the idiom it matches, and Status is untouched at
+        // every width.
+        let mut id_lines = vec![Line::from(a.id.clone())];
+        if let Some(sig) = top_attention_signal(&a.attention) {
             let age = age_display(sig);
             let reason_line = match &sig.evidence {
                 Some(ev) => format!("  {} {} ({}) · {age}", glyph, sig.reason.label(), sanitize(ev)),
                 None     => format!("  {} {} · {age}", glyph, sig.reason.label()),
             };
-            ratatui::text::Text::from(vec![
-                Line::from(a.id.clone()),
-                Line::from(Span::styled(reason_line, glyph_style)),
-            ])
-        } else {
-            ratatui::text::Text::from(a.id.clone())
-        };
-        let height = if top_attention_signal(&a.attention).is_some() { 2 } else { 1 };
+            id_lines.push(Line::from(Span::styled(reason_line, glyph_style)));
+        }
+        if let Some(marker) = app.cancel_marker(&a.id) {
+            let style = match marker {
+                // Escalation, not decoration: this is a cancel that never took.
+                CancelMarker::Unconfirmed => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                CancelMarker::InFlight    => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                // Green against the row's red `failed`: the stop worked, and that is the point.
+                CancelMarker::Landed      => Style::default().fg(Color::Green),
+            };
+            // Both lines when both apply: an attention signal is advisory, a requested cancel is
+            // something the operator DID, and neither may hide the other.
+            id_lines.push(Line::from(Span::styled(format!("  ⨯ {}", marker.label()), style)));
+        }
+        let height = id_lines.len() as u16;
         Row::new(vec![
-            Cell::from(id_text),
+            Cell::from(ratatui::text::Text::from(id_lines)),
             Cell::from(a.status.clone()).style(status_style(&a.status)),
             Cell::from(glyph).style(glyph_style),
             Cell::from(format!("{}", a.context_tokens)),
@@ -397,7 +419,7 @@ fn render_dashboard(f: &mut Frame, app: &App) {
             rows,
             [
                 Constraint::Min(20),     // Agent ID
-                Constraint::Length(20),  // Status
+                Constraint::Length(20),  // Status (unchanged: the cancel marker has its own line)
                 Constraint::Length(4),   // ATTN (ux.2a) — leads, right after Status
                 Constraint::Length(10),  // Context
                 Constraint::Length(12),  // Budget
@@ -422,14 +444,12 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     // ux.10-A: `[l]ogs` appears ONLY when a compose project was detected at startup — the
     // same `logs_view.available` flag that gates the key itself (mod.rs), so the legend can
     // never advertise a key that does nothing.
-    let logs_key = if app.logs_view.available { "  [l]ogs" } else { "" };
-    let hints = if !rail_fits {
-        format!(" ↑/↓ select  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector{logs_key}  q quit  (resize to 115+ cols / 8+ rows for chat) ")
-    } else if app.converse_view.rail_focused {
-        " Esc/Tab: back to table  Enter: send  ↑/↓: scroll  End: follow  Ctrl-c: cancel ".to_string()
-    } else {
-        format!(" ↑/↓ select  r retarget chat  Tab: chat  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector{logs_key}  q quit ")
-    };
+    let hints = dashboard_hints(
+        if app.converse_view.rail_focused { FooterState::RailFocused }
+        else if rail_fits { FooterState::Table }
+        else { FooterState::NoRail },
+        app.logs_view.available,
+    );
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
         footer_chunks[0],
@@ -441,6 +461,542 @@ fn render_dashboard(f: &mut Frame, app: &App) {
         Paragraph::new(legend).style(Style::default().fg(Color::DarkGray)),
         footer_chunks[1],
     );
+
+    // ux.13-TUI: drawn LAST so it sits over the table + rail. Anything openable must be visible —
+    // an overlay that owns the keyboard without rendering would trap the operator in an invisible mode.
+    if let Some(ov) = &app.dashboard_overlay {
+        render_dashboard_overlay(f, app, ov, content_area);
+    }
+}
+
+
+/// Will the row-action overlay render as a BOX (rather than degrade to a single line) on a terminal of
+/// `term_size`?
+///
+/// The key handler needs the same answer the renderer will reach, and it has only `App.term_size` —
+/// the renderer works from `content_area`, which is the frame minus the Dashboard's fixed chrome and,
+/// when it fits, minus the chat rail. Uses the widest chrome (banner present) and subtracts the rail,
+/// so the predicate is CONSERVATIVE: it can say "no box" one row before the renderer would, and a
+/// too-small answer only ever disables verbs (fail closed), never enables one that cannot be seen.
+pub fn overlay_fits_dashboard(term_size: (u16, u16)) -> bool {
+    let (w, h) = term_size;
+    let content_h = h.saturating_sub(dashboard_chrome_rows(true));
+    let content_w = if converse_rail_fits(w, content_h) {
+        w.saturating_sub(CONVERSE_RAIL_WIDTH)
+    } else {
+        w
+    };
+    overlay_fits(content_w, content_h)
+}
+
+/// The widest a footer line may be **in a state that only renders when the chat rail fits** — so the
+/// terminal is at least `MIN_TOTAL_WIDTH_FOR_RAIL` columns wide. Derived, not a literal: the rail floor
+/// and the footer budget are the same number and must not drift apart.
+///
+/// Measured, not chosen: the pre-ux.13-TUI narrow footer ran to **162 columns** with `[l]ogs`
+/// present, so `q quit` began at column 114 and its own `(resize to 115+ cols…)` hint started at 122 —
+/// on the only widths where that branch renders (width < 115) the hint about being too narrow was
+/// itself off-screen. Acceptance is a WIDTH, deliberately: `contains("q quit")` passes with the clip
+/// bug fully intact (design finding V3).
+pub const MAX_FOOTER_COLS: usize = MIN_TOTAL_WIDTH_FOR_RAIL as usize - 1;
+
+/// The widest the **narrow** footer may be. A separate, much smaller bound, because
+/// `FooterState::NoRail` renders ONLY below the rail floor — bounding it by `MAX_FOOTER_COLS` was
+/// vacuous, and /review's testing specialist caught that the shipped narrow line was 113 cols with
+/// `q quit` at column 87: on an 80-column terminal, the exact defect V3 exists to fix was still there,
+/// with the test passing. 80 columns is the canonical narrow terminal; the view keys come off the line
+/// and live behind `?`, which is what `?` is for.
+pub const MAX_NARROW_FOOTER_COLS: usize = 80;
+
+/// Which footer the Dashboard is showing. The three states predate this increment (ux.1's DX pass);
+/// only their content changed.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FooterState {
+    /// Table focused, chat rail visible.
+    Table,
+    /// Chat rail has text focus — its keys replace the table's entirely.
+    RailFocused,
+    /// Terminal too narrow/short for the rail.
+    NoRail,
+}
+
+/// One row of the Dashboard key map.
+///
+/// **This table is the single source of truth for both the footer and the `?` overlay.** The Eng phase
+/// called `?` "not nearly free" for exactly this reason: a hand-written help screen is a second copy of
+/// the key list, and the copy that drifts is always the one the operator reads when they are lost.
+pub struct KeyHint {
+    /// Footer form — terse, because the footer has 114 columns for everything.
+    pub short:  &'static str,
+    /// Help form: the key, then what it does in words.
+    pub key:    &'static str,
+    pub what:   &'static str,
+    /// Rendered in the footer's table state (all rows appear in `?`).
+    pub footer: bool,
+    /// Only present when a docker-compose project was detected at startup.
+    pub docker: bool,
+}
+
+const DASHBOARD_KEYS: &[KeyHint] = &[
+    KeyHint { short: "x act",      key: "x",       what: "row actions on the selected agent (park, budget, cancel)", footer: true,  docker: false },
+    KeyHint { short: "? keys",     key: "?",       what: "this help", footer: true, docker: false },
+    KeyHint { short: "↑↓ sel",     key: "↑/↓, j/k", what: "select a row", footer: true, docker: false },
+    KeyHint { short: "r target",   key: "r",       what: "retarget the chat rail at the selected agent", footer: true, docker: false },
+    KeyHint { short: "Tab chat",   key: "Tab",     what: "focus the chat rail (Esc/Tab returns)", footer: true, docker: false },
+    KeyHint { short: "Enter open", key: "Enter",   what: "open the selected agent's detail view", footer: true, docker: false },
+    KeyHint { short: "[s]ys",      key: "s",       what: "system view — queue, budget, provider, sandbox, credentials", footer: true, docker: false },
+    KeyHint { short: "[t]op",      key: "t",       what: "topology — the spawn tree and message edges", footer: true, docker: false },
+    KeyHint { short: "[m]em",      key: "m",       what: "memory — per-agent short-term and the shared KB", footer: true, docker: false },
+    KeyHint { short: "[n]ew",      key: "n",       what: "spawn a new agent from a template", footer: true, docker: false },
+    KeyHint { short: "[a]pp",      key: "a",       what: "approvals — resolve pending operator gates", footer: true, docker: false },
+    KeyHint { short: "[c]red",     key: "c",       what: "credentials — provider health and token freshness", footer: true, docker: false },
+    KeyHint { short: "[i]nsp",     key: "i",       what: "inspector — the flight-recorder log", footer: true, docker: false },
+    KeyHint { short: "[l]og",      key: "l",       what: "logs — tail the docker compose project", footer: true, docker: true },
+    KeyHint { short: "q quit",     key: "q",       what: "quit (inside an overlay it dismisses instead)", footer: true, docker: false },
+    // Not in the footer — real keys with no room, which is precisely what `?` is for.
+    KeyHint { short: "", key: "Ctrl-c", what: "quit from anywhere, including mid-verb", footer: false, docker: false },
+    KeyHint { short: "", key: "Esc",    what: "leave a view, dismiss an overlay, or unfocus the chat rail", footer: false, docker: false },
+];
+
+/// The footer line for `state`. Kept pure and public so its WIDTH can be asserted (see
+/// [`MAX_FOOTER_COLS`]) — the clip bug it replaces was invisible to every content-based assertion.
+pub fn dashboard_hints(state: FooterState, logs_available: bool) -> String {
+    if state == FooterState::RailFocused {
+        return " Esc/Tab back to table  Enter send  ↑↓ scroll  End follow  Ctrl-c cancel ".to_string();
+    }
+    // Below the rail floor the line has ~80 columns for everything, so it keeps only the keys that
+    // cannot be discovered another way: the rail keys are unreachable at this width, and the per-view
+    // letters are one `?` away. A hint that clips is worse than a hint that is absent.
+    let skip_rail = state == FooterState::NoRail;
+    let parts: Vec<&str> = DASHBOARD_KEYS
+        .iter()
+        .filter(|k| k.footer)
+        .filter(|k| !k.docker || logs_available)
+        .filter(|k| !(skip_rail && matches!(k.key, "r" | "Tab")))
+        .filter(|k| !(skip_rail && k.short.starts_with('[')))
+        .map(|k| k.short)
+        .collect();
+    // The view cluster is single-spaced so the whole line fits; the other groups are double-spaced.
+    let mut line = String::from(" ");
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            let tight = part.starts_with('[') && parts[i - 1].starts_with('[');
+            line.push_str(if tight { " " } else { "  " });
+        }
+        line.push_str(part);
+    }
+    if skip_rail {
+        // Derived from the same constant the rail's own fits check uses, so the advertised width cannot
+        // drift from the width that actually brings the rail back.
+        line.push_str(&format!("  ({MIN_TOTAL_WIDTH_FOR_RAIL}+ cols: chat)"));
+    }
+    line.push(' ');
+    // Load-bearing in debug builds as well as in the test: the footer is assembled from a table that
+    // will grow, and the next key someone adds must fail loudly rather than silently push `q quit` off
+    // the right edge again. Bound per state — the narrow line is drawn on narrow terminals.
+    let budget = if skip_rail { MAX_NARROW_FOOTER_COLS } else { MAX_FOOTER_COLS };
+    debug_assert!(
+        line.chars().count() <= budget,
+        "footer is {} cols (max {budget}): {line}",
+        line.chars().count(),
+    );
+    line
+}
+
+/// The `?` overlay's body: every key, including the ones the footer has no room for.
+fn help_lines(logs_available: bool) -> Vec<(&'static str, &'static str)> {
+    DASHBOARD_KEYS
+        .iter()
+        .filter(|k| !k.docker || logs_available)
+        .map(|k| (k.key, k.what))
+        .collect()
+}
+
+/// ux.13-TUI: the Dashboard row-action overlay, drawn OVER the live dashboard.
+///
+/// `Clear` is the only widget in this tree that panics on an out-of-frame `Rect` (it indexes the
+/// buffer without intersecting, unlike `Block`), so the rect comes from `overlay_rect`, which clamps,
+/// and an empty result degrades to a single-line prompt instead of reaching `Clear` at all.
+///
+/// The target's live row is rendered INSIDE the box: a centred overlay usually covers the very row it
+/// is about, so "the dashboard is visible behind it" cannot be the way the operator confirms they are
+/// acting on the right agent.
+fn render_dashboard_overlay(f: &mut Frame, app: &App, ov: &DashboardOverlay, area: Rect) {
+    let target = ov.target(&app.agents);
+
+    // Degraded path for a terminal too small for a box — never a modal with no visible exit.
+    //
+    // From `term_size`, the SAME input `handle_overlay_key`'s fail-closed gate uses. Deriving it from
+    // `area` here instead left a window (height 11: chrome differs by one row) where the renderer drew a
+    // full menu that the handler refused to act on — a live-looking, completely dead dialog with no
+    // explanation on screen (/review's red team). One predicate, one answer.
+    if !overlay_fits_dashboard(app.term_size) {
+        // "dismiss", never "cancel": Cancel is a VERB in this overlay, and this is the one hint that
+        // used to teach the opposite reading of the same key. It also states that the actions are
+        // unavailable here, because `handle_overlay_key` refuses to arm one at this size.
+        // Help carries no target (`target_id` is empty), so it must not fall through to the row wording —
+        // pressing `?` on a small terminal used to answer " is no longer present" about no agent at all
+        // (/review's red team). The box path already guarded this; the degraded path did not.
+        let line = match (&ov.mode, target) {
+            (OverlayMode::Help, _) => " key map needs a bigger terminal; Esc/q dismisses ".to_string(),
+            (_, Some(_)) => format!(
+                " {} — row actions need a bigger terminal; Esc/q dismisses ",
+                sanitize(&ov.target_id),
+            ),
+            (_, None) => format!(" {} is no longer present — Esc/q dismisses ", sanitize(&ov.target_id)),
+        };
+        let row = Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 };
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(Color::Yellow).fg(Color::Black)),
+            row.intersection(area),
+        );
+        return;
+    }
+
+    let mut body: Vec<Line> = Vec::new();
+    // Help is not about a row, so it gets no agent header and no "no longer present" notice.
+    let show_target = !matches!(ov.mode, OverlayMode::Help);
+    match target.filter(|_| show_target) {
+        Some(a) => {
+            body.push(Line::from(vec![
+                Span::styled("agent  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(sanitize(&a.id), Style::default().add_modifier(Modifier::BOLD)),
+            ]));
+            body.push(Line::from(vec![
+                Span::styled("status ", Style::default().fg(Color::DarkGray)),
+                Span::styled(sanitize(&a.status), status_style(&a.status)),
+            ]));
+            body.push(Line::from(vec![
+                Span::styled("spend  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format_budget_cell(a.windowed_spent, &a.budget)),
+            ]));
+        }
+        None if !show_target => {}
+        None => {
+            // Resolve-at-use: the pinned agent is gone, so say so and offer no action. Mirrors the
+            // Approvals view's "already resolved" branch rather than acting on a stale target.
+            // Copy is the DX phase's replacement, verbatim: what happened, why, what to do — and it
+            // opens with "No action sent", because the first thing the operator needs to know is that
+            // nothing was written.
+            for line in wrap_plain(
+                &format!(
+                    "No action sent: {} is no longer in the snapshot. It may have finished or been \
+                     removed; dismiss and select another running agent.",
+                    sanitize(&ov.target_id),
+                ),
+                overlay_text_width(area),
+            ) {
+                body.push(Line::from(Span::styled(line, Style::default().fg(Color::Yellow))));
+            }
+        }
+    }
+    body.push(Line::from(""));
+    // The mode body renders even when the target has vanished: an `InFlight`/`Result` frame is ABOUT a
+    // write already sent against the pinned id, and an agent that disappeared because the cancel
+    // landed is the most likely case of all.
+    body.extend(overlay_mode_body(
+        ov,
+        target,
+        &app.topology,
+        OverlayCtx {
+            budget_resettable: app.budget_resettable(),
+            logs_available:    app.logs_view.available,
+            cli_conn:          &app.cli_conn,
+        },
+        overlay_text_width(area),
+    ));
+    body.push(Line::from(""));
+
+    let hints = Line::from(Span::styled(
+        overlay_hints(&ov.mode),
+        Style::default().bg(Color::DarkGray).fg(Color::White),
+    ));
+
+    let rect = overlay_rect(area, body.len() as u16 + 3);
+    if rect.is_empty() {
+        return; // clamped to nothing — the fits check above normally prevents this
+    }
+    // The hints line is the LAST thing dropped, never the first. `overlay_rect` caps height to the
+    // frame, so on a short terminal the body is taller than the box and `Paragraph` clips from the
+    // bottom — which is exactly where the dismissal key lives. A modal whose exit key has been clipped
+    // off is a trapped operator, so the body yields rows to it instead.
+    let inner_rows = rect.height.saturating_sub(2) as usize;
+    if inner_rows > 0 {
+        body.truncate(inner_rows - 1);
+        body.push(hints);
+    } else {
+        body.clear();
+    }
+    let title = match ov.mode {
+        OverlayMode::Menu                 => " row actions ",
+        OverlayMode::ConfirmCancel        => " confirm cancel ",
+        OverlayMode::Budget { .. }        => " set budget ",
+        OverlayMode::ConfirmBudget { .. } => " confirm budget change ",
+        OverlayMode::InFlight { .. }      => " working ",
+        OverlayMode::Result { .. }        => " result ",
+        OverlayMode::Help                 => " keys ",
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(title),
+        ),
+        rect,
+    );
+}
+
+/// The per-mode content of the row-action overlay.
+///
+/// Split out from `render_dashboard_overlay` so the geometry/`Clear` path stays one small function
+/// with one job, and so this can grow per mode without the clamp logic drifting.
+/// The session facts the overlay body needs. A struct, not four positional parameters: two of them were
+/// adjacent same-typed bools derived from the same `App`, so transposing them compiled and produced a
+/// plausible-looking frame — including in this file's own test, which passed them as `false, true`
+/// (/review's maintainability specialist).
+#[derive(Clone, Copy)]
+struct OverlayCtx<'a> {
+    /// Does the connected agentd have a budget-reset window? Decides what Park MEANS.
+    budget_resettable: bool,
+    /// Was a docker-compose project detected? Gates the `[l]` row in the `?` key map.
+    logs_available: bool,
+    /// Flags that make a printed `agentctl …` command reach THIS daemon.
+    cli_conn: &'a str,
+}
+
+/// `text_width` is the REAL inner width of the box for this frame (`overlay_text_width`), not a
+/// constant: prose is wrapped to it here, because the box height is derived from the resulting line
+/// count. Hardcoding it is what made the first real pty frame read "…stop at the n".
+fn overlay_mode_body<'a>(
+    ov: &'a DashboardOverlay,
+    target: Option<&'a reader::AgentInfo>,
+    topology: &TopologyGraph,
+    ctx: OverlayCtx<'_>,
+    text_width: usize,
+) -> Vec<Line<'a>> {
+    let OverlayCtx { budget_resettable, logs_available, cli_conn } = ctx;
+    let mut out: Vec<Line> = Vec::new();
+    // Wrap a paragraph of prose into styled lines at the box width.
+    let para = |out: &mut Vec<Line>, text: &str, indent: usize, style: Style| {
+        for line in wrap_plain(text, text_width.saturating_sub(indent).max(8)) {
+            out.push(Line::from(Span::styled(format!("{}{line}", " ".repeat(indent)), style)));
+        }
+    };
+    match &ov.mode {
+        OverlayMode::Menu => {
+            let Some(a) = target else { return out };
+            let items = menu_items(a, budget_resettable);
+            for (i, item) in items.iter().enumerate() {
+                let selected = i == ov.cursor;
+                let marker = if selected { "▸ " } else { "  " };
+                let label_style = match (selected, item.enabled()) {
+                    (_, false)    => Style::default().fg(Color::DarkGray),
+                    (true, true)  => Style::default().fg(Color::White).bg(Color::Blue).add_modifier(Modifier::BOLD),
+                    (false, true) => Style::default().add_modifier(Modifier::BOLD),
+                };
+                // The detail is clipped rather than wrapped: a row that grows to two lines would
+                // shift every row below it as the cursor moves.
+                let detail = clip_to(&item.detail,
+                    text_width.saturating_sub(marker.len() + item.label.chars().count() + 2));
+                out.push(Line::from(vec![
+                    Span::raw(marker),
+                    Span::styled(item.label.clone(), label_style),
+                    Span::raw("  "),
+                    Span::styled(detail, Style::default().fg(Color::DarkGray)),
+                ]));
+                // The blocked reason renders under the row it belongs to, which is what lets Enter on a
+                // disabled item be a plain no-op instead of an error the operator must dismiss.
+                if selected {
+                    if let Some(reason) = &item.blocked {
+                        // Wrapped: this copy carries the "what to do instead" clause at the END, and a
+                        // clipped line would keep the refusal while losing the remedy.
+                        para(&mut out, reason, 4, Style::default().fg(Color::Yellow));
+                    }
+                }
+            }
+        }
+
+        OverlayMode::ConfirmCancel => {
+            para(&mut out, &format!("Cancel {}?", sanitize(&ov.target_id)), 0,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+            para(&mut out,
+                "This cannot be undone. The agent and its spawned subtree stop at the next step \
+                 boundary.",
+                0, Style::default().fg(Color::DarkGray));
+            // C4: Cancel CASCADES. On this repo's own coordinator fixture that is three agents, and a
+            // confirm dialog naming one id would have understated the blast radius by 2. "at least"
+            // because the client walk is a floor — the snapshot is up to a poll stale and has no
+            // universal-tier parentage, so the server's count can legitimately be higher (E6).
+            let kids = descendants(topology, &ov.target_id);
+            if !kids.is_empty() {
+                para(&mut out,
+                    &format!("Also stops at least {} spawned agent{}: {}",
+                        kids.len(),
+                        if kids.len() == 1 { "" } else { "s" },
+                        kids.iter().map(|k| sanitize(k)).collect::<Vec<_>>().join(", ")),
+                    0, Style::default().fg(Color::Yellow));
+            }
+            out.push(Line::from(""));
+            out.extend(equivalent_cli_lines(
+                &PendingVerb::Cancel { agent_id: ov.target_id.clone() },
+                cli_conn, text_width,
+            ));
+        }
+
+        OverlayMode::Budget { input, error } => {
+            let current = target.map(|a| a.budget.display()).unwrap_or_else(|| "?".to_string());
+            para(&mut out,
+                &format!("Token budget for {} (current: {current})", sanitize(&ov.target_id)),
+                0, Style::default().add_modifier(Modifier::BOLD));
+            out.push(Line::from(""));
+            out.push(Line::from(clip_to(
+                &format!("  > {}", input_with_cursor_glyph(input, '_')),
+                text_width,
+            )));
+            // Said on the field itself, because this is the inversion design finding M2 is about: an
+            // empty field plus Enter must not read as "no cap".
+            para(&mut out, "0 = unlimited (removes the cap)", 2, Style::default().fg(Color::DarkGray));
+            if let Some(e) = error {
+                para(&mut out, e, 2, Style::default().fg(Color::Red));
+            }
+        }
+
+        OverlayMode::ConfirmBudget { limit } => {
+            let headline = if *limit == 0 {
+                format!("Remove the budget cap on {}?", sanitize(&ov.target_id))
+            } else {
+                format!("Raise {}'s budget to {limit} tokens?", sanitize(&ov.target_id))
+            };
+            para(&mut out, &headline, 0,
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+            para(&mut out,
+                if *limit == 0 {
+                    "0 means UNLIMITED — the agent can then spend without bound, and the change \
+                     survives a restart."
+                } else {
+                    "This widens the cap rather than tightening it, and the change survives a \
+                     restart."
+                },
+                0, Style::default().fg(Color::Yellow));
+            out.push(Line::from(""));
+            out.extend(equivalent_cli_lines(
+                &PendingVerb::SetBudget { agent_id: ov.target_id.clone(), limit: *limit, park: false },
+                cli_conn, text_width,
+            ));
+        }
+
+        OverlayMode::InFlight { label } => {
+            para(&mut out, &sanitize(label), 0,
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            para(&mut out, "waiting for agentd to confirm…", 0,
+                Style::default().fg(Color::DarkGray));
+        }
+
+        OverlayMode::Help => {
+            // Rendered from the SAME table as the footer, so the two cannot drift.
+            for (key, what) in help_lines(logs_available) {
+                let key_col = format!("{key:<9}");
+                out.push(Line::from(vec![
+                    Span::styled(key_col, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    Span::raw(clip_to(what, text_width.saturating_sub(9))),
+                ]));
+            }
+        }
+
+        OverlayMode::Result { text, ok } => {
+            let style = if *ok {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            };
+            // Wrapped here rather than by `Paragraph::wrap`, which is not enabled: the box height is
+            // computed from `body.len()`, so wrapping has to happen where it can be counted.
+            para(&mut out, &sanitize(text), 0, style);
+        }
+    }
+    out
+}
+
+/// The DX phase's highest-value line: every overlay states the `agentctl` command that does the same
+/// thing, including the flags that make it reach THIS daemon. It teaches the fallback path for when the TUI is the broken thing, and makes an incident
+/// note copy-pasteable.
+fn equivalent_cli_lines(verb: &PendingVerb, conn: &str, width: usize) -> Vec<Line<'static>> {
+    const LABEL: &str = "Equivalent: ";
+    // Built from `PendingVerb`, never hand-formatted: the two `format!("agentctl …")` copies this
+    // replaces were invisible to the clap drift guard AND skipped `sanitize`, so an agent id carrying
+    // ESC/CSI bytes reached the terminal from the two frames an operator reads before granting a
+    // destructive verb (/review: maintainability + security, same two lines).
+    let cmd = &sanitize(&verb.equivalent_cli(conn));
+    if LABEL.len() + cmd.chars().count() <= width {
+        return vec![Line::from(vec![
+            Span::styled(LABEL, Style::default().fg(Color::DarkGray)),
+            Span::styled(cmd.to_string(), Style::default().fg(Color::Cyan)),
+        ])];
+    }
+    // Narrow box: label on its own row, command wrapped under it. The command stays readable in full
+    // rather than being clipped — it is meant to be typed.
+    let mut out = vec![Line::from(Span::styled("Equivalent:", Style::default().fg(Color::DarkGray)))];
+    for line in wrap_plain(cmd, width.saturating_sub(2).max(8)) {
+        out.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+    out
+}
+
+/// Clip a string to `width`, marking the cut. Used where a line must stay ONE row tall (menu rows),
+/// as opposed to prose, which wraps.
+fn clip_to(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let head: String = s.chars().take(width - 1).collect();
+    format!("{head}…")
+}
+
+/// Greedy word wrap. `Paragraph::wrap` cannot be used for the overlay body because the box height is
+/// derived from the line count before rendering, so wrapping has to happen where it can be counted.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Per-mode key hints. Every mode states its own exit — a modal whose dismissal key is only listed on
+/// another screen is how an operator gets stuck in one.
+fn overlay_hints(mode: &OverlayMode) -> &'static str {
+    match mode {
+        OverlayMode::Menu                 => " ↑/↓ select   Enter choose   Esc/q dismiss ",
+        OverlayMode::ConfirmCancel        => " Enter/y CANCEL THE AGENT   Esc/q back ",
+        OverlayMode::Budget { .. }        => " type a number   Enter submit   Esc back ",
+        OverlayMode::ConfirmBudget { .. } => " Enter/y confirm   Esc back to the field ",
+        OverlayMode::InFlight { .. }      => " working — keys are ignored until agentd answers ",
+        OverlayMode::Result { .. }        => " Esc/q/Enter dismiss ",
+        OverlayMode::Help                 => " Esc/q/Enter/? close ",
+    }
 }
 
 /// ux.1: middle-ellipsis truncation for the border-title target selector, so a long
@@ -1679,51 +2235,73 @@ fn render_approvals(f: &mut Frame, app: &App) {
         }
 
         ApprovalsMode::Confirm => {
-            let item = app.approvals_items.get(av.selected_idx);
-            let (id, agent, kind, risk, summary) = item
-                .map(|a| (a.id.as_str(), a.agent_id.as_str(), a.kind.as_str(), a.risk.as_str(), a.summary.as_str()))
-                .unwrap_or(("?", "?", "?", "?", "?"));
-
-            let risk_style = match risk {
-                "high"   => Style::default().fg(Color::Red),
-                "medium" => Style::default().fg(Color::Yellow),
-                _        => Style::default().fg(Color::Green),
+            // ux.13-TUI step 4: render from the PINNED id (`App::confirm_item`), the same resolver the
+            // key handler acts through. Reading `approvals_items[selected_idx]` here meant an item
+            // resolving out-of-band could shift the list under a live dialog, showing one approval's
+            // risk/summary while `[a]` approved another.
+            let lines = match app.confirm_item() {
+                Some(a) => {
+                    let risk_style = match a.risk.as_str() {
+                        "high"   => Style::default().fg(Color::Red),
+                        "medium" => Style::default().fg(Color::Yellow),
+                        _        => Style::default().fg(Color::Green),
+                    };
+                    vec![
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("  ID:      ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(a.id.as_str()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("  Agent:   ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(a.agent_id.as_str()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("  Kind:    ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(a.kind.as_str()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("  Risk:    ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::styled(a.risk.as_str(), risk_style),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("  Summary: ", Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(sanitize(&a.summary)),
+                        ]),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("  [a] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                            Span::raw("Approve"),
+                            Span::raw("    "),
+                            Span::styled("[d] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                            Span::raw("Approve (don't ask again for this kind)"),
+                            Span::raw("    "),
+                            Span::styled("[r] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                            Span::raw("Reject"),
+                        ]),
+                    ]
+                }
+                // The former `unwrap_or(("?", "?", "?", "?", "?"))` case, said out loud: the pinned
+                // approval is no longer pending, so there is nothing here to approve or reject. The
+                // keys are no-ops that return to the list — the body must not imply otherwise.
+                None => {
+                    // sanitize: approval ids are internally generated today, but this is the last
+                    // unsanitized id rendered in a dialog and the next id source may not be.
+                    let pinned = sanitize(av.confirmed_id.as_deref().unwrap_or("(none)"));
+                    vec![
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("  This approval was already resolved.",
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                        ]),
+                        Line::from(""),
+                        Line::from(format!("  {pinned} is no longer pending — it was approved or")),
+                        Line::from("  rejected elsewhere (Telegram, agentctl, or it expired)."),
+                        Line::from(""),
+                        Line::from("  Press Esc to go back to the list."),
+                    ]
+                }
             };
-
-            let lines = vec![
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  ID:      ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(id),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Agent:   ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(agent),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Kind:    ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(kind),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Risk:    ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(risk, risk_style),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Summary: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(sanitize(summary)),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled("  [a] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                    Span::raw("Approve"),
-                    Span::raw("    "),
-                    Span::styled("[d] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                    Span::raw("Approve (don't ask again for this kind)"),
-                    Span::raw("    "),
-                    Span::styled("[r] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                    Span::raw("Reject"),
-                ]),
-            ];
 
             f.render_widget(
                 Paragraph::new(lines)
@@ -2037,9 +2615,31 @@ pub fn render_plain(app: &App) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
     use super::*;
     use crate::watch::app::App;
-    use crate::watch::reader::{AgentInfo, BudgetKind, Snapshot, SysBudget, SysProvider, SysQueue};
+    use crate::watch::reader::{AgentInfo, BudgetKind, PendingAction, Snapshot, SysBudget, SysProvider, SysQueue};
+
+    /// Render one view into a `TestBackend` and flatten the buffer to text, one line per row.
+    ///
+    /// The only way to test what the operator actually SEES. Introduced for ux.13-TUI step 4: the
+    /// approvals Confirm dialog resolved its display by index while acting by pinned id, and no
+    /// pure-function test can catch a divergence that lives in the renderer.
+    fn render_to_text(app: &App, w: u16, h: u16, view: fn(&mut Frame, &App)) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test backend");
+        term.draw(|f| view(f, app)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     // ── ux.10-A: Logs view formatters + the widened control-char guard ───────
 
@@ -2341,7 +2941,7 @@ mod tests {
     fn render_plain_includes_tokens_spent_when_budget_present() {
         let snap = Snapshot {
             agents: vec![],
-            budget: Some(SysBudget { spent: 99_000, total: 0 }),
+            budget: Some(SysBudget { spent: 99_000, total: 0, resettable: false }),
             queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
         };
         let out = render_plain(&app_from_snap(snap));
@@ -3161,5 +3761,483 @@ mod tests {
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("degraded (brave_search) · active"), "since:0 sentinel must show 'active': {out}");
         assert!(!out.contains("0s ago"), "must never render the misleading '0s ago' for a never-tracked onset: {out}");
+    }
+
+    // ── ux.13-TUI step 4: the Approvals confirm dialog renders the PINNED item ───────
+
+    fn approval(id: &str, kind: &str, risk: &str, summary: &str) -> PendingAction {
+        PendingAction {
+            id:       id.to_string(),
+            agent_id: "cos-inbox".to_string(),
+            kind:     kind.to_string(),
+            risk:     risk.to_string(),
+            summary:  summary.to_string(),
+            args:     serde_json::Value::Null,
+            age_secs: 12,
+        }
+    }
+
+    /// Two approvals, the dialog pinned to the SECOND while the highlight still points at the first —
+    /// exactly the state `update_approvals` produces when an item resolves out-of-band (Telegram,
+    /// `agentctl approve`, expiry) while the dialog is up: the list is replaced, only `selected_idx`
+    /// is clamped, and the pin is untouched.
+    ///
+    /// Negative control: reverting the renderer to `approvals_items.get(av.selected_idx)` makes this
+    /// fail on every assertion — it would display the low-risk item while `[a]` approved the high-risk
+    /// one. That mismatch is a security defect, not a cosmetic one: risk is the field the operator
+    /// reads before granting.
+    #[test]
+    fn approvals_confirm_renders_the_pinned_item_not_the_highlighted_index() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.update_approvals(vec![
+            approval("act_9", "kb_write", "low", "append to the changelog segment"),
+            approval("act_1", "shell_exec", "high", "rm -rf /data/checkpoints"),
+        ]);
+        app.approvals_view.selected_idx = 0;                        // highlight = act_9
+        app.approvals_view.confirmed_id = Some("act_1".to_string()); // pinned    = act_1
+        app.approvals_view.mode = ApprovalsMode::Confirm;
+
+        let out = render_to_text(&app, 100, 20, render_approvals);
+        assert!(out.contains("act_1"), "must show the pinned id: {out}");
+        assert!(out.contains("rm -rf /data/checkpoints"), "must show the pinned summary: {out}");
+        assert!(out.contains("high"), "must show the pinned RISK — the field authority turns on: {out}");
+        assert!(!out.contains("act_9"), "must not show the highlighted-but-unpinned item: {out}");
+        assert!(!out.contains("append to the changelog"), "wrong summary shown: {out}");
+        assert!(!out.contains("kb_write"), "wrong kind shown: {out}");
+    }
+
+    /// The other direction: the pinned approval is no longer pending. Previously this rendered
+    /// `ID: ?  Agent: ?  Kind: ?  Risk: ?` — which reads as a live dialog with unknown fields, over
+    /// keys that are silently no-ops. It must say what happened instead.
+    #[test]
+    fn approvals_confirm_says_already_resolved_when_the_pin_is_gone() {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.update_approvals(vec![approval("act_9", "kb_write", "low", "append to the changelog")]);
+        app.approvals_view.confirmed_id = Some("act_1".to_string()); // resolved out-of-band
+        app.approvals_view.mode = ApprovalsMode::Confirm;
+
+        let out = render_to_text(&app, 100, 20, render_approvals);
+        assert!(out.contains("already resolved"), "must state what happened: {out}");
+        assert!(out.contains("act_1"), "must name the approval that went away: {out}");
+        assert!(!out.contains("Risk:"), "must not render a live field set with '?' values: {out}");
+        assert!(!out.contains("act_9"), "must never silently retarget to a surviving item: {out}");
+    }
+
+    /// E3, the render-thread panic guard, driven through a REAL frame rather than only the geometry
+    /// helper. `Clear` indexes the buffer without intersecting it, so an out-of-frame rect aborts the
+    /// render thread and drops the operator out of the cockpit with the runaway still running. Three
+    /// sizes: below the box floor (degraded single line), just above it, and a normal terminal (the
+    /// path that actually reaches `Clear`).
+    ///
+    /// **40×14 is the row that does the work**, and it is here because the negative control was run:
+    /// with `overlay_rect` reverted to naive fixed-72-wide geometry, 10×3 / 34×8 / 80×24 / 200×50 all
+    /// still PASS — the small frames never reach `Clear` (the degraded path catches them) and the wide
+    /// ones fit a 72-col box. Only a frame wide enough to open the box yet narrower than the box
+    /// panics. Do not drop that size.
+    #[test]
+    fn dashboard_overlay_renders_without_panicking_at_every_frame_size() {
+        let snap = Snapshot {
+            agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let mut app = app_from_snap(snap);
+        app.dashboard_overlay = Some(crate::watch::overlay::DashboardOverlay::menu("scout-2"));
+
+        for (w, h) in [(10, 3), (34, 8), (40, 14), (44, 11), (80, 24), (200, 50)] {
+            let out = render_to_text(&app, w, h, render_dashboard);
+            assert!(!out.is_empty(), "no frame drawn at {w}x{h}");
+        }
+    }
+
+    // ── ux.13-TUI step 5: every overlay mode has to be readable on a real frame ───────
+
+    fn overlay_frame(mode: crate::watch::overlay::OverlayMode, spent: u64, w: u16, h: u16) -> String {
+        let mut a = make_agent("scout-2", "running", 12_000, vec![]);
+        a.windowed_spent = spent;
+        a.budget = BudgetKind::Tokens(200_000);
+        let snap = Snapshot {
+            agents: vec![a],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let mut app = app_from_snap(snap);
+        let mut ov = crate::watch::overlay::DashboardOverlay::menu("scout-2");
+        ov.mode = mode;
+        app.dashboard_overlay = Some(ov);
+        render_to_text(&app, w, h, render_dashboard)
+    }
+
+    #[test]
+    fn overlay_menu_frame_shows_all_three_verbs_and_the_live_row() {
+        use crate::watch::overlay::OverlayMode;
+        let out = overlay_frame(OverlayMode::Menu, 47_000, 120, 30);
+        assert!(out.contains("scout-2"), "the pinned target's live row belongs inside the box: {out}");
+        for verb in ["Park", "Set budget", "Cancel"] {
+            assert!(out.contains(verb), "missing verb {verb}: {out}");
+        }
+        assert!(out.contains("Esc/q dismiss"), "every modal states its own exit: {out}");
+    }
+
+    /// E1's UI half: at zero spend Park is visibly unavailable AND says why, rather than silently
+    /// doing something dangerous or silently doing nothing.
+    #[test]
+    fn overlay_menu_frame_explains_a_blocked_park() {
+        use crate::watch::overlay::OverlayMode;
+        let out = overlay_frame(OverlayMode::Menu, 0, 120, 30);
+        assert!(out.contains("0 means unlimited"), "the reason must be on screen: {out}");
+        assert!(out.contains("Use Cancel or set a positive budget"), "and the alternative: {out}");
+    }
+
+    #[test]
+    fn overlay_confirm_cancel_frame_states_the_irreversibility_and_the_cli() {
+        use crate::watch::overlay::OverlayMode;
+        let out = overlay_frame(OverlayMode::ConfirmCancel, 47_000, 120, 30);
+        assert!(out.contains("cannot be undone"), "{out}");
+        assert!(out.contains("agentctl cancel scout-2"),
+            "the CLI equivalent is what makes the TUI teachable and the incident note copy-pasteable: {out}");
+    }
+
+    /// C4/E6: the confirm must show the CASCADE, not just the id the operator selected. A dialog naming
+    /// one agent while the scheduler flags three is the blast radius nobody was shown.
+    #[test]
+    fn overlay_confirm_cancel_frame_shows_the_subtree_it_will_also_stop() {
+        use crate::watch::overlay::{DashboardOverlay, OverlayMode};
+        let mut coordinator = make_agent("cos-coordinator", "running", 31_000, vec![]);
+        coordinator.windowed_spent = 31_000;
+        let mut s1 = make_agent("scout-1", "running", 1_000, vec![]);
+        s1.parent_id = Some("cos-coordinator".to_string());
+        let mut s2 = make_agent("scout-2", "running", 1_000, vec![]);
+        s2.parent_id = Some("cos-coordinator".to_string());
+        let snap = Snapshot {
+            agents: vec![coordinator, s1, s2],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let mut app = app_from_snap(snap);
+        let mut ov = DashboardOverlay::menu("cos-coordinator");
+        ov.mode = OverlayMode::ConfirmCancel;
+        app.dashboard_overlay = Some(ov);
+
+        let out = render_to_text(&app, 120, 30, render_dashboard);
+        assert!(out.contains("at least 2 spawned agents"),
+            "the count must be labelled 'at least' — the client walk is a floor, the server's count \
+             can be higher (no universal-tier parentage, up-to-a-poll-stale snapshot): {out}");
+        assert!(out.contains("scout-1") && out.contains("scout-2"),
+            "and the actual ids, so the operator can recognise what they are about to stop: {out}");
+    }
+
+    #[test]
+    fn overlay_budget_frame_shows_the_field_and_the_zero_meaning() {
+        use crate::watch::overlay::OverlayMode;
+        let out = overlay_frame(
+            OverlayMode::Budget { input: tui_input::Input::new("200000".into()), error: None },
+            47_000, 120, 30,
+        );
+        assert!(out.contains("200000"), "the prefilled limit must be visible: {out}");
+        assert!(out.contains("0 = unlimited"), "M2's inversion must be stated at the field: {out}");
+    }
+
+    #[test]
+    fn overlay_in_flight_frame_says_what_is_happening() {
+        use crate::watch::overlay::OverlayMode;
+        let out = overlay_frame(
+            OverlayMode::InFlight { label: "cancelling scout-2…".into() }, 47_000, 120, 30,
+        );
+        assert!(out.contains("cancelling scout-2"), "{out}");
+        assert!(out.contains("waiting for agentd"), "{out}");
+    }
+
+    /// A long result string must WRAP, not vanish off the right edge — the failure copy carries the
+    /// actionable half at the end ("…then restart agentctl watch").
+    #[test]
+    fn overlay_result_frame_wraps_a_long_failure() {
+        use crate::watch::overlay::OverlayMode;
+        let long = "Action refused: approval token missing or wrong (HTTP 401/403). Export the same \
+                    AGENTOS_APPROVAL_SECRET used by agentd, then restart agentctl watch.";
+        let out = overlay_frame(
+            OverlayMode::Result { text: long.to_string(), ok: false }, 47_000, 120, 30,
+        );
+        assert!(out.contains("Action refused"), "{out}");
+        // The tail is asserted word-wise, because WHERE the wrap falls is layout, not contract — what
+        // matters is that the actionable end of the sentence is on screen at all.
+        assert!(out.contains("AGENTOS_APPROVAL_SECRET") && out.contains("watch."),
+            "the actionable tail must survive wrapping, not fall off the box: {out}");
+    }
+
+    /// M8 on the actual frame, at every width this branch claims to support and with the LONGEST real
+    /// status. Parameterised because the single 120x24 + "running" case was exactly the one combination
+    /// that fit: ratatui gives the Status cell 24 cols at the 115 rail floor and 21 at 80, so appending
+    /// the marker there rendered `awaiting_approval · NOT CANCELLED` with no cancel signal at all
+    /// (the fix-review pass). The marker now lives on its own line in the widest column.
+    #[test]
+    fn the_cancel_marker_is_visible_at_every_supported_width_and_status() {
+        for (w, h) in [(80u16, 24u16), (100, 24), (115, 24), (120, 20), (140, 40)] {
+            for status in ["running", "awaiting_approval"] {
+                let snap = Snapshot {
+                    agents: vec![make_agent("scout-2", status, 12_000, vec![])],
+                    budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+                };
+                let mut app = app_from_snap(snap);
+                app.term_size = (w, h);
+
+                let before = render_to_text(&app, w, h, render_dashboard);
+                assert!(before.contains(&status[..7]), "precondition at {w}x{h}: {before}");
+
+                app.mark_cancel_requested("scout-2", true);
+                let during = render_to_text(&app, w, h, render_dashboard);
+                assert!(during.contains("cancelling…"),
+                    "the in-flight marker must be WHOLE at {w}x{h} with status {status}:\n{during}");
+                // The row's real state stays visible — the marker annotates, it never substitutes
+                // (/review's red team).
+                assert!(during.contains(&status[..7]),
+                    "the status must survive alongside the marker at {w}x{h}:\n{during}");
+
+                // Aged out with no confirmation: escalation must be legible at the same widths.
+                let stale = std::time::Instant::now()
+                    .checked_sub(crate::watch::app::CANCEL_CONFIRM_GRACE + std::time::Duration::from_secs(1))
+                    .expect("monotonic clock far enough from its origin");
+                app.pending_cancel.insert("scout-2".to_string(),
+                    crate::watch::app::CancelRequest { asked_at: stale, confirmed: false, landed: false });
+                let after = render_to_text(&app, w, h, render_dashboard);
+                assert!(after.contains("NOT CANCELLED"),
+                    "a lost cancel must be visible at {w}x{h} with status {status}:\n{after}");
+            }
+        }
+    }
+
+    /// The clip discipline: on a short frame the body loses rows before the hints line does, because
+    /// the hints line is where the dismissal key is written.
+    #[test]
+    fn overlay_keeps_its_exit_key_visible_on_a_short_terminal() {
+        use crate::watch::overlay::OverlayMode;
+        let out = overlay_frame(OverlayMode::Menu, 47_000, 100, 13);
+        assert!(out.contains("Esc/q dismiss"),
+            "a modal whose exit key got clipped off is a trapped operator: {out}");
+    }
+
+    /// The general guard for the defect the first real pty frame exposed: a hand-wrapped sentence that
+    /// was 73 chars wide inside a 70-col box, so `confirm cancel` read "…stop at the n". Every mode's
+    /// body is checked against every plausible box width — a per-mode assertion on one width would go
+    /// stale the moment someone adds a sentence.
+    #[test]
+    fn no_overlay_mode_emits_a_line_wider_than_its_box() {
+        use crate::watch::overlay::{DashboardOverlay, OverlayMode};
+        let mut a = make_agent("scout-2", "running", 12_000, vec![]);
+        a.windowed_spent = 0; // zero spend ⇒ the long blocked-Park reason is in play
+        a.budget = BudgetKind::Tokens(200_000);
+
+        let modes = || vec![
+            OverlayMode::Menu,
+            OverlayMode::ConfirmCancel,
+            OverlayMode::Budget { input: tui_input::Input::new("200000".into()), error: None },
+            OverlayMode::Budget {
+                input: tui_input::Input::new("20o000".into()),
+                error: Some("'20o000' is not a token count. Enter digits only (0 = unlimited).".into()),
+            },
+            OverlayMode::ConfirmBudget { limit: 0 },
+            OverlayMode::ConfirmBudget { limit: 900_000 },
+            OverlayMode::InFlight { label: "cancelling scout-2…".into() },
+            OverlayMode::Result {
+                text: "Cancel requested for scout-2 — takes effect at its next step boundary — \
+                       agentctl cancel scout-2".into(),
+                ok: true,
+            },
+        ];
+
+        for width in [34u16, 40, 60, 80, 100, 120, 200] {
+            let frame = Rect { x: 0, y: 0, width, height: 40 };
+            let text_width = crate::watch::overlay::overlay_text_width(frame);
+            for mode in modes() {
+                let mut ov = DashboardOverlay::menu("scout-2");
+                let kind = mode.kind();
+                ov.mode = mode;
+                let ctx = OverlayCtx {
+                    budget_resettable: false, logs_available: true, cli_conn: " --url http://h:7999",
+                };
+                for line in overlay_mode_body(&ov, Some(&a), &TopologyGraph::default(), ctx, text_width) {
+                    assert!(
+                        line.width() <= text_width,
+                        "{kind} at frame width {width}: line is {} cols in a {text_width}-col box: {:?}",
+                        line.width(), line,
+                    );
+                }
+            }
+        }
+    }
+
+    // ── V3: the footer clip, and the `?` that replaces what the footer had to give up ──
+
+    /// The acceptance criterion is a WIDTH. `contains("q quit")` passes with the clip bug fully intact:
+    /// before this, the narrow footer ran to 162 columns, so `q quit` started at column 114 and the
+    /// `(resize to 115+ cols…)` hint at 122 — and since that branch only renders BELOW 115 columns, the
+    /// hint about being too narrow was itself always off-screen.
+    /// Each state is bounded by the width it is actually DRAWN at — the fix /review's testing specialist
+    /// forced. Bounding every state by 114 was vacuous for `NoRail`, which only renders BELOW the rail
+    /// floor: the shipped narrow line was 113 cols with `q quit` at column 87, so on an 80-column
+    /// terminal the very defect V3 exists to fix was still shipping, with this test green.
+    #[test]
+    fn every_footer_state_fits_the_terminal_it_is_drawn_in() {
+        for logs in [false, true] {
+            for state in [FooterState::Table, FooterState::RailFocused] {
+                let line = dashboard_hints(state, logs);
+                let cols = line.chars().count();
+                assert!(cols <= MAX_FOOTER_COLS,
+                    "footer is {cols} cols (max {MAX_FOOTER_COLS}) with logs={logs}: {line}");
+            }
+            // NoRail renders only below MIN_TOTAL_WIDTH_FOR_RAIL, so 114 was never its bound.
+            let narrow = dashboard_hints(FooterState::NoRail, logs);
+            let cols = narrow.chars().count();
+            assert!(cols <= MAX_NARROW_FOOTER_COLS,
+                "narrow footer is {cols} cols but only renders below {MIN_TOTAL_WIDTH_FOR_RAIL}: {narrow}");
+        }
+    }
+
+    /// And the assertion no string length can fake: drive a real 80x24 frame and read the bottom rows.
+    /// `contains("q quit")` on the STRING passes with the clip bug intact; `contains` on the rendered
+    /// BUFFER cannot, because ratatui truncates at the terminal edge.
+    #[test]
+    fn the_narrow_footer_is_actually_on_screen_at_eighty_columns() {
+        let snap = Snapshot {
+            agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let out = render_to_text(&app_from_snap(snap), 80, 24, render_dashboard);
+        assert!(out.contains("q quit"), "the quit key must be ON SCREEN at 80 cols: {out}");
+        assert!(out.contains("115+ cols"),
+            "so must the hint that explains the missing rail — the branch that renders it IS the \
+             too-narrow case: {out}");
+        assert!(out.contains("x act") && out.contains("? keys"),
+            "and the two keys that reach the verbs and the key map: {out}");
+    }
+
+    /// The docker gate the ux.10-A build established: one flag gates the key AND its hint, so the footer
+    /// can never advertise a key that does nothing.
+    #[test]
+    fn the_logs_hint_appears_only_when_a_compose_project_was_detected() {
+        assert!(!dashboard_hints(FooterState::Table, false).contains("[l]"),
+            "no compose project ⇒ no advertised key");
+        assert!(dashboard_hints(FooterState::Table, true).contains("[l]"));
+    }
+
+    /// The rail keys are meaningless at a width where the rail cannot appear, and the narrow footer has
+    /// to spend those columns telling the operator how to get it back.
+    #[test]
+    fn the_narrow_footer_drops_what_it_cannot_afford_and_states_the_width_it_needs() {
+        let narrow = dashboard_hints(FooterState::NoRail, true);
+        assert!(!narrow.contains("Tab chat"), "the rail is not reachable at this width: {narrow}");
+        assert!(!narrow.contains("r target"), "{narrow}");
+        assert!(!narrow.contains("[s]ys"), "the per-view letters live behind `?` at this width: {narrow}");
+        assert!(!narrow.contains("[l]og"), "{narrow}");
+        assert!(narrow.contains("? keys"), "…which means `?` itself must survive: {narrow}");
+        assert!(narrow.contains("x act"), "and the verb key: {narrow}");
+        assert!(narrow.contains("115+ cols"), "must say what it needs: {narrow}");
+        let wide = dashboard_hints(FooterState::Table, true);
+        assert!(wide.contains("Tab chat") && wide.contains("r target") && wide.contains("[s]ys"), "{wide}");
+    }
+
+    /// `?` and the footer must render from ONE table. A hand-written help screen is a second copy of the
+    /// key list, and the copy that drifts is the one the operator reads when they are already lost.
+    #[test]
+    fn the_help_overlay_covers_every_footer_key_and_then_some() {
+        use crate::watch::overlay::{DashboardOverlay, OverlayMode};
+        let help = help_lines(true);
+        for hint in DASHBOARD_KEYS.iter().filter(|k| k.footer) {
+            assert!(help.iter().any(|(k, _)| *k == hint.key)
+                    || help.iter().any(|(k, _)| k.starts_with(hint.key)),
+                "footer key '{}' is missing from ?", hint.key);
+        }
+        // And it documents keys the footer has no room for — the reason `?` exists at all.
+        assert!(help.iter().any(|(k, _)| *k == "Ctrl-c"));
+
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(Snapshot {
+            agents: vec![make_agent("scout-2", "running", 1, vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        });
+        let mut ov = DashboardOverlay::help();
+        ov.mode = OverlayMode::Help;
+        app.dashboard_overlay = Some(ov);
+        let out = render_to_text(&app, 120, 30, render_dashboard);
+        assert!(out.contains("keys"), "the box must be titled: {out}");
+        assert!(out.contains("row actions on the selected agent"), "{out}");
+        assert!(out.contains("Esc/q/Enter/? close"), "and state how to leave: {out}");
+        assert!(!out.contains("scout-2 is no longer present"),
+            "help is not row-scoped — it must not render the vanished-target notice: {out}");
+    }
+
+    /// /review's red team: the degraded path predates the `?` mode and fell through to the row wording,
+    /// so `?` on a small terminal answered " is no longer present" — about no agent at all, from the one
+    /// mode whose entire purpose is teaching the key map.
+    #[test]
+    fn the_help_overlay_degrades_to_its_own_wording_not_a_vanished_agent_notice() {
+        use crate::watch::overlay::DashboardOverlay;
+        let snap = Snapshot {
+            agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let mut app = app_from_snap(snap);
+        app.term_size = (40, 8); // below the box floor
+        app.dashboard_overlay = Some(DashboardOverlay::help());
+        let out = render_to_text(&app, 40, 8, render_dashboard);
+        assert!(out.contains("key map needs a bigger terminal"), "{out}");
+        assert!(!out.contains("no longer present"),
+            "help is not about a row, so it must never say a row vanished: {out}");
+    }
+
+    /// RT2: the renderer and the key handler must reach the SAME box-vs-line answer. Deriving one from
+    /// `area` and the other from `term_size` left a height where the renderer drew a full menu that the
+    /// handler refused to act on — a live-looking, completely dead dialog.
+    #[test]
+    fn the_renderer_and_the_key_handler_agree_on_box_versus_line() {
+        use crate::watch::overlay::DashboardOverlay;
+        for (w, h) in [(40u16, 8u16), (80, 11), (80, 12), (100, 13), (120, 30), (34, 24)] {
+            let snap = Snapshot {
+                agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
+                budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            };
+            let mut app = app_from_snap(snap);
+            app.term_size = (w, h);
+            app.dashboard_overlay = Some(DashboardOverlay::menu("scout-2"));
+            let out = render_to_text(&app, w, h, render_dashboard);
+
+            // The BOX is identified by its border title, not by the words "row actions" — the degraded
+            // line contains those too ("row actions need a bigger terminal"), which made the first
+            // version of this probe ambiguous.
+            let drew_box = out.contains("┌ row actions");
+            let handler_acts = overlay_fits_dashboard((w, h));
+            assert_eq!(drew_box, handler_acts,
+                "at {w}x{h} the renderer drew {} while the handler would {} — a dead menu with no \
+                 explanation on screen is the failure this asserts against:\n{out}",
+                if drew_box { "a box" } else { "the degraded line" },
+                if handler_acts { "act" } else { "refuse" },
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_plain_breaks_on_words_and_never_loses_text() {
+        let text = "one two three four five six seven";
+        let lines = wrap_plain(text, 10);
+        assert!(lines.iter().all(|l| l.chars().count() <= 10), "{lines:?}");
+        assert_eq!(lines.join(" "), text, "wrapping must not drop or duplicate words");
+        // A word longer than the width still gets emitted rather than dropped (it will be clipped by
+        // the renderer, not silently swallowed here).
+        assert_eq!(wrap_plain("aaaaaaaaaaaaaaa", 5), vec!["aaaaaaaaaaaaaaa"]);
+        assert_eq!(wrap_plain("", 10), vec![""]);
+    }
+
+    /// And with a target that has vanished — the branch that must not fall back to row 0.
+    #[test]
+    fn dashboard_overlay_renders_the_vanished_target_branch() {
+        let snap = Snapshot {
+            agents: vec![make_agent("cos-coordinator", "running", 1_000, vec![])],
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+        };
+        let mut app = app_from_snap(snap);
+        app.dashboard_overlay = Some(crate::watch::overlay::DashboardOverlay::menu("scout-2"));
+
+        let out = render_to_text(&app, 100, 24, render_dashboard);
+        assert!(out.contains("No action sent"),
+            "the first thing the operator needs is that nothing was written: {out}");
+        assert!(out.contains("no longer in the snapshot"), "must say the pinned target is gone: {out}");
+        assert!(out.contains("select another running agent"), "and what to do instead: {out}");
     }
 }

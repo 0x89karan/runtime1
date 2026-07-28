@@ -112,6 +112,14 @@ struct SchedulerState {
     /// Lifetime `tokens_spent` at the current window's start; windowed global
     /// spend = `tokens_spent − global_window_anchor` (ux.8′, monotonic-counter).
     global_window_anchor: u64,
+    /// Is a budget-reset window configured (`[scheduler] budget_reset_interval > 0`)?
+    ///
+    /// Decides what per-agent budget exhaustion MEANS: with a window it DEFERS and the next
+    /// rollover revives the agent; without one it calls `handle_agent_terminal` — a kill. ux.13-TUI
+    /// publishes it because the cockpit offers "Park" (a `set_budget` at current spend) and described
+    /// it as reversible, which is only true when this is set. Default `0` (only the CoS configs set
+    /// an interval), so on a plain `agentd agent.toml` Park IS Cancel — the operator has to be told.
+    budget_resettable: bool,
     /// child_id → parent waiting info (parent is paused until child completes).
     awaiting:         HashMap<String, AwaitingParent>,
     /// Monotonically increasing counter for auto-generated child IDs.
@@ -528,6 +536,7 @@ impl Scheduler {
             tokens_spent:       0,
             budget_window_start: 0,
             global_window_anchor: 0,
+            budget_resettable:  false,
             awaiting:           HashMap::new(),
             child_seq:          0,
             spawn_depths:       HashMap::new(),
@@ -1543,6 +1552,9 @@ fn init_budget_window(state: &mut SchedulerState, sched: &SchedulerConfig, now: 
         state.budget_window_start = now;
     }
     let budget_resettable = sched.budget_reset_interval > 0;
+    // Published to the operator surfaces too (ux.13-TUI): the cockpit's Park verb is only reversible
+    // when this holds, and nothing in the snapshot carried it.
+    state.budget_resettable = budget_resettable;
     for task in state.agents.values_mut() {
         task.set_budget_resettable(budget_resettable);
     }
@@ -3446,6 +3458,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         // budget.1 / P2-2: report combined native + universal spend so the metering
         // surface no longer under-counts the universal tier.
         s.global_tokens_spent = state.combined_lifetime_spent();
+        s.budget_resettable   = state.budget_resettable;
         s.in_flight           = state.in_flight;
         s.queue_depth         = state.deferred.len();
         s.pending_actions     = pending_actions;
@@ -5110,6 +5123,7 @@ mod tests {
             pending:            FuturesUnordered::new(),
             deferred:           BinaryHeap::new(),
             deferred_seq:       0,
+            budget_resettable:  false,
             in_flight:          0,
             tokens_spent:       0,
             budget_window_start: 0,
@@ -6434,6 +6448,10 @@ mod tests {
         assert_eq!(state.global_window_anchor, 0, "interval=0 must not rebase — lifetime preserved");
         assert_eq!(state.budget_window_start, 0, "interval=0 leaves the window unset");
         assert_eq!(state.global_windowed_spent(), 5_000, "windowed == lifetime under interval=0");
+        // ux.13-TUI: and the operator surfaces must SAY so. With no window, per-agent exhaustion
+        // terminates the agent, so the cockpit's budget-based "Park" is a kill — asserting only the
+        // `true` case below would pass with this hardcoded.
+        assert!(!state.budget_resettable, "interval=0 must publish budget_resettable=false");
     }
 
     #[test]
@@ -6452,6 +6470,32 @@ mod tests {
         assert_eq!(state.budget_window_start, 1_800_000_000, "window opens at now");
         assert_eq!(state.global_window_anchor, state.tokens_spent, "global anchor = current lifetime spend");
         assert_eq!(state.agents.get("cos").unwrap().windowed_spent(), 0, "per-agent windowed spend rebased to 0");
+        assert!(state.budget_resettable,
+            "a configured window must publish budget_resettable=true (ux.13-TUI reads it to decide \
+             whether Park is reversible)");
+    }
+
+    /// …and it must survive SERIALIZATION onto the wire. `update_snapshot`'s one-line copy plus the
+    /// snapshot field are what the cockpit reads to decide whether Park is a pause or a kill; both
+    /// consumers default to `false`, so deleting either leaves the TUI permanently labelling Park as
+    /// terminal with nothing failing (/review: the safe-looking default is what hides the break).
+    #[test]
+    fn the_published_snapshot_carries_budget_resettable() {
+        let mut state = minimal_state("cos");
+        init_budget_window(&mut state, &budget_sched(86_400), 1_800_000_000);
+        let snapshot: surfaces::SharedSnapshot = Default::default();
+        update_snapshot(&snapshot, &state);
+        let json = serde_json::to_value(&*snapshot.read().unwrap()).expect("snapshot serializes");
+        assert_eq!(json["budget_resettable"], serde_json::json!(true),
+            "the key agentctl reads must be present and true: {json}");
+
+        // And the other direction, from the same code path.
+        let mut off = minimal_state("solo");
+        init_budget_window(&mut off, &SchedulerConfig { budget_reset_interval: 0, ..unlimited() }, 9_999);
+        let snapshot2: surfaces::SharedSnapshot = Default::default();
+        update_snapshot(&snapshot2, &off);
+        let json2 = serde_json::to_value(&*snapshot2.read().unwrap()).unwrap();
+        assert_eq!(json2["budget_resettable"], serde_json::json!(false));
     }
 
     #[test]

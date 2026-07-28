@@ -499,9 +499,12 @@ impl AgentsFs {
     fn sys_file_content(&self, ino: u64) -> Option<Vec<u8>> {
         let snap = self.snapshot.read().ok()?;
         let content = match ino {
+            // ux.13-TUI: `resettable` says whether per-agent budget exhaustion DEFERS (a reversible
+            // park) or TERMINATES. The cockpit offers a budget-based soft stop and cannot honestly
+            // call it reversible without this.
             INO_SYS_BUDGET => format!(
-                "{{\"spent\":{},\"total\":0}}\n",
-                snap.global_tokens_spent
+                "{{\"spent\":{},\"total\":0,\"resettable\":{}}}\n",
+                snap.global_tokens_spent, snap.budget_resettable
             ),
             INO_SYS_QUEUE => format!(
                 "{{\"depth\":{}}}\n",
@@ -1464,6 +1467,7 @@ mod tests {
             egress_addr:         None,
             isolation_caps:      None,
             credential_snapshot: None,
+            budget_resettable:   false,
         }))
     }
 
@@ -1486,6 +1490,7 @@ mod tests {
             egress_addr:         None,
             isolation_caps:      None,
             credential_snapshot: None,
+            budget_resettable:   false,
         }))
     }
 
@@ -2410,7 +2415,19 @@ mod tests {
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_BUDGET).unwrap();
         let s = String::from_utf8(content).unwrap();
-        assert_eq!(s, "{\"spent\":42000,\"total\":0}\n");
+        assert_eq!(s, "{\"spent\":42000,\"total\":0,\"resettable\":false}\n");
+    }
+
+    /// ux.13-TUI: the flag has to make it out of the snapshot, because `agentctl watch`'s Park verb is
+    /// only a reversible pause when a reset window is configured — and with no window it is a kill.
+    /// Asserting only the `false` default would pass with the field hardcoded.
+    #[test]
+    fn sys_budget_reports_a_configured_reset_window() {
+        let snap = make_snap_with_sys(vec![], 42_000, 0, false, "");
+        snap.write().unwrap().budget_resettable = true;
+        let fs = AgentsFs::new(snap, None, None);
+        let s = String::from_utf8(fs.sys_file_content(INO_SYS_BUDGET).unwrap()).unwrap();
+        assert_eq!(s, "{\"spent\":42000,\"total\":0,\"resettable\":true}\n");
     }
 
     #[test]
@@ -2419,7 +2436,7 @@ mod tests {
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_BUDGET).unwrap();
         let s = String::from_utf8(content).unwrap();
-        assert_eq!(s, "{\"spent\":0,\"total\":0}\n");
+        assert_eq!(s, "{\"spent\":0,\"total\":0,\"resettable\":false}\n");
     }
 
     #[test]
@@ -2487,6 +2504,7 @@ mod tests {
             egress_addr:         None,
             isolation_caps:      None,
             credential_snapshot: None,
+            budget_resettable:   false,
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
@@ -2597,6 +2615,7 @@ mod tests {
             egress_addr:         None,
             isolation_caps:      None,
             credential_snapshot: None,
+            budget_resettable:   false,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
@@ -2624,6 +2643,7 @@ mod tests {
             egress_addr:         None,
             isolation_caps:      None,
             credential_snapshot: None,
+            budget_resettable:   false,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a2");
@@ -2662,6 +2682,7 @@ mod tests {
             egress_addr:         None,
             isolation_caps:      None,
             credential_snapshot: None,
+            budget_resettable:   false,
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a3");
@@ -2948,6 +2969,7 @@ mod tests {
                     }
                 ],
             }),
+            budget_resettable:   false,
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_CREDENTIALS).unwrap();

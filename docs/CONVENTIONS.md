@@ -235,11 +235,11 @@ Each agent appears as a directory; memory and KB surfaces appeared in p5.7.
 | `/agents/<id>/attention` | active attention signals | JSON (ux.2a+) | |
 | `/agents/kb/<segment>/<key>` | shared KB segment entry | raw JSON value + provenance | agent-namespaced entries (`agent/…`) excluded; ≤100 keys per segment |
 | `/agents/approvals` | all pending approval requests (all agents) | JSONL one `PendingActionView` JSON per line; `[]\n` when empty (p7.4+) | read-only; write approvals/rejections via `/agents/control` |
-| `/agents/control` | **write-only** control channel | `echo '{"task":"…"}' > /agents/control` — spawn/inject/approve verbs (p7.3+) | the only writable node in the surface |
-| `/agents/system/budget` | global budget window state | text | |
-| `/agents/system/queue` | scheduler queue depth | text | |
-| `/agents/system/sandbox` | active sandbox enforcement summary | text | |
-| `/agents/system/provider` | inference provider health | text | |
+| `/agents/control` | **write-only** control channel | `echo '{"task":"…"}' > /agents/control` — `spawn` / `inject` / `approve` / `reject` / `reset_budget` / `set_budget` / `cancel` / `set_caps` (p7.3+, verbs through ux.13). Full wire format: `docs/CONTROL_SURFACE.md` | the only writable node in the surface. Fire-and-forget: the writer gets no scheduler verdict (see `confirms_mutations()` in `agentctl`) |
+| `/agents/system/budget` | global budget window state | JSON — `{"spent":N,"total":0,"resettable":BOOL}`; `resettable` is `[scheduler] budget_reset_interval > 0` (ux.13-TUI) | `total` is always `0` — the global ceiling is not published here |
+| `/agents/system/queue` | scheduler queue depth | JSON — `{"depth":N}` | |
+| `/agents/system/sandbox` | active sandbox enforcement summary | JSON — `{"any_sandboxed":BOOL,"servers":[{name,transport,isolation,landlock,seccomp,spawn_enforcement,namespace_net,namespace_mount,landlock_net}],"degradations":[…]}` | |
+| `/agents/system/provider` | inference provider health | JSON — `{"model":"…","backend":"…"}` | |
 | `/agents/system/egress_addr` | bound HTTP egress-proxy URL | URL or `not configured` (p7.5b+) | |
 | `/agents/system/isolation` | device-level isolation tier | JSON (ma.4+) | |
 | `/agents/system/credentials` | credential-gateway health + per-provider status | JSON (cred.5+) | |

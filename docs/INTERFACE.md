@@ -81,11 +81,15 @@ to view it — browser absent in QEMU; HTTP server grows `agentd`); Tauri/iced/e
 
 ## 3. Views
 
-> **Note (ux.1, 2026-07-13):** this section is the pre-implementation Phase 6 design
+> **Note (ux.1, 2026-07-13; keymap refreshed ux.13-TUI, 2026-07-28):** this section is the
+> pre-implementation Phase 6 design
 > sketch — number-key/`Tab` view switching, as written below, was never what shipped.
 > The actual keymap is single-letter shortcuts per view (`[s]ystem`, `[t]opology`,
-> `[m]emory`, `[n]ew`, `[a]pprove`, `[c]reds`, `[i]nspector`, `q` quit — see
-> `agentctl/src/watch/mod.rs`'s `handle_dashboard_key`), and `Tab` is used for
+> `[m]emory`, `[n]ew`, `[a]pprove`, `[c]reds`, `[i]nspector`, `[l]ogs`, `[x]` row actions,
+> `?` key map, `q` quit — see
+> `agentctl/src/watch/mod.rs`'s `handle_dashboard_key`). **`?` is the authoritative list**,
+> and it renders from the same `DASHBOARD_KEYS` table as the footer so the two cannot drift —
+> prefer reading that constant over any prose list, including this one. `Tab` is used for
 > intra-view sub-pane focus cycling (Memory's short-term/long-term/KB panes, and —
 > as of ux.1 — Dashboard's chat-rail focus toggle), not view switching. Dashboard
 > also gained a permanent chat rail beside the agent table (`Tab` focuses it, `r`
@@ -266,9 +270,11 @@ exposed today, the fix is a **`surfaces/` amendment**, never a parallel data pla
 Design rules for the amendments: keep `snapshot.rs` the single in-memory truth the
 scheduler writes via `try_write` (stale-not-torn, per AUDIT F-002… er, F-2 snapshot
 note) and the FUSE handler reads; keep new files read-only; follow the existing inode
-scheme (root=1, dirs from 1010 step 10). The **one writable surface** (`/agents/control`
-for spawn) is a deliberate, narrow exception — and per the memory threat model it must
-*not* live inside any MCP server's FS sandbox prefix.
+scheme (root=1, dirs from 1010 step 10). The **one writable surface** (`/agents/control`)
+is a deliberate, narrow exception — and per the memory threat model it must
+*not* live inside any MCP server's FS sandbox prefix. It stayed one node while the verb
+set grew from `spawn` to eight (approvals p7.4, `inject` orch.1, budget ux.8′/ux.11a,
+`cancel`/`set_caps` ux.13); the current wire format is `docs/CONTROL_SURFACE.md`.
 
 Two AUDIT findings shape this: **F-004** (FUSE `read()` overflow — fixed in p4.7) is a
 prerequisite for the larger `tools`/`memory` files; **F-013/F-014** (event taxonomy /
@@ -412,6 +418,14 @@ template didn't suggest without an explicit operator toggle.
   restored turn count and an `agent_restored` flight line. (Phase 6 surfaces the
   checkpoint state in System; it does not add a new pause mechanism — SIGTERM is the
   contract.)
+  > **Superseded in part (ux.13-TUI, 2026-07-28).** SIGTERM is still the whole-*process*
+  > contract, but a single agent can now be stopped from the Dashboard: `[x]` on the row
+  > offers **Park** (a `set_budget` at the spend already recorded), **Set budget**, and
+  > **Cancel** (irreversible, cascades to the spawned subtree). Park is not the
+  > general-purpose pause this bullet says does not exist: with `budget_reset_interval > 0`
+  > it expires by itself at the next window rollover, and with no window configured
+  > budget exhaustion *ends* the agent. The overlay labels which one it is from the
+  > `budget_resettable` snapshot field. Operator how-to: `docs/RUNBOOK.md` §11.8a.
 - **Review a capability denial.** Logs view → filter `kind=capability_denied` → see
   `tool=write_file required=FsWrite{/etc} agent=librarian` → understand the agent tried
   to escape its `/workspace/library` grant and was blocked at the registry boundary.

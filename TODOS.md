@@ -34,13 +34,13 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   `agent/mod.rs:624-636` is the sole check site; `step_need_infer` (`:413-556`) checks
   `max_turns` but never the budget, so a text-only orchestrated agent accrues unbounded spend
   across the EndTurn→park→inject cycle. Fix: budget fail-fast at the top of `step_need_infer`. → `ux.8′`.
-- **audit86-P1-2 (P1) [re-rate from P3] — flight.jsonl has no rotation anywhere.**
+- ~~**audit86-P1-2 (P1) [re-rate from P3] — flight.jsonl has no rotation anywhere.**~~ **[FIXED in run.1 (v0.99.0), struck 2026-07-28 after a code check: `flight_recorder.rs:22-64` rotates in place at `MAX_FLIGHT_BYTES = 100 MB` — an `AtomicU64` size counter seeded from file metadata at open (`:43`) and bumped per write, `set_len(0)` under the recorder's file mutex so the inode is preserved and the otel `tail.rs` sentinel follows it, best-effort (a failed rotation falls through to appending rather than crashing an agent). Two tests: `record_rotates_in_place_when_over_cap` + `new_seeds_size_from_metadata_so_a_preexisting_oversized_log_rotates` (the run.1-ar-01 regression for the metadata seed). CHANGELOG v0.99.0.]**
   `flight_recorder.rs:23-33` appends with no cap; nothing in `entrypoint.sh`, `overlay/init`,
   or the image rotates it. The otel sidecar *detects* rotation nobody performs. With
   streaming default-on, `InferenceStreamDelta` per SSE chunk ⇒ ~10–100 MB/day for a 24/7 CoS,
   filling `cos-data` in months. Fix: size-threshold copy-truncate self-rotation in
   `FlightRecorder::record` (the otel sentinel already survives copy-truncate). → `run.1`.
-- **audit86-P1-3 (P1) [re-rate; = p5.2-ar-01/audit-C8] — `short_term` grows unbounded for parked agents.**
+- ~~**audit86-P1-3 (P1) [re-rate; = p5.2-ar-01/audit-C8] — `short_term` grows unbounded for parked agents.**~~ **[FIXED in run.1 (v0.99.0), struck 2026-07-28 after a code check: `agent/mod.rs:12` `MAX_SHORT_TERM = 1000` + `cap_short_term()` (`:361-372`) ring-drops the OLDEST paged summaries beyond the cap, so RAM and the per-turn `to_checkpoint` clone stay bounded for a never-terminating agent whose only other drain (run-completion distillation) never fires. Safe because these are already-evicted per-turn summaries, not live tool-call/result pairs. Tests assert the checkpoint clone is bounded (`:2355`). CHANGELOG v0.99.0. **Remainder (by design, not a P1):** mid-run distillation of the dropped context is still deferred — the summaries are discarded, not folded into long-term memory.]**
   `agent/mod.rs:67-68,475` only ever `extend`s; its sole consumer (distillation) runs
   post-run only (`scheduler.rs:811`), which a never-terminating orchestrated agent never
   reaches. Full-cloned into every checkpoint (interval 1 turn) and every snapshot tick ⇒
@@ -51,7 +51,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   `agents_fs.rs`), `sandbox` (34), and `otel` (34) test suites are never executed in CI on
   any target, and their clippy is not reliably denied. The "1420 workspace tests" figure is
   a local-only guarantee. Fix: `cargo test/clippy --workspace --all-targets` from repo root. → `ci.1`.
-- ~~**audit86-P1-5 (P1→ci.1 remainder) — entrypoint sed-rewrite pipeline has zero test coverage.**~~ **[audit.1: guards + dry-run hooks. ci.1 (v0.88.0): docker-smoke CI job runs cos/agent DRY_RUN_ONLY + binary probe + PR-#124-class negative fixture on every PR; the fixture exercises the extra-pattern concat branch (positive-form hit → `17:store_path` named). Still unexercised: the grep rc>=2 internal-error refusal branch (needs a grep malfunction to trigger — accepted residual). Known coverage limit (ship adversarial): the extra ERE only matches `*_path`/`*_dir` keys — a bare `path = "x"`/`dir = "x"` relative value without `./` escapes it; the class dies with the sed pipeline in par.2. **[STILL OPEN — par.2 /autoplan-recovery (2026-07-25): an ERE-tightening fix to `[a-z_]*(path|dir)` was built then DROPPED — a bare `path`/`dir` key is not reachable by a VALID config (no such field in the Config schema; `agentd check --strict` rejects it before boot anyway), and its negative-control fixture broke `config_parse_all` (which requires `.github/fixtures/` to parse). The genuinely-reachable escapes (`prefix = "output"`, relative MCP `args`) aren't caught by the key-suffix ERE either — the real fix is the runtime path-identity newtype in cap.3 (audit86-P1-8), which absolutizes at deserialization instead of string-matching in a boot grep. This remainder is superseded by cap.3, not by a bigger grep.]**]**
+- ~~**audit86-P1-5 (P1→ci.1 remainder) — entrypoint sed-rewrite pipeline has zero test coverage.**~~ **[audit.1: guards + dry-run hooks. ci.1 (v0.88.0): docker-smoke CI job runs cos/agent DRY_RUN_ONLY + binary probe + PR-#124-class negative fixture on every PR; the fixture exercises the extra-pattern concat branch (positive-form hit → `17:store_path` named). Still unexercised: the grep rc>=2 internal-error refusal branch (needs a grep malfunction to trigger — accepted residual). Known coverage limit (ship adversarial): the extra ERE only matches `*_path`/`*_dir` keys — a bare `path = "x"`/`dir = "x"` relative value without `./` escapes it; the class dies with the sed pipeline in par.2. **[STILL OPEN — par.2 /autoplan-recovery (2026-07-25): an ERE-tightening fix to `[a-z_]*(path|dir)` was built then DROPPED — a bare `path`/`dir` key is not reachable by a VALID config (no such field in the Config schema; `agentd check --strict` rejects it before boot anyway), and its negative-control fixture broke `config_parse_all` (which requires `.github/fixtures/` to parse). The genuinely-reachable escapes (`prefix = "output"`, relative MCP `args`) aren't caught by the key-suffix ERE either — the real fix is the runtime path-identity newtype in cap.3 (audit86-P1-8), which absolutizes at deserialization instead of string-matching in a boot grep. This remainder is superseded by cap.3, not by a bigger grep.]** **[cap.3 SHIPPED in v0.107.0 (see audit86-P1-8 above) — the path-identity absolutization this was waiting on is in, so this remainder is closed too (noted 2026-07-28).]**]**
   `entrypoint.sh:242-247`'s `DRY_RUN_ONLY` hook (cred.2) is invoked by nothing; the v0.86.2
   guard (`:159`) covers 1 of 6 `cos)` rewrite rules and checks the *prompt* half of the
   v0.86.2 pair, not the *grant* half (`prefix = "./output"`), so the inverse desync passes.
@@ -70,13 +70,13 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   `template.rs` has catalogue tests, but nothing globs `docker/*.toml`, `agentd/*.toml`, or
   `distro/overlay/etc/agentd/*.toml`; audit86-P0-1 is the proof. Fix:
   `agentd/tests/config_parse_all.rs` asserting `Config` deserializes each (~1 h). → `audit.1`.
-- **audit86-P1-8 (P1) [new] — "Relative paths fail closed" is false; path identity is string identity.**
+- ~~**audit86-P1-8 (P1) [new] — "Relative paths fail closed" is false; path identity is string identity.**~~ **[FIXED in cap.3 (v0.107.0), struck 2026-07-28 after a code check: `capability.rs`'s `anchor_abs` (`:60-75`) is the SINGLE place the CWD anchor enters matching — it absolutizes BOTH grant and request against the startup CWD (`fs_anchor`) before normalizing, so matching is absolute-vs-absolute and no longer string-identity/CWD-blind. The doc comments name this fix explicitly ("cap.3 / audit86-P1-8", `:110-115`). Deliberately NOT behaviour-preserving: a relative request inside an absolute grant now correctly ALLOWS where the old lexical `starts_with` denied. cap.3 also closed the p5.8 boot containment hole. CHANGELOG v0.107.0.]**
   `capability.rs:27-29` documents fail-closed, but `normalize_path` (`:76-94`) strips `CurDir`,
   so a relative grant matches a relative request textually and CWD-blind; production dev-mode
   (`cos.agents.toml:247,375`) depends on the undocumented behavior. This is the v0.86.2 root
   cause. Fix: `AbsPathPrefix` newtype absolutizing at deserialization + at
   `required_capability_for` (`native.rs:88/128/169`, `main.rs:1345-1349`). → `cap.3`.
-- **audit86-P1-9 (P1) [new] — Wrong-tier capability grants are silent no-ops (6 of 9 combos inert).**
+- **audit86-P1-9 (P1) [new] — Wrong-tier capability grants are no-ops (6 of 9 combos inert).** **[PARTIAL — no longer SILENT as of cap.1 (v0.93.0), re-checked 2026-07-28: the shared `tier_legality` resolver + `agentd check` now REPORT every inert grant (`Legality::Inert(why)` at `check.rs:108/176/224`, for `CapContext::Agent` and `CapContext::StdioMcp`), and cap.1 added a `CapabilitiesResolved` boot event + a fail-closed entrypoint gate. So an operator is told. What remains is the substance: the grants are still INERT at those tiers, and the open question is whether that is the intended design (declare-then-lint) or a gap to close by making them load-bearing. Needs a scope decision, not more code — raise it at the next planning pass rather than leaving it to read as an unaddressed P1.]**
   Agent-level `Credential` (`capability.rs:69`, "deferred") and `Net` (`:162`, returns true
   unconditionally) are decorative; HTTP MCP servers discard `capabilities`/`isolation`
   (`config.rs:604-628`, `main.rs:468-513`) and are *exempted* from `mcp_require_capabilities`
@@ -111,7 +111,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
 - **cap.1-ar-03 (P3) [new, cap.1 /review] — distro/QEMU init doesn't run `agentd check`.**
   Only the Docker `entrypoint.sh cos)` path is gated with `agentd check --strict`; the distro/QEMU `/init`
   boot path is not. The distro config is already clean, so informational — add the check to `/init` for parity.
-- **audit86-P1-10 (P1) [re-rate; = cos-dev-02, was P2] — Spawn inheritance is all-or-nothing; Curator inherits live Gmail. [PARTIAL — floor shipped in cap.2 (v0.94.0); STILL OPEN for the injected-orchestrator threat → cap.2b.]**
+- ~~**audit86-P1-10 (P1) [re-rate; = cos-dev-02, was P2] — Spawn inheritance is all-or-nothing; Curator inherits live Gmail.**~~ **[CLOSED in cap.2b (v0.95.0), struck 2026-07-28: the entry's "STILL OPEN for the injected-orchestrator threat → cap.2b" note predates cap.2b actually shipping. cap.2 (v0.94.0) shipped the attenuation FLOOR (`SpawnConfig.capabilities` + `capability_covered_by`, reject-not-clamp); cap.2b (v0.95.0) shipped the REAL closure — sealed `run_job` with config-owned caps/task + `AwaitingParent.deliver_content = false` so a trigger gets a completion signal and never the job output, plus a de-privileged cron trigger. CHANGELOG v0.95.0 states it directly: "Audit P1-10 CLOSED against the pinned claim", with a no-read proof and a negative-control-verified topology guard in /qa. Residual documented in THREAT_MODEL §9.5: a brief social-engineering vector, not capability inheritance.]**
   `SpawnConfig` (`config.rs:412-422`) has no capabilities field; `dispatch_spawn`
   (`scheduler.rs:1586`) does `parent_cap_set.clone()`. The Curator (processes
   attacker-influenceable email text daily) inherits `Credential{Google}`, so a prompt-injection
@@ -454,19 +454,55 @@ direction. Claude adversarial pass was SOUND on all 5 focus areas; Codex caught 
   Requires new per-target "unseen" state in `ConverseState` (`agentctl/src/watch/converse.rs`)
   with reset semantics on retarget/focus — not just cosmetic, needs its own small design
   pass on exactly when the counter clears. Depends on: none.
-- **`converse::dispatch()` blocks the whole TUI, not just the rail, for up to ~8s worst
-  case** (P2, found by /review's adversarial pass): `Enter` calls `dispatch()` synchronously
-  on the render/key-poll thread (`agentctl/src/watch/mod.rs`'s Enter handler) — it calls
-  `source.load_snapshot()` (5s timeout, `source.rs`) then `source.spawn()` (3s) or
-  `source.inject()` (500ms). This mirrors the EXISTING Approvals approve/deny pattern
-  (same "blocking call on the main thread" architecture, documented at `mod.rs:328` as
-  deliberate) but with much longer timeouts on what's now the cockpit's highest-frequency
-  interaction (chat) instead of an occasional approval. Worst case: sending a chat message
-  freezes the ENTIRE Dashboard — including already-streaming background conversations,
-  redraws, and Ctrl-C — for several seconds. Proper fix needs an async/background-thread
-  dispatch path with a channel-based result delivery back into `step()`, not a quick patch.
-  Depends on: none, but touches the Option B event-loop architecture (ux.0) — read
-  `mod.rs`'s Option B doc comment before starting.
+- **`pending_focus` can stick forever and later hijack the selection** (P3, pre-existing ux.3 M5,
+  found by Codex during ux.13-TUI's /review, 2026-07-28): `App::apply_snapshot` refuses to clear a dead
+  selection while it equals `pending_focus` (`app.rs`), and `pending_focus` is only dropped when an agent
+  with that id appears. A spawn that never materializes therefore pins the selection indefinitely, and if
+  an UNRELATED agent later takes that id — CoS ids are config-fixed and cron respawns them — the fold
+  silently moves the operator's selection onto it. Wants a deadline on `pending_focus` (drop it after N
+  ticks or on the next snapshot that lacks the id, whichever the spawn race actually needs). Not touched
+  by ux.13-TUI: the row-action overlay pins its OWN target and does not read the selection. Depends on:
+  none.
+- **`detect_source_fallback_to_http_when_no_fuse` fails whenever agentd is running locally** (P3,
+  found by /qa 2026-07-28): the test probes `http://127.0.0.1:7999/healthz` and asserts the fallback
+  does NOT resolve to HTTP, so it goes red for any developer who has agentd up — which is this repo's
+  own documented workflow (`cargo run -- agent.toml` + `agentctl watch`), and could bite CI if the port
+  is ever bound. Pre-existing (predates ux.13-TUI); left untouched because /qa's rules forbid modifying
+  existing tests. Fix: give `detect_source` an injectable probe URL, or have the test occupy an
+  ephemeral port and assert against that instead of a well-known one. Depends on: none.
+- **The Budget cell rounds an overshoot into invisibility below 10k** (P3, found by /qa 2026-07-28):
+  `format_budget_cell(2700, Tokens(2000))` renders `2k/2k`, so a real over-cap agent (the state where
+  Park is refused, since capping at the spend would RAISE the ceiling) reads as merely "at its limit"
+  in the table. Above 10k it is visible (`119k/100k`). The row-action overlay explains it in full, so
+  this is cosmetic; the honest fix is one decimal place when spend exceeds the cap. Pre-existing
+  formatter, shared by every budget cell. Depends on: none.
+- **Park cannot name its own deadline** (P3, found by /review's security specialist, 2026-07-28):
+  with `budget_reset_interval > 0` a parked agent resumes at the next window rollover, and the cockpit
+  can only say *that* it will, not *when* — `budget_resettable` is a bool. The honest copy shipped
+  ("resumes by itself at the next budget-window rollover"), but an operator parking a runaway at 2 am
+  wants "resumes in ~6h". Needs `budget_window_start` + `budget_reset_interval` (or a precomputed
+  `next_rollover_at`) on the snapshot next to `budget_resettable`, then a relative-time render in
+  `menu_items` + `verb_requested_text`. Cheap once someone wants it; the plumbing pattern is exactly
+  what `budget_resettable` just established. Depends on: none.
+- **`approve_with_kind` has no HTTP route, so `[d]` is FUSE-only** (P3, found by /review's security
+  specialist, 2026-07-28): `HttpSource` inherits the trait's plain-approve fallback, so "don't ask
+  again for this kind" registers no standing rule over `--url`. ux.13-TUI made the TUI SAY so
+  (`supports_auto_approve_kind()`, and the result line now reads "…but 'don't ask again' is FUSE-only")
+  rather than silently claiming a policy that does not exist — but the capability is still missing on
+  the surface most operators use. Needs an `auto_approve_kind` field on the approve route +
+  `HttpSource::approve_with_kind` + the override returning true. Depends on: none.
+- **`converse::dispatch()` still blocks the loop for the duration of its HTTP calls** (P3,
+  downgraded from P2 by ux.13-TUI): the *user-visible* half is fixed. `Enter` no longer calls
+  `dispatch()` from the key handler — it pushes the optimistic echo, sets the rail's
+  `Dispatching…` phase, and parks the turn in `App.pending_verb`; `run_tui_loop`'s
+  `drain_pending_verb` performs the call on the next iteration, after that frame is flushed
+  (measured on a real pty: echo + `...` on the wire 0.02 s after Enter, against a server that
+  took 2.5 s to answer the spawn). What REMAINS is that the call still runs on the loop thread,
+  so for its duration (worst case ~8 s: `load_snapshot` 5 s + `spawn` 3 s) redraws are paused
+  and queued keystrokes — including Ctrl-C, which raw mode delivers as a key event, not a
+  signal — are not serviced. Closing that needs the background-thread dispatch path with
+  channel-based result delivery into `step()` described in the original entry; the `pending_verb`
+  slot is the seam it would plug into. Depends on: none.
 - **Shared SSE broadcast channel (`agentd/src/main.rs:114`, capacity 1024) now carries
   per-token delta traffic on top of every other event kind** (P2, found by /review's
   adversarial pass): `EventKind::InferenceStreamDelta` fires once per streamed chunk on

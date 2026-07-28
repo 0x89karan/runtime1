@@ -1167,7 +1167,11 @@ tick) → one channel; `DataSource` pushes, never `.await` on the render thread.
   path, and a sticky `pending_focus` auto-drops into the new agent across the snapshot race. Privileged-cap
   refusal (cap.4, **400** not 403) surfaces the server reason verbatim in the Spawn view — reject-not-clamp.
   Built per REVISED MECHANISM M1–M7. **DEFERRED → ux.3b**: the `:` command palette + modal-over-live-dashboard
-  overlay (net-new UI subsystems, no reusable infra).
+  overlay (net-new UI subsystems, no reusable infra). **ux.3b was RESHAPED and closed as ux.13-TUI
+  (2026-07-28):** the palette is STRUCK (6/6 adverse CEO consensus — borrowed multi-user pain over 10
+  compile-time views; lazygit/htop/btop answer this shape with `?`, and k9s only needs `:` because its noun
+  space is runtime-discovered), and the overlay half was redirected to ux.13's deferred TUI verbs, which is
+  what the operator actually lacked. See `docs/plans/ux.13-tui-verbs.md`.
 
 **The reshape (2026-07-18, office-hours — plan of record).** Framing: *trust after absence* — the
 operator wakes up, understands the night, unblocks from anywhere, and can stop a runaway. Four core
@@ -1232,8 +1236,23 @@ increments, friction-ordered, each independently shippable. Full design + premis
   at the top of `enqueue_or_defer` (running agent = flag-only → funnel on future-return, no panic),
   cascade-cancels via `parent_map` with per-child `AgentCancelled`; SetCaps narrows via a
   `capability_covered_by` fail-closed check + recomputed specs. All three verbs reachable via management
-  HTTP + FUSE control + `agentctl {cancel,set-budget,set-caps}` CLI; **TUI keys deferred** (CLI/HTTP/FUSE
-  cover the surface — a convenience follow-up).
+  HTTP + FUSE control + `agentctl {cancel,set-budget,set-caps}` CLI.
+  - **TUI keys landed 2026-07-28 as ux.13-TUI** (the ux.3b reshape; plan `docs/plans/ux.13-tui-verbs.md`).
+    `[x]` on a Dashboard row opens a graded row-action overlay — **Park** (`set_budget` at the recorded
+    window spend, gated on `park_limit() != None` so a zero-spend park can never write the checkpointed
+    `0` ≡ UNLIMITED, and labelled from the new `budget_resettable` snapshot field because it means two
+    different things: with a window the park **expires by itself** at the next rollover, without one it
+    **ends the agent** — "reversible" was true of neither, caught at /review), **Set budget** (prefilled,
+    `0`/raise behind a second gate),
+    **Cancel** (own confirm, showing "at least N" of the cascade from a cycle-safe `descendants()` walk and
+    reporting the SERVER's count). Verbs are performed by the loop via `App.pending_verb`, never from the
+    key handler — `HttpSource`'s confirm client blocks up to 3 s. `confirms_mutations()` keeps FUSE from
+    claiming a scheduler verdict it cannot see; a client-side `cancelling…` marker escalates to
+    "cancel not confirmed" after 60 s. Also here: `?` (the first help key this cockpit ever had), the
+    measured footer clip fix (162 → ≤114 cols), and the chat rail migrated onto the same slot.
+    **SetCaps stays CLI-only** — it has no snapshot data behind it (not in `AgentSnapshot`, not in
+    `AgentInfo`, no `capabilities` FUSE file) and `SetCaps` REPLACES the whole set, so revoking one cap
+    means transmitting all the others. Its own increment when someone wants it.
 
 **Cathedral expansions (accepted 2026-07-10, CEO review — re-scoped by the reshape):** the "CoS you live with."
 - ~~**ux.4** — Proactive push~~ **superseded by ux.12** (Telegram is push *and* reply; the old plan was

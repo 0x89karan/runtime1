@@ -154,6 +154,11 @@ pub struct SchedulerSnapshot {
     /// System-wide credential surface snapshot (cred.5). None when gateway is disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_snapshot: Option<CredentialSnapshot>,
+    /// Is `[scheduler] budget_reset_interval > 0` (ux.13-TUI)? When false, per-agent budget
+    /// exhaustion TERMINATES the agent instead of deferring it until the next window — so a
+    /// budget-based soft stop ("Park" in `agentctl watch`) is not reversible on this deployment.
+    /// Default `false`, matching the config default: only the CoS configs set an interval.
+    pub budget_resettable:   bool,
 }
 
 /// Why an agent's `attention` signal fired — see `docs/plans/ux.2-attention-evidence.md`.

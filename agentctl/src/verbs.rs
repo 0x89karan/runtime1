@@ -15,10 +15,28 @@ pub struct CancelArgs {
     pub agents_dir: std::path::PathBuf,
 }
 
+/// Map a verb failure through the SAME copy the cockpit shows. The DX phase's finding was that the
+/// CLI and the TUI must not describe one write two ways; /qa found the error paths still did —
+/// `agentctl cancel nope` printed `HTTP 404: {"error":"agent 'nope' not found"}` while the overlay
+/// explained what it meant and what to do.
+fn explain(e: String) -> anyhow::Error {
+    anyhow::anyhow!("{}", crate::watch::explain_verb_error(&e))
+}
+
 pub fn run_cancel(args: CancelArgs) -> anyhow::Result<()> {
     let source = crate::watch::source::detect_source(args.url.as_deref(), &args.agents_dir)?;
-    source.cancel(&args.agent_id).map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("cancel requested for '{}' (takes effect at the next step boundary)", args.agent_id);
+    // ux.13-TUI: the route returns the cascade size (native subtree + universal agents parented into
+    // it). The TUI now reports it, so the CLI does too — one vocabulary for one write.
+    let count = source.cancel(&args.agent_id).map_err(explain)?;
+    if count > 0 {
+        println!(
+            "cancel requested for '{}' — {count} agent{} flagged (takes effect at the next step boundary)",
+            args.agent_id,
+            if count == 1 { "" } else { "s" },
+        );
+    } else {
+        println!("cancel requested for '{}' (takes effect at the next step boundary)", args.agent_id);
+    }
     Ok(())
 }
 
@@ -38,7 +56,7 @@ pub struct SetBudgetArgs {
 
 pub fn run_set_budget(args: SetBudgetArgs) -> anyhow::Result<()> {
     let source = crate::watch::source::detect_source(args.url.as_deref(), &args.agents_dir)?;
-    source.set_budget(&args.agent_id, args.limit).map_err(|e| anyhow::anyhow!("{e}"))?;
+    source.set_budget(&args.agent_id, args.limit).map_err(explain)?;
     println!("budget for '{}' set to {}", args.agent_id, args.limit);
     Ok(())
 }
@@ -60,7 +78,7 @@ pub struct SetCapsArgs {
 
 pub fn run_set_caps(args: SetCapsArgs) -> anyhow::Result<()> {
     let source = crate::watch::source::detect_source(args.url.as_deref(), &args.agents_dir)?;
-    source.set_caps(&args.agent_id, &args.capabilities_json).map_err(|e| anyhow::anyhow!("{e}"))?;
+    source.set_caps(&args.agent_id, &args.capabilities_json).map_err(explain)?;
     println!("capabilities for '{}' narrowed", args.agent_id);
     Ok(())
 }

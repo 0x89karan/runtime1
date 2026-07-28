@@ -15,6 +15,12 @@
 //!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
+//!   POST /api/v1/agents/:id/cancel               → 200 {cancelled,count} | 400 | 404 | 503 (ux.13)
+//!     (`cancelled` is the agent id; `count` is the whole cascaded subtree — what `agentctl cancel`
+//!      and the TUI's `[x]` confirm both report. The FUSE path has no confirmation channel, so it
+//!      cannot report either.)
+//!   POST /api/v1/agents/:id/caps                 → 200 {agent,old,new} | 400 (widening / inert) | 404 | 503 (ux.13)
+//!     (body: {"capabilities":[…]}; revoke/narrow-only — the new set must be covered by the old)
 //!   POST /api/v1/budget/reset                    → 200 {target,spent_before,reset_to,window_start} | 400 | 404 | 503 (ux.8′)
 //!   POST /api/v1/budget/set                       → 200 {target,old_limit,limit} | 400 (incl. global) | 404 | 503 (ux.11a)
 //!     (per-agent native-tier only; universal-tier agents are proxy-metered and return 404)

@@ -52,6 +52,18 @@ pub trait DataSource: Send + Sync {
     fn approve_with_kind(&self, id: &str, _kind: &str) -> Result<(), String> {
         self.approve(id)
     }
+
+    /// Does [`Self::approve_with_kind`] actually register the standing rule, or does it silently
+    /// degrade to a plain approve?
+    ///
+    /// `false` for HTTP, which has no route for it and inherits the trait's plain-approve fallback. The
+    /// Approvals view used to report "Approved <id> (auto for '<kind>')" either way, telling the operator
+    /// a standing policy existed on the ONE surface that is a real authority boundary — the same
+    /// display-vs-reality class as the pinned-id fix in this increment (/review's security specialist).
+    /// Default `false` so a new source must claim the capability deliberately.
+    fn supports_auto_approve_kind(&self) -> bool {
+        false
+    }
     /// Spawn a new orchestrated agent. Returns the resolved agent ID or an error.
     fn spawn(&self, _req: &SpawnRequest) -> Result<String, String> {
         Err("spawn not supported on this data source (use --url to connect to management API)".to_string())
@@ -61,7 +73,12 @@ pub trait DataSource: Send + Sync {
         Err("inject not supported on this data source (use --url to connect to management API)".to_string())
     }
     /// Cancel an agent (ux.13). Cascade-cancels its spawned subtree at the next step boundary.
-    fn cancel(&self, _agent_id: &str) -> Result<(), String> {
+    ///
+    /// Returns the number of agents the SERVER flagged (`Ok(0)` = "this source cannot know"). The
+    /// client's own subtree walk is a floor: the snapshot is up to a poll interval stale and carries
+    /// no universal-tier parentage, so only the server's count is authoritative (eng finding E6 — the
+    /// route has always returned it and the TUI used to discard the body).
+    fn cancel(&self, _agent_id: &str) -> Result<u64, String> {
         Err("cancel not supported on this data source".to_string())
     }
     /// Set a per-agent token budget at runtime (ux.13; `limit = 0` = unlimited).
@@ -76,6 +93,36 @@ pub trait DataSource: Send + Sync {
     /// Returns the base URL for SSE event streaming, if supported.
     fn event_stream_url(&self) -> Option<String> {
         None
+    }
+
+    /// Can this source tell the caller what the SCHEDULER decided about a mutation, or only that the
+    /// command was handed over?
+    ///
+    /// `false` for FUSE, and that is a design decision rather than an oversight (design finding C5):
+    /// `write_control_command`'s only error signal is `close(2)`, and the dispatch closure returns 0
+    /// once the command is QUEUED. The scheduler's actual verdict arrives with `confirm_tx: None` and
+    /// lands in the flight recorder as `FuseControlError` — so over FUSE, "agent not found",
+    /// "SetCaps is narrow-only" and "capability is inert" ALL return `Ok(())`. A footer reading
+    /// "Cancelled cos-inbox" would be a lie the operator has no way to check.
+    ///
+    /// Callers must use past tense only when this is true. Default `false` so a new source is honest
+    /// until it proves otherwise — but note that the default is also what keeps every test double
+    /// compiling, so a double that impersonates HTTP has to override it deliberately (eng finding E9).
+    fn confirms_mutations(&self) -> bool {
+        false
+    }
+
+    /// The `agentctl` flags that point a fresh invocation at THIS source, e.g. `" --url http://host:7999"`.
+    ///
+    /// The overlay prints an equivalent CLI command so the operator can fall back when the TUI is the
+    /// broken thing — but `run_cancel`/`run_set_budget` re-resolve the source from scratch
+    /// (`--url` > `AGENTCTL_URL` > FUSE `/agents` > `http://127.0.0.1:7999`). In the primary documented
+    /// topology (host `agentctl watch --url …` against agentd in Docker) a flagless command reaches a
+    /// different daemon or none at all, so printing one is worse than printing nothing. Caught by
+    /// /review's api-contract specialist: the clap drift guard proved the string PARSES, not that it
+    /// arrives. Empty string when the defaults already resolve here.
+    fn cli_connection_flags(&self) -> String {
+        String::new()
     }
 }
 
@@ -106,6 +153,11 @@ impl DataSource for FuseSource {
         write_control_command(&self.agents_dir, &payload.to_string())
     }
 
+    /// True: the control command carries `auto_approve_kind`, which the scheduler registers.
+    fn supports_auto_approve_kind(&self) -> bool {
+        true
+    }
+
     fn deny(&self, id: &str, reason: Option<&str>) -> Result<(), String> {
         let payload = if let Some(r) = reason {
             serde_json::json!({"reject": {"id": id, "reason": r}})
@@ -120,9 +172,12 @@ impl DataSource for FuseSource {
         write_control_command(&self.agents_dir, &payload.to_string())
     }
 
-    fn cancel(&self, agent_id: &str) -> Result<(), String> {
+    fn cancel(&self, agent_id: &str) -> Result<u64, String> {
         let payload = serde_json::json!({"cancel": {"agent_id": agent_id}});
-        write_control_command(&self.agents_dir, &payload.to_string())
+        // 0 = unknown, not "nothing cancelled": over FUSE the only signal is `close(2)`, which reports
+        // that the command was QUEUED. Everything the scheduler decides — including how many agents
+        // the cascade touched — is unreachable from here (design finding C5).
+        write_control_command(&self.agents_dir, &payload.to_string()).map(|()| 0)
     }
 
     fn set_budget(&self, agent_id: &str, limit: u64) -> Result<(), String> {
@@ -135,6 +190,18 @@ impl DataSource for FuseSource {
             .map_err(|e| format!("capabilities must be a JSON array: {e}"))?;
         let payload = serde_json::json!({"set_caps": {"agent_id": agent_id, "capabilities": caps}});
         write_control_command(&self.agents_dir, &payload.to_string())
+    }
+
+    fn cli_connection_flags(&self) -> String {
+        // `/agents` is the clap default, so naming it would be noise on the copy-pasteable line.
+        if self.agents_dir == std::path::Path::new("/agents") {
+            String::new()
+        } else {
+            // Quoted: a mount path with a space made the printed command unrunnable, and `shell_arg`
+            // was only protecting the agent id (Codex, reviewing the review fixes). The URL form needs
+            // no quoting — a URL with whitespace would not have built a client at startup.
+            format!(" --agents-dir {}", crate::watch::overlay::shell_arg(&self.agents_dir.display().to_string()))
+        }
     }
 }
 
@@ -153,6 +220,31 @@ pub struct HttpSource {
     /// `X-Approval-Token` header on approve/deny so agentd's gate accepts them. None when
     /// unset (open deployment); Some when the CoS approval secret is configured.
     approval_token:  Option<String>,
+}
+
+/// Reject an agent id that would not survive being interpolated into a URL path.
+///
+/// `/`, `?`, `#` and `..` re-point the request: an id like `victim/cancel?x=` turns
+/// `/api/v1/agents/{id}/cancel` into a cancel of `victim`. Ids are free-form
+/// (`OperatorSpawnRequest.id` has no charset validation), and the TUI now sends mutations against an id
+/// it also DISPLAYS — so the displayed target and the target that gets hit must not be able to differ.
+/// Rejecting is better than percent-encoding here: a legitimate agent id in this system is a config or
+/// template name, and an encoded slash would just fail server-side anyway. Flagged by /review's security
+/// specialist; the URL building predates this branch, but the new confirm dialogs are what make a
+/// mismatch consequential. No new crate — CLAUDE.md's "justify every crate" applies.
+fn check_path_segment(agent_id: &str) -> Result<(), String> {
+    let bad = agent_id.is_empty()
+        || agent_id == "."
+        || agent_id == ".."
+        || agent_id.chars().any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%') || c.is_control());
+    if bad {
+        return Err(format!(
+            "Refusing to send: '{}' is not a usable agent id (it would change which route the \
+             request reaches). Agent ids may not contain / \\ ? # % or control characters.",
+            agent_id.escape_debug(),
+        ));
+    }
+    Ok(())
 }
 
 impl HttpSource {
@@ -178,9 +270,14 @@ impl HttpSource {
     }
 
     /// POST a confirm-channel verb (cancel/set-budget/set-caps) through the 3 s
-    /// `confirm_client`. Sends `X-Approval-Token` — cap.4 gates the whole mutating surface,
-    /// not just approve/deny. Returns Err with the status + any body detail on a non-2xx.
-    fn post_confirm(&self, path: &str, body: Option<&Value>) -> Result<(), String> {
+    /// `confirm_client`, returning the parsed response body. Sends `X-Approval-Token` — cap.4 gates
+    /// the whole mutating surface, not just approve/deny. Returns Err with the status + any body
+    /// detail on a non-2xx.
+    ///
+    /// A body that fails to parse is NOT an error: the mutation already succeeded, and reporting a
+    /// failure the scheduler did not have would be the spawn path's `agent_id`-fabrication bug in a
+    /// new place. Callers that read a field must tolerate its absence.
+    fn post_confirm_json(&self, path: &str, body: Option<&Value>) -> Result<Value, String> {
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let mut req = self.confirm_client.post(&url);
         if let Some(b) = body {
@@ -189,18 +286,25 @@ impl HttpSource {
         if let Some(tok) = &self.approval_token {
             req = req.header("X-Approval-Token", tok);
         }
-        let resp = req.send().map_err(|e| format!("HTTP error: {e}"))?;
+        let resp = req.send().map_err(|e| describe_send_error(&e))?;
         let status = resp.status();
-        if status.is_success() {
-            Ok(())
-        } else {
+        if !status.is_success() {
             let detail = resp.text().unwrap_or_default();
-            Err(if detail.is_empty() {
+            return Err(if detail.is_empty() {
                 format!("HTTP {}", status.as_u16())
             } else {
                 format!("HTTP {}: {}", status.as_u16(), detail.trim())
-            })
+            });
         }
+        Ok(resp.json().unwrap_or(Value::Null))
+    }
+
+    /// [`Self::post_confirm_json`] for the verbs with nothing to read. One body, not two: the
+    /// duplicate carried its own copy of the `X-Approval-Token` header and the error formatting, and
+    /// a change to either (a new header, a different error shape) would have landed on one only —
+    /// with the header being a cap.4 security surface.
+    fn post_confirm(&self, path: &str, body: Option<&Value>) -> Result<(), String> {
+        self.post_confirm_json(path, body).map(|_| ())
     }
 
     fn get_json(&self, path: &str) -> anyhow::Result<Value> {
@@ -239,6 +343,43 @@ impl HttpSource {
 
 }
 
+/// The `GET /api/v1/snapshot` body → [`Snapshot`] mapping.
+///
+/// Split out of `load_snapshot` so it can be tested against a real payload. It was not, and the test that
+/// claimed to cover it COPIED these lines into its own body and asserted against the copy — so deleting
+/// `budget_resettable` here would have left it green, which is verbatim the failure its own comment said
+/// it prevented (the fix-review pass). `credentials` is passed in because it comes from a SECOND request,
+/// which is exactly the kind of thing that has no business inside a mapping function.
+pub(crate) fn snapshot_from_json(val: &Value, credentials: Option<SysCredentials>) -> Snapshot {
+    let agents: Vec<AgentInfo> = val["agents"]
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .map(agent_info_from_json)
+        .collect();
+
+    let budget = val["global_tokens_spent"].as_u64().map(|spent| SysBudget {
+        spent,
+        total: 0,
+        // Absent on a pre-ux.13-TUI agentd → false, which is both the config default and the
+        // cautious reading (Park is a kill unless a reset window is configured).
+        resettable: val["budget_resettable"].as_bool().unwrap_or(false),
+    });
+
+    let queue = val["queue_depth"].as_u64().map(|d| SysQueue { depth: d as usize });
+
+    let sandbox = sandbox_from_json(&val["sandbox"]);
+
+    let provider = val["provider_model"].as_str().map(|m| SysProvider {
+        model:   m.to_string(),
+        backend: "anthropic".to_string(),
+    });
+
+    let isolation = isolation_from_json(&val["isolation_caps"]);
+
+    Snapshot { agents, budget, queue, sandbox, provider, isolation, credentials, error: None }
+}
+
 impl DataSource for HttpSource {
     fn load_snapshot(&self) -> Snapshot {
         let val = match self.get_json("/api/v1/snapshot") {
@@ -254,36 +395,9 @@ impl DataSource for HttpSource {
                 error:       Some(format!("HTTP error: {e:#}")),
             },
         };
-
-        let agents: Vec<AgentInfo> = val["agents"]
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(agent_info_from_json)
-            .collect();
-
-        let budget = val["global_tokens_spent"].as_u64().map(|spent| SysBudget {
-            spent,
-            total: 0,
-        });
-
-        let queue = val["queue_depth"].as_u64().map(|d| SysQueue {
-            depth: d as usize,
-        });
-
-        let sandbox = sandbox_from_json(&val["sandbox"]);
-
-        let provider = val["provider_model"].as_str().map(|m| SysProvider {
-            model:   m.to_string(),
-            backend: "anthropic".to_string(),
-        });
-
-        let isolation = isolation_from_json(&val["isolation_caps"]);
-
         let credentials = self.get_json("/api/v1/credentials").ok()
             .and_then(|v| credentials_from_json(&v));
-
-        Snapshot { agents, budget, queue, sandbox, provider, isolation, credentials, error: None }
+        snapshot_from_json(&val, credentials)
     }
 
     fn load_approvals(&self) -> Vec<PendingAction> {
@@ -294,10 +408,16 @@ impl DataSource for HttpSource {
     }
 
     fn approve(&self, id: &str) -> Result<(), String> {
+        // Approval ids are internally generated (`act_{seq}`) today, but this client's OTHER path-
+        // interpolating verbs validate and the same commit added `sanitize()` to the displayed approval id
+        // on the argument that the next id source may not be — one predicate for every id that lands in a
+        // URL path (the fix-review pass caught the two halves disagreeing).
+        check_path_segment(id)?;
         self.post_mutation(&format!("/api/v1/approvals/{id}/approve"), None)
     }
 
     fn deny(&self, id: &str, reason: Option<&str>) -> Result<(), String> {
+        check_path_segment(id)?;
         let body = reason.map(|r| serde_json::json!({"reason": r}));
         self.post_mutation(&format!("/api/v1/approvals/{id}/deny"), body.as_ref())
     }
@@ -336,20 +456,33 @@ impl DataSource for HttpSource {
     }
 
     fn inject(&self, agent_id: &str, text: &str) -> Result<(), String> {
+        check_path_segment(agent_id)?;
         let body = serde_json::json!({"text": text});
         self.post_mutation(&format!("/api/v1/agents/{agent_id}/inject"), Some(&body))
     }
 
-    fn cancel(&self, agent_id: &str) -> Result<(), String> {
-        self.post_confirm(&format!("/api/v1/agents/{agent_id}/cancel"), None)
+    fn cancel(&self, agent_id: &str) -> Result<u64, String> {
+        check_path_segment(agent_id)?;
+        // The route replies `{"cancelled": "<id>", "count": N}` after the scheduler confirms. `count`
+        // is the native subtree PLUS universal agents parented into it — a number the client cannot
+        // compute, which is why this reads the body instead of discarding it.
+        let body = self.post_confirm_json(&format!("/api/v1/agents/{agent_id}/cancel"), None)?;
+        Ok(body["count"].as_u64().unwrap_or(0))
     }
 
     fn set_budget(&self, agent_id: &str, limit: u64) -> Result<(), String> {
+        // The id travels in the BODY here, so it cannot re-point the route — validated anyway so the
+        // cockpit does not refuse an id for Cancel and accept the same id for Park, which is the kind of
+        // inconsistency that turns into a bug the next time someone moves a parameter (Codex, reviewing
+        // the review fixes). `FuseSource` needs no equivalent: it writes JSON into a control FILE, with
+        // no path interpolation anywhere.
+        check_path_segment(agent_id)?;
         let body = serde_json::json!({"target": {"agent": agent_id}, "limit": limit});
         self.post_confirm("/api/v1/budget/set", Some(&body))
     }
 
     fn set_caps(&self, agent_id: &str, caps_json: &str) -> Result<(), String> {
+        check_path_segment(agent_id)?;
         let caps: Value = serde_json::from_str(caps_json)
             .map_err(|e| format!("capabilities must be a JSON array: {e}"))?;
         let body = serde_json::json!({"capabilities": caps});
@@ -358,6 +491,38 @@ impl DataSource for HttpSource {
 
     fn event_stream_url(&self) -> Option<String> {
         Some(format!("{}/api/v1/events", self.base_url.trim_end_matches('/')))
+    }
+
+    /// True: every verb here goes through `post_confirm`/`post_confirm_json`, and the route holds the
+    /// connection until the scheduler answers over a oneshot (up to 2 s), so a 2xx means the mutation
+    /// was ACCEPTED, not merely delivered.
+    fn confirms_mutations(&self) -> bool {
+        true
+    }
+
+    fn cli_connection_flags(&self) -> String {
+        format!(" --url {}", self.base_url.trim_end_matches('/'))
+    }
+}
+
+/// Turn a transport failure into something an operator can act on.
+///
+/// `reqwest::Error`'s `Display` drops the cause chain, so the confirm client's 3 s timeout reached the
+/// cockpit as the useless "HTTP error: error sending request for url (…)" — found by driving the real
+/// TUI against a deliberately slow agentd, not by any unit test. The two cases matter differently: a
+/// timeout means the scheduler may STILL apply the mutation (the request was delivered), while a
+/// connect failure means it certainly did not.
+pub fn describe_send_error(e: &reqwest::Error) -> String {
+    if e.is_timeout() {
+        "Timed out after 3s waiting for agentd to confirm. The request may still have been applied — \
+         check the agent's state before retrying."
+            .to_string()
+    } else if e.is_connect() {
+        "Could not reach agentd — nothing was sent. Check it is running and that --url points at its \
+         [management] address."
+            .to_string()
+    } else {
+        format!("HTTP error: {e}")
     }
 }
 
@@ -871,5 +1036,90 @@ mod tests {
         let creds = credentials_from_json(&v).expect("empty-but-enabled → Some");
         assert!(creds.gateway_enabled);
         assert!(creds.configured_providers.is_empty());
+    }
+
+    // ── ux.13-TUI /review: the wire, from both ends ───────────────────────────────
+
+    /// Both new keys degrade SAFELY on a parse miss (`unwrap_or(false)` / `serde(default)`), which is
+    /// exactly why only a wire test catches a rename: delete the producer key and the cockpit silently
+    /// labels Park as terminal forever, with every other test green (/review: api-contract + testing).
+    ///
+    /// Drives the REAL mapping (`snapshot_from_json`). The first version of this test copied the four
+    /// production lines into its own body and asserted against the copy, so it would have passed with
+    /// the production read deleted — the very failure it was written to prevent (the fix-review pass).
+    #[test]
+    fn the_snapshot_reader_parses_budget_resettable_from_the_real_wire_shape() {
+        let val: Value = serde_json::from_str(
+            r#"{"agents":[],"global_tokens_spent":78000,"queue_depth":0,"budget_resettable":true}"#
+        ).unwrap();
+        let snap = snapshot_from_json(&val, None);
+        assert_eq!(snap.budget.map(|b| b.resettable), Some(true),
+            "the HTTP snapshot key must be read by the production mapping");
+
+        // Absent (an older agentd) → false: the cautious direction, and the config default.
+        let older: Value = serde_json::from_str(
+            r#"{"agents":[],"global_tokens_spent":1,"queue_depth":0}"#
+        ).unwrap();
+        assert_eq!(snapshot_from_json(&older, None).budget.map(|b| b.resettable), Some(false));
+
+        // And the FUSE file's own spelling, through serde (the `alias` keeps both names working).
+        let fuse: SysBudget = serde_json::from_str(r#"{"spent":42000,"total":0,"resettable":true}"#).unwrap();
+        assert!(fuse.resettable);
+        let aliased: SysBudget =
+            serde_json::from_str(r#"{"spent":1,"total":0,"budget_resettable":true}"#).unwrap();
+        assert!(aliased.resettable, "either wire name must parse — a rename must not degrade to false");
+        let absent: SysBudget = serde_json::from_str(r#"{"spent":1,"total":0}"#).unwrap();
+        assert!(!absent.resettable);
+    }
+
+    /// `HttpSource::cancel` must read the SERVER's cascade count out of the real body shape. Proved
+    /// against a one-shot HTTP stub rather than a double, because the thing under test is the JSON key.
+    #[test]
+    fn http_cancel_reads_the_cascade_count_from_the_response_body() {
+        for (body, want) in [
+            (r#"{"cancelled":"scout-2","count":3}"#, 3u64),
+            // A body with no count (older agentd) or a non-JSON body must degrade to 0, not to an error:
+            // the mutation already succeeded, and reporting a failure the scheduler did not have is the
+            // spawn path's id-fabrication bug in a new place.
+            (r#"{"cancelled":"scout-2"}"#, 0),
+            ("not json at all", 0),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().unwrap();
+            let label = body.to_string();
+            let body = body.to_string();
+            let server = std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                let (mut sock, _) = listener.accept().expect("accept");
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body,
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                req
+            });
+
+            let src = HttpSource::new(format!("http://{addr}"));
+            assert_eq!(src.cancel("scout-2"), Ok(want), "count from body {label:?}");
+            let req = server.join().expect("server thread");
+            assert!(req.starts_with("POST /api/v1/agents/scout-2/cancel"),
+                "the id must land in the path as a single segment: {req}");
+        }
+    }
+
+    /// The id can never re-point the route it is interpolated into.
+    #[test]
+    fn a_path_breaking_agent_id_is_refused_before_any_request_goes_out() {
+        let src = HttpSource::new("http://127.0.0.1:1".to_string());
+        for id in ["victim/cancel?x=", "..", "a#b", "a%2fb", "a\u{1b}[2Jb", "with/slash", ""] {
+            let err = src.cancel(id).expect_err("must refuse {id}");
+            assert!(err.contains("not a usable agent id"), "id {id:?} → {err}");
+        }
+        // A normal id is untouched (this would otherwise fail to connect, not to validate).
+        let err = src.cancel("cos-coordinator").expect_err("nothing is listening on port 1");
+        assert!(!err.contains("not a usable agent id"), "a legitimate id must pass validation: {err}");
     }
 }
