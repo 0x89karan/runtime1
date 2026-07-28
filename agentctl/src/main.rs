@@ -6,6 +6,7 @@ use clap::Parser;
 mod approve;
 mod auth;
 mod brief;
+mod docker;
 mod inject;
 mod list;
 mod orchestrate;

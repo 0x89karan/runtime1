@@ -3,7 +3,61 @@
 **Track:** UX (operator cockpit)
 **Branch:** `ux.10-tui-polish` (off `main` after ux.1/v0.86.0)
 **Depends on:** ux.1 (converse rail, shipped v0.86.0), ux.9 (cockpit mode, shipped v0.82.0), p7.7 (management HTTP API, shipped v0.53.0)
-**Status:** planning, 2026-07-16.
+**Status:** ✅ SHIPPED in two parts — sub-part B (inputs) v0.113.0; sub-part A (Logs view) this
+increment. Sub-part C (`color-eyre`) STRUCK at the /autoplan gate as redundant. Plan body below is the
+2026-07-16 original; the two sections at the END (the /autoplan gate decisions + the eng consensus
+reshape) are authoritative wherever they differ.
+
+**Sub-part A — as built** (deltas from the body, all consistent with the eng consensus):
+- Key `[l]`; `g`/`G`/`Home`/`End` = in-view top/bottom, `Tab` = service filter, `/` = search
+  (highlight + `n`/`N`, NOT a filter — a matching log line is only useful with its context), `[t]` =
+  relative↔absolute timestamps.
+- `--tail 500` bounds the initial backfill (compose replays the ENTIRE history by default, which the
+  2 000-line ring would only tail-drop).
+- `A2` orphan-kill went one process deeper than the plan assumed: `docker compose` is a CLI plugin, so
+  `docker` forks `docker-compose` and passes our pipe down. `child.kill()` alone would strand it, so the
+  tail is spawned with `process_group(0)` and torn down with `kill(-pid, SIGKILL)` + `wait()`
+  (`docker::kill_tail`, regression-tested with a fake `docker` that forks a grandchild — no daemon needed).
+- New files: `agentctl/src/docker.rs` (process concerns only) + `agentctl/src/watch/logs.rs`
+  (`LogLine`/`LogsState` + parse + scroll/search state machine). `AppEvent::LogLines(Vec<LogLine>)` +
+  `AppEvent::LogLinesDropped(usize)`; `View::Logs`; `LogsState::available` gates key AND legend.
+- **Batching alone was NOT enough** (found at /qa, not by tests): `docker compose logs` writes
+  line-by-line, so the pipe hands the reader one line per read and "flush when the buffer runs dry"
+  degenerates to one-line batches. A 5 000-line burst then overflowed the 256-slot channel and lost
+  **4 479 lines (~90%)** — honestly counted in the header, but useless as a log view. A full channel is
+  now WAITED OUT for up to 250 ms (`LOG_SEND_BACKPRESSURE`, sized against the render loop's ~30 ms
+  drain) before anything counts as dropped; the same burst now lands 2 000/2 000 ring lines with zero
+  drops. Only a wait past the deadline counts as loss, so a wedged render loop still can't stall the
+  reader.
+
+**Sub-part A — second /review round** (5 specialist subagents + red team + `codex review`; run because the
+first round was Codex-adversarial only). Highest-value finds, all fixed: the unconditional `Effect::Redraw`
+on log events (Dashboard rebuilt at 33 Hz whenever the tail was chatty — the eager tail made this the
+DEFAULT state, not an edge case); bracketed paste inserted per-char into `tui-input` (O(n²) on the render
+thread → a big paste froze the loop with Ctrl-C inert); the 250 ms backpressure window starving the
+drop-on-full authoritative producers (priority inversion → 60 ms); `--tail` being per-CONTAINER (4 services
+× 500 = the whole ring). The lesson worth carrying: three of these are *interaction* defects between the
+new producer and the pre-existing loop, which is exactly what a diff-scoped adversarial pass does not
+surface — the specialists were dispatched with explicit "what did the others miss" framing and cross-file
+scope.
+
+**Sub-part A — the QA harness is now a committed project skill:**
+`.claude/skills/run-agentctl-watch/` (SKILL.md + `driver.py` + `fake-docker.sh`). It captures the pty
+driver, the three pitfalls that silently defeat TUI verification (unsized pty → blank frames; grepping raw
+ratatui output → split words; `kill(pid,0)` → a zombie reads as a hang), and six fake-docker modes
+(`stream`/`flood`/`giant`/`empty`/`fail`/`hang`) covering the gate, the ring cap, truncation, and the probe
+deadline. Verifying the skill's own recipe before committing caught a bug in the driver — `set_size` stored
+the shrunken width, so the repaint trick was a no-op and captures came back near-blank, i.e. exactly the
+pitfall it documents.
+
+**Sub-part A — /qa evidence (runtime, in a real pty; the harness used a
+fake `docker` that forks a grandchild, so no daemon was needed):** gate ON → `[l]ogs` in the legend, view
+streams all 3 services with correct attribution; gate OFF (real docker, daemon down) → key and legend
+entry both absent, `l` inert, `q` still quits; `Tab` filter ("12 of 36 lines"), `[t]` rel↔abs, `/` live +
+committed search with match counts, `n` jump, `k` → PAUSED, `G` → FOLLOW; ring holds at 2 000 under a
+5 000-line flood; a 12 KB newline-less record is truncated, attributed, and the stream resyncs after it;
+**no orphaned `docker compose logs`/grandchild process survived any clean quit**, and the exit status
+stayed 0.
 
 ---
 

@@ -24,27 +24,47 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.113.0 (shipped 2026-07-27)
+**Current version:** v0.114.0 (shipped 2026-07-27)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.10 sub-part B (v0.113.0) — real input widgets in `agentctl watch` (3rd of the UX
-tail). The 5 hand-rolled text inputs are now `tui-input`/`tui-textarea` (cursor movement, word-delete,
-bracketed paste); deps pinned to hold a single ratatui 0.29; `step_key` threads the full `KeyEvent` with
-per-view Enter/Esc/Tab interception (converse Enter=send, spawn Tab=focus/Enter=newline preserved). /autoplan
-reshaped it (sync-loop not tokio, dep pins, spawn Enter/Tab) + STRUCK sub-part C (color-eyre — redundant,
-`TermGuard` already restores on panic); /review (Codex) caught a cursor drawn at end-of-value instead of at
-the edit position. **Sub-part A (Logs view) is the remaining ux.10 follow-on** (heavy: pump-refactor +
-subprocess/orphan-kill; `docs/plans/ux.10-tui-polish.md`).
+**Latest shipped:** ux.10 sub-part A (v0.114.0) — the `[l]` **Logs view** in `agentctl watch`, which
+**completes ux.10** and the core UX tail. Tails `docker compose logs --follow --timestamps --no-color
+--tail 500` via a `std::process::Command` read on a background std-thread → batched
+`AppEvent::LogLines(Vec<LogLine>)` into a bounded 2 000-line ring (no tokio runtime exists in the sync
+crossterm loop). Per-service `Tab` filter, `/` search (highlight + `n`/`N`), follow mode, `[t]` rel↔abs
+timestamps. `[l]` not `[g]` (Spawn's generate); `g`/`G` stay in-view scroll. Docker-context gated on a
+3 s-bounded `docker compose ps --all --quiet` probe — one flag gates key AND legend, so no advertised
+dead key. **Orphan-kill went a process deeper than planned:** `docker compose` is a CLI plugin, so
+`Producers::drop` kills the whole PROCESS GROUP (`process_group(0)` + `kill(-pid)` + `wait`) — killing
+only the direct child would strand `docker-compose` holding the pipe.
+- **/review (4 Codex rounds) fixed:** substring service-matching mislabeled every `cos` line as `agent`
+  in *this repo's own* project (`agentos-cos-1`); unbounded `read_line` (newline-less-record OOM) +
+  non-UTF-8 killing the tail permanently → bounded lossy reader with truncate-and-resync; unbounded
+  startup probe (+ Ctrl-C swallowed by the signal handler installed too early); `n`/`N` deadlock on a
+  final-viewport match; DEL/C1 sanitizing; per-frame search allocation.
+- **/qa (runtime, real pty + a fake `docker` that forks a grandchild) fixed:** batching alone dropped
+  **4 479 of 5 000 lines (~90%)** because compose writes line-by-line — a full channel is now waited out
+  (60 ms) before anything counts as loss; the same burst now lands 2 000/2 000 with zero drops. Runtime
+  proof of gate on/off, ring bound, filter/search/follow, 12 KB-record truncation, and **no orphaned
+  tail process after any clean quit**.
+- **Second /review round (5 specialist subagents + red team + `codex review`) fixed:** an unconditional
+  `Effect::Redraw` on log events rebuilt the **Dashboard** at 33 Hz while the tail ran (now gated on the
+  Logs view being visible — measured 150 vs 2 556 bytes/4 s); bracketed paste was O(n²) per char on the
+  render thread and could freeze the loop with Ctrl-C inert (now capped + spliced — also fixes sub-part
+  B's four other input sites); the 250 ms backpressure window starved the drop-on-full authoritative
+  producers (cut to 60 ms); `--tail` is per CONTAINER so a flat 500 replayed the entire ring on a
+  4-service project; plus a bounded quit-path reap, a min-height guard, cursor-windowed query display,
+  and the project name in the title (the tail follows the CWD, not `--url`). +24 tests → **1 713**.
 
-**Prev:** ux.3 (v0.112.0) — spawn custom agents on the fly over HTTP (p7.3-ar-02 cluster): the Spawn view
-sends toggled caps + priority into a running instance via `POST /api/v1/spawn` (was silently dropped); one
-shared resolver makes preview == spawn; inline routing; sticky `pending_focus` auto-drop. /review killed a
-fabricated-agent_id. Closes the TUI Spawn-view gap; CLI-subcommand exec stays a P3 residual.
+**Prev:** ux.10 sub-part B (v0.113.0) — real input widgets (`tui-input`/`tui-textarea` across the 5
+hand-rolled inputs; single ratatui 0.29 held by exact pins; `step_key` threads the full `KeyEvent`).
+Sub-part C (color-eyre) STRUCK at the /autoplan gate as redundant (`TermGuard` already restores on panic).
+Before that, ux.3 (v0.112.0) — spawn custom agents on the fly over HTTP (p7.3-ar-02 cluster); CLI-subcommand
+exec stays a P3 residual.
 
-**UX tail so far:** ux.2b (v0.111.0) idle+error attention (closes cos-ux-01) → ux.3 (v0.112.0, this).
-Next: ux.10 (TUI polish). (v0.109.0/0.110.0/0.111.0 are the doc.1/p3.1-era releases; none tagged past
-v0.109.0 — tags are a manual gate.)
+**UX tail:** ux.2b (v0.111.0) idle+error attention (closes cos-ux-01) → ux.3 (v0.112.0) → ux.10-B
+(v0.113.0) → **ux.10-A (v0.114.0) — tail complete.** (None tagged past v0.113.0 — tags are a manual gate.)
 
 **AUDIT-v0.97 remediation — COMPLETE** (sweep + tail, v0.98.0→v0.109.0). Full audit: `docs/AUDIT-v0.97.md`.
 Every increment ran plan→build→review→qa→ship; a holistic cross-model /review + per-increment /autoplan
@@ -77,10 +97,11 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **ux.10 sub-part A** — the `[l]` Logs view (tail `docker compose logs` via a std-thread
-subprocess → mpsc; `child.kill()` on Drop to avoid orphaning; docker-context-gated). Heavy (pump-refactor);
-plan reshaped + locked in `docs/plans/ux.10-tui-polish.md`. Then ux.3b (`:` palette + modal) +
-evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue tracks.
+**Next (roadmap):** the core UX tail is CLOSED (ux.2b → ux.3 → ux.10-B → ux.10-A). Next is **ux.3b**
+(`:` command palette + modal), then evidence-gated ux.6/ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain
+the two end-of-queue tracks. Residuals: port-7999 shared constant (trivial), agentctl `spawn`
+CLI-subcommand exec (P3), and Logs-view follow-ons nobody has asked for yet (no horizontal scroll, no
+in-view restart of a dead tail).
 
 Full per-increment completion notes: `docs/STATUS.md`.
 
@@ -118,6 +139,15 @@ Full per-increment completion notes: `docs/STATUS.md`.
   via `cargo install cross --locked`) before pushing a branch that changes
   arch-conditional behavior. `Cross.toml` at the repo root pins the Docker image
   version so `ring`'s `build.rs` gets the correct `aarch64-linux-musl-gcc`.
+- **Run the TUI, don't just test it.** `agentctl watch` is a ratatui TUI: it needs a
+  real pty AND a window size, so piping into it renders an empty frame that makes
+  every assertion pass vacuously. The project skill
+  `.claude/skills/run-agentctl-watch/` is the verified path — a stdlib pty driver
+  (`driver.py`) that sends keys and captures readable frames, plus a fake `docker`
+  that reproduces the compose CLI-plugin fork so the `[l]` Logs view and its
+  process teardown can be exercised with no daemon. Use it for any `watch` change;
+  ux.10-A's worst defect (90% of a log burst dropped) was invisible to 1 689
+  passing tests and only appeared when the real binary was driven.
 - **Match the existing style.** Small modules, narrow traits, minimal
   dependencies. This is meant to be a *light* runtime — justify every new crate.
 - Update `docs/ROADMAP.md` (check off the increment) and any affected doc in the

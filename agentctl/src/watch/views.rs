@@ -9,6 +9,7 @@ use ratatui::{
 use super::app::{App, MemoryAbsence, MemoryPane, SpawnFocus, View};
 use super::approvals::ApprovalsMode;
 use super::converse::{ConversePhase, TurnRole};
+use super::logs::{clip_payload, format_ts, logs_viewport_rows};
 use super::memory::{
     filter_entries, filter_short_term, read_agent_memory, read_kb_segments, MAX_DISPLAY_ENTRIES,
     MAX_SEARCH_ENTRIES,
@@ -16,11 +17,19 @@ use super::memory::{
 use super::reader;
 use super::topology::render_tree;
 
-/// Strip ASCII control characters (< 0x20, except tab) from a string before
-/// rendering it in a TUI widget or plain-text output. Guards against ANSI
-/// escape sequences embedded in OS error messages.
+/// Strip control characters from a string before rendering it in a TUI widget or plain-text
+/// output. Guards against ANSI escape sequences embedded in OS error messages — and, since
+/// ux.10-A, against raw container output, which is fully untrusted bytes.
+///
+/// Three classes go: C0 (< 0x20, except tab), DEL (0x7f), and C1 (U+0080–U+009F — many
+/// terminals still interpret these as control codes, `ESC`-equivalents among them, when they
+/// arrive as UTF-8).
 fn sanitize(s: &str) -> String {
-    s.chars().filter(|&c| c >= ' ' || c == '\t').collect()
+    s.chars()
+        .filter(|&c| {
+            c == '\t' || (c >= ' ' && c != '\u{7f}' && !('\u{80}'..='\u{9f}').contains(&c))
+        })
+        .collect()
 }
 
 const MIN_TOPOLOGY_WIDTH: u16 = 60;
@@ -76,6 +85,7 @@ pub fn render(f: &mut Frame, app: &App) {
         View::Inspector   => render_inspector(f, app),
         View::Approvals   => render_approvals(f, app),
         View::Credentials => render_credentials(f, app),
+        View::Logs        => render_logs(f, app),
     }
 }
 
@@ -409,12 +419,16 @@ fn render_dashboard(f: &mut Frame, app: &App) {
     // ux.1: 3-state footer (DX Pass 1 — the single biggest discoverability gap found in
     // review). `r` is listed first and set apart from the `[x]` nav-key bracket style,
     // since it's a different key *category* (act on the selected row, not navigate away).
+    // ux.10-A: `[l]ogs` appears ONLY when a compose project was detected at startup — the
+    // same `logs_view.available` flag that gates the key itself (mod.rs), so the legend can
+    // never advertise a key that does nothing.
+    let logs_key = if app.logs_view.available { "  [l]ogs" } else { "" };
     let hints = if !rail_fits {
-        " ↑/↓ select  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector  q quit  (resize to 115+ cols / 8+ rows for chat) ".to_string()
+        format!(" ↑/↓ select  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector{logs_key}  q quit  (resize to 115+ cols / 8+ rows for chat) ")
     } else if app.converse_view.rail_focused {
         " Esc/Tab: back to table  Enter: send  ↑/↓: scroll  End: follow  Ctrl-c: cancel ".to_string()
     } else {
-        " ↑/↓ select  r retarget chat  Tab: chat  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector  q quit ".to_string()
+        format!(" ↑/↓ select  r retarget chat  Tab: chat  Enter: view detail  [s]ystem  [t]opology  [m]emory  [n]ew  [a]pprove  [c]reds  [i]nspector{logs_key}  q quit ")
     };
     f.render_widget(
         Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
@@ -1302,6 +1316,278 @@ fn render_inspector(f: &mut Frame, app: &App) {
     );
 }
 
+/// ux.10-A: stable per-service colour so the eye can follow one service through an
+/// interleaved tail. A byte sum, not a real hash — enough to spread a handful of compose
+/// services across the palette, and stable across restarts (a colour that moved between
+/// sessions would be worse than no colour).
+const SERVICE_COLORS: [Color; 6] = [
+    Color::Cyan,
+    Color::Green,
+    Color::Magenta,
+    Color::Yellow,
+    Color::Blue,
+    Color::LightRed,
+];
+
+fn service_color(name: &str) -> Color {
+    let sum: usize = name.bytes().map(usize::from).sum();
+    SERVICE_COLORS[sum % SERVICE_COLORS.len()]
+}
+
+/// Fixed gutter widths so payloads line up into a readable column regardless of service
+/// name length (the whole point of keeping compose's prefix).
+const LOG_SERVICE_COL: usize = 12;
+const LOG_TS_COL: usize = 8;
+
+/// Left-align into exactly `width` display cells, ellipsizing an over-long value.
+fn pad_or_clip(s: &str, width: usize) -> String {
+    if s.chars().count() > width {
+        let keep = width.saturating_sub(1);
+        return s.chars().take(keep).chain(std::iter::once('…')).collect();
+    }
+    format!("{s:<width$}")
+}
+
+/// Max characters of the search query shown in the Logs header.
+const MAX_HEADER_QUERY_CHARS: usize = 80;
+
+/// Render an over-long query as a window AROUND THE CURSOR, with `…` marking each cut side.
+///
+/// Not tail-keeping: with the tail kept, pressing Home on a 200-char query and typing put the
+/// cursor glyph inside the discarded prefix, so the header froze and every keystroke was
+/// invisible — the same "cursor isn't where the edit is" defect /review caught in sub-part B,
+/// reintroduced through the clip (/review's red-team pass). Slicing to the window first also
+/// makes the per-frame work O(window) instead of two full-length Strings, which is what the
+/// clip was there for in the first place.
+fn header_query_window(input: &tui_input::Input, glyph: char) -> String {
+    let value: Vec<char> = input.value().chars().collect();
+    if value.len() < MAX_HEADER_QUERY_CHARS {
+        return input_with_cursor_glyph(input, glyph);
+    }
+    let cursor = input.cursor().min(value.len());
+    // Room for the glyph plus a leading/trailing ellipsis.
+    let span  = MAX_HEADER_QUERY_CHARS.saturating_sub(3);
+    let half  = span / 2;
+    let start = cursor.saturating_sub(half);
+    let end   = (start + span).min(value.len());
+    let start = end.saturating_sub(span);
+    let mut out = String::with_capacity(MAX_HEADER_QUERY_CHARS + 2);
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&value[start..cursor]);
+    out.push(glyph);
+    out.extend(&value[cursor..end]);
+    if end < value.len() {
+        out.push('…');
+    }
+    out
+}
+
+/// Head-keeping clip for a COMMITTED query (no cursor to track — what was searched for is the
+/// useful part).
+fn clip_header_query(q: &str) -> String {
+    let mut chars = q.chars();
+    let out: String = chars.by_ref().take(MAX_HEADER_QUERY_CHARS).collect();
+    if chars.next().is_some() {
+        return format!("{out}…");
+    }
+    out
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// ux.10-A: the `[l]` Logs view — a bounded tail of `docker compose logs`, service-filtered
+/// with `Tab`, searched with `/` (highlight + `n`/`N`, NOT a filter — a matching log line is
+/// only useful with its surrounding context).
+/// Below this height the content block is all border and no payload rows, so the view would
+/// render an empty box while its header claimed thousands of lines and every scroll key mutated
+/// an invisible viewport. Guarded like `render_memory`'s `MIN_MEMORY_WIDTH` (/review's red-team
+/// pass): header 1 + footer 1 + 2 border rows + at least 2 usable rows.
+const MIN_LOGS_HEIGHT: u16 = 6;
+
+fn render_logs(f: &mut Frame, app: &App) {
+    let (header_area, content_area, footer_area) = header_footer_layout(f.area());
+    let lv = &app.logs_view;
+
+    if f.area().height < MIN_LOGS_HEIGHT {
+        f.render_widget(
+            Paragraph::new(format!(
+                " logs need at least {MIN_LOGS_HEIGHT} rows — resize, or Esc/q to go back "
+            ))
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+            f.area(),
+        );
+        return;
+    }
+
+    // The same helper the key handler uses (`logs::logs_viewport_rows`) — fed the frame height
+    // here and `App::term_size` there. Those agree because the `Event::Resize` arm keeps
+    // `term_size` equal to the frame size; only the arithmetic is genuinely shared, so this is
+    // a maintained invariant, not a structural guarantee (/review's maintainability pass
+    // corrected an earlier "can never disagree" claim here). The debug_assert below pins the
+    // chrome arithmetic against the layout actually used.
+    let rows = logs_viewport_rows(f.area().height);
+    debug_assert_eq!(
+        rows,
+        content_area.height.saturating_sub(2).max(1) as usize,
+        "logs_viewport_rows drifted from header_footer_layout + the content block's borders"
+    );
+    let indices = lv.visible_indices();
+    // Reuses `indices.len()` instead of re-walking the ring inside `filtered_len()`.
+    let scroll = lv.effective_scroll_for_len(indices.len(), rows);
+    let now    = now_unix();
+    // ONE match pass per frame, reusing `indices`. Previously the header count called
+    // `match_positions()` (which re-derived `visible_indices()` and re-scanned every stored
+    // line) and each visible row called `matches_search()` again — measured by /review's
+    // performance pass at 1.2 ms/frame typical and 9.5 ms with 4 KB lines, against a 30 ms
+    // tick. `matches` is indexed by position within `indices`, so the body reuses it directly.
+    let matches: Vec<bool> = if lv.search_query.value().is_empty() {
+        Vec::new()
+    } else {
+        indices
+            .iter()
+            .map(|&i| lv.lines.get(i).is_some_and(|l| lv.matches_search(l)))
+            .collect()
+    };
+    let match_count = matches.iter().filter(|m| **m).count();
+
+    // ── header: filter cycle, line counts, drop accounting, search state ──
+    let filters = lv
+        .filter_labels()
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if i == lv.filter_idx {
+                format!("[{}]", sanitize(name))
+            } else {
+                sanitize(name)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let counts = if lv.active_filter().is_some() {
+        format!("{} of {} lines", indices.len(), lv.lines.len())
+    } else {
+        format!("{} lines", lv.lines.len())
+    };
+    // Never silent: lines lost to backpressure are stated, not quietly missing.
+    let dropped = if lv.dropped > 0 {
+        format!("  ⚠ {} dropped", lv.dropped)
+    } else {
+        String::new()
+    };
+    // The query is operator input (possibly a large paste), so it is clipped FIRST and only
+    // then sanitized — clipping last still built two full-length Strings per frame, so the
+    // stated "a 100 KB paste must not build a 100 KB line every frame" guard did not actually
+    // hold (found by /review's performance pass).
+    let search = if lv.search_active {
+        // Sanitized on the EDITING path too, not just the committed one: bracketed paste can
+        // put control bytes into the field, and an unsanitized live query would put them
+        // straight into the header line (found by /review round 2).
+        format!("   search: {}", sanitize(&header_query_window(&lv.search_query, '_')))
+    } else if !lv.search_query.value().is_empty() {
+        format!(
+            "   /{} ({match_count} match{})",
+            sanitize(&clip_header_query(lv.search_query.value())),
+            if match_count == 1 { "" } else { "es" }
+        )
+    } else {
+        String::new()
+    };
+    f.render_widget(
+        Paragraph::new(format!(
+            " agentctl watch › logs  {filters} — {counts}{dropped}{search} "
+        ))
+        .style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        header_area,
+    );
+
+    // ── body: service | age | payload ──
+    let mut body: Vec<Line> = indices
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(rows)
+        .filter_map(|(pos, &i)| lv.lines.get(i).map(|l| (pos, l)))
+        .map(|(pos, l)| {
+            // agentctl's own status lines are never attributed to a service.
+            if l.notice {
+                return Line::from(Span::styled(
+                    sanitize(&l.text),
+                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                ));
+            }
+            // Every untrusted-derived column is sanitized, not just the payload: the service
+            // name comes from the compose prefix and the timestamp column can fall back to raw
+            // stamp bytes, so both are container-controlled too (/review's security pass found
+            // this asymmetry — ratatui filters control chars as a second layer, but the plain
+            // renderer does not, so the guard belongs here).
+            let svc = l.service.as_deref().unwrap_or("-");
+            let ts  = format_ts(l.ts.as_deref(), lv.absolute_ts, now);
+            let payload_style = if matches.get(pos).copied().unwrap_or(false) {
+                Style::default().fg(Color::Black).bg(Color::Yellow)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(
+                    sanitize(&pad_or_clip(svc, LOG_SERVICE_COL)),
+                    Style::default().fg(service_color(svc)),
+                ),
+                Span::styled(
+                    format!(" {:>w$}  ", sanitize(&ts), w = LOG_TS_COL),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                // Clip BEFORE sanitize: sanitizing first walked and allocated the whole stored
+                // record (up to 4 KB) only for ~87% of it to be thrown away.
+                Span::styled(sanitize(&clip_payload(&l.text)), payload_style),
+            ])
+        })
+        .collect();
+    if body.is_empty() {
+        // Distinguish "the tail has produced nothing" from "this filter matches nothing" — the
+        // header simultaneously says e.g. "0 of 1500 lines", so a single message contradicted
+        // it and read as a dead tail (/review's maintainability pass).
+        let msg = match lv.active_filter() {
+            Some(svc) if !lv.lines.is_empty() => {
+                format!("  (no lines from '{}' yet — Tab to change filter)", sanitize(svc))
+            }
+            _ => "  (no output yet — tailing `docker compose logs`)".to_string(),
+        };
+        body.push(Line::from(Span::styled(msg, Style::default().fg(Color::DarkGray))));
+    }
+    // Name the project in the title. The compose project comes from agentctl's CWD while the
+    // rest of the cockpit describes whatever `--url`/FUSE points at, so these can be different
+    // machines — an unlabelled title let local container output read as the watched host's
+    // (/review's red-team pass).
+    let title = if lv.project.is_empty() {
+        " docker compose logs ".to_string()
+    } else {
+        format!(" docker compose logs — {} ", sanitize(&lv.project))
+    };
+    f.render_widget(
+        Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title)),
+        content_area,
+    );
+
+    // ── footer: keys + follow state (the one piece of state the body can't show) ──
+    let follow = if lv.follow { "FOLLOW" } else { "PAUSED — [G] to follow" };
+    let hints = format!(
+        " Tab:service  [/]search  n/N:match  ↑/↓ scroll  [g]/[G] top/bottom  [t]ime:{}  Esc/q back — {follow} ",
+        if lv.absolute_ts { "abs" } else { "rel" }
+    );
+    f.render_widget(
+        Paragraph::new(hints).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+        footer_area,
+    );
+}
+
 fn render_approvals(f: &mut Frame, app: &App) {
     let (header_area, content_area, footer_area) = header_footer_layout(f.area());
 
@@ -1754,6 +2040,76 @@ mod tests {
     use super::*;
     use crate::watch::app::App;
     use crate::watch::reader::{AgentInfo, BudgetKind, Snapshot, SysBudget, SysProvider, SysQueue};
+
+    // ── ux.10-A: Logs view formatters + the widened control-char guard ───────
+
+    /// `sanitize` was widened in ux.10-A specifically because container stdout is untrusted
+    /// bytes. Only the C0 class had any coverage, so reverting the widening would have passed
+    /// every test while restoring the injection vector (/review's testing pass).
+    #[test]
+    fn sanitize_strips_c0_del_and_c1_but_keeps_tab_and_printables() {
+        assert_eq!(sanitize("a\x1bb\x07c"), "abc", "C0 incl. ESC and BEL");
+        assert_eq!(sanitize("a\u{7f}b"), "ab", "DEL");
+        assert_eq!(sanitize("a\u{80}b\u{9b}c\u{9f}d"), "abcd", "C1 range incl. CSI + bounds");
+        assert_eq!(sanitize("a\tb"), "a\tb", "tab is deliberately kept");
+        assert_eq!(sanitize("a\u{a0}é🚀b"), "a\u{a0}é🚀b", "non-controls survive");
+    }
+
+    #[test]
+    fn logs_gutter_formatters_respect_their_width_contracts() {
+        assert_eq!(pad_or_clip("cos", LOG_SERVICE_COL).chars().count(), LOG_SERVICE_COL);
+        assert_eq!(
+            pad_or_clip(&"a".repeat(LOG_SERVICE_COL), LOG_SERVICE_COL).chars().count(),
+            LOG_SERVICE_COL
+        );
+        let clipped = pad_or_clip(&"a".repeat(LOG_SERVICE_COL + 5), LOG_SERVICE_COL);
+        assert_eq!(clipped.chars().count(), LOG_SERVICE_COL);
+        assert!(clipped.ends_with('…'));
+        // Multibyte names stay char-count-correct (display width is a known caveat).
+        assert_eq!(pad_or_clip("日本語サービス名", LOG_SERVICE_COL).chars().count(), LOG_SERVICE_COL);
+    }
+
+    #[test]
+    fn service_colour_is_stable_and_spreads_across_the_palette() {
+        assert_eq!(service_color("cos"), service_color("cos"), "stable across calls");
+        let distinct: std::collections::HashSet<_> =
+            ["cos", "agent", "qdrant"].iter().map(|s| service_color(s)).collect();
+        assert!(distinct.len() >= 2, "real service names should not all collide");
+    }
+
+    /// The header window must keep the CURSOR visible on a long query — tail-keeping put the
+    /// glyph inside the discarded prefix, so editing at the start showed no feedback at all
+    /// (/review's red-team pass).
+    #[test]
+    fn header_query_window_keeps_the_cursor_visible_wherever_it_is() {
+        let long = "q".repeat(MAX_HEADER_QUERY_CHARS * 3);
+        // Cursor at the very start (Home).
+        let at_start = header_query_window(&tui_input::Input::new(long.clone()).with_cursor(0), '_');
+        assert!(at_start.starts_with('_'), "cursor must be visible at the head: {at_start}");
+        assert!(at_start.ends_with('…'), "and the cut tail marked");
+        assert!(at_start.chars().count() <= MAX_HEADER_QUERY_CHARS + 2);
+        // Cursor in the middle.
+        let mid_pos = long.chars().count() / 2;
+        let mid = header_query_window(
+            &tui_input::Input::new(long.clone()).with_cursor(mid_pos),
+            '_',
+        );
+        assert!(mid.contains('_'), "cursor visible mid-query");
+        assert!(mid.starts_with('…') && mid.ends_with('…'), "both cuts marked: {mid}");
+        // Short queries are untouched (identical to the plain glyph rendering).
+        let short = tui_input::Input::new("abc".to_string());
+        assert_eq!(header_query_window(&short, '_'), input_with_cursor_glyph(&short, '_'));
+    }
+
+    #[test]
+    fn committed_header_query_keeps_the_head_and_marks_the_cut() {
+        let exact = "q".repeat(MAX_HEADER_QUERY_CHARS);
+        assert_eq!(clip_header_query(&exact), exact, "at the boundary nothing is clipped");
+        let over = "q".repeat(MAX_HEADER_QUERY_CHARS + 10);
+        let out  = clip_header_query(&over);
+        assert_eq!(out.chars().count(), MAX_HEADER_QUERY_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
 
     // ── ux.10: cursor glyph is drawn at the input's actual position ──────────
     // (Codex /review: appending the glyph at .value()'s end lied about the edit

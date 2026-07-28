@@ -16,13 +16,14 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 // ux.10: `tui_input` widgets consume a crossterm `Event`; the `EventHandler` trait provides
-// `Input::handle_event`, and `InputRequest::InsertChar` is used to route bracketed-paste text.
-use tui_input::{backend::crossterm::EventHandler, InputRequest};
+// `Input::handle_event`. Bracketed-paste text is spliced directly (see insert_paste_into_input).
+use tui_input::backend::crossterm::EventHandler;
 
 pub mod app;
 pub mod approvals;
 pub mod converse;
 pub mod inspector;
+pub mod logs;
 pub mod memory;
 pub mod pump;
 pub mod reader;
@@ -200,14 +201,26 @@ fn run_tui(
     log_path: Option<PathBuf>,
     source: Arc<dyn DataSource>,
 ) -> anyhow::Result<()> {
+    // ux.10-A (D1): probe for a Docker Compose project ONCE, deliberately BEFORE both
+    // TermGuard::enter() AND the signal handlers. Before TermGuard because the docker CLI can
+    // take a few hundred ms (or fail noisily) and must do so on the normal screen, never
+    // inside the alternate screen. Before the handlers because they downgrade SIGINT to "set
+    // an atomic the render loop polls" — install them first and a Ctrl-C during a wedged
+    // probe would do nothing at all, since the loop isn't running yet (found by /review's
+    // Codex pass; the probe also has its own 3 s deadline). The result gates the `[l]` Logs
+    // view and its legend entry for the whole session.
+    let docker = crate::docker::detect_docker_context();
     install_shutdown_signal_handlers();
     let guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut term = Terminal::new(backend).context("creating terminal")?;
     let mut app = App::new(agents_dir.clone());
     app.log_path = log_path.clone();
+    if let Some(ctx) = &docker {
+        app.logs_view.enable(ctx.services.clone(), ctx.project.clone());
+    }
 
-    run_tui_loop(&mut term, &mut app, &source, interval)?;
+    run_tui_loop(&mut term, &mut app, &source, interval, docker.as_ref())?;
 
     // Restore the terminal before any pending exec replaces the process.
     drop(guard);
@@ -230,9 +243,12 @@ fn run_tui(
                 let mut term2 = Terminal::new(backend2).context("recreating terminal")?;
                 let mut app2 = App::new(agents_dir.clone());
                 app2.log_path = log_path.clone();
+                if let Some(ctx) = &docker {
+                    app2.logs_view.enable(ctx.services.clone(), ctx.project.clone());
+                }
                 app2.spawn_banner =
                     Some(format!("Agent '{}' injected via /agents/control", agent_id_hint));
-                run_tui_loop(&mut term2, &mut app2, &source, interval)?;
+                run_tui_loop(&mut term2, &mut app2, &source, interval, docker.as_ref())?;
                 drop(guard2);
                 pending = app2.spawn_view.pending_exec.take();
             }
@@ -256,13 +272,39 @@ fn on_resize(app: &mut App, w: u16, h: u16) {
     }
 }
 
-/// ux.10: insert bracketed-paste text into a `tui_input::Input` char-by-char.
-/// `tui_input`'s crossterm backend does not translate `Event::Paste` on its own, so
-/// the text is fed as a run of `InsertChar` requests (each respects the cursor position).
+/// Upper bound on a single bracketed paste. Generous for a chat message or a search term,
+/// small enough that splicing it is microseconds of work on the render thread.
+const MAX_PASTE_CHARS: usize = 8192;
+
+/// ux.10: splice bracketed-paste text into a `tui_input::Input` at the cursor.
+///
+/// `tui_input`'s crossterm backend does not translate `Event::Paste`, so the text has to be
+/// inserted by hand. It is spliced in ONE rebuild rather than as a run of `InsertChar`
+/// requests: `InsertChar` walks the value to compare against the cursor (and rebuilds the
+/// String when the cursor is interior), so per-char insertion is O(n²) in the paste length —
+/// and `route_paste` runs on the MAIN render thread, so a large paste froze the whole cockpit
+/// with Ctrl-C inert (raw mode suppresses the tty's SIGINT and the loop is not polling).
+/// Found by /review's red-team pass; the bound and the splice together make the cost linear
+/// and capped. Control characters are dropped — none of these fields is multi-line, and a
+/// pasted ESC has no business reaching a widget.
 fn insert_paste_into_input(input: &mut tui_input::Input, text: &str) {
-    for c in text.chars() {
-        input.handle(InputRequest::InsertChar(c));
+    let clean: String = text
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PASTE_CHARS)
+        .collect();
+    if clean.is_empty() {
+        return;
     }
+    let value    = input.value();
+    let cursor   = input.cursor().min(value.chars().count());
+    let byte_idx = value.char_indices().nth(cursor).map_or(value.len(), |(i, _)| i);
+    let mut next = String::with_capacity(value.len() + clean.len());
+    next.push_str(&value[..byte_idx]);
+    next.push_str(&clean);
+    next.push_str(&value[byte_idx..]);
+    let next_cursor = cursor + clean.chars().count();
+    *input = tui_input::Input::new(next).with_cursor(next_cursor);
 }
 
 /// ux.10: route bracketed-paste text to whichever input widget currently has focus.
@@ -286,6 +328,12 @@ fn route_paste(app: &mut App, text: &str) {
         View::Approvals if app.approvals_view.mode == ApprovalsMode::RejectReason => {
             insert_paste_into_input(&mut app.approvals_view.reject_reason, text);
         }
+        // ux.10-A: the Logs search field is a tui_input like the others, so a pasted
+        // container id / error string can be searched for without retyping it.
+        View::Logs if app.logs_view.search_active => {
+            insert_paste_into_input(&mut app.logs_view.search_query, text);
+            app.logs_view.match_cursor = None;
+        }
         _ => {}
     }
 }
@@ -300,9 +348,17 @@ fn run_tui_loop(
     app: &mut App,
     source: &Arc<dyn DataSource>,
     interval: Duration,
+    docker: Option<&crate::docker::DockerContext>,
 ) -> anyhow::Result<()> {
-    // Producers stop when `_producers`/`rx`/`wake_tx` drop at loop exit (detached; never joined — F7).
-    let (rx, wake_tx, _producers) = spawn_producers(Arc::clone(source), interval);
+    // Producers stop when `_producers`/`rx`/`wake_tx` drop at loop exit (detached; never
+    // joined — F7). ux.10-A: `_producers` also OWNS the `docker compose logs --follow`
+    // child and kills it in `Drop`, so it must stay bound for the whole loop (a `_`
+    // binding would drop it immediately and kill the tail before the first frame).
+    let (rx, wake_tx, _producers) = spawn_producers(
+        Arc::clone(source),
+        interval,
+        docker.map(|d| d.services.clone()),
+    );
     // ux.1: seed the real terminal size once at startup (crossterm::event::Resize keeps
     // it current after this — see the Event::Resize arm below); App::term_size otherwise
     // defaults to DEFAULT_TERM_SIZE, which is only a placeholder for tests/pre-first-frame.
@@ -395,6 +451,18 @@ fn drain_events(
     false
 }
 
+/// ux.10-A: a log-state change is only worth a frame when the Logs view is the one on screen.
+/// Off-view the ring, the service registry, and the drop counter still accumulate (that is the
+/// point of the eager tail) — only the redraw is skipped. Entering the view repaints anyway,
+/// via the `[l]` keypress's own `Effect::Redraw`.
+fn logs_redraw(app: &App) -> Vec<Effect> {
+    if app.view == View::Logs {
+        vec![Effect::Redraw]
+    } else {
+        vec![]
+    }
+}
+
 /// Fold one `AppEvent` into `App`, returning render/quit effects (F2). Pure and
 /// terminal-free except that the Approvals view calls `source.approve/deny` — which
 /// runs on the MAIN thread here, NOT inside a tokio runtime, so `reqwest::blocking`
@@ -428,9 +496,32 @@ fn step(app: &mut App, ev: AppEvent, source: &dyn DataSource) -> Vec<Effect> {
             app.note_dropped(n);
             vec![Effect::Redraw]
         }
-        AppEvent::ProducerDied(_which) => {
+        AppEvent::LogLines(batch) => {
+            // ux.10-A: folded unconditionally, regardless of the active view — the tail
+            // keeps filling its ring while the operator is elsewhere, so `[l]` opens on
+            // real scrollback instead of an empty pane. The REDRAW, however, is gated on the
+            // Logs view actually being on screen: the tail is spawned eagerly, so an
+            // unconditional Redraw made a chatty compose project rebuild the Dashboard (table
+            // + rail + attention signals) at the 33 Hz tick ceiling instead of once per
+            // snapshot — burning CPU on frames nobody is looking at AND slowing the drain that
+            // decides whether log batches get dropped (found by /review's red-team pass).
+            app.logs_view.push_lines(batch);
+            logs_redraw(app)
+        }
+        AppEvent::LogLinesDropped(n) => {
+            app.logs_view.note_dropped(n);
+            logs_redraw(app)
+        }
+        AppEvent::ProducerDied(which) => {
             // A producer thread panicked (fix 5): surface it as a gap so the feed
             // reads as stalled instead of silently rendering the last state forever.
+            // ux.10-A: a dead LOG reader is not a snapshot/SSE gap — reporting it as one
+            // would slander the authoritative feed, so it is reported in the Logs view.
+            if which == pump::LOGS_PRODUCER {
+                app.logs_view
+                    .push_lines(vec![logs::LogLine::notice("— log reader stopped —")]);
+                return logs_redraw(app);
+            }
             app.mark_gap();
             vec![Effect::Redraw]
         }
@@ -486,6 +577,7 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
                 app.view = View::Dashboard;
             }
         }
+        View::Logs => handle_logs_key(key, app),
     }
     let mut effects = vec![Effect::Redraw];
     if matches!(key.code, KeyCode::Char('q')) && was_dashboard && !rail_was_focused {
@@ -752,6 +844,65 @@ fn handle_dashboard_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
         KeyCode::Char('c') => {
             app.view = View::Credentials;
         }
+        // ux.10-A: [l] opens the compose log tail. `[l]`, not `[g]` — `[g]` is Spawn's
+        // "generate preview" and, although key dispatch is per-view, reusing the letter
+        // across views is a footgun the /autoplan eng consensus explicitly rejected.
+        // Gated on the startup detection: on bare agentd / QEMU there is no compose project,
+        // so the key is inert AND absent from the legend (views.rs reads the same flag).
+        KeyCode::Char('l') if app.logs_view.available => {
+            app.view = View::Logs;
+        }
+        _ => {}
+    }
+}
+
+/// ux.10-A: Logs view keys.
+///
+/// The `rows` page size comes from `logs::logs_viewport_rows(app.term_size)` — the same
+/// helper `views::render_logs` uses — so "scroll one page" and "am I at the bottom" agree
+/// with what is actually on screen.
+fn handle_logs_key(key: KeyEvent, app: &mut App) {
+    let rows = logs::logs_viewport_rows(app.term_size.1);
+    // Search field owns the keyboard while active: Enter COMMITS the query (the field
+    // closes, the query stays for highlighting + n/N), Esc cancels and clears. Everything
+    // else edits the tui_input widget — so typing a word containing 'q'/'j'/'n' searches
+    // for it instead of quitting, scrolling, or jumping (the ux.1 rail-focus lesson).
+    if app.logs_view.search_active {
+        match key.code {
+            KeyCode::Enter => app.logs_view.search_active = false,
+            KeyCode::Esc => {
+                app.logs_view.search_active = false;
+                app.logs_view.search_query.reset();
+                app.logs_view.match_cursor = None;
+            }
+            _ => {
+                app.logs_view.search_query.handle_event(&Event::Key(key));
+                // Editing the query changes the match set, so the n/N cursor is stale.
+                app.logs_view.match_cursor = None;
+            }
+        }
+        return;
+    }
+    // Taken before the mutable borrow below, which would otherwise conflict with `app.view`.
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.view = View::Dashboard;
+        return;
+    }
+    let lv = &mut app.logs_view;
+    match key.code {
+        KeyCode::Char('/')                 => lv.search_active = true,
+        KeyCode::Tab                       => lv.cycle_filter(),
+        KeyCode::Char('t')                 => lv.absolute_ts = !lv.absolute_ts,
+        KeyCode::Char('n')                 => lv.next_match(rows),
+        KeyCode::Char('N')                 => lv.prev_match(rows),
+        KeyCode::Up | KeyCode::Char('k')   => lv.scroll_by(rows, -1),
+        KeyCode::Down | KeyCode::Char('j') => lv.scroll_by(rows, 1),
+        KeyCode::PageUp                    => lv.scroll_by(rows, -(rows as isize)),
+        KeyCode::PageDown                  => lv.scroll_by(rows, rows as isize),
+        // g/G keep their in-view top/bottom meaning (the plan's D7) — they are NOT the
+        // view-opening key, which is why the Logs key is `[l]`.
+        KeyCode::Char('g') | KeyCode::Home => lv.scroll_to_top(),
+        KeyCode::Char('G') | KeyCode::End   => lv.scroll_to_bottom(),
         _ => {}
     }
 }
@@ -1124,8 +1275,8 @@ mod tests {
 
     use super::{
         do_spawn_action, drain_events, handle_approvals_key, handle_dashboard_key,
-        handle_inspector_key, handle_memory_key, handle_spawn_key, on_resize, route_paste, step,
-        step_key, App, Effect, View,
+        handle_inspector_key, handle_logs_key, handle_memory_key, handle_spawn_key, logs,
+        on_resize, route_paste, step, step_key, App, Effect, View, MAX_PASTE_CHARS,
     };
     use crate::watch::app::{MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
@@ -2297,6 +2448,240 @@ mod tests {
         assert_eq!(app.view, View::Dashboard);
     }
 
+    // ── ux.10-A: Logs view ───────────────────────────────────────────────────
+    //
+    // These exercise the DISPATCH GATE and the key/state machine, never the shell-out:
+    // `docker compose ps` / `logs` are only reached from `run_tui`/`spawn_producers`, which
+    // no test enters. `/qa` covers the real subprocess + the orphan-kill at runtime.
+
+    fn logs_app(available: bool) -> App {
+        let mut app = App::new(PathBuf::from("/agents"));
+        if available {
+            app.logs_view.enable(vec!["cos".to_string(), "agent".to_string()], "test-project".to_string());
+        }
+        app
+    }
+
+    fn push_log_lines(app: &mut App, n: usize) {
+        let batch = (0..n)
+            .map(|i| logs::LogLine {
+                service: Some("cos".to_string()),
+                ts:      None,
+                text:    format!("line {i}"),
+                notice:  false,
+            })
+            .collect();
+        step(app, AppEvent::LogLines(batch), &TestSource);
+    }
+
+    #[test]
+    fn dashboard_key_l_opens_logs_only_when_docker_was_detected() {
+        // Gate ON: [l] opens the view.
+        let mut app = logs_app(true);
+        handle_dashboard_key(key('l'), &mut app, &TestSource);
+        assert_eq!(app.view, View::Logs);
+
+        // Gate OFF (bare agentd / QEMU / no compose project): the key is inert. Not merely
+        // "renders an empty view" — it must not change the view at all, matching the legend
+        // which omits it entirely.
+        let mut app = logs_app(false);
+        handle_dashboard_key(key('l'), &mut app, &TestSource);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn step_log_lines_fills_the_ring_regardless_of_active_view() {
+        // The tail keeps filling while the operator is elsewhere, so [l] opens on real
+        // scrollback rather than an empty pane.
+        let mut app = logs_app(true);
+        app.view = View::Memory;
+        push_log_lines(&mut app, 3);
+        assert_eq!(app.logs_view.lines.len(), 3);
+    }
+
+    #[test]
+    fn step_log_lines_dropped_accumulates_visible_drop_count() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        let effects = step(&mut app, AppEvent::LogLinesDropped(12), &TestSource);
+        assert_eq!(app.logs_view.dropped, 12);
+        assert_eq!(effects, vec![Effect::Redraw]);
+    }
+
+    /// Log traffic must not repaint the whole TUI while the operator is looking at another
+    /// view: the tail is spawned eagerly, so an unconditional Redraw turned a chatty compose
+    /// project into a 33 Hz dashboard rebuild (and the slower drain then manufactured the very
+    /// drops the header reports). Found by /review's red-team pass.
+    #[test]
+    fn log_events_do_not_repaint_while_another_view_is_on_screen() {
+        let mut app = logs_app(true);
+        assert_eq!(app.view, View::Dashboard);
+        let batch = vec![logs::LogLine { text: "tick".into(), ..logs::LogLine::default() }];
+        assert!(
+            step(&mut app, AppEvent::LogLines(batch.clone()), &TestSource).is_empty(),
+            "off-view log lines must not request a frame"
+        );
+        assert_eq!(app.logs_view.lines.len(), 1, "but the ring still accumulates");
+        assert!(step(&mut app, AppEvent::LogLinesDropped(3), &TestSource).is_empty());
+        assert_eq!(app.logs_view.dropped, 3, "and so does the drop counter");
+        assert!(
+            step(&mut app, AppEvent::ProducerDied(crate::watch::pump::LOGS_PRODUCER), &TestSource).is_empty()
+        );
+        assert_eq!(app.event_gaps, 0, "a dead log reader is not an event-feed gap");
+
+        // On the Logs view the same events DO redraw.
+        app.view = View::Logs;
+        assert_eq!(
+            step(&mut app, AppEvent::LogLines(batch), &TestSource),
+            vec![Effect::Redraw]
+        );
+    }
+
+    #[test]
+    fn step_producer_died_for_logs_reports_in_the_logs_view_not_as_a_feed_gap() {
+        // A dead log reader must not slander the authoritative snapshot/SSE feed.
+        let mut app = logs_app(true);
+        step(&mut app, AppEvent::ProducerDied("logs"), &TestSource);
+        assert_eq!(app.event_gaps, 0, "the log tail is not the event feed");
+        assert!(app.logs_view.lines.back().unwrap().notice);
+    }
+
+    #[test]
+    fn logs_key_q_returns_to_dashboard_and_esc_does_too() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        handle_logs_key(key('q'), &mut app);
+        assert_eq!(app.view, View::Dashboard);
+
+        app.view = View::Logs;
+        handle_logs_key(kev(KeyCode::Esc), &mut app);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn logs_key_q_while_searching_types_instead_of_leaving_the_view() {
+        // Same class of bug as the ux.1 chat-rail 'q' quit: a text field must swallow
+        // letters that are shortcuts elsewhere.
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        handle_logs_key(kev(KeyCode::Char('/')), &mut app);
+        assert!(app.logs_view.search_active);
+        handle_logs_key(key('q'), &mut app);
+        assert_eq!(app.view, View::Logs);
+        assert_eq!(app.logs_view.search_query.value(), "q");
+    }
+
+    #[test]
+    fn logs_search_enter_commits_the_query_and_esc_clears_it() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        app.logs_view.search_active = true;
+        for c in "boom".chars() {
+            handle_logs_key(key(c), &mut app);
+        }
+        handle_logs_key(kev(KeyCode::Enter), &mut app);
+        assert!(!app.logs_view.search_active, "Enter closes the field");
+        assert_eq!(app.logs_view.search_query.value(), "boom", "…but keeps the query");
+
+        app.logs_view.search_active = true;
+        handle_logs_key(kev(KeyCode::Esc), &mut app);
+        assert!(!app.logs_view.search_active);
+        assert_eq!(app.logs_view.search_query.value(), "");
+        assert_eq!(app.view, View::Logs, "Esc cancels the search, it does not leave");
+    }
+
+    #[test]
+    fn logs_key_tab_cycles_the_service_filter() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        assert_eq!(app.logs_view.active_filter(), None);
+        handle_logs_key(kev(KeyCode::Tab), &mut app);
+        assert_eq!(app.logs_view.active_filter(), Some("cos"));
+        handle_logs_key(kev(KeyCode::Tab), &mut app);
+        assert_eq!(app.logs_view.active_filter(), Some("agent"));
+        handle_logs_key(kev(KeyCode::Tab), &mut app);
+        assert_eq!(app.logs_view.active_filter(), None);
+    }
+
+    #[test]
+    fn logs_key_scroll_pauses_follow_and_g_shift_g_jump_to_the_ends() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        app.term_size = (120, 24); // → logs_viewport_rows == 20
+        push_log_lines(&mut app, 100);
+        let rows = logs::logs_viewport_rows(app.term_size.1);
+        assert!(app.logs_view.follow);
+
+        handle_logs_key(kev(KeyCode::Up), &mut app);
+        assert!(!app.logs_view.follow, "any upward scroll pauses follow");
+        assert_eq!(app.logs_view.effective_scroll(rows), 79);
+
+        handle_logs_key(key('g'), &mut app);
+        assert_eq!(app.logs_view.effective_scroll(rows), 0);
+        handle_logs_key(key('G'), &mut app);
+        assert!(app.logs_view.follow, "[G] re-arms follow");
+        assert_eq!(app.logs_view.effective_scroll(rows), 80);
+
+        // PageUp moves a full viewport.
+        handle_logs_key(kev(KeyCode::PageUp), &mut app);
+        assert_eq!(app.logs_view.effective_scroll(rows), 60);
+    }
+
+    #[test]
+    fn logs_key_t_toggles_the_timestamp_mode() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        assert!(!app.logs_view.absolute_ts);
+        handle_logs_key(key('t'), &mut app);
+        assert!(app.logs_view.absolute_ts);
+        handle_logs_key(key('t'), &mut app);
+        assert!(!app.logs_view.absolute_ts);
+    }
+
+    /// A large paste must not be able to freeze the render loop. Per-char `InsertChar` was
+    /// O(n²) and ran on the main thread, so Ctrl-C, `q` and even an external SIGTERM were all
+    /// inert during it (raw mode suppresses the tty's SIGINT and the loop isn't polling).
+    /// Found by /review's red-team pass.
+    #[test]
+    fn a_huge_paste_is_bounded_spliced_at_the_cursor_and_stripped_of_control_chars() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        app.logs_view.search_active = true;
+        let huge = "x".repeat(MAX_PASTE_CHARS * 4);
+        let started = std::time::Instant::now();
+        route_paste(&mut app, &huge);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "a big paste must stay linear and fast (took {:?})",
+            started.elapsed()
+        );
+        assert_eq!(
+            app.logs_view.search_query.value().chars().count(),
+            MAX_PASTE_CHARS,
+            "capped at ingest, not just clipped at render"
+        );
+
+        // Spliced AT THE CURSOR, and control characters never make it into a widget.
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        app.logs_view.search_active = true;
+        app.logs_view.search_query = tui_input::Input::new("ac".to_string()).with_cursor(1);
+        route_paste(&mut app, "b\x1b\n");
+        assert_eq!(app.logs_view.search_query.value(), "abc");
+        assert_eq!(app.logs_view.search_query.cursor(), 2, "cursor follows the inserted text");
+    }
+
+    #[test]
+    fn logs_paste_routes_into_the_search_field_only_while_searching() {
+        let mut app = logs_app(true);
+        app.view = View::Logs;
+        route_paste(&mut app, "needle");
+        assert_eq!(app.logs_view.search_query.value(), "", "no focused field → dropped");
+        app.logs_view.search_active = true;
+        route_paste(&mut app, "needle");
+        assert_eq!(app.logs_view.search_query.value(), "needle");
+    }
+
     #[test]
     fn step_flight_pushes_to_ring() {
         let mut app = App::new(PathBuf::from("/agents"));
@@ -2338,8 +2723,10 @@ mod tests {
         use std::sync::Arc;
         use std::time::Duration;
         let src: Arc<dyn DataSource> = Arc::new(TestSource);
+        // `None` log_services: no compose tail is spawned, so this test never shells out
+        // to docker (ux.10-A — the log producer is opt-in on startup detection).
         let (rx, _wake, _producers) =
-            crate::watch::pump::spawn_producers(src, Duration::from_millis(5));
+            crate::watch::pump::spawn_producers(src, Duration::from_millis(5), None);
         let ev = rx
             .recv_timeout(Duration::from_secs(2))
             .expect("snapshot producer should emit");

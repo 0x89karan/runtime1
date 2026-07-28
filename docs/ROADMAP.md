@@ -1249,12 +1249,21 @@ increments, friction-ordered, each independently shippable. Full design + premis
   ux.11 ships the minimal drill-down; ux.7 returns only if the digest leaves deep-replay wanting.
 - ~~**ux.8** — Live budget control (added 2026-07-11)~~ **absorbed into ux.8′** (above): view + set
   per-agent and global token budgets. Fixed the live-run "500k too small" finding.
-- **ux.10** — TUI polish: log streaming + input ergonomics (added 2026-07-16): (1) new `[g]` Logs view
-  tailing `docker compose logs --follow` as a subprocess into a 2 000-line ring buffer with per-service
-  filter + `/` search + follow mode; Docker-context-gated (absent on bare agentd); (2) replace all
-  hand-rolled char-accumulation inputs with `tui-input` (converse rail, Memory/Inspector/Logs search,
-  deny reason) and `tui-textarea` (Spawn task field); (3) `color-eyre` panic hook for guaranteed
-  terminal restore. No new management API endpoints. Full plan: `docs/plans/ux.10-tui-polish.md`.
+- ~~**ux.10** — TUI polish: log streaming + input ergonomics (added 2026-07-16)~~ ✅ **shipped in two
+  parts** (sub-part C struck at the /autoplan gate — `color-eyre` was redundant, `TermGuard` already
+  restores the terminal on panic and producer panics are `catch_unwind`'d):
+  - **sub-part B** ✅ (v0.113.0) — all 5 hand-rolled char-accumulation inputs replaced with `tui-input`
+    (converse rail, Memory/Inspector/Logs search, deny reason) and `tui-textarea` (Spawn task field),
+    pinned to hold a single ratatui 0.29; `step_key` threads the full `KeyEvent` with per-view
+    Enter/Esc/Tab interception.
+  - **sub-part A** ✅ — the `[l]` Logs view (`[l]`, not `[g]`: `[g]` is Spawn's generate) tailing
+    `docker compose logs --follow --timestamps` via a `std::process::Command` + background std-thread →
+    batched `AppEvent::LogLines` into a 2 000-line ring, with per-service `Tab` filter, `/` search
+    (highlight + `n`/`N`), follow mode, and `[t]` relative/absolute timestamps. Docker-context-gated at
+    startup (`docker compose ps --quiet`), so the key AND its legend entry are absent on bare
+    agentd/QEMU. The child is owned by `Producers` and killed **as a process group** on `Drop` — `docker
+    compose` is a CLI plugin, so a plain `child.kill()` would strand the forked `docker-compose` holding
+    our pipe. No new management API endpoints. Full plan: `docs/plans/ux.10-tui-polish.md`.
 - ~~**ux.9** — Cockpit mode~~ ✅ **shipped (v0.82.0)** — `docker/entrypoint.sh`'s `cockpit)` case:
   the new zero-arg Docker default, cold-starts `agentd` with a zero-agent config
   (`docker/cockpit.toml`) and attaches `agentctl watch` (non-exec'd, preserving signal handling).

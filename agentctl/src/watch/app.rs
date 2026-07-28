@@ -6,6 +6,7 @@ use tui_textarea::TextArea;
 
 use super::approvals::ApprovalsViewState;
 use super::inspector::InspectorState;
+use super::logs::LogsState;
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
 use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue, SysSandbox};
 use super::source::{DataSource, SpawnRequest};
@@ -33,6 +34,9 @@ pub enum View {
     Approvals,
     /// Credential gateway health and per-provider status.
     Credentials,
+    /// ux.10-A: live tail of `docker compose logs` (only reachable when a Compose project
+    /// was detected at startup — see `LogsState::available`).
+    Logs,
 }
 
 // ── Spawn view ───────────────────────────────────────────────────────────────
@@ -475,6 +479,9 @@ pub struct App {
     pub spawn_view:      SpawnViewState,
     /// UI state for the Inspector view.
     pub inspector_view:  InspectorState,
+    /// ux.10-A: UI state for the Logs view (also owns the "is this view reachable at all"
+    /// flag, set once from the startup docker-compose detection).
+    pub logs_view:       LogsState,
     /// Current approval queue (refreshed every tick from /agents/approvals).
     pub approvals_items: Vec<PendingAction>,
     /// UI state for the Approvals view.
@@ -542,6 +549,7 @@ impl App {
             memory_view:     MemoryPaneState::default(),
             spawn_view:      SpawnViewState::default(),
             inspector_view:  InspectorState::default(),
+            logs_view:       LogsState::default(),
             approvals_items: vec![],
             approvals_view:  ApprovalsViewState::default(),
             spawn_banner:    None,

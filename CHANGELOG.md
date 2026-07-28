@@ -3,6 +3,79 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.114.0] - 2026-07-27
+
+### Added
+- **ux.10 (sub-part A) — the `[l]` Logs view in `agentctl watch`.** Live tail of
+  `docker compose logs --follow --timestamps --no-color --tail 500`, so an operator no longer has to drop
+  out of the cockpit and open a second terminal to see what the sidecars, agentd, and the credential
+  broker are printing. Completes ux.10 (sub-part B shipped in v0.113.0; C struck as redundant).
+  - **Sync, not tokio.** `agentctl watch` has no tokio runtime, so the child is a `std::process::Command`
+    whose stdout is read on a background `std::thread` and pushed into the existing `sync_channel` as
+    `AppEvent::LogLines(Vec<LogLine>)` (mirroring `pump.rs`'s producer + `catch_unwind`→`ProducerDied`
+    guard). Lines land in a bounded 2 000-line ring (`LOG_RING_CAP`, mirroring `EVENT_RING_CAP`).
+  - **`[l]`, not `[g]`** — `[g]` is the Spawn view's "generate preview", and `g`/`G` stay as in-view
+    top/bottom scroll. Per-service `Tab` filter, `/` search (highlight + `n`/`N`, not a filter — a matching
+    log line is only useful with its context), follow mode with `PAUSED`/`FOLLOW` state, `[t]` toggles
+    relative↔absolute timestamps.
+  - **Docker-context gated** on a startup `docker compose ps --all --quiet` probe (`--all` so a *stopped*
+    project's history is still readable — the postmortem case). One flag gates both the key and the legend
+    entry, so the cockpit can never advertise a key that does nothing; on bare agentd/QEMU the view is
+    simply absent. The probe is bounded by a 3 s deadline and runs before the signal handlers, so a wedged
+    Docker daemon can neither hang startup nor swallow Ctrl-C.
+  - **No orphaned tail process.** `docker compose` is a CLI plugin: `docker` forks `docker-compose` and
+    hands it our pipe, so `--follow` (which never EOFs) would strand it. `Producers` owns the `Child` and
+    tears down the whole **process group** on `Drop` (`process_group(0)` + `kill(-pid)` + `wait`).
+    Regression-tested with a fake `docker` that forks a grandchild — no daemon required.
+
+### Fixed
+- **ux.10-A hardening from `/review` + `/qa`** (all found before landing):
+  - Service attribution used a substring match, which mislabeled every `cos` line as `agent` in this
+    repo's own compose project (`agentos-cos-1` contains "agent"); now anchored to `-` segment boundaries.
+  - The reader is bounded and lossy: `read_line` grew without limit on a newline-less record (a container
+    could exhaust memory) and treated one invalid UTF-8 byte as EOF, permanently killing the tail. Records
+    are now capped at 4 KB, returned immediately on truncation (liveness — a mid-record stall must not
+    freeze other services' lines), resynchronized at the next newline, and decoded lossily.
+  - Channel backpressure is waited out (250 ms) instead of dropped on sight: `docker compose logs` writes
+    line-by-line, so `/qa`'s 5 000-line burst lost **4 479 lines (~90%)** before this change and loses none
+    after. Loss past the deadline is still counted and shown in the header.
+  - `n`/`N` deadlocked on a match inside the final viewport (offset-derived stepping read its own clamp
+    back as "no movement"); stepping is now by match index.
+  - `sanitize()` also strips DEL and C1 controls (log payloads are untrusted bytes), the header's search
+    query is sanitized on the editing path and clipped, and search matching no longer allocates per line
+    per frame.
+- **ux.10-A, second review round** (specialist + red-team passes, all found before landing):
+  - **Redraw storm.** `AppEvent::LogLines` requested a frame unconditionally, so a chatty compose project
+    rebuilt the *Dashboard* at the 33 Hz tick ceiling (vs once per snapshot before) — and the slower drain
+    then manufactured the very drops the header reported. Log events now only request a frame while the
+    Logs view is on screen; the ring, service registry, and drop counter still fill off-view. Measured:
+    150 bytes of terminal output in 4 s on the Dashboard vs 2 556 in the Logs view, same tail.
+  - **Paste could freeze the cockpit.** Bracketed paste was inserted char-by-char into `tui-input`, which
+    is O(n²), on the main render thread — a ~100 KB paste blocked the loop with Ctrl-C, `q`, and SIGTERM
+    all inert (raw mode suppresses the tty's SIGINT and the loop isn't polling). Paste is now capped at
+    8 192 chars, stripped of control characters, and spliced in one rebuild at the cursor. Fixes the four
+    pre-existing sub-part B input sites too.
+  - **Priority inversion.** The backpressure window let the log tail hold channel slots for 250 ms while
+    every authoritative producer (snapshot, approvals, SSE) is drop-on-full — log verbosity could freeze
+    the agent table silently. Cut to 60 ms (≈2 drain ticks), which still lands zero drops on the
+    5 000-line flood.
+  - **`--tail` is per container, not per project**: a flat 500 across this repo's 4 services replayed
+    exactly the whole 2 000-line ring, so nothing but backfill was ever visible. Now a project budget
+    divided by the container count.
+  - Quit path bounded (a wedged `docker` could hang `Producers::drop` with the terminal still in raw
+    mode); startup probe left in agentctl's own process group so Ctrl-C reaches it; the Logs view names
+    the compose **project** in its title (it comes from the CWD, while the rest of the cockpit describes
+    whatever `--url` points at); a min-height guard replaces an empty bordered box on a short terminal;
+    the search-query header windows around the **cursor** instead of tail-keeping (tail-keeping hid the
+    cursor when editing the start of a long query); a bare timestamp with no payload is parsed as an
+    empty line instead of rendering the stamp as the message; `match_cursor` is invalidated on ring
+    eviction; the render path makes one match pass per frame instead of three ring scans; and the
+    `ProducerDied("logs")` string is a shared constant, since `step()` branches on it.
+  - +24 tests (1 713 total), including the ones that pin the previously-unpinned parts: the docker gate's
+    every branch (fake `docker` on PATH, no daemon needed), the tail's argv, `pump_lines`' normal path and
+    batch cap, EINTR retry, the exactly-at-cap boundary, `sanitize`'s new DEL/C1 classes, and negative
+    controls for the state resets that deleting would otherwise leave green.
+
 ## [v0.113.0] - 2026-07-27
 
 ### Changed
