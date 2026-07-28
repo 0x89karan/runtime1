@@ -68,7 +68,10 @@ Before that, ux.3 (v0.112.0) — spawn custom agents on the fly over HTTP (p7.3-
 exec stays a P3 residual.
 
 **UX tail:** ux.2b (v0.111.0) idle+error attention (closes cos-ux-01) → ux.3 (v0.112.0) → ux.10-B
-(v0.113.0) → **ux.10-A (v0.114.0) — tail complete.** (None tagged past v0.113.0 — tags are a manual gate.)
+(v0.113.0) → **ux.10-A (v0.114.0) — tail complete.** (Tags are a manual gate, but the tail IS tagged:
+v0.113.0, v0.114.0 and v0.115.0 are all pushed. This line previously claimed "none tagged past
+v0.113.0", which was stale and misled a session into repeating it — check `git ls-remote --tags`, not
+this file.)
 
 **AUDIT-v0.97 remediation — COMPLETE** (sweep + tail, v0.98.0→v0.109.0). Full audit: `docs/AUDIT-v0.97.md`.
 Every increment ran plan→build→review→qa→ship; a holistic cross-model /review + per-increment /autoplan
