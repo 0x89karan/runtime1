@@ -200,11 +200,26 @@ pub struct EgressProxy {
     /// Shared global budget meter (budget.1). One instance is shared between the
     /// scheduler (via `with_egress`) and the HTTP proxy (via `start_http_proxy`).
     meter:    GlobalBudgetMeter,
+    /// Per-agent set of deny `reason`s already receipted, so a signed receipt is written ONCE
+    /// per deny episode rather than once per attempt (ux.6a). Re-armed when an inference of
+    /// theirs is allowed, so re-arming costs metered tokens.
+    ///
+    /// This bounds signed-receipt VOLUME and is a security control, not an optimisation — see
+    /// `record_denied_policy`. Keyed per-agent (rather than by a flat `(id, reason)` set) so
+    /// that re-arm and terminal cleanup are both O(1); `forget_agent` must be called when an
+    /// agent terminates or the map leaks for the life of the process, since a terminally
+    /// denied agent never records another inference to re-arm itself (audit86-P2-5's class).
+    denied_edges: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<&'static str>>>,
 }
 
 impl EgressProxy {
     pub fn new(writer: Arc<EvidenceWriter>, recorder: Arc<FlightRecorder>) -> Self {
-        Self { writer, recorder, meter: GlobalBudgetMeter::default() }
+        Self {
+            writer,
+            recorder,
+            meter: GlobalBudgetMeter::default(),
+            denied_edges: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Set the global windowed ceiling for universal-tier self-throttling (budget.1).
@@ -228,6 +243,20 @@ impl EgressProxy {
         input_tokens:  u64,
         output_tokens: u64,
     ) {
+        // An allowed inference re-arms this agent's deny edges: the next denial for the same
+        // reason gets a fresh receipt.
+        //
+        // Be precise about what this bounds, because an earlier version of this comment claimed
+        // more than is true. For a LIVE agent, re-arming costs metered tokens, so receipt volume
+        // is bounded by real work — that is the case the edge trigger was built for (a workload
+        // retrying against a 429 from the proxy). It does NOT hold across termination: every
+        // native deny site is terminal and `handle_agent_terminal` now clears the entry, so
+        // terminate-and-respawn re-arms for free and native denial receipts are bounded by the
+        // spawn rate instead. That is an accepted trade for not leaking the set forever, and the
+        // per-attempt flood the trigger exists to stop is still stopped.
+        if let Ok(mut edges) = self.denied_edges.lock() {
+            edges.remove(agent_id);
+        }
         match self.writer.record_allowed("inference", model, agent_id) {
             Ok(seq) => {
                 self.recorder.record(
@@ -262,6 +291,15 @@ impl EgressProxy {
     }
 
     /// Record a denied egress attempt. Emits `EgressDenied` + `ActionReceiptEmitted`.
+    ///
+    /// **Deprecated by ux.6a; no production callers remain.** Both former call sites in
+    /// `handle_proxy_request` now use `record_denied_policy`. Kept only so the pre-ux.6a
+    /// receipt shape stays constructible in tests. Do NOT reach for this: it writes
+    /// `action: "egress"` (the namespace split that made allows and denies ungroupable), its
+    /// `EgressDenied` event omits the `reason` field `CONVENTIONS.md` now documents, and it is
+    /// NOT edge-triggered, so it is exactly the fsync-amplification shape
+    /// `record_denied_policy` exists to prevent.
+    #[deprecated(note = "use record_denied_policy (edge-triggered, action=\"inference\", carries reason)")]
     pub fn record_denied(&self, agent_id: &str, target: &str) {
         match self.writer.record_denied("egress", target, agent_id) {
             Ok(seq) => {
@@ -288,6 +326,111 @@ impl EgressProxy {
                 );
             }
         }
+    }
+
+    /// Record a POLICY denial of a known principal: the boundary said no to *this agent* for
+    /// *this reason* (ux.6a).
+    ///
+    /// Before ux.6a `record_denied` had **zero production callers** — its only two call sites
+    /// in the workspace were tests — so the chain structurally could not contain a "no", and
+    /// a 100%-`allowed` receipt log was a property of the code rather than of the run.
+    ///
+    /// **The flight event fires on every attempt; the signed receipt fires once per
+    /// `(agent, reason)` episode.** That asymmetry is deliberate and load-bearing:
+    /// `write_receipt` holds a mutex across `flush()` + `sync_data()`, so a receipt per
+    /// attempt would let a caller that can reach this boundary (a retry loop, or — if the
+    /// unauthenticated request paths were ever wired here — any local process) force
+    /// unbounded fsync'd writes to the file `agentd` reads at boot, pin the mutex so real
+    /// inference receipts stall behind it, and, now that rotation exists, roll the audit log
+    /// to evict older segments at will. **Signed-receipt volume must be bounded by metered
+    /// work, never by request volume.** Attempt counts live in `flight.jsonl`, which is
+    /// unsigned, cheap, and already rotated.
+    ///
+    /// `reason` is `&'static str` so the edge set cannot be grown by attacker-supplied
+    /// strings. It is NOT carried in the receipt: nothing may be added to `ReceiptBody`,
+    /// because `verify_chain` re-serializes that struct to recover the signed bytes, so a new
+    /// field would break every existing verifier on new lines. The reason lives in the event.
+    pub fn record_denied_policy(&self, agent_id: &str, target: &str, reason: &'static str) {
+        // Always: the per-attempt record.
+        self.recorder.record(
+            agent_id,
+            None,
+            EventKind::EgressDenied,
+            json!({ "agent": agent_id, "attempted_dest": target, "reason": reason }),
+        );
+        self.receipt_denial_once(agent_id, target, reason);
+    }
+
+    /// The signed-receipt half of a policy denial, without the `EgressDenied` event.
+    ///
+    /// For callers that already emit their own denial event — the scheduler's terminal
+    /// admission denials emit `AgentAdmissionDenied` — so the same fact is not recorded twice
+    /// under two kinds. Edge-triggering is identical; see `record_denied_policy` for why it is
+    /// a security control.
+    pub fn receipt_denial_once(&self, agent_id: &str, target: &str, reason: &'static str) {
+        // Once per episode: the signed receipt. Probe with a borrowed &str so the suppressed
+        // path (the common one during a deny burst) allocates nothing.
+        let first = match self.denied_edges.lock() {
+            Ok(mut edges) => match edges.get_mut(agent_id) {
+                Some(reasons) => reasons.insert(reason),
+                None => {
+                    edges.insert(agent_id.to_string(), [reason].into_iter().collect());
+                    true
+                }
+            },
+            // A poisoned lock must not silently drop the receipt for a real denial.
+            Err(_) => true,
+        };
+        if !first {
+            return;
+        }
+
+        // `action = "inference"` so allowed and denied receipts for the same action class
+        // share a namespace. Pre-ux.6a, allows were "inference" and denies were "egress",
+        // so they could not even be grouped.
+        match self.writer.record_denied("inference", target, agent_id) {
+            Ok(seq) => self.recorder.record(
+                agent_id,
+                None,
+                EventKind::ActionReceiptEmitted,
+                json!({
+                    "agent": agent_id,
+                    "verdict": "denied",
+                    "chain_seq": seq,
+                    "reason": reason,
+                }),
+            ),
+            Err(e) => {
+                tracing::warn!(agent = agent_id, "denied-receipt write failed: {e:#}");
+                self.recorder.record(
+                    agent_id,
+                    None,
+                    EventKind::EgressProxyFailed,
+                    json!({ "error": format!("{e:#}") }),
+                );
+            }
+        }
+    }
+
+    /// Drop all deny-episode state for a terminated agent (ux.6a).
+    ///
+    /// Must be called from `handle_agent_terminal`. Without it `denied_edges` grows for the
+    /// life of the process: every scheduler deny site is a TERMINAL denial, so the agent is
+    /// handed to `handle_agent_terminal` immediately after and can never record another
+    /// allowed inference to re-arm itself. In a PID-1 deployment with cron- or
+    /// orchestrator-spawned agents repeatedly hitting a no-window ceiling, that is a
+    /// monotonic leak — the same class as `audit86-P2-5`.
+    pub fn forget_agent(&self, agent_id: &str) {
+        if let Ok(mut edges) = self.denied_edges.lock() {
+            edges.remove(agent_id);
+        }
+    }
+
+    /// Number of agents currently holding deny-episode state. Test-only introspection for the
+    /// leak guard; there is no production reason to read this.
+    #[cfg(test)]
+    pub fn denied_edge_agents(&self) -> usize {
+        self.denied_edges.lock().map(|e| e.len()).unwrap_or(0)
     }
 
     /// Emit an EgressProxyFailed event. Used by the HTTP proxy for upstream errors.
@@ -461,7 +604,9 @@ async fn handle_proxy_request(
     //    Token accounting is post-hoc (step 10), but we refuse to forward a new
     //    request when the counter is already at zero to prevent over-spend.
     if entry.policy.token_budget_remaining.load(Ordering::Acquire) == 0 {
-        state.egress.record_proxy_failed(&entry.agent_id, "budget_exhausted");
+        // ux.6a: a budget denial is a POLICY denial, not a proxy failure. This also moves it
+        // out of the Inspector's Errors filter and into Egress, where an operator looks for it.
+        state.egress.record_denied_policy(&entry.agent_id, "anthropic", "budget_exhausted");
         return Ok(json_error_response(
             429,
             "egress_budget_exhausted",
@@ -493,7 +638,9 @@ async fn handle_proxy_request(
     let meter = state.egress.meter();
     let ceiling = meter.ceiling();
     if ceiling != 0 && meter.windowed() >= ceiling {
-        state.egress.record_proxy_failed(&entry.agent_id, "global_budget_window_exhausted");
+        state
+            .egress
+            .record_denied_policy(&entry.agent_id, "anthropic", "global_budget_exhausted");
         return Ok(json_error_response(
             429,
             "global_budget_exhausted",
@@ -763,7 +910,11 @@ mod tests {
         assert!(log.contains("action_receipt_emitted"));
     }
 
+    /// Pins the PRE-ux.6a receipt shape so the deprecated path stays constructible and its
+    /// difference from `record_denied_policy` stays visible. Deliberately calls the deprecated
+    /// method — that is the point of the test.
     #[test]
+    #[allow(deprecated)]
     fn record_denied_writes_receipt_and_events() {
         let dir = TempDir::new().unwrap();
         let proxy = make_egress(&dir);
@@ -773,6 +924,135 @@ mod tests {
         let log = std::fs::read_to_string(dir.path().join("flight.jsonl")).unwrap();
         assert!(log.contains("egress_denied"));
         assert!(log.contains("action_receipt_emitted"));
+    }
+
+    // ---------------------------------------------------------------------------------
+    // ux.6a Step 4 — edge-triggered policy denials
+    // ---------------------------------------------------------------------------------
+
+    fn count_matches(path: &std::path::Path, needle: &str) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .count()
+    }
+
+    /// The core of the ux.6a Q2 ruling: attempts are counted in the (unsigned, rotated)
+    /// flight log; signed receipts fire once per deny episode. A receipt per attempt would be
+    /// an fsync amplification path and — with rotation — an evidence-eviction primitive.
+    #[test]
+    fn denied_receipt_written_once_per_deny_episode() {
+        let dir = TempDir::new().unwrap();
+        let proxy = make_egress(&dir);
+        for _ in 0..100 {
+            proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        }
+        assert_eq!(
+            count_matches(&dir.path().join("evidence.jsonl"), "\"verdict\":\"denied\""),
+            1,
+            "100 attempts must produce exactly ONE signed receipt"
+        );
+        assert_eq!(
+            count_matches(&dir.path().join("flight.jsonl"), "egress_denied"),
+            100,
+            "every attempt must still be counted in the flight log"
+        );
+    }
+
+    /// Distinct reasons are distinct episodes — collapsing them would hide a denial class.
+    #[test]
+    fn distinct_reasons_are_distinct_episodes() {
+        let dir = TempDir::new().unwrap();
+        let proxy = make_egress(&dir);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        proxy.record_denied_policy("agent_0", "anthropic", "global_budget_exhausted");
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        assert_eq!(
+            count_matches(&dir.path().join("evidence.jsonl"), "\"verdict\":\"denied\""),
+            2,
+            "one receipt per (agent, reason), and no more"
+        );
+    }
+
+    /// Per-agent, not global: one agent's denial must not suppress another's receipt.
+    #[test]
+    fn deny_edges_are_per_agent() {
+        let dir = TempDir::new().unwrap();
+        let proxy = make_egress(&dir);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        proxy.record_denied_policy("agent_1", "anthropic", "budget_exhausted");
+        assert_eq!(
+            count_matches(&dir.path().join("evidence.jsonl"), "\"verdict\":\"denied\""),
+            2
+        );
+    }
+
+    /// What makes the bound safe rather than lossy: re-arming requires an ALLOWED inference,
+    /// which costs metered tokens. So receipts stay bounded by budget, transitively.
+    #[test]
+    fn deny_edge_rearms_after_an_allowed_inference() {
+        let dir = TempDir::new().unwrap();
+        let proxy = make_egress(&dir);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        proxy.record_inference("agent_0", "claude-sonnet-4-6", 10, 20);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        assert_eq!(
+            count_matches(&dir.path().join("evidence.jsonl"), "\"verdict\":\"denied\""),
+            2,
+            "a genuinely new episode after intervening allowed work gets its own receipt"
+        );
+    }
+
+    /// An allowed inference for a DIFFERENT agent must not re-arm this one's edge.
+    #[test]
+    fn allowed_inference_rearms_only_its_own_agent() {
+        let dir = TempDir::new().unwrap();
+        let proxy = make_egress(&dir);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        proxy.record_inference("agent_1", "claude-sonnet-4-6", 10, 20);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        assert_eq!(
+            count_matches(&dir.path().join("evidence.jsonl"), "\"verdict\":\"denied\""),
+            1,
+            "another agent's allowed work must not re-arm agent_0's edge"
+        );
+    }
+
+    /// Denied receipts now share the `inference` action namespace with allowed ones. Before
+    /// ux.6a, allows were `action: "inference"` and denies were `action: "egress"`, so the two
+    /// verdicts for the same action class could not even be grouped.
+    #[test]
+    fn denied_and_allowed_receipts_share_an_action_namespace() {
+        let dir = TempDir::new().unwrap();
+        let proxy = make_egress(&dir);
+        proxy.record_inference("agent_0", "claude-sonnet-4-6", 10, 20);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        let content = std::fs::read_to_string(dir.path().join("evidence.jsonl")).unwrap();
+        for line in content.lines() {
+            let r: crate::evidence::ActionReceipt = serde_json::from_str(line).unwrap();
+            assert_eq!(r.action, "inference", "both verdicts use the same action string");
+        }
+        assert_eq!(count_matches(&dir.path().join("evidence.jsonl"), "\"verdict\":\"allowed\""), 1);
+        assert_eq!(count_matches(&dir.path().join("evidence.jsonl"), "\"verdict\":\"denied\""), 1);
+    }
+
+    /// The chain stays verifiable once denials are real — a denied receipt is a normal link.
+    #[test]
+    fn chain_still_verifies_with_denied_receipts_interleaved() {
+        let dir = TempDir::new().unwrap();
+        let proxy = make_egress(&dir);
+        proxy.record_inference("agent_0", "m", 1, 2);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        proxy.record_inference("agent_0", "m", 1, 2);
+        proxy.record_denied_policy("agent_0", "anthropic", "budget_exhausted");
+        drop(proxy);
+        let n = crate::evidence::verify_chain(
+            &dir.path().join("evidence.jsonl"),
+            &dir.path().join("egress.pub"),
+        )
+        .unwrap();
+        assert_eq!(n, 4);
     }
 
     #[tokio::test]
@@ -1272,6 +1552,24 @@ mod tests {
         assert_eq!(r2.status(), 429, "universal tier throttled at the global window");
         let body: serde_json::Value = r2.json().await.unwrap();
         assert_eq!(body["error"]["detail"], "global_budget_exhausted");
+
+        // ux.6a: the global-window site is the SECOND wired policy-denial call site, and it
+        // needs its own end-to-end proof — the budget_exhausted test covers a different one.
+        let log = std::fs::read_to_string(dir.path().join("flight.jsonl")).unwrap();
+        assert!(
+            log.contains("egress_denied"),
+            "the global-window denial must be recorded as a denial, not a proxy failure"
+        );
+        let ev_path = dir.path().join("evidence.jsonl");
+        let ev = std::fs::read_to_string(&ev_path).unwrap();
+        assert!(ev.contains("\"verdict\":\"denied\""), "a signed receipt was written");
+        assert!(ev.contains("univ-agent"), "receipt attributes the denial to the workload");
+        // The allowed forward and the denial coexist in one still-valid chain.
+        assert_eq!(
+            crate::evidence::verify_chain(&ev_path, &dir.path().join("egress.pub")).unwrap(),
+            2,
+            "chain holds the allowed inference receipt plus the denial receipt"
+        );
     }
 
     /// Plan acceptance: Anthropic error responses (e.g. 401 auth failure) are passed
@@ -1331,6 +1629,61 @@ mod tests {
         assert_eq!(body["error"]["detail"], "unknown_workload_key");
     }
 
+    /// ux.6a Q2, the negative control. **An unauthenticated caller must not be able to cause
+    /// a single signed receipt to be written.**
+    ///
+    /// `write_receipt` holds a mutex across `flush()` + `sync_data()`. If the pre-auth deny
+    /// paths (missing key, unknown key, bad path, bad method) were wired to the receipt
+    /// writer, any local process that can reach this loopback listener could force unbounded
+    /// fsync'd writes to the file `agentd` reads at boot, pin that mutex so real inference
+    /// receipts stall behind it, and — now that rotation exists — roll the audit log to evict
+    /// older segments at will.
+    ///
+    /// This test exists so a later well-meaning "denials should be receipted everywhere"
+    /// patch cannot silently re-open that hole. The proxy being loopback-only narrows the
+    /// blast radius but does not close it: this system deliberately runs less-trusted
+    /// workloads locally.
+    #[tokio::test]
+    async fn proxy_unauthenticated_requests_write_no_receipt() {
+        let dir = TempDir::new().unwrap();
+        let (bound, _registry) =
+            start_test_proxy(&dir, "sk-ant-REAL-KEY", "http://127.0.0.1:1".to_string()).await;
+        let client = reqwest::Client::new();
+        let url = format!("http://{bound}/v1/messages");
+
+        for i in 0..25 {
+            // Bogus key: fails the registry lookup.
+            let _ = client
+                .post(&url)
+                .header("x-api-key", format!("sk-ant-BOGUS-{i}"))
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await;
+            // No key at all: fails the header check even earlier.
+            let _ = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .body("{}")
+                .send()
+                .await;
+        }
+        // Unknown path and wrong method, also pre-auth as far as the principal goes.
+        let _ = client.post(format!("http://{bound}/v1/nope")).body("{}").send().await;
+        let _ = client.get(&url).send().await;
+
+        // NON-VACUITY: `unwrap_or(0)` would make a MISSING file indistinguishable from an
+        // empty one, so a change to the evidence path or the proxy wiring could silently stop
+        // this guard from guarding while it stayed green. Assert existence first.
+        let ev = dir.path().join("evidence.jsonl");
+        assert!(ev.exists(), "precondition: the writer created the chain file");
+        let size = std::fs::metadata(&ev).unwrap().len();
+        assert_eq!(
+            size, 0,
+            "unauthenticated traffic must never write to the signed chain (got {size} bytes)"
+        );
+    }
+
     /// GAP 2: Non-POST method to /v1/messages → 405 method_not_allowed.
     #[tokio::test]
     async fn proxy_non_post_method_returns_405() {
@@ -1369,6 +1722,25 @@ mod tests {
         assert_eq!(resp.status(), 429);
         let body: serde_json::Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["detail"], "budget_exhausted");
+
+        // ux.6a: an AUTHENTICATED policy denial is receipted and attributed. Pre-ux.6a this
+        // path called record_proxy_failed, so it landed in the Inspector's Errors filter as a
+        // "proxy failure" and produced no receipt at all.
+        let log = std::fs::read_to_string(dir.path().join("flight.jsonl")).unwrap();
+        assert!(log.contains("egress_denied"), "the denial is recorded as a denial");
+        assert!(
+            !log.contains("\"reason\":\"budget_exhausted\",\"agent\":\"unknown\""),
+            "the denial must be attributed to the real workload, never to `unknown`"
+        );
+        let ev = dir.path().join("evidence.jsonl");
+        let content = std::fs::read_to_string(&ev).unwrap();
+        assert!(content.contains("\"verdict\":\"denied\""), "a signed receipt was written");
+        assert!(content.contains("broke-agent"), "receipt names the principal");
+        // And the chain is still a valid chain with a denial in it.
+        assert_eq!(
+            crate::evidence::verify_chain(&ev, &dir.path().join("egress.pub")).unwrap(),
+            1
+        );
     }
 
     /// GAP 3: Request body exceeding 4 MB → 413 request_body_too_large.

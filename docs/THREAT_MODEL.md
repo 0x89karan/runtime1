@@ -554,6 +554,42 @@ cred.3.2):
 - **`EvidenceWriter` (p7.5) is the signing mechanism for the *egress proxy* path only.**
   The credential gateway uses `FlightRecorder` only; it does not write to `evidence.jsonl`
   and does not compute body hashes.
+
+### §8.7.1 Receipt-chain scope and key custody (ux.6a — ratified de-claim)
+
+`ROADMAP.md` and `PRODUCT-THESIS.md` previously described this subsystem as delivering
+"provable accountability", "action receipts", and "offline-verifiable forensic evidence".
+Those claims were corrected in ux.6a. What the chain actually is:
+
+- **Coverage: model calls only.** `evidence.jsonl` contains inference receipts — allowed,
+  and (since ux.6a) denied. It contains **no** tool invocations, capability verdicts,
+  approval grants or denials, cancels, or budget mutations. Those are recorded in
+  `flight.jsonl`, which is **unsigned and unchained**. Any Art. 12-style
+  record-keeping argument rests on `flight.jsonl`, not on the signed chain.
+  - Before ux.6a it was worse: `record_denied` had **zero production callers**, so the chain
+    could not contain a "no" at all, and a 100%-`allowed` log was a property of the code.
+- **Custody: the signer is the audited party.** `EvidenceWriter::open` generates the Ed25519
+  key locally on first run and **rewrites the `.pub` from the private key on every open**;
+  `verify_chain` reads that same `.pub`. So anyone who can write the directory can mint a key
+  and rewrite the log from genesis, and it will verify. Verification therefore means
+  **"consistent with a key held by this host"** — self-attestation — and **not** evidence
+  against a party whose repudiation is at issue. Third-party-grade evidence needs the key
+  outside the boundary (customer-held key, external timestamping, or control-plane
+  countersigning). That is unbuilt; see the P3 in `TODOS.md`.
+  - The OV-1 boot guards keep MCP sandboxes off the key and log. That is a real control
+    against a *tool* reading the key, and irrelevant to the paragraph above — the adversary
+    excluded here is the operator, root, and the agent process itself.
+- **Deletion and rotation are undetectable from the chain alone.** Resume derives the next
+  `seq` from the tail receipt (pre-ux.6a: by counting lines), so deleting `evidence.jsonl`
+  silently restarts at 0 and still verifies. ux.6a added rename-based segment rotation
+  (`evidence.jsonl.1` … `.3`, 32 MiB each): every segment verifies independently, but the
+  **seam between segments is unprovable** — a whole segment can be removed with nothing in the
+  remaining files to show it. Detecting rewind requires an out-of-band record of
+  `(pubkey, max seq)`.
+- **Boot does not verify the chain, deliberately.** ux.6a checks the *tail* receipt's
+  signature on resume and **warns without refusing**. Failing closed there would brick any
+  operator who archived, copied, or hand-edited `evidence.jsonl`. Full verification is
+  `agentctl verify <evidence.jsonl> <egress-key.pub>`, offline, per segment.
 - **Tracking.** A real content audit (`SecretRewriter`) scanning tool output for
   credential-shaped tokens is tracked as cred.3-ar-S3 (P2) in TODOS.md. Operators who
   require this control should treat `flight.jsonl` as potentially containing live tokens

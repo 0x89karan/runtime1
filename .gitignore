@@ -13,7 +13,17 @@ checkpoint.json.corrupt
 egress-key.pkcs8
 egress-key.pub
 evidence.jsonl
+# ux.6a: rotation creates numbered segments. The bare pattern above matches only the exact
+# basename, so without this the documented dev flow (`cd agentd && cargo run -- agent.toml`)
+# leaves rotated segments — full of agent ids, model ids and egress targets — as untracked
+# files that `git add -A` would stage.
+evidence.jsonl.*
 output/
+# ux.6a: the committed golden receipt-chain fixture is the backward-compat guard for the
+# signed on-disk format, so it must be TRACKED. Public key only — `egress-key.pkcs8` above
+# has no negation and stays ignored everywhere, including here.
+!agentd/tests/fixtures/evidence/evidence.jsonl
+!agentd/tests/fixtures/evidence/egress-key.pub
 
 # OS + tooling cruft
 .DS_Store

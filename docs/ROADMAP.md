@@ -62,7 +62,7 @@ remaining work — one increment per branch, `main` shippable between, each thro
 8. ~~**cred.6** (v0.83.0)~~ ✅ shipped — CoS broker migration; `passthrough_query_params` allowlist (D3 + Gmail params); google_oauth sidecar holds no raw credential at rest.
 9. ~~**cred.7** (v0.84.0)~~ ✅ shipped — credential resilience (on top of broker mode).
 10. **Audit remediation** (from `docs/AUDIT-v0.86.md` §6/§9): ~~**audit.1** (v0.87.0)~~ ✅ shipped — P0 hotfix + guard batch (`docs/plans/audit.1-p0-hotfix-guards.md`) → ~~**ci.1** (v0.88.0)~~ ✅ shipped — CI tests the artifact (`docs/plans/ci.1-ci-tests-the-artifact.md`): workspace-wide CI, sidecar marker contract, docker-smoke + negative fixture, fail-closed release guards, nightly mock E2E, monthly qemu cron; broker E2E deferred as named `ci.2` (TODOS) → then cap.1/cap.2/run.1/par.1-2 interleave per the audit build order.
-11. **Track UX cockpit** (agentctl-client): ux.0 → ux.9 → ux.2a → ux.1 (all ✅ shipped) → **reshaped 2026-07-18 (office-hours "trust after absence", `docs/plans/0x89karan-ux-control-panel-design-*.md`): ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram digest+approve/deny) → cap.1 → ux.13 (Cancel + live budget/caps)**, then the tail (ux.3, ux.2b, ux.10) and evidence-gated expansions (ux.6, ux.5, ux.7). Turns the cockpit from watch-and-chat into a control panel. A second identity — the governed-agent-microVM **mv track** — shares agentd core; see `docs/plans/0x89karan-mv-governed-agent-runtime-design-*.md`.
+11. **Track UX cockpit** (agentctl-client): ux.0 → ux.9 → ux.2a → ux.1 (all ✅ shipped) → **reshaped 2026-07-18 (office-hours "trust after absence", `docs/plans/0x89karan-ux-control-panel-design-*.md`): ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram digest+approve/deny) → cap.1 → ux.13 (Cancel + live budget/caps)**, then the tail (ux.3, ux.2b, ux.10) and evidence-gated expansions (ux.6, ux.5, ux.7). Turns the cockpit from watch-and-chat into a control panel. A second identity — the governed-agent-microVM **mv track** — shares agentd core. Its design record lives **outside this repo**, at `~/.gstack/projects/0x89karan-runtime1/0x89karan-mv-governed-agent-runtime-design-20260720-114634.md` (APPROVED 2026-07-20); the old `docs/plans/0x89karan-mv-*` pointer here was dangling and cost a /autoplan session a wrong premise. **External gate date: the earlier of mv.3 shipped or 2026-10-01** (named 2026-07-29 during ux.6a — it had never been recorded, and the design doc's own warning is that "an unnamed gate date is how 'deferred' becomes 'never'"). The gate needs 10 named humans and 3 booked demos; no `mv.*` increment is scheduled yet, and none should be until the gate work starts. **Correction on the record:** that doc estimates its demo package at "~2 days, everything exists" on the strength of "normal tool use → signed receipt" and "forbidden capability → denied + receipt". Neither action class is receipted, and before ux.6a no deny was reachable at all, so the estimate is wrong.
 12. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
@@ -931,8 +931,10 @@ proves both. Build the thin vertical slice, get it *used* on a real inbox, **the
 An always-on, cron-triggered Chief of Staff that produces a Daily Operating Brief from Gmail,
 read-only (autonomy L0), with the full trust story *demonstrable*: the agent never holds the
 OAuth token (it lives in the `google_oauth` sidecar), egress is confined to Gmail + the model
-gateway (off-domain → `egress_denied`), every step is in OTLP + the signed `evidence.jsonl`
-(verifies offline), and any send (opt-in L1) routes through `request_approval`. It is a
+gateway (off-domain → `egress_denied`), every step is in OTLP and in `flight.jsonl` — with the
+**model calls** additionally in the signed `evidence.jsonl`, which verifies offline against a
+**locally-held** key (scope: `THREAT_MODEL.md` §8.7; ux.6a) — and any send (opt-in L1) routes
+through `request_approval`. It is a
 **composition** of shipped pieces — cron (h7.3) + OAuth (h7.2) + scheduler/spawn (P1) + KB
 (P5) + approval gate (p7.4) + egress/receipts (p7.5) + gVisor floor (p7.6) + OTLP (obs.1–3) —
 not new infrastructure: 3 subagents (orchestrator/inbox/curator), one workflow, one system.
@@ -1257,9 +1259,25 @@ increments, friction-ordered, each independently shippable. Full design + premis
 **Cathedral expansions (accepted 2026-07-10, CEO review — re-scoped by the reshape):** the "CoS you live with."
 - ~~**ux.4** — Proactive push~~ **superseded by ux.12** (Telegram is push *and* reply; the old plan was
   push-only). If a non-Telegram signed-webhook sink is still wanted, it re-enters as a ux.12 follow-on.
-- **ux.6** — Evidence view: surface the signed Ed25519 receipt chain (`evidence.jsonl`) + inline
-  `agentctl verify` + per-agent "chain verified" badge. Provable accountability. **Cross-track:** this is
-  also the governance artifact the mv product thesis rests on (EU AI Act Art.12) — build it once for both.
+- ~~**ux.6** — Evidence view~~ **split at its /autoplan premise gate (2026-07-29); the original framing
+  was withdrawn.** Both CEO voices returned RESHAPE. The line used to read *"Provable accountability.
+  Cross-track: the governance artifact the mv product thesis rests on (EU AI Act Art.12) — build it once
+  for both."* That was an overclaim in three ways, all code-verified: `record_denied` had **zero
+  production callers**, so the chain structurally could not contain a "no"; the signing key is generated
+  and held by the process being held accountable, so verification is **self-attestation, not third-party
+  evidence**; and the chain covers **egress (inference) calls only** — no tool calls, capability verdicts,
+  approvals, cancels, or budget decisions. `THREAT_MODEL.md` §8.7 already said as much, so this line
+  contradicted it. Plans: `docs/plans/ux.6a-declaim-and-detrap.md`, `docs/plans/ux.6b-signed-action-ledger.md`.
+  - ~~**ux.6a**~~ **(v0.116.0)** ✅ shipped — de-claimed the receipt language repo-wide + closed the
+    `evidence.jsonl` fail-closed boot trap (bounded 64 KiB tail resume, torn-tail repair, tail signature
+    check that warns rather than refuses, rename-based segment rotation needing no format or verifier
+    change) + gave the deny path real production callers, edge-triggered. **No UI.** Closed
+    `audit86-P2-4` and `audit-S5`. /review found 6 CRITICALs across three rounds (the third found one in
+    the fixes); /qa proved the semantics against a real agentd, 9/9.
+  - **ux.6b** — signed action ledger (widen the record to the action classes that carry governance
+    weight, or sign a projection of `flight.jsonl` instead). **DEFERRED**, named and specified. Note the
+    approved mv design doc already considered and rejected this ("Approach C … harden receipts before
+    hypervisor work" — *"dogfooding requires none of it yet"*).
 - **ux.5** — Local web cockpit: self-contained host-loopback SPA over the management API/SSE (same
   converse/observe/spawn surface in a browser; still single-tenant, still loopback). ⚠ Browser ≠ FUSE
   boundary — needs an Origin/Host allowlist (DNS-rebinding guard) to land first. **Now the "custom app"
@@ -1302,8 +1320,8 @@ increments, friction-ordered, each independently shippable. Full design + premis
 Sequencing (reshaped 2026-07-18): core **ux.0 → ux.9 → ux.2a → ux.1 (all ✅ shipped) →
 ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram) → cap.1 → ux.13 (verbs)**, then the tail
 **ux.3 (spawn-on-the-fly) · ux.2b (idle/error, closes cos-ux-01) · ux.10 (TUI polish)** and
-evidence-gated expansions **ux.6 (evidence, shared with mv track) · ux.5 (web/app, post-Telegram-dogfood)
-· ux.7 (replay)**, then **skills (Phase 11) last**. One increment per branch, `main` shippable at each
+evidence-gated expansions **ux.6a (de-claim + de-trap; ux.6b ledger DEFERRED) · ux.5 (web/app,
+post-Telegram-dogfood) · ux.7 (replay)**, then **skills (Phase 11) last**. One increment per branch, `main` shippable at each
 step. ux.8′ ships first regardless — the P0-2 self-brick (prod currently runs UNBOUNDED, violating the
 "bounded" invariant) blocks every deployment shape. (ux.8′ was split at its autoplan gate 2026-07-20 to
 the P0-2 integrity hotfix alone; per-agent spend visibility + SetBudget + the BudgetRisk re-key moved to

@@ -244,8 +244,12 @@ then restart agentctl watch"). Read-only routes (`/snapshot`, `/healthz`, `/brie
 ungated. (FUSE-mode `agentctl watch` inside the container is unaffected — it writes the
 `/agents/control` file, which is deliberately not gated, since `:7999` is the boundary that is.)
 
-**Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed action-receipt
-chain with `agentctl verify ~/.agentos-data/evidence.jsonl`.
+**Logs & receipts:** inspect `~/.agentos-data/flight.jsonl` with `jq`; verify the signed receipt chain
+with `agentctl verify ~/.agentos-data/evidence.jsonl ~/.agentos-data/egress-key.pub` (it takes **two**
+arguments — this was documented with one and failed as printed until ux.6a). The chain covers **model
+calls only**, and verifies against a locally-held key; see `THREAT_MODEL.md` §8.7. Once the chain passes
+32 MiB it rotates to `evidence.jsonl.1` … `.3`; each segment verifies independently with the same
+command.
 
 **Privacy note — email embeddings:** The CoS uses OpenAI's Embeddings API
 (`text-embedding-3-small`) to store email bodies as semantic vectors in Qdrant. Plain-text
@@ -591,8 +595,10 @@ sudo journalctl -u agentos-cos --no-pager | grep -i "agentd\|error\|panic"
 # Did it connect to Gmail?
 jq 'select(.kind == "tool_call")' /home/agentos/.agentos-output/flight.jsonl | head -5
 
-# Are credentials valid?
-agentctl verify /home/agentos/.agentos-output/evidence.jsonl   # signed receipt chain
+# Is the signed receipt chain intact? (NOT a credential check — this label was wrong, and the
+# command was missing its second argument, so it failed as printed. Both fixed in ux.6a.)
+agentctl verify /home/agentos/.agentos-output/evidence.jsonl \
+                /home/agentos/.agentos-output/egress-key.pub
 
 # Did cron fire?
 jq 'select(.kind == "tool_call") | select(.data.tool == "wait_for_trigger")' \

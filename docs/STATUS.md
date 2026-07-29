@@ -11,6 +11,28 @@ The roadmap (with acceptance criteria and what's next) lives in `docs/ROADMAP.md
 
 ---
 
+**ux.6a complete (v0.116.0).** De-claimed the receipt chain and closed the `evidence.jsonl` boot trap;
+no UI. Split from ux.6 at the /autoplan premise gate (both CEO voices RESHAPE); `ux.6b` (signed action
+ledger) deferred, named and specified. Closes `audit86-P2-4` and `audit-S5`, both filed against `run.1`,
+which shipped without them.
+- The chain could not say "no": `record_denied` had ZERO production callers, so a 100%-`allowed` log was a
+  property of the code. Wiring only the HTTP proxy would not have fixed it (that proxy never starts in
+  production, per its own in-code comment); the reachable denial is native scheduler admission.
+- Denial receipts are edge-triggered — one per `(agent, reason)` episode, not per attempt — because
+  `write_receipt` fsyncs under a mutex, so per-attempt receipting is write amplification against the
+  boot-read file and, with rotation, an audit-eviction primitive. Deferral is not denial (ux.8′).
+- `resume_chain` no longer reads the whole file at boot (measured 1 KiB → 0.14 s vs 30 MiB → 0.16 s), and
+  rotation needed no format or verifier change: genesis anchoring only ever blocked in-place truncation.
+- `THREAT_MODEL.md` §8.7.1 states the real limits — model calls only, the signer IS the audited party
+  (self-attestation, not third-party evidence), and deletion/rotation seams are undetectable. The mv
+  external gate date is now named (earlier of mv.3 or 2026-10-01).
+- /review: 6 CRITICALs across three rounds — a boot panic (`hex_decode` byte-slicing a `&str` with
+  `panic = "abort"` on PID 1), an unbounded `seq` from an unverified receipt, a rotation cascade that
+  unlinked the live inode while returning Ok, a false-green test that never entered the code it claimed
+  to guard, and one introduced BY the fix (a fallible unlink after the live rename). /qa: 9/9 against a
+  real agentd. 1851 workspace tests.
+
+
 **Phases 0–3 complete (p3.1 + p3.2 + p3.3 all landed).** `agentd/` is a
 working Rust binary. Phases 0–2 built the full single/multi-agent loop, config,
 flight recorder, Anthropic gateway, tool ABI, native tools, MCP stdio client,
@@ -186,8 +208,9 @@ pending/decided maps; `PendingActionView` in `SchedulerSnapshot`; `agentctl watc
 (`[a]` key) with approve/deny key-bindings; `REQUEST_APPROVAL` / `APPROVAL_GRANTED` /
 `APPROVAL_DENIED` flight events; 932 workspace tests (up from 902).
 **p7.5 complete (v0.39.0).** Ed25519 signed action receipts: `EvidenceWriter` signs egress
-allow/deny records in `evidence.jsonl`; `agentctl verify <flight.jsonl>` validates the receipt
-chain; `EgressBrokered` + `ActionReceiptEmitted` flight events; 945 workspace tests. NOTE:
+allow/deny records in `evidence.jsonl`; `agentctl verify <evidence.jsonl> <egress-key.pub>`
+validates the receipt chain (this said `<flight.jsonl>` — the wrong file, and missing the key
+argument; corrected in ux.6a); `EgressBrokered` + `ActionReceiptEmitted` flight events; 945 workspace tests. NOTE:
 boundary secret rewriting (`SecretRewriter`) was planned but NOT built — tool output is NOT
 scanned for credential-shaped tokens, and no `BoundarySecretRedacted` event exists.
 De-claimed in cred.3.1 (v0.61.0); tracked as cred.3-ar-S3 (P2) in TODOS.md.

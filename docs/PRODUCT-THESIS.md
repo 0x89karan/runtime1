@@ -96,9 +96,15 @@ the two — we have been over-crediting the capability layer.
   The agent never holds real credentials, so even a full memory dump yields inert strings.
   This kills credential exfiltration structurally (it does not stop laundering data through the
   model — different threat).
-- **Tamper-evident audit:** the proxy (outside agent memory, holding a signing key the agent
-  can't reach) emits hash-chained, Ed25519-signed action receipts — the difference between
-  "logs a compromised agent can forge" and offline-verifiable forensic evidence.
+- **Tamper-evident audit, honestly scoped** (corrected in ux.6a — this bullet previously claimed
+  "action receipts" and "forensic evidence", neither of which the implementation supports): the
+  egress mediator emits hash-chained, Ed25519-signed **inference receipts** — model calls, allowed
+  and (since ux.6a) denied. Not tool calls, capability verdicts, approvals, cancels, or budget
+  decisions; those are in `flight.jsonl`, which is unsigned. And the signing key is generated and
+  held by the same process, so the chain proves integrity **relative to a local key** —
+  self-attestation, not third-party forensic evidence. Making it third-party-grade requires moving
+  the key outside the boundary (customer-held key, external timestamping, or control-plane
+  countersigning), which is unbuilt. Full scope: `THREAT_MODEL.md` §8.7.
 - **The claim we make:** allowlist-only egress, every allowed call metered + audited, approval
   gates on risky actions, content redaction on the native tier, dramatically reduced blast
   radius, and a tamper-evident audit trail of what each agent actually did. Defense-in-depth +

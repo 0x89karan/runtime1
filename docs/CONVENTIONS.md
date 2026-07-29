@@ -110,9 +110,9 @@ Phase 0 kinds (canonical — do not rename):
 | `approval_granted` | operator approved a pending action; agent resumed (agent_id, approval_id, auto_approve_kind: Option<String>) (p7.4+) |
 | `approval_rejected` | operator rejected a pending action; agent receives rejection reason (agent_id, approval_id, reason: Option<String>) (p7.4+) |
 | `egress_brokered` | egress call permitted; signed receipt written to evidence.jsonl (agent, kind, dest, input_tokens, output_tokens) (p7.5+) |
-| `egress_denied` | egress call denied by policy; receipt written (agent, attempted_dest) (p7.5+) |
-| `action_receipt_emitted` | action receipt appended to evidence.jsonl (agent, verdict, chain_seq) (p7.5+) |
-| `egress_proxy_failed` | egress proxy failed to initialise or write a receipt (error) (p7.5+) |
+| `egress_denied` | model call denied by policy, emitted on **every attempt** (agent, attempted_dest, reason) (p7.5+; `reason` + real production callers in ux.6a). A signed receipt is written once per `(agent, reason)` **episode**, not per attempt — so attempt counts live here and the chain holds one receipt per episode. That asymmetry is a security control: receipts are fsync'd under a mutex, so per-attempt receipting would be a write-amplification and audit-log-eviction vector. |
+| `action_receipt_emitted` | action receipt appended to evidence.jsonl (agent, verdict, chain_seq, reason on denials) (p7.5+) |
+| `egress_proxy_failed` | egress proxy failed to initialise or write a receipt; also carries the once-per-boot evidence-chain resume note when a torn tail was repaired or the tail signature failed (error \| reason: `evidence_chain_resume`) (p7.5+; resume note ux.6a) |
 | `universal_agent_started` | universal-tier child process spawned (id, command, pid, isolation) (p7.6+) |
 | `universal_agent_exited` | universal-tier child process exited (id, exit_code: Option<i32>, wall_seconds) (p7.6+) |
 | `universal_agent_isolation_degraded` | `runsc` missing; fell back to unsandboxed exec (id, reason) (p7.6+) |

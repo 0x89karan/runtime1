@@ -1145,6 +1145,24 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
             return Err(e.context("initializing egress evidence writer (fail-closed)"));
         }
     };
+    // ux.6a: chain resume repaired a torn tail, failed the tail signature check, or fell back
+    // to the full scan. Diagnostic only — boot deliberately continues (resume verified nothing
+    // at all before ux.6a, so failing closed here would brick anyone who archived, copied, or
+    // hand-edited evidence.jsonl). Real detection is `agentctl verify`.
+    if let Some(note) = evidence_writer.resume_note() {
+        tracing::warn!("evidence chain resume: {note}");
+        recorder.record(
+            "agentd",
+            None,
+            EventKind::EgressProxyFailed,
+            serde_json::json!({
+                "reason": "evidence_chain_resume",
+                "detail": note,
+                "evidence_path": evidence_path.display().to_string(),
+                "remedy": "run `agentctl verify <evidence.jsonl> <egress-key.pub>`",
+            }),
+        );
+    }
     // Capture the real API key before overwriting env with the placeholder.
     // The proxy uses this key for upstream forwarding; the key never leaves agentd's
     // memory and is never written to disk or logged.

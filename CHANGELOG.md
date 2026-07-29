@@ -3,6 +3,60 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.116.0] - 2026-07-29
+
+### Changed
+- **ux.6a — de-claimed the receipt chain and closed the `evidence.jsonl` boot trap.** No UI. Split from
+  ux.6 at the /autoplan premise gate after both CEO voices returned RESHAPE; `ux.6b` (signed action
+  ledger) is deferred. Closes `audit86-P2-4` and `audit-S5`.
+  - **The deny path got production callers.** `EvidenceWriter::record_denied` had **zero** — its only two
+    call sites in the workspace were tests — so a 100%-`allowed` chain was a property of the code, not of
+    any run. Wiring only the HTTP egress proxy would not have fixed it (`egress.rs` states in-code that
+    the proxy "never starts in production"); the reachable denial is native scheduler admission.
+  - **Denial receipts are edge-triggered.** `EgressDenied` fires on every attempt; the signed receipt
+    fires once per `(agent, reason)` episode, re-armed by an allowed inference. This is a security
+    control, not an optimisation: `write_receipt` fsyncs under a mutex, so per-attempt receipting would
+    be write amplification against the file `agentd` reads at boot and, with rotation, an
+    audit-log-eviction primitive. **Deferral is not denial** (ux.8′) and shutdown is not a policy
+    verdict; neither is receipted.
+  - **Bounded boot.** `resume_chain` read the whole file at every process start on a fail-closed path
+    (O(file) forever). It now reads a bounded 64 KiB tail and takes `seq` from the tail receipt rather
+    than a line count. Measured: 1 KiB → 0.14 s vs 30 MiB → 0.16 s.
+  - **Torn-tail repair + tail signature check.** A process killed mid-`writeln!` used to leave a fragment
+    that got hashed as a record; the next append fused onto it and the chain became permanently
+    unverifiable while `agentd` booted happily. Now repaired and reported via a flight event. The tail
+    signature is checked and **warns without refusing** — resume verified nothing at all before, so
+    failing closed would have bricked any operator who archived, copied, or hand-edited the file.
+  - **Rename-based segment rotation** (`evidence.jsonl.1`…`.3`, 32 MiB each). Needed **no format or
+    verifier change**: genesis anchoring only ever blocked in-place truncation, so every segment is a
+    complete independently-verifiable chain. Every irreversible step runs last, and a failure latches
+    rotation off rather than retrying into a cascade.
+  - **Honest scope in the docs.** New `THREAT_MODEL.md` §8.7.1: coverage is model calls only; the signing
+    key is generated and held by the audited process, so verification is **self-attestation, not
+    third-party evidence**; deletion and rotation seams are undetectable from the chain alone.
+    `ROADMAP.md`'s "Provable accountability" and `PRODUCT-THESIS.md`'s "action receipts" are corrected to
+    match. Four documented commands were broken and are fixed (`agentctl verify` takes **two**
+    arguments; `RUNBOOK.md` grepped an event kind that does not exist).
+  - **mv external gate date named** — earlier of mv.3 shipped or 2026-10-01. It had never been recorded
+    anywhere despite being the approved mv design doc's one assigned action.
+
+### Fixed
+- **`hex_decode` aborted the process at boot** (found by /review). It byte-sliced a `&str`, which panics
+  when a multi-byte char straddles an even offset; ux.6a made that reachable from `EvidenceWriter::open`,
+  i.e. the boot path of a process that is PID 1 in the distro, with `panic = "abort"` set workspace-wide.
+  A panic is not an `Err`, so the resume fallback could not catch it.
+- **An unverified tail receipt's `seq` reached the writer unbounded.** `seq: u64::MAX` either panicked
+  inside the mutex (debug) or wrapped to 0 in release, making every later genuine receipt fail
+  `verify_chain` with a sequence gap. Now bounded by file length.
+- **Rotation could cascade-destroy the audit history.** Delete-first ordering plus no reset of the
+  size counter on failure walked the live inode down the segment slots and unlinked it, while
+  `write_receipt` kept returning `Ok`. Fixed by ordering every irreversible step last and latching
+  rotation off on failure.
+- `denied_edges` leaked for terminally-denied agents (same class as `audit86-P2-5`); `forget_agent` is
+  now called from `handle_agent_terminal`.
+- `.gitignore` did not cover `evidence.jsonl.*`, so rotated segments would have been staged by
+  `git add -A`.
+
 ## [v0.115.0] - 2026-07-28
 
 ### Added

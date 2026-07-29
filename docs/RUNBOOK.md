@@ -649,7 +649,7 @@ Autonomy L0 (read-only). All five trust properties are live and verifiable.
 | Read Gmail without holding the token | `oauth_mcp.py` sidecar — token lives in the process, never in the agent context |
 | Multi-agent | Orchestrator spawns Inbox + Curator each cycle via `spawn_agent` |
 | Brief persistence | KB `ops:briefs` (log) + `ops:entities` (scratch) |
-| Tamper-evident | Ed25519-signed receipt chain in `evidence.jsonl` |
+| Tamper-evident (model calls only) | Ed25519-signed receipt chain in `evidence.jsonl`, verified against a **locally-held** key — see `THREAT_MODEL.md` §8.7 for what it does and does not cover |
 
 **Cost:** ~50 k tokens/day × $3/1M = ~$0.15/day (Sonnet for both orchestrator and inbox).
 
@@ -744,10 +744,16 @@ The `output0` 9p mount at `/run/output` is readable from the host at `distro/bui
 grep -E "ya29\.|access_token|refresh_token" flight.jsonl && echo "FAIL" || echo "PASS"
 
 # 2. Egress confined (any off-domain attempt logged as denied):
-jq 'select(.kind=="egress_rejected")' flight.jsonl
+#    NOTE: the kind is `egress_denied`. This grepped `egress_rejected`, which is not an
+#    event kind and never matched anything (fixed in ux.6a).
+jq 'select(.kind=="egress_denied")' flight.jsonl
 
-# 3. Signed receipt chain (exit 0 = chain intact):
-cargo run --bin agentctl -- verify evidence.jsonl
+# 3. Signed receipt chain (exit 0 = chain intact). Takes TWO arguments — the chain and the
+#    public key; this was documented with one and failed as printed (fixed in ux.6a).
+#    Covers model calls only; see THREAT_MODEL.md §8.7.
+cargo run --bin agentctl -- verify evidence.jsonl egress-key.pub
+#    After a rotation, each segment verifies independently:
+#    cargo run --bin agentctl -- verify evidence.jsonl.1 egress-key.pub
 
 # 4. Cost bounded (total tokens per run):
 jq -r 'select(.kind=="inference_response") | .data | (.input_tokens + .output_tokens)' flight.jsonl \

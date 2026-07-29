@@ -24,11 +24,46 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.115.0 (shipped 2026-07-28)
+**Current version:** v0.116.0 (shipped 2026-07-29)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.13-TUI (v0.115.0) — **row-scoped control verbs in `agentctl watch`**. ux.13 had
+**Latest shipped:** ux.6a (v0.116.0) — **de-claimed the receipt chain and closed the `evidence.jsonl`
+boot trap.** ux.6 was planned as an "Evidence view" surfacing the signed chain under the roadmap's label
+"Provable accountability"; both CEO voices returned RESHAPE and the increment was **split at the /autoplan
+premise gate**: ux.6a (this) ships the honesty + durability half with **no UI**, and `ux.6b` (the signed
+action ledger) is DEFERRED, named and specified. Plans: `docs/plans/ux.6a-declaim-and-detrap.md`,
+`docs/plans/ux.6b-signed-action-ledger.md`.
+- **The chain could not say "no."** `EvidenceWriter::record_denied` had **zero production callers** — its
+  only two call sites in the workspace were tests — so a 100%-`allowed` receipt log was a property of the
+  CODE, not of any run. Wiring only the HTTP proxy would not have fixed it: `egress.rs` says in the code
+  that "this proxy never starts in production". The production-reachable denial is **native scheduler
+  admission**, now wired. Proven in /qa against a real agentd: `action="inference" verdict="denied"
+  principal="qa-runner"`, chain still verifies.
+- **Denial receipts are EDGE-TRIGGERED, and that is a security control.** `write_receipt` fsyncs under a
+  mutex, so a receipt per attempt would let a retry loop force unbounded fsync'd writes to the file
+  `agentd` reads at boot and — with rotation — roll the audit log to evict older segments. So the flight
+  event fires per attempt; the signed receipt fires once per `(agent, reason)` episode. Deferral is NOT
+  denial (ux.8′), and shutdown is not a policy verdict — neither is receipted.
+- **Closes `audit86-P2-4` + `audit-S5`**, both filed against `run.1`, which shipped without them.
+  `resume_chain` used to `read_to_string` the WHOLE file at every boot on a **fail-closed** path; it now
+  reads a bounded 64 KiB tail, repairs a torn tail, and signature-checks the tail receipt (warn, never
+  refuse — it verified *nothing* before, so failing closed would have bricked anyone who archived or
+  hand-edited the file). Measured in /qa: 1 KiB → 0.14 s vs 30 MiB → 0.16 s. **Rotation needed no format
+  or verifier change** — genesis anchoring only ever blocked in-place truncation, never rename, so each
+  segment is a complete independently-verifiable chain.
+- **/review found 6 CRITICALs across three rounds, and the third round found one in the fixes.** A boot
+  panic (`hex_decode` byte-sliced a `&str`; `panic = "abort"` + PID 1), an unbounded `seq` from an
+  unverified receipt, a rotation cascade that unlinked the live inode while `write_receipt` returned Ok,
+  a **false-green test of mine** that never entered the code it claimed to guard, and — in the fix itself —
+  a fallible unlink placed after the live rename that reintroduced the same symptom.
+- **Honesty is the point.** `THREAT_MODEL.md` §8.7.1 now states the three real limits: coverage is model
+  calls only; the signer **is** the audited party (self-attestation, not third-party evidence); and
+  deletion/rotation seams are undetectable from the chain alone. `ROADMAP.md`'s "Provable accountability"
+  and `PRODUCT-THESIS.md`'s "action receipts" are corrected, and the **mv external gate date is now named**
+  (earlier of mv.3 or 2026-10-01) — it had never been recorded despite being that doc's one assigned action.
+
+**Prev:** ux.13-TUI (v0.115.0) — **row-scoped control verbs in `agentctl watch`**. ux.13 had
 shipped Cancel/SetBudget/SetCaps end to end with **no view invoking them** (`ROADMAP.md` said "TUI keys
 deferred"), so the operator could not stop a runaway from the screen showing it. `[x]` opens a graded
 row-action overlay (Park / Set budget / Cancel), `?` is the first help key this cockpit ever had, and the

@@ -205,6 +205,10 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
   releases publish fine after the hotfix.
 - **test-flake-01 (P2) [new; found in cap.2 /ship] — Full-suite `cargo test --workspace` is flaky under high parallelism.**
+  **ux.6a update (2026-07-29): independently reproduced AT THE MERGE BASE** (`92f208f7`, 2 of 8
+  whole-suite runs), so it is confirmed pre-existing and must not be attributed to a diff that
+  merely raises the hit rate. ux.6a adds ~30 fsync-heavy evidence tests to the same parallel
+  pool, which does raise it. `--test-threads=1` remains 100% green.
   On a high-core machine (many `--test-threads`), `cargo test --workspace` intermittently fails a
   *varying* set of async scheduler/egress tests (`streaming_*`, `stream_delta_*`,
   `spawn_attenuation_documents_injection_bypass`, `egress::proxy_large_request_body_returns_413`) —
@@ -300,12 +304,19 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   `cron_mcp.py:196,247,253` keeps `_NEXT_FIRE_TS` in process memory only; a crash/restart
   spanning a scheduled fire drops the brief (interval mode phase-shifts). Fix: persist
   last-fired under `/data`; fire-on-startup-if-missed. → `run.1`.
-- **audit86-P2-4 (P2) [new] — evidence.jsonl cannot rotate safely.**
+- ~~**audit86-P2-4 (P2) [new] — evidence.jsonl cannot rotate safely.**~~ **[FIXED in ux.6a.]**
   Hash chain (`evidence.rs:4-5,38`); `resume_chain` re-hashes the whole file at every boot
   (`:184-197`, O(file) forever); rename-rotate is silently ignored; archive-and-restart
-  drops to GENESIS with no segment manifest. Fix: chain-aware segment rotation (new segment's
-  first `chain_prev_hash` = prior segment's last hash); teach `agentctl verify` non-genesis
-  starts. → `run.1`.
+  drops to GENESIS with no segment manifest. Was assigned to `run.1`, which shipped without it.
+  **Fixed more cheaply than this entry proposed.** It called for "chain-aware segment rotation
+  (new segment's first `chain_prev_hash` = prior segment's last hash); teach `agentctl verify`
+  non-genesis starts" — none of which was necessary. Genesis anchoring only ever blocked
+  *in-place truncation*, never rename: each renamed segment is a COMPLETE genesis-anchored
+  chain, so the **shipped** verifier passes on every segment with no format change, no anchor
+  records, and no `FORMAT_VERSION` bump (which is what keeps it clear of the audit86-P3-4
+  rollback trap). Delivered: bounded 64 KiB tail resume, torn-tail repair, rename rotation to
+  `.1`…`.3` (32 MiB each, oldest dropped with a log line, not silently). Residual, documented
+  in `THREAT_MODEL.md` §8.7.1 rather than fixed: the **seam between segments is unprovable**.
 - **audit86-P2-5 (P2) [new] — Terminal root agents + several scheduler maps leak/grow monotonically.**
   Terminal agents are removed from `state.agents` only in the child branch (`scheduler.rs:959`);
   `parent_map` is insert-only and checkpointed (`:1663,1934,2472`), as are
@@ -503,6 +514,82 @@ direction. Claude adversarial pass was SOUND on all 5 focus areas; Codex caught 
   signal — are not serviced. Closing that needs the background-thread dispatch path with
   channel-based result delivery into `step()` described in the original entry; the `pending_verb`
   slot is the seam it would plug into. Depends on: none.
+- **`denied_edges` still leaks for UNIVERSAL-tier agents** (P2, filed by ux.6a's fix-review red
+  team): `forget_agent` is wired only into `handle_agent_terminal`, which `scheduler.rs` itself
+  documents as "a native-only funnel". The two WIRED proxy denial sites (`egress.rs` budget and
+  global-window) belong to universal-tier workloads, torn down via `reg.deregister_by_key(...)`
+  with no `forget_agent` call — and those are the only NON-terminal denials, i.e. the only place
+  the edge trigger does real work and the only place the entry is never reclaimed. Fix: call
+  `forget_agent` alongside every `deregister_by_key`, ideally via one helper so the two cannot
+  drift, and extend `handle_agent_terminal_clears_egress_deny_edges` to a universal agent.
+  Depends on: none.
+- **`agentctl verify` does not know rotated segments exist** (P2, filed by ux.6a): after the
+  first rotation the documented command prints `chain ok: 3 receipts verified` while ~100 000
+  receipts sit in `.1`–`.3`, with no warning and no `--all`. `rotate_segments`' own doc leans on
+  this reader ("the only readers are `agentctl verify` and the operator"), and no FUSE or HTTP
+  surface exposes evidence, so there is no second reader to catch the narrowed scope. Fix: glob
+  the siblings, verify each independently, print a per-segment summary, and state that the seam
+  between segments is not cryptographically linked. Depends on: none.
+- **Rotation is not crash-durable: no parent-directory fsync** (P3, filed by ux.6a): durability
+  rests on `sync_data()` (fdatasync), which does not persist the DIRENT of a newly created file
+  — and rotation creates a new file every 32 MiB and performs four un-fsynced renames. A crash
+  just after a rotation can lose the new segment's dirent, discarding receipts `write_receipt`
+  already acknowledged. Pre-existing in kind (p7.5 had it for the first-ever file) but rotation
+  makes it recur. Fix: `File::open(parent)?.sync_all()` after the renames and after creating the
+  replacement. Depends on: none.
+- **Rotation-at-open runs BEFORE torn-tail repair** (P3, filed by ux.6a): a process killed
+  mid-write on an at-cap file leaves a never-fsynced fragment; the next boot renames that
+  fragment into `.1` untouched and repairs a brand-new empty file instead, so
+  `agentctl verify evidence.jsonl.1` fails with a parse error — i.e. the tamper detector fires
+  on a crash, in a subsystem whose claim is that a verify failure means tampering. Fix: resume
+  (and repair) before rotating at open, or repair the segment in place after the rename.
+  Depends on: none.
+- **The parked-for-eviction name has no reaper** (P3, filed by ux.6a): if the park succeeds and
+  the shift then fails, rotation latches off and a full 32 MiB segment of signed receipts is
+  stranded at `evidence.jsonl.evicting` — a name no reader knows about — so the documented
+  128 MiB retention bound silently becomes 160 MiB. Self-heals only in that the next successful
+  park renames over it. p3.1 set the opposite precedent with its orphaned-checkpoint-tmp sweep.
+  Fix: sweep it at `open`, ideally renaming it into the first free numbered slot so the receipts
+  stay verifiable, and report the choice in `resume_note`. Depends on: none.
+- **OV-1's FsWrite guard does not cover rotated segments** (P3, filed by ux.6a): `main.rs`
+  checks only `evidence_path`, while rotation now creates `.1`/`.2`/`.3` (plus a transient
+  `.evicting`) holding up to 96 MiB of the same signed receipts. `Path::starts_with` is
+  component-wise, so a directory prefix is still caught, but an explicit
+  `FsWrite { prefix = "<dir>/evidence.jsonl.1" }` passes the gate and hands a sandboxed MCP
+  server write access to a segment of the chain. Fix: check every name the writer can produce,
+  or simpler and drift-proof, assert the evidence file's PARENT directory is outside every
+  FsWrite prefix. Depends on: none.
+- **Segment eviction is not durably recorded** (P3, filed by ux.6a): `rotate_segments` announces
+  the deletion of ~32 MiB of signed receipts on `tracing` only. `EvidenceWriter` holds no
+  `FlightRecorder`, so nothing durable records which segment went — which sits badly against the
+  "Record everything" invariant precisely where the record being destroyed IS the audit record,
+  and against THREAT_MODEL §8.7.1, which names an out-of-band `(pubkey, max seq)` as the only
+  way to detect rewind. Fix: pass the recorder in (or surface the dropped segment for `main.rs`
+  to record) and emit the segment name, receipt count and final `seq` before unlinking. Also
+  document the deletion in DEPLOYMENT.md and consider making the count configurable.
+  Depends on: none.
+- **`write_receipt` fsyncs under a `std::sync::Mutex` on tokio worker threads** (P3, filed by
+  ux.6a): `evidence.rs`'s `write_receipt` holds the `Inner` lock across `writeln!` + `flush()` +
+  `sync_data()`, and its callers run inside async contexts (`egress.rs`'s proxy handler,
+  `scheduler.rs`'s `make_infer_future`). Benign **today** because receipt volume is bounded by
+  real work: one per inference (amortized against a network round-trip, invisible) plus, since
+  ux.6a, at most one per deny episode per agent. **It becomes a live problem the moment anything
+  makes receipts per-request** — which `ux.6b`'s B1 chain-widening explicitly would, putting a
+  synchronous fsync on every tool call and capability check. Any such change must FIRST move the
+  write off the reactor onto a dedicated writer lane, exactly as ux.11b did with `run_writer`.
+  Depends on: none (but is a hard prerequisite for ux.6b B1).
+- **The receipt chain's signing key never leaves the boundary, so verification is
+  self-attestation** (P3, filed by ux.6a; the honest fix for the whole
+  delete-and-restart-at-0 class): `EvidenceWriter::open` generates the Ed25519 key locally and
+  rewrites the `.pub` from the private key on every open; `verify_chain` reads that same `.pub`.
+  So anyone who can write the directory can mint a key and rewrite the log from genesis, and
+  deleting the file restarts the chain at 0 and still verifies. Segment seams (ux.6a rotation)
+  are likewise unprovable. ux.6a **documented** all of this (`THREAT_MODEL.md` §8.7.1) rather
+  than fixing it, because fixing it means moving the key outside the boundary: customer-held
+  key, external timestamping, or control-plane countersigning, plus an out-of-band record of
+  `(pubkey, max seq)` to make rewind detectable. **This — not chain widening — is what would
+  change what can honestly be claimed**, and it is the piece a governance buyer would actually
+  need. Depends on: a decision about where the second party lives (mv control plane?).
 - **Shared SSE broadcast channel (`agentd/src/main.rs:114`, capacity 1024) now carries
   per-token delta traffic on top of every other event kind** (P2, found by /review's
   adversarial pass): `EventKind::InferenceStreamDelta` fires once per streamed chunk on
@@ -867,8 +954,15 @@ Wave 2 = C1,C3,C4,C5,C8,S5,S6,S7 · Wave 3 (docs, one pass) = D1–D5,S4 · Wave
 - **audit-S4 (P2) — OTEL "credential guard" (obs.1) not implemented + README default documented backwards.**
   Only preview-redaction exists; `otel/README.md:54` says `OTEL_REDACT_PREVIEWS` defaults `false`, code
   defaults `true`. Fix: add a scrub choke point in `finish()` or correct the docs. `otel/src/span_builder.rs`.
-- **audit-S5 (P2) — signed chain not re-verified on resume** (same as p7.5-scope-03; live append trusts the
-  tail, offline `agentctl verify` still catches). `evidence.rs:184`.
+- ~~**audit-S5 (P2) — signed chain not re-verified on resume**~~ **[FIXED in ux.6a: `resume_chain` now
+  verifies the TAIL receipt's Ed25519 signature at open and reports via `EvidenceWriter::resume_note()`
+  → an `egress_proxy_failed` flight event with `reason: "evidence_chain_resume"`.]** (same as
+  p7.5-scope-03; live append trusts the tail, offline `agentctl verify` still catches).
+  `evidence.rs:184`. **It warns and boots — deliberately, and this is not a partial fix.** Before ux.6a
+  `resume_chain` verified *nothing* (no JSON parse, no `seq` check, no chain-hash check, no signature),
+  so it failed only on an I/O error or invalid UTF-8. Failing closed on a bad tail would therefore have
+  created a NEW unbootable `agentd` for anyone who archived, copied, or hand-edited `evidence.jsonl`.
+  Full verification stays `agentctl verify`'s job, per segment, offline.
 - **audit-S6 (P2) — sandbox degradation fail-open.** Landlock/`unshare(NEWNET)` silently degrade;
   `mcp_require_capabilities` checks non-empty rules, not that isolation applied → a "network-isolated"
   server keeps network on userns-disabled hosts. Fix: strict mode that aborts on requested-isolation
@@ -1271,11 +1365,18 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 - Fixed: `detect_source_fuse_path_returns_fuse_source` and `detect_source_fallback_to_http_when_no_fuse`
   unit tests added in `source.rs`.
 
-**p7.7-ar-03 (LOW) — `egress_brokered`/`egress_rejected` hardcoded to 0 in `HttpSource`**
+**p7.7-ar-03 (P2 — raised from LOW in ux.6a) — `egress_brokered`/`egress_rejected` hardcoded to 0 in `HttpSource`**
 - `HttpSource::load_snapshot()` maps `/api/v1/snapshot` JSON to `SchedulerSnapshot` but
   leaves `egress_brokered` and `egress_rejected` as 0 (fields not yet emitted by the HTTP
   endpoint). The FUSE path reads them from live files. Align in dx.2 when the HTTP endpoint
   exposes egress counters.
+- **Raised because ux.6a made denials real.** Until then the TUI Detail pane's
+  `"{} brokered  {} denied"` (`agentctl/src/watch/views.rs`, fed by `count_egress_by_agent` in
+  `reader.rs`) read 0 in *both* modes, so the HTTP hardcode was invisible. Now FUSE mode shows
+  true counts while HTTP mode still shows a **false "0 denied"** — a wrong answer about a
+  governance signal, which is worse than a missing one. Not fixed in ux.6a: that increment is
+  explicitly no-UI. Fix = emit the counters from `/api/v1/snapshot` and read them in
+  `HttpSource`.
 
 **~~p7.7-ar-04~~ (resolved dx.2) — `status_detail` not threaded through `agent_info_from_json`**
 - Fixed: `agent_info_from_json` now parses `status_detail` from the JSON response;

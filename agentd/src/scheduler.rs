@@ -1225,6 +1225,13 @@ fn handle_agent_terminal(
     // Always clear orchestration membership on termination — prevents phantom entries.
     state.waiting.remove(&agent_id);
     state.orchestrated.remove(&agent_id);
+    // ux.6a: drop this agent's deny-episode state. Every scheduler deny site is a TERMINAL
+    // denial, so without this the agent's entry can never be reclaimed — it will never record
+    // another allowed inference to re-arm itself — and `denied_edges` grows for the life of the
+    // process. Same leak class as audit86-P2-5, which is why it belongs in this block.
+    if let Some(eg) = state.egress.as_ref() {
+        eg.forget_agent(&agent_id);
+    }
 
     // ux.11b: close the run segment before the agent leaves state.agents. This funnels
     // every native terminal (child, root, admission-denial). Spend = Δ context_tokens
@@ -1690,6 +1697,12 @@ fn drain_deferred(
                 EventKind::AgentAdmissionDenied,
                 json!({ "reason": "global_budget_exhausted", "tokens_spent": state.tokens_spent, "remedy": BUDGET_REMEDY }),
             );
+            // ux.6a: TERMINAL denial → signed receipt. This is the production-reachable
+            // denial: the HTTP egress proxy never starts in the shipped config, so before
+            // this the chain could never contain a "no" in practice either.
+            if let Some(eg) = state.egress.as_ref() {
+                eg.receipt_denial_once(&d.agent_id, gateway.model_id(), "global_budget_exhausted");
+            }
             handle_agent_terminal(
                 d.agent_id,
                 Err(anyhow::anyhow!("admission denied: global token budget exhausted ({BUDGET_REMEDY})")),
@@ -1767,6 +1780,10 @@ fn drain_deferred(
                 EventKind::AgentAdmissionDenied,
                 json!({ "reason": "agent_budget_exhausted", "remedy": BUDGET_REMEDY }),
             );
+            // ux.6a: TERMINAL (legacy no-window) denial → signed receipt.
+            if let Some(eg) = state.egress.as_ref() {
+                eg.receipt_denial_once(&id, gateway.model_id(), "agent_budget_exhausted");
+            }
             handle_agent_terminal(
                 id,
                 Err(anyhow::anyhow!("admission denied: agent_budget_exhausted ({BUDGET_REMEDY})")),
@@ -1870,6 +1887,12 @@ fn enqueue_or_defer(
                     state.deferred.push(DeferredInfer { priority, seq, agent_id, request: req, turn });
                 } else {
                     // No window (legacy): permanent exhaustion → terminate.
+                    // ux.6a: receipt only HERE, never in the deferral branch above —
+                    // deferral is not denial (ux.8′), and receipting it would put the
+                    // boundary on record as refusing work it is actually going to do.
+                    if let Some(eg) = state.egress.as_ref() {
+                        eg.receipt_denial_once(&agent_id, gateway.model_id(), reason);
+                    }
                     handle_agent_terminal(
                         agent_id,
                         Err(anyhow::anyhow!("admission denied: {reason} ({BUDGET_REMEDY})")),
@@ -7589,6 +7612,170 @@ mod tests {
         assert!(!state.cancel_requested.contains_key("a"), "flag consumed by handle_agent_terminal");
         assert!(!state.waiting.contains("a"), "removed from waiting");
         assert!(state.outcomes.contains_key("a"), "terminal outcome recorded for the root");
+    }
+
+    // ---------------------------------------------------------------------------------
+    // ux.6a Step 5 — terminal admission denials are receipted; deferral and shutdown are not
+    // ---------------------------------------------------------------------------------
+
+    /// Build a state with an egress proxy attached, returning the temp dir so the evidence
+    /// file can be inspected.
+    fn state_with_egress(id: &str) -> (SchedulerState, Arc<EgressProxy>, tempfile::TempDir) {
+        use crate::evidence::EvidenceWriter;
+        let dir = tempfile::TempDir::new().unwrap();
+        let (rec, _tmp) = recorder();
+        let writer = Arc::new(
+            EvidenceWriter::open(&dir.path().join("ev.jsonl"), &dir.path().join("k.pkcs8"))
+                .unwrap(),
+        );
+        let egress = Arc::new(EgressProxy::new(writer, rec));
+        let mut state = minimal_state(id);
+        state.egress = Some(Arc::clone(&egress));
+        (state, egress, dir)
+    }
+
+    fn denied_receipts(dir: &tempfile::TempDir) -> usize {
+        std::fs::read_to_string(dir.path().join("ev.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("\"verdict\":\"denied\""))
+            .count()
+    }
+
+    /// The finding that reshaped ux.6: before this, `record_denied` had ZERO production
+    /// callers, so the chain structurally could not contain a "no". And wiring only the HTTP
+    /// egress proxy would not have fixed it — that proxy never starts in the shipped config.
+    /// THIS is the production-reachable denial.
+    #[test]
+    fn native_admission_denial_writes_denied_receipt() {
+        let (mut state, _egress, dir) = state_with_egress("a");
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, log) = recorder();
+        // Legacy no-window config, already over the global ceiling → permanent denial.
+        let sched = SchedulerConfig {
+            global_token_budget: 1_000,
+            budget_reset_interval: 0,
+            ..unlimited()
+        };
+        state.tokens_spent = 5_000;
+        state.deferred.push(DeferredInfer {
+            priority: 0,
+            seq: 0,
+            agent_id: "a".into(),
+            request: test_infer_req(),
+            turn: 0,
+        });
+
+        drain_deferred(&mut state, &sched, &gateway, &registry, &rec);
+
+        assert_eq!(denied_receipts(&dir), 1, "a terminal denial must be receipted");
+        let content = std::fs::read_to_string(dir.path().join("ev.jsonl")).unwrap();
+        let r: crate::evidence::ActionReceipt =
+            serde_json::from_str(content.lines().last().unwrap()).unwrap();
+        assert_eq!(r.principal, "a", "receipt is attributed to the denied agent");
+        assert_eq!(r.verdict, "denied");
+        assert_eq!(r.action, "inference", "shares the action namespace with allows");
+        // The chain remains a valid chain with a denial in it.
+        assert_eq!(
+            crate::evidence::verify_chain(
+                &dir.path().join("ev.jsonl"),
+                &dir.path().join("k.pub")
+            )
+            .unwrap(),
+            1
+        );
+        let events = std::fs::read_to_string(log.path()).unwrap_or_default();
+        assert!(events.contains("agent_admission_denied"));
+    }
+
+    /// ux.8′'s hardest-won distinction: with a reset window, exhaustion DEFERS rather than
+    /// denies. Receipting that would put the boundary on record refusing work it is about to
+    /// do — and would make the signed chain lie in the safe direction, which is still a lie.
+    #[test]
+    fn deferred_agent_writes_no_denied_receipt() {
+        let (mut state, _egress, dir) = state_with_egress("a");
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _log) = recorder();
+        // Identical to the test above EXCEPT a reset window is configured.
+        let sched = SchedulerConfig {
+            global_token_budget: 1_000,
+            budget_reset_interval: 86_400,
+            ..unlimited()
+        };
+        state.tokens_spent = 5_000;
+        state.deferred.push(DeferredInfer {
+            priority: 0,
+            seq: 0,
+            agent_id: "a".into(),
+            request: test_infer_req(),
+            turn: 0,
+        });
+
+        drain_deferred(&mut state, &sched, &gateway, &registry, &rec);
+
+        assert_eq!(denied_receipts(&dir), 0, "deferral is NOT denial (ux.8′)");
+        assert!(!state.deferred.is_empty(), "the agent stays queued for the next rollover");
+    }
+
+    /// Shutdown is not a policy verdict, and its loop drains the WHOLE deferred queue — so
+    /// receipting it would also put N fsyncs on the shutdown path.
+    #[test]
+    fn shutdown_denial_writes_no_receipt() {
+        let (mut state, _egress, dir) = state_with_egress("a");
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, log) = recorder();
+        let sched = unlimited();
+        state.shutdown_requested = true;
+        for i in 0..5 {
+            state.deferred.push(DeferredInfer {
+                priority: 0,
+                seq: i,
+                agent_id: "a".into(),
+                request: test_infer_req(),
+                turn: 0,
+            });
+        }
+
+        drain_deferred(&mut state, &sched, &gateway, &registry, &rec);
+
+        assert_eq!(denied_receipts(&dir), 0, "shutdown must not write receipts");
+        let events = std::fs::read_to_string(log.path()).unwrap_or_default();
+        assert!(events.contains("\"reason\":\"shutdown\""), "but it is still recorded");
+    }
+
+    /// ux.6a leak guard, mirroring `handle_agent_terminal_clears_both_sets`. Every scheduler
+    /// deny site is a TERMINAL denial, so a denied agent never records another allowed
+    /// inference and can never re-arm itself — without cleanup its `denied_edges` entry lives
+    /// for the whole process. Same class as audit86-P2-5.
+    #[test]
+    fn handle_agent_terminal_clears_egress_deny_edges() {
+        let (mut state, egress, _dir) = state_with_egress("a");
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _log) = recorder();
+        let sched = unlimited();
+
+        egress.receipt_denial_once("a", "m", "agent_budget_exhausted");
+        assert_eq!(egress.denied_edge_agents(), 1, "precondition: the edge exists");
+
+        handle_agent_terminal(
+            "a".to_string(),
+            Err(anyhow::anyhow!("terminal")),
+            &mut state,
+            &sched,
+            &gateway,
+            &registry,
+            &rec,
+        );
+
+        assert_eq!(
+            egress.denied_edge_agents(),
+            0,
+            "a terminated agent's deny-episode state must be reclaimed, or it leaks forever"
+        );
     }
 
     #[test]
