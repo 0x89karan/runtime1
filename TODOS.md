@@ -961,6 +961,55 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   taking ~2 actions a morning, do not build it. Both CEO voices ranked this whole track below
   `audit-S3`, naming mv design partners, and `p7.7-ar-03`.
 
+- **brief-05 (P1) [new, from /autoplan 2026-07-30] — the whole brief track is being planned against
+  artifacts that do not exist. Run the pipeline for seven mornings BEFORE any further brief.* work.**
+  Found when an /autoplan CEO voice did the thing three prior review rounds never did: looked at the
+  output instead of the source. Verified independently:
+  - `~/.agentos-output/` holds **two briefs in fifteen days** — `brief-2026-07-16.md`,
+    `brief-2026-07-23.md`. Nothing since. `docker info` reports the daemon down, so nothing is
+    producing one now either.
+  - **brief.1 (v0.117.0) has never produced a brief.** The real Response Needed table is
+    `| From | Subject | Ask | Deadline |` — four columns, **no Thread column**. Every claim about
+    what brief.1 changed for the operator is currently unobserved.
+  - The model **already escapes** table-breaking characters unprompted: `brief-2026-07-23.md:31`
+    contains `Hackathon \| Tech Discussion`, written before brief.1 said anything about escaping.
+  This is the same failure mode as brief.1's premise, one level up: we keep verifying code and not
+  verifying reality. The tally named in `docs/plans/connectors-action-queue.md` has **zero days of
+  data** and has now been deferred twice. It is `docker compose up` and it gates the entire track.
+
+- **brief-06 (P2) [new, from /autoplan 2026-07-30] — brief.2's premise is contradicted by the only
+  field evidence there is.** `brief-2026-07-23.md:39` says verbatim:
+  *"ℹ️ No prior-day briefs found in KB — all items below originate from today's inbox scan."* —
+  while `brief-2026-07-16.md` existed and the curator's STEP 2 had written `ops:briefs`. So the
+  carry-forward path found **nothing**, which is the *inverse* of brief.2's stated defect (items
+  re-listing forever). Six of the ten "carried forward" items on 07-23 also appear on 07-16, meaning
+  the model re-derived them from the inbox rather than reading the KB. **Do not build brief.2 until
+  this is resolved** — the defect may be "carry-forward silently finds nothing", not "carry-forward
+  never forgets", and those need opposite fixes. Note brief.1's `/review` established that
+  `kb_search(segment='ops:briefs')` is the only carry-forward source; this suggests it returns
+  nothing useful in practice, which no review has yet explained.
+
+- **brief-03 note (P1 rating CONTESTED, from /autoplan 2026-07-30).** Both CEO voices argued the P1
+  is inflated and should be P2: `THREAT_MODEL.md` §9.5 already accepts, open by design, that an
+  injected curator can write a *misleading brief* (worked example: `"URGENT: wire funds to X"`), and
+  escaping does nothing about fabricated prose — so brief-03 closes a narrow hole in a wall with a
+  deliberate wider one. The sender's link is also already live in the operator's Gmail; the brief
+  adds disguise, not access. **Rating left at P1 pending the tally** rather than changed unilaterally,
+  because the re-rate argument and the deflation argument both now rest on unobserved artifacts
+  (`brief-05`). The genuinely high-severity half of §9.5 is *persistence* — untrusted open-item text
+  read back into the curator every morning in a context holding `FsWrite` + `BriefPublish` — and
+  escaping is the control that helps least with it. Plan (DEFERRED, with the reshape named):
+  `docs/plans/brief.3-runtime-authored-brief.md`.
+
+- **brief-07 (P2) [new, from /autoplan 2026-07-30] — `agentctl brief` prints model-authored strings
+  unsanitised.** `agentctl/src/brief.rs:61-124` interpolates `narrative`, `last_error`, `stop_reason`
+  and `agent_id` straight into terminal output. `narrative` is written by the curator, whose context
+  holds untrusted email, so it is sender-influenced — terminal escape sequences in a `println!`.
+  The workspace's only control-char stripper is `agentctl/src/watch/memory.rs:261-263`
+  (`sanitize_str`, not exported). **~30 minutes, and it lands on a surface the operator actually
+  uses** — unlike the markdown file. Deliberately unbundled from brief-03: it has nothing to do with
+  a markdown emitter.
+
 - **brief-04 (P2) [new, from /qa 2026-07-29] — the OperatingBrief byte budget depends on a model
   counting UTF-8 bytes.** /qa proved on a real `agentd` that the caps are enforced in bytes at two
   places (`MAX_MEM_CONTENT_BYTES` on the JSON-escaped-and-wrapped entry for L1, `HIT_CONTENT_CAP` on

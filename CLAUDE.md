@@ -171,7 +171,20 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **brief.2 is NOT the automatic next step** — gate it on the one-week operator
+**Next (roadmap):** **STOP planning the brief track and run it.** `/autoplan` deferred brief.3
+(`brief-03`) at the premise gate on 2026-07-30 with 6/6 adverse CEO consensus, because a voice finally
+looked at the OUTPUT: `~/.agentos-output/` has **two briefs in fifteen days**, none in the last eight,
+and the real Response Needed table has **no Thread column** — so **brief.1 has never produced a
+brief** and every claim about what it changed is unobserved (`brief-05`, P1). Three prior review
+rounds verified code and never verified reality. Do this in order: (1) `docker compose up` for seven
+mornings + the tally; (2) `brief-07` — sanitise `agentctl brief` (~30 min, a surface actually used);
+(3) `p7.7-ar-03` (~half a day, kills a false `0 denied`); (4) name mv design partners — the only item
+whose cost of delay is irreversible (gate 2026-10-01, 0 of 10 humans, 0 of 3 demos, zero engineering).
+brief.3 returns ONLY in the reshaped one-typed-brief form (`docs/plans/brief.3-runtime-authored-brief.md`)
+— never as a second runtime renderer. `brief-06`: brief.2's premise is contradicted by field evidence
+(carry-forward found NOTHING on 07-23), so it may need the opposite fix; do not build it yet.
+
+**Prev-next:** **brief.2 is NOT the automatic next step** — gate it on the one-week operator
 tally (see brief.1 above). Both CEO voices ranked the whole brief track BELOW three open items:
 (1) name mv design partners or strike mv (external gate 2026-10-01, needs 10 named humans + 3 booked
 demos, has zero of each, zero engineering); (2) `p7.7-ar-03` (~half a day — `HttpSource` hardcodes
