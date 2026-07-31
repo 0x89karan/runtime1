@@ -194,6 +194,13 @@ agentctl watch --url http://localhost:7999
 cat ~/.agentos-output/brief-$(date +%Y-%m-%d).md
 ```
 
+**Reading the brief:** the `Thread` column links straight to each Gmail conversation, and a literal
+dash means the thread id was missing or malformed (fail-closed by design). **If the brief starts with
+`⚠ Shortened to fit`, it is incomplete** — a morning's mail exceeded the 8 KiB store limit, so the
+inbox job shed content and told you rather than producing nothing. Check Gmail for anything
+time-critical. Full anatomy and the known limitations (handled items can reappear; sender-text
+escaping is a prompt rule, not enforcement) are in `docs/RUNBOOK.md` §11.6.
+
 **Schedule:** `TRIGGER_INTERVAL="every 2m"` is for testing and only accepts `every N(s|m|h)`. For a
 daily brief use the **separate** cron variable: `-e "TRIGGER_CRON=0 8 * * *"` (08:00 UTC) — a cron
 expression in `TRIGGER_INTERVAL` will not parse.

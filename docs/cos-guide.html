@@ -604,9 +604,32 @@
   </div>
 
   <div class="whats-new">
-    <div class="whats-new-label">v0.95.0 — What's new</div>
+    <div class="whats-new-label">v0.117.0 — What's new for operators</div>
+    <p style="margin:0 0 .9rem"><em>Operator-visible changes only. The full per-release list lives in
+    <code>CHANGELOG.md</code> — this section is deliberately not a second copy of it.</em></p>
     <ul>
-      <li><strong>Sealed-job pipeline — the orchestrator is de-privileged</strong> <span class="step-tag tag-new">new</span> — the node that reads the schedule now holds only <code>{cron_trigger, RunJob}</code>: no Gmail, no KB, no file write, no spawn. It fires two config-declared <em>sealed jobs</em> (<code>cos-inbox</code> reads Gmail; <code>cos-curator</code> writes the brief) whose capabilities and instructions are owned by config, not chosen by the trigger — and it receives only a "job completed" signal, never a job's output. This closes audit P1-10 (an injected trigger cannot reach live Gmail). It does NOT stop an injected curator from writing a <em>misleading</em> brief — that's a social-engineering channel, not a credential path (see THREAT_MODEL §9.5). No setup changes: same OAuth flow, same <code>docker compose up cos</code>. What changed is what you see in the flight log — <code>run_job</code> calls and <code>cos-inbox-…</code>/<code>cos-curator-…</code> job children instead of <code>spawn_agent</code>.</li>
+      <li><strong>The brief's action items are addressable</strong> <span class="step-tag tag-new">v0.117.0</span>
+        — every item now carries its Gmail <code>threadId</code>, the Response Needed table gained a
+        <strong>Thread</strong> permalink column, and the Important / Open Items lists link too. See
+        <em>Read the brief</em> below for the anatomy, the fail-closed dash, and what
+        <code>⚠ Shortened to fit</code> means. <strong>Known limitation:</strong> items you already handled
+        can still reappear under Open Items — nothing in the pipeline can observe that you replied
+        (<code>brief.2</code>). And escaping of sender-written text is a prompt rule, not enforcement
+        (<code>brief-03</code>): treat a link in the brief exactly as you would the original email.</li>
+      <li><strong>The brief survives its own size limit</strong> <span class="step-tag tag-new">v0.117.0</span>
+        — it used to exceed the 8&nbsp;KiB store limit at its own documented maxima and produce
+        <em>no brief at all</em>, with nothing to say why. Caps are now counted in bytes (non-Latin
+        subjects cost 2&ndash;3&times; per character) and an over-size morning sheds content and tells you,
+        rather than vanishing.</li>
+      <li><strong>Row-scoped control verbs in <code>agentctl watch</code></strong> <span class="step-tag tag-new">v0.115.0</span>
+        — select an agent row and press <code>[x]</code> for Park / Set budget / Cancel, so a runaway can
+        be stopped from the screen showing it. <code>?</code> opens the authoritative key map.</li>
+      <li><strong>Denial receipts are real</strong> <span class="step-tag tag-new">v0.116.0</span>
+        — the signed receipt chain can now record a <em>refusal</em>, not just permitted actions
+        (native scheduler admission is wired). Read <code>THREAT_MODEL.md</code> §8.7.1 for the three
+        limits that still apply: coverage is model calls only, the signer is the audited party, and
+        deletion seams are undetectable from the chain alone.</li>
+      <li><strong>Sealed-job pipeline — the orchestrator is de-privileged</strong> <span class="step-tag tag-new">v0.95.0</span> — the node that reads the schedule now holds only <code>{cron_trigger, RunJob}</code>: no Gmail, no KB, no file write, no spawn. It fires two config-declared <em>sealed jobs</em> (<code>cos-inbox</code> reads Gmail; <code>cos-curator</code> writes the brief) whose capabilities and instructions are owned by config, not chosen by the trigger — and it receives only a "job completed" signal, never a job's output. This closes audit P1-10 (an injected trigger cannot reach live Gmail). It does NOT stop an injected curator from writing a <em>misleading</em> brief — that's a social-engineering channel, not a credential path (see THREAT_MODEL §9.5). No setup changes: same OAuth flow, same <code>docker compose up cos</code>. What changed is what you see in the flight log — <code>run_job</code> calls and <code>cos-inbox-…</code>/<code>cos-curator-…</code> job children instead of <code>spawn_agent</code>.</li>
       <li><strong>Docker <code>:full</code> / <code>:latest</code> publish fixed</strong> <span class="step-tag tag-new">fixed</span> — the release job had been failing to publish the full image since v0.92.0 (a retired GitHub Actions cache backend returned <code>not_found</code> on cache export, which buildx treated as fatal <em>after</em> the image already pushed). Fixed by making cache export non-fatal. v0.95.0 is the first full image published since; if <code>docker pull …:full</code> gave you a stale build recently, this is why.</li>
       <li><strong>Brief writes actually work now</strong> <span class="step-tag tag-new">fixed</span> — earlier v0.86.x images silently denied every <code>write_file</code> call from the CoS orchestrator ("File write" showed as a "known environment constraint" in the daily brief). Root cause: the FsWrite capability grant and the prompt's write path drifted out of sync during Docker's config rewrite. Fixed at the config level; no setup changes needed. If you still see briefs delivered inline instead of written to disk, re-pull the image (≥ v0.86.2).</li>
       <li><strong>Gmail actually works now</strong> — earlier v0.86.x images rejected every Gmail API call with <code>credential_denied</code>/<code>no_providers_configured</code> even after a successful <code>agentctl auth google</code>, because the <code>google_oauth</code> MCP server was missing its own broker capability grant. Fixed at the config level; no setup changes needed. If you still see this error, re-pull the image (≥ v0.86.1).</li>
@@ -772,7 +795,7 @@
       </div>
       <p>Use the <code>[c]</code> key for credentials, <code>[a]</code> for approvals, <code>[i]</code> for the flight log inspector. Press <code>q</code> to exit the cockpit — the agents keep running.</p>
 
-      <p><strong>Chat with an agent directly <span class="step-tag tag-new">new</span></strong> — the Dashboard now has a chat rail beside the agent table. Press <code>Tab</code> to focus it (the border turns white), select an agent row and press <code>r</code> to retarget the rail to it, type a message, then <code>Enter</code> to send. The reply streams in live, token by token, in green. <code>Esc</code> or <code>Tab</code> again returns focus to the table; <code>↑</code>/<code>↓</code> scroll the transcript while focused, <code>End</code> jumps back to the live tail.</p>
+      <p><strong>Chat with an agent directly <span class="step-tag tag-new">v0.95.0</span></strong> — the Dashboard now has a chat rail beside the agent table. Press <code>Tab</code> to focus it (the border turns white), select an agent row and press <code>r</code> to retarget the rail to it, type a message, then <code>Enter</code> to send. The reply streams in live, token by token, in green. <code>Esc</code> or <code>Tab</code> again returns focus to the table; <code>↑</code>/<code>↓</code> scroll the transcript while focused, <code>End</code> jumps back to the live tail.</p>
       <div class="expect">
         <div class="expect-label">Note</div>
         <div class="timeline">
@@ -797,6 +820,43 @@
 
 <span class="c"># Read today's brief</span>
 <span class="cmd">cat</span> <span class="path">~/.agentos-output/brief-$(date +%Y-%m-%d).md</span></code></pre>
+      </div>
+
+      <p style="margin-top:1.1rem"><strong>What is in it</strong> (as of v0.117.0):</p>
+      <ul>
+        <li><strong>Important (action needed)</strong> — the ranked short list, highest urgency first.</li>
+        <li><strong>Response Needed</strong> — a table: <code>From | Subject | Ask | Deadline | Thread</code>.
+          The <strong>Thread</strong> cell is a Gmail permalink straight to the conversation, so you never
+          have to hunt for it. It uses the <code>#all/</code> view on purpose: a thread you have finished
+          replying to gets archived, and an <code>#inbox/</code> link would 404 the moment you dealt with it.
+          A row shows a literal dash instead of a link when the thread id is missing or malformed
+          &mdash; that is deliberate fail-closed behaviour, not a bug.</li>
+        <li><strong>Open Items (carried forward)</strong> — unresolved items from earlier briefs plus today's.
+          <em>Known limitation:</em> items you have already handled can still reappear here. Nothing in the
+          pipeline can currently observe that you replied, so treat this list as a reminder, not a to-do
+          state. Tracked as <code>brief.2</code>.</li>
+        <li><strong>Focus Recommendation</strong> and <strong>Stats</strong> (threads reviewed, skipped).</li>
+      </ul>
+
+      <div class="note" style="margin-top:1rem">
+        <div class="note-label">If you see &ldquo;⚠ Shortened to fit&rdquo;, the brief is incomplete</div>
+        <p>A brief is stored in a knowledge-base entry with a hard 8&nbsp;KiB ceiling, and that ceiling is
+        measured in <strong>bytes</strong> &mdash; non-Latin subject lines cost 2&ndash;3&times; per character.
+        When a morning's mail would not fit, the inbox job now sheds content rather than failing: it trims
+        the longest sender-written fields first, then drops the oldest items, and it prints a line like</p>
+        <div class="code-block"><pre><code>&gt; ⚠ Shortened to fit: 2 important, 1 response-needed, 3 open items omitted; fields truncated.</code></pre></div>
+        <p>at the top of the brief. <strong>If that line is present, you are not looking at the whole
+        picture</strong> &mdash; check Gmail directly for anything time-critical. Before v0.117.0 an
+        oversized brief produced <em>no brief at all</em>, with nothing to tell you why.</p>
+      </div>
+
+      <div class="note" style="margin-top:1rem">
+        <div class="note-label">Worth doing: run it for a week and count</div>
+        <p>The brief is only worth its complexity if you act on it. For one week, after each morning's
+        brief, note how many actions you actually took as a result &mdash; the thread links make that a
+        quick diff between what the brief listed and what you did. If it comes out at roughly two actions
+        a morning, say so: the honest answer is to read the inbox and stop investing here. That tally
+        gates further work on this pipeline.</p>
       </div>
     </div>
 

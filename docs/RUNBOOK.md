@@ -737,6 +737,36 @@ cat ./output/brief-$(date +%Y-%m-%d).md
 **QEMU/distro mode:**
 The `output0` 9p mount at `/run/output` is readable from the host at `distro/build/output/images/run/`.
 
+**What the brief contains (v0.117.0).** `## Important (action needed)` (ranked), `## Response Needed`
+(a `From | Subject | Ask | Deadline | Thread` table), `## Open Items (carried forward)`,
+`## Focus Recommendation`, `## Stats`.
+
+- **The `Thread` cell is a Gmail permalink** to that conversation, using the `#all/` view rather than
+  `#inbox/` — a thread you finished replying to is archived, and an `#inbox/` link would 404 exactly
+  when you had dealt with it. A **literal dash** appears instead of a link when the thread id is
+  absent or does not match `^[0-9a-f]{1,20}$`. That is deliberate: the id reaches the brief author
+  from a model that read untrusted email, so anything unverified is refused rather than linked.
+  `/u/0/` is the browser's *first* signed-in Google account — with several accounts signed in, a link
+  may open the wrong mailbox.
+- **`⚠ Shortened to fit` means the brief is incomplete.** A brief is stored in an 8 KiB KB entry, and
+  the limit is counted in **bytes** (non-Latin subjects cost 2–3× per character). When a morning's
+  mail will not fit, the inbox job sheds content instead of failing: it truncates the longest
+  sender-written fields, then drops the oldest items, and emits
+  `> ⚠ Shortened to fit: N important, M response-needed, K open items omitted; fields truncated.`
+  as the first line. **If that line is there, check Gmail for anything time-critical.** Before
+  v0.117.0 an over-size brief produced *no brief at all* with no visible cause; if the write still
+  fails after the shed ladder, the job's final answer begins `BRIEF WRITE FAILED (size)`.
+- **Handled items can still reappear** under Open Items. Nothing in the pipeline can currently
+  observe that you replied, so this is a reminder list, not resolution state (`brief.2`).
+- **Escaping is a prompt instruction, not enforcement** (`brief-03`, P1). Sender-written fields
+  (`From`, `Subject`, `Ask`) are entity-escaped by a rule the model is told to follow, not by code.
+  Treat a link in the brief with the same suspicion you would give the original email.
+
+> **Before building anything further on the brief, run it for a week and count the actions you
+> actually take.** As of 2026-07-31 the pipeline has produced two briefs in fifteen days, so every
+> claim about how well it works is unmeasured (`brief-05`). If the answer is ~2 actions a morning,
+> read the inbox instead.
+
 ### 11.7 Verifying the trust story
 
 ```bash
