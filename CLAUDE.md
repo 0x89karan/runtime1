@@ -171,18 +171,52 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **STOP planning the brief track and run it.** `/autoplan` deferred brief.3
-(`brief-03`) at the premise gate on 2026-07-30 with 6/6 adverse CEO consensus, because a voice finally
-looked at the OUTPUT: `~/.agentos-output/` has **two briefs in fifteen days**, none in the last eight,
-and the real Response Needed table has **no Thread column** — so **brief.1 has never produced a
-brief** and every claim about what it changed is unobserved (`brief-05`, P1). Three prior review
-rounds verified code and never verified reality. Do this in order: (1) `docker compose up` for seven
-mornings + the tally; (2) `brief-07` — sanitise `agentctl brief` (~30 min, a surface actually used);
-(3) `p7.7-ar-03` (~half a day, kills a false `0 denied`); (4) name mv design partners — the only item
-whose cost of delay is irreversible (gate 2026-10-01, 0 of 10 humans, 0 of 3 demos, zero engineering).
-brief.3 returns ONLY in the reshaped one-typed-brief form (`docs/plans/brief.3-runtime-authored-brief.md`)
-— never as a second runtime renderer. `brief-06`: brief.2's premise is contradicted by field evidence
-(carry-forward found NOTHING on 07-23), so it may need the opposite fix; do not build it yet.
+**Next (roadmap):** **`attn.1a` — make sub-daily jobs safe, and make the CoS actually run**
+(`docs/plans/attn.1a-sub-daily-job-safety.md`). Ships no new capability; fixes verified root causes.
+
+**brief.1 IS VERIFIED WORKING — correcting a claim this file carried from 2026-07-30 to 2026-08-01.**
+That claim read: "`~/.agentos-output/` has two briefs in fifteen days… the real Response Needed table
+has **no Thread column** — so **brief.1 has never produced a brief**." **All three parts are now
+false.** `brief-2026-07-31.md` is the first brief produced after brief.1 shipped, and it has the Thread
+column, **12 working `#all/{threadId}` permalinks**, and the entity-escaping rule applied. Three briefs
+exist (07-16, 07-23, 07-31). **`brief-05` is CLOSED with evidence.** The lesson is the one this file
+already teaches and then fell for: a staleness claim about an artifact must be re-checked against the
+artifact, not inherited from the previous session's note.
+
+**What the artifact check on 2026-08-01 actually found** (`/autoplan` on attn.1, 3 voices, 4 CRITICALs):
+- **The root cause of "3 briefs in 15 days" is uptime, not brief design.** `docker-compose.yml` had
+  **no `restart:` policy on any service**, while `distro/agentos-cos.service:37-38` (the Linux path) has
+  `Restart=on-failure`. The Mac path the operator actually uses never got it. Fixed in `attn.1a` §2.
+- **The `every 2m` default is FIXED and landed on `main` standalone** — it ran the pipeline 31× for
+  ~4.1M tokens in one morning. Default is now the 08:00 UTC daily cron, both modes `docker compose
+  config`-verified.
+- **`[[jobs]]` assumes once-daily and says so.** `scheduler.rs:2469` derives `child_id =
+  "{job_id}-{date}"`; the collision guard (`:2482`) plus ux.8′ defer-not-brick plus
+  `budget_reset_interval = 86400` means **one deferral silently stalls a sub-daily job for up to 24 h**,
+  emitting only `EventKind::Error`. A per-job `token_budget` is **per-fire, not a daily fence**
+  (`:2498`) — 48 fires × 500k against a 10M global.
+- **Nothing in the stack can express local time.** No `chrono::Local` anywhere, no `tzdata` in the
+  image, no `TZ` in the cos env — so any "07:00–23:00 local" rule silently means UTC.
+- **`brief-06` confirmed and inverted.** Carry-forward found NOTHING on 07-23 **and** 07-31 ("first
+  brief in the store"), while 07-16 carried 2 items. It worked once, then stopped. brief.2's premise
+  (handled items *re-list*) is contradicted twice; the real defect is the opposite. Do not build it yet.
+- **New:** the 07-31 brief carries **37 HTML entities** (`&#40;`, `&#60;`, `&#8212;`…), so
+  `John Doe &#40;john@example.com&#41;` is what the operator reads in a terminal. brief.1's
+  escaping over-escapes — only `[`/`]` can forge a link. → `brief-04`.
+
+**`attn.1b` (the interrupt tier) is NOT ready** — 8 preconditions in the plan, two of them flat
+contradictions (a no-`from` payload cannot support a VIP-sender night gate; a field the agent writes
+from untrusted email is tainted, not "agent-authored"). Worst finding: `^[0-9a-f]{1,20}$` accepts any
+*attacker-owned* thread id, so an injected email can buzz the phone at 03:00 with a link into a thread
+the attacker wrote. Both CEO voices returned RESHAPE/DEFER on the whole tier (6/6 adverse); the operator
+overrode and reaffirmed (decision `5ef9f33a`) — that override stands, but 1b's preconditions gate it.
+
+Still true, and still the only irreversible item: **name mv design partners** (gate 2026-10-01, 0 of 10
+humans, 0 of 3 demos, zero engineering). The CEO review found the pipeline **inside the brief files** —
+live threads with Mayfield, MIT and Kong (domain-verified), plus Microsoft/GitHub, NTT and Amex by name.
+Then: `brief-07` (sanitise `agentctl brief`, ~30 min); `p7.7-ar-03` (~half a day, kills a false
+`0 denied`). brief.3 returns ONLY in the reshaped one-typed-brief form
+(`docs/plans/brief.3-runtime-authored-brief.md`) — never as a second runtime renderer.
 
 **Prev-next:** **brief.2 is NOT the automatic next step** — gate it on the one-week operator
 tally (see brief.1 above). Both CEO voices ranked the whole brief track BELOW three open items:
