@@ -201,7 +201,7 @@ artifact, not inherited from the previous session's note.
   brief in the store"), while 07-16 carried 2 items. It worked once, then stopped. brief.2's premise
   (handled items *re-list*) is contradicted twice; the real defect is the opposite. Do not build it yet.
 - **New:** the 07-31 brief carries **37 HTML entities** (`&#40;`, `&#60;`, `&#8212;`…), so
-  `John Doe &#40;john@example.com&#41;` is what the operator reads in a terminal. brief.1's
+  `Jane Doe &#40;jane@example.com&#41;` is what the operator reads in a terminal. brief.1's
   escaping over-escapes — only `[`/`]` can forge a link. → `brief-04`.
 
 **`attn.1b` (the interrupt tier) is NOT ready** — 8 preconditions in the plan, two of them flat
