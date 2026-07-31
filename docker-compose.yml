@@ -32,7 +32,19 @@ services:
       # Google OAuth credentials are read from /run/secrets/google.json (the volume above).
       # cos requires /run/secrets/google.json — there is no env-var fallback for this mode.
       # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
-      - TRIGGER_INTERVAL=${TRIGGER_INTERVAL:-every 2m}
+      # Schedule. TRIGGER_CRON and TRIGGER_INTERVAL are MUTUALLY EXCLUSIVE — cron_mcp.py
+      # exits 1 if both are non-empty. Default is the daily cron, because `every 2m` as a
+      # default meant a plain `docker compose up cos` ran the full Gmail pipeline 30× in a
+      # morning (~4.1M tokens against a 10M/day window) with no indication anything was wrong.
+      # Keep the fire time away from 00:00 UTC: the inbox→curator handoff is date-keyed and
+      # server-stamped per job, so a cycle straddling UTC midnight fails the brief (cap.2b-ar-01).
+      #   daily 08:00 UTC (default)  : docker compose up cos
+      #   twice daily                : TRIGGER_CRON="0 8,17 * * *" docker compose up cos
+      #   interval, for testing only : TRIGGER_CRON= TRIGGER_INTERVAL="every 2m" docker compose up cos
+      # Note the single-dash ${VAR-default}: it substitutes only when VAR is UNSET, so an
+      # explicitly empty TRIGGER_CRON= passes through empty and interval mode works.
+      - TRIGGER_CRON=${TRIGGER_CRON-0 8 * * *}
+      - TRIGGER_INTERVAL=${TRIGGER_INTERVAL-}
       # OpenAI API key — required for semantic KB (email embeddings via text-embedding-3-small).
       - OPENAI_API_KEY
       # Telegram reach (ux.12) — OPTIONAL. Set all three to enable the two-way bridge
