@@ -1968,6 +1968,509 @@ allow_insecure_local = true
     // invariants that are easy to regress without a compile-time check.
     // -----------------------------------------------------------------------
 
+    /// Every shipped copy of the CoS prompts. The dev config is what Docker boots
+    /// (`Dockerfile`), the overlay is what QEMU boots (`agentd.config=/etc/agentd/...`), and
+    /// the templates are what `agentctl spawn` instantiates. A prompt-hygiene invariant that
+    /// only holds in one of them is a deployment that silently runs the old behaviour —
+    /// brief.1 shipped exactly that way until /review caught it.
+    const COS_PROMPT_SOURCES: &[(&str, &str)] = &[
+        ("dev", include_str!("../cos.agents.toml")),
+        (
+            "overlay",
+            include_str!("../../distro/overlay/etc/agentd/cos.agents.toml"),
+        ),
+        (
+            "template:cos-inbox",
+            include_str!("../../templates/cos-inbox.template.toml"),
+        ),
+        (
+            "template:cos-curator",
+            include_str!("../../templates/cos-curator.template.toml"),
+        ),
+    ];
+
+    /// How many physical lines a single `kb_*(` call may span before `kb_calls` gives up.
+    /// Generous: real calls are 1-2 lines, and an under-capture is a silent loss of coverage.
+    const KB_CALL_MAX_SPAN: usize = 12;
+
+    /// Blank out single- and double-quoted spans so punctuation inside a string literal cannot
+    /// perturb paren balancing. `kb_put(segment='ops:x (y)', …)` balanced to zero on its first
+    /// line without this, truncating the call and hiding every argument after it.
+    fn strip_quoted(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut quote: Option<char> = None;
+        for c in line.chars() {
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    }
+                    out.push(' ');
+                }
+                None => {
+                    if c == '\'' || c == '"' {
+                        quote = Some(c);
+                        out.push(' ');
+                    } else {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Collect each `kb_*(` call joined with its continuation lines, as
+    /// `(1-based line number, joined call text, parens_balanced)`.
+    ///
+    /// A line-scoped `contains("kb_put") && contains("value=")` scan is silently defeated the
+    /// moment a call's arguments wrap onto the next line: the `kb_put` token and the offending
+    /// argument land on different lines and neither matches. That is not hypothetical — the
+    /// first wrapped `kb_put(` in these files blinded this exact guard, and the mutation
+    /// (`content=` → `value=` on the continuation line) still reported `ok`.
+    ///
+    /// The third tuple element is load-bearing: a call whose parens never balance inside the
+    /// window is returned TRUNCATED, and a truncated call silently drops the arguments the
+    /// guards exist to inspect. `kb_calls_never_silently_truncate` turns that into a loud
+    /// failure; `kb_call_scanner_sees_wrapped_calls` is the positive/negative control pair.
+    fn kb_calls(raw: &str) -> Vec<(usize, String, bool)> {
+        let lines: Vec<&str> = raw.lines().collect();
+        let mut calls = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("kb_put") && !line.contains("kb_get") && !line.contains("kb_search") {
+                continue;
+            }
+            let mut joined = String::new();
+            let mut depth: i32 = 0;
+            let mut balanced = false;
+            for l in lines.iter().skip(i).take(KB_CALL_MAX_SPAN) {
+                joined.push_str(l);
+                joined.push(' ');
+                let bare = strip_quoted(l);
+                depth += bare.matches('(').count() as i32;
+                depth -= bare.matches(')').count() as i32;
+                if depth <= 0 {
+                    balanced = true;
+                    break;
+                }
+            }
+            calls.push((i + 1, joined, balanced));
+        }
+        calls
+    }
+
+    #[test]
+    fn kb_call_scanner_sees_wrapped_calls() {
+        // Negative control for `kb_calls`. If this ever passes vacuously, every guard built on
+        // kb_calls has stopped guarding — which is the failure mode it exists to prevent.
+        let wrapped = "  kb_put(segment='ops:entities', key='open:nothread:{slug}',\n\
+                       \x20        value=<item text>)\n";
+        let calls = kb_calls(wrapped);
+        assert_eq!(calls.len(), 1, "expected one kb_put call, got {calls:?}");
+        assert!(calls[0].2, "a 2-line call must balance inside the window");
+        assert!(
+            calls[0].1.contains("value="),
+            "scanner must see `value=` on a kb_put continuation line; a line-scoped \
+             contains(\"kb_put\") && contains(\"value=\") filter does not"
+        );
+        assert!(
+            calls[0].1.contains("segment='ops:entities'"),
+            "scanner must preserve args from the opening line too"
+        );
+
+        // A 5-line call: the previous 4-line window truncated this and let `value=` escape.
+        let five = "  kb_put(\n    segment='ops:entities',\n    key='open:{thread_id}',\n\
+                    \x20   # keep the item text verbatim\n    value=<item text>)\n";
+        let c5 = kb_calls(five);
+        assert_eq!(c5.len(), 1);
+        assert!(c5[0].2, "a 5-line call must balance inside the window");
+        assert!(
+            c5[0].1.contains("value="),
+            "scanner must reach the 5th line of a wrapped call"
+        );
+
+        // Parens inside a quoted string must not fake a balance and truncate the call.
+        let quoted = "  kb_put(segment='ops:entities (thread-keyed)', key='k',\n\
+                      \x20        value=<item text>)\n";
+        let cq = kb_calls(quoted);
+        assert_eq!(cq.len(), 1);
+        assert!(cq[0].2, "quoted parens must not end the call early");
+        assert!(
+            cq[0].1.contains("value="),
+            "a ')' inside a string literal must not truncate the scan"
+        );
+
+        // And an unterminated call must be REPORTED, not silently accepted.
+        let unbalanced = "  kb_put(segment='ops:entities',\n";
+        let cu = kb_calls(unbalanced);
+        assert_eq!(cu.len(), 1);
+        assert!(
+            !cu[0].2,
+            "an unterminated kb_ call must come back balanced=false so the guard can fail loudly"
+        );
+    }
+
+    #[test]
+    fn kb_calls_never_silently_truncate() {
+        // If a real call ever outgrows the window, every guard built on kb_calls quietly stops
+        // inspecting its arguments. Fail loudly instead.
+        for (label, raw) in COS_PROMPT_SOURCES {
+            for (line_no, joined, balanced) in kb_calls(raw) {
+                assert!(
+                    balanced,
+                    "{label} line {line_no}: kb_* call's parens do not close within \
+                     {KB_CALL_MAX_SPAN} lines, so the scanner truncated it and every guard built \
+                     on kb_calls silently stopped covering it. Reformat the call or widen \
+                     KB_CALL_MAX_SPAN. Captured: {joined}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cos_prompts_key_open_items_by_thread_not_date() {
+        // brief.1: `open:{date}:{N}` mints a fresh KB key for the same item every morning, so
+        // `ops:entities` accumulates a new entry per item per day forever. Keys must be
+        // provider-native (Gmail threadId) with a deterministic slug fallback.
+        //
+        // NOTE this does NOT assert that handled items stop appearing in the brief — they do
+        // not, and no test should imply otherwise. See the brief.1 HONESTY NOTE above the
+        // cos-curator task and brief.2 in TODOS.md.
+        for (label, raw) in COS_PROMPT_SOURCES {
+            // Assert on the EXTRACTED CALLS, never on the raw file. `raw.contains("open:{thread_id}")`
+            // is satisfied by a mere comment, so a prompt could key `open:item-{N}-{today}` and stay
+            // green — brief.1's whole bug, reintroduced past its own guard (mutation-proven).
+            // Checking the calls also makes this spelling-independent: any key template other than
+            // the two allowed ones fails, so `{today}`/`{day}`/`{N}` cannot slip through a filter
+            // that only knew about `{date}`/`{DATE}`.
+            let open_calls: Vec<(usize, String)> = kb_calls(raw)
+                .into_iter()
+                .filter(|(_, call, _)| call.contains("kb_put") && call.contains("key='open:"))
+                .map(|(n, call, _)| (n, call))
+                .collect();
+            // Only the curator-side sources key open items; the inbox side just emits the field.
+            if raw.contains("key='open:") {
+                assert!(
+                    !open_calls.is_empty(),
+                    "{label}: file mentions `key='open:` but kb_calls extracted no open-item \
+                     kb_put — the scanner is not seeing the call it is supposed to guard"
+                );
+                for (n, call) in &open_calls {
+                    let ok = call.contains("key='open:{thread_id}'")
+                        || call.contains("key='open:nothread:{slug}'");
+                    assert!(
+                        ok,
+                        "{label} line {n}: open item keyed by neither the provider-native \
+                         `open:{{thread_id}}` nor the deterministic `open:nothread:{{slug}}` \
+                         fallback. A date, an ordinal, or any model-chosen key re-creates the \
+                         accumulate-forever bug brief.1 exists to fix. Call: {call}"
+                    );
+                }
+                let has_thread = open_calls
+                    .iter()
+                    .any(|(_, c)| c.contains("key='open:{thread_id}'"));
+                let has_slug = open_calls
+                    .iter()
+                    .any(|(_, c)| c.contains("key='open:nothread:{slug}'"));
+                assert!(
+                    has_thread && has_slug,
+                    "{label}: needs BOTH the `open:{{thread_id}}` primary path and the \
+                     `open:nothread:{{slug}}` fallback (found thread={has_thread} slug={has_slug})"
+                );
+            }
+            assert!(
+                raw.contains("thread_id"),
+                "{label}: must carry `thread_id` per item — without it the curator has nothing \
+                 provider-native to key by and the brief has nothing to link to"
+            );
+        }
+    }
+
+    #[test]
+    fn cos_prompts_never_interpolate_unvalidated_thread_id_into_a_link() {
+        // A Gmail permalink is the first clickable thing the brief ever contained, and
+        // `thread_id` reaches the curator from a model that read untrusted email. Without a
+        // charset guard, a value carrying ')' closes the markdown link early and the remainder
+        // forges a second, attacker-chosen link in a document the operator is invited to click.
+        // Only the two configs author the markdown brief; the templates do not.
+        for (label, raw) in COS_PROMPT_SOURCES
+            .iter()
+            .filter(|(l, _)| *l == "dev" || *l == "overlay")
+        {
+            assert!(
+                raw.contains("mail.google.com/mail/u/0/#all/{thread_id}"),
+                "{label}: expected the Gmail permalink form; `#all/` survives archiving, \
+                 which is what happens to a thread you finished replying to"
+            );
+            // Bind to the CONTROL SENTENCE, not the bare regex. `^[0-9a-f]{1,20}$` appears three
+            // times per config (STEP 3 emit gate, STEP 2 key gate, STEP 4 link gate), so a
+            // whole-file `contains` stayed green when the STEP 4 link rule was deleted outright
+            // (mutation-proven). THREAT_MODEL.md §9.5 cites this test as the pin for that control,
+            // so the pin has to actually hold.
+            assert!(
+                raw.contains(
+                    "Emit a thread link ONLY when thread_id is a non-empty string matching \
+                     ^[0-9a-f]{1,20}$"
+                ),
+                "{label}: the curator STEP 4 link rule is missing or reworded. The gate on an \
+                 email-derived value entering a markdown href must be stated at the link site — \
+                 THREAT_MODEL.md §9.5 names this test as what pins it"
+            );
+            assert!(
+                raw.contains("emit a literal dash and do NOT put the value in the URL"),
+                "{label}: the link rule needs its FAIL-CLOSED branch — without it a non-matching \
+                 thread_id has no defined rendering and the model may interpolate it anyway"
+            );
+            // The other cells are sender-written too. thread_id was never the cheapest injection
+            // path: a subject line reading `x [Pay now](https://evil.example)` needs no escape
+            // trick at all. Pin the neutralisation rule that closes it.
+            assert!(
+                raw.contains("NEUTRALISE SENDER TEXT"),
+                "{label}: `from`/`subject`/`ask`/`summary`/open-item text/`focus_recommendation` \
+                 are all sender-written and land in markdown cells; the brief must neutralise \
+                 markdown metacharacters in them, not just guard thread_id"
+            );
+            for entity in ["&#91;", "&#93;", "&#40;", "&#41;", "&#124;"] {
+                assert!(
+                    raw.contains(entity),
+                    "{label}: the neutralisation rule must name the entity {entity} so the model \
+                     has an exact substitution rather than a vague instruction to 'escape'"
+                );
+            }
+        }
+    }
+
+    /// Regression: QA-1 — the OperatingBrief at its documented maxima must fit the store.
+    /// Found by /qa on 2026-07-29 driving a real agentd against a fake provider.
+    /// Report: .gstack/qa-reports/qa-report-agentos-cos-2026-07-29.md
+    ///
+    /// brief.1 added ~650 bytes of `thread_id` overhead without touching the caps, and the
+    /// review's first fix was sized against RAW json — but the L1 path (`kb_put` on a scratch
+    /// segment, `agentd/src/tools/native.rs`) measures the brief AFTER embedding it as a JSON
+    /// string (every `"` becomes `\"`) inside a provenance wrapper. That is ~605 bytes of
+    /// overhead here, which left only 39 bytes of real margin. Over the cap, the inbox write
+    /// fails, the curator finds no input and stops, and the operator gets NO brief that morning.
+    ///
+    /// The caps below MIRROR the prompt. If you change one, change the other — the second half
+    /// of this test fails if the prompt no longer states these numbers.
+    #[test]
+    fn cos_operating_brief_at_documented_maxima_fits_the_kb_entry_limit() {
+        use crate::tools::native::MAX_MEM_CONTENT_BYTES;
+
+        const MAX_IMPORTANT: usize = 6;
+        const MAX_RESPONSE_NEEDED: usize = 8;
+        const MAX_OPEN_ITEMS: usize = 10;
+        const LEN_SUMMARY: usize = 100;
+        const LEN_SUBJECT: usize = 80;
+        const LEN_FROM: usize = 60;
+        const LEN_OPEN_TEXT: usize = 100;
+        const LEN_FOCUS: usize = 200;
+        const LEN_DEADLINE: usize = 20;
+        // Gmail thread ids are 16 hex chars in practice; the prompt bounds them at 20.
+        const THREAD_ID: &str = "1a2b3c4d5e6f78901234";
+
+        // `fill` lets the same shape be measured with ASCII or multi-byte text.
+        let build = |n_imp: usize,
+                     n_rn: usize,
+                     n_oi: usize,
+                     l_from: usize,
+                     l_subj: usize,
+                     l_body: usize,
+                     l_oi: usize,
+                     l_focus: usize,
+                     fill: &dyn Fn(usize) -> String| {
+            let brief = serde_json::json!({
+                "date": "2026-07-30",
+                "important": (0..n_imp).map(|_| serde_json::json!({
+                    "from": fill(l_from), "subject": fill(l_subj), "summary": fill(l_body),
+                    "urgency": "medium", "thread_id": THREAD_ID,
+                })).collect::<Vec<_>>(),
+                "response_needed": (0..n_rn).map(|_| serde_json::json!({
+                    "from": fill(l_from), "subject": fill(l_subj), "ask": fill(l_body),
+                    "deadline": "x".repeat(LEN_DEADLINE), "thread_id": THREAD_ID,
+                })).collect::<Vec<_>>(),
+                "open_items": (0..n_oi).map(|_| serde_json::json!({
+                    "text": fill(l_oi), "thread_id": THREAD_ID,
+                })).collect::<Vec<_>>(),
+                "focus_recommendation": fill(l_focus),
+                "omitted": { "important": 0, "response_needed": 0, "open_items": 0,
+                             "truncated": false },
+                "thread_count_reviewed": 50,
+                "skipped_count": 30,
+            });
+            let content = serde_json::to_string(&brief).unwrap();
+            // Exactly the scratch-class entry `kb_put` builds in tools/native.rs. `version` and
+            // `turn` are modelled wide, and `ts` at full rfc3339 precision, so the model is
+            // pessimistic rather than optimistic about the real wrapper.
+            let entry = serde_json::to_string(&serde_json::json!({
+                "content": content,
+                "class": "scratch",
+                "version": 999_999u64,
+                "provenance": {
+                    "agent_id": "cos-inbox-orchestrator-2026-07-30",
+                    "turn": 999_999u64,
+                    "task_fp": "ae32ccaf97a2ca2b",
+                    "ts": "2026-07-30T08:00:01.123456789+00:00",
+                    "citation": "msg-18f2c3a4b5d6e7f8",
+                }
+            }))
+            .unwrap();
+            (content.len(), entry.len())
+        };
+
+        let ascii = |n: usize| "x".repeat(n);
+        // The prompt tells the model a non-ASCII field costs 2-3x and to truncate to roughly a
+        // third. Model that literally: a CJK char is 3 bytes, so cap/3 chars fills the byte cap.
+        let cjk = |n: usize| "中".repeat(n / 3);
+
+        let (raw_ascii, wrapped_ascii) = build(
+            MAX_IMPORTANT, MAX_RESPONSE_NEEDED, MAX_OPEN_ITEMS,
+            LEN_FROM, LEN_SUBJECT, LEN_SUMMARY, LEN_OPEN_TEXT, LEN_FOCUS, &ascii,
+        );
+        let margin = MAX_MEM_CONTENT_BYTES as i64 - wrapped_ascii as i64;
+        // 512 bytes is the floor, not a nicety: a longer agent id, a non-null citation, or a
+        // handful of multi-byte characters in a real subject line all eat into it, and going
+        // over costs the operator the entire brief.
+        assert!(
+            margin >= 512,
+            "OperatingBrief at documented maxima wraps to {wrapped_ascii} bytes of \
+             {MAX_MEM_CONTENT_BYTES} (margin {margin}); need >= 512 bytes spare. Raw json is \
+             {raw_ascii} bytes — the wrapper and JSON-string escaping add ~600. Lower a cap in \
+             BOTH cos.agents.toml copies and here, or the morning brief fails closed with no \
+             operator-visible cause."
+        );
+
+        // QA-2 as an executable property, not prose: if a model obeys the prompt's "truncate a
+        // non-ASCII field to roughly a third", the multi-byte brief must ALSO fit. Without this,
+        // "in BYTES, not characters" is a sentence nothing enforces.
+        let (_, wrapped_cjk) = build(
+            MAX_IMPORTANT, MAX_RESPONSE_NEEDED, MAX_OPEN_ITEMS,
+            LEN_FROM, LEN_SUBJECT, LEN_SUMMARY, LEN_OPEN_TEXT, LEN_FOCUS, &cjk,
+        );
+        assert!(
+            wrapped_cjk as i64 <= MAX_MEM_CONTENT_BYTES as i64 - 512,
+            "a CJK brief built to the prompt's own 'roughly a third' rule wraps to {wrapped_cjk} \
+             bytes of {MAX_MEM_CONTENT_BYTES} — the byte-vs-character guidance does not actually \
+             keep the brief inside the cap (QA-2)"
+        );
+
+        // QA-1's shrink ladder must actually RECOVER, not merely exist. Model its FLOOR rung
+        // (STEP 4 rung 4: <=3 important + <=3 response_needed, from<=30 / subject<=40 only, no
+        // open items, focus<=80) with the worst-case 3-byte-per-char fill. If the floor does not
+        // fit, the ladder ends with the operator still getting nothing.
+        let (_, wrapped_floor) = build(3, 3, 0, 30, 40, 0, 0, 80, &|n| "中".repeat(n));
+        assert!(
+            wrapped_floor as i64 <= MAX_MEM_CONTENT_BYTES as i64 - 2048,
+            "the shrink ladder's FLOOR rung wraps to {wrapped_floor} bytes of \
+             {MAX_MEM_CONTENT_BYTES} even before truncation — the ladder cannot recover, so an \
+             over-size brief still ends with no brief at all"
+        );
+
+        // The prompt and these constants must not drift apart. Driven FROM the constants, so
+        // adding a modelled field forces a prompt cross-check and raising a prompt cap fails
+        // here. A hand-listed subset let `open_items ≤10` → `≤30` ship green while the real
+        // entry was 1 765 bytes over the cap (mutation-proven).
+        let caps: [(&str, usize); 9] = [
+            ("important", MAX_IMPORTANT),
+            ("response_needed", MAX_RESPONSE_NEEDED),
+            ("open_items", MAX_OPEN_ITEMS),
+            ("summaries/asks", LEN_SUMMARY),
+            ("subjects", LEN_SUBJECT),
+            ("from", LEN_FROM),
+            ("open item text", LEN_OPEN_TEXT),
+            ("deadline", LEN_DEADLINE),
+            ("focus_recommendation", LEN_FOCUS),
+        ];
+        for (label, raw) in COS_PROMPT_SOURCES
+            .iter()
+            .filter(|(l, _)| *l == "dev" || *l == "overlay")
+        {
+            // Whitespace-tolerant and `<=`-tolerant: reformatting `≤6` to `≤ 6` is a no-op change
+            // that must not fail, or the next author deletes the assertion instead of fixing it.
+            let flat = raw
+                .replace("<=", "≤")
+                .replace(" ≤", "≤")
+                .replace("≤ ", "≤")
+                .replace('\n', " ");
+            for (name, n) in caps {
+                let needle = format!("{name}≤{n}");
+                assert!(
+                    flat.contains(&needle),
+                    "{label}: prompt does not state `{name} ≤{n}`, but this test's byte budget \
+                     assumes it. Every modelled cap must be pinned to the prompt text — a cap \
+                     that drifts upward silently reintroduces QA-1."
+                );
+            }
+            assert!(
+                raw.contains("in BYTES, not characters"),
+                "{label}: the caps must be stated in bytes — the store measures bytes, so a CJK \
+                 subject at a character cap silently blows the limit (QA-2)"
+            );
+            // BOTH enforcement points, not just L1: production routes through the sidecar under
+            // `tool_override = true`, and that path says "content too large". Pinning only the
+            // L1 phrase let the production trigger be deleted green (mutation-proven).
+            for phrase in ["entry too large", "content too large"] {
+                assert!(
+                    raw.contains(phrase),
+                    "{label}: the shrink-and-retry ladder keys off the runtime's error text, so \
+                     it must name BOTH `entry too large` (L1) and `content too large` (the \
+                     Qdrant sidecar, which is the path production actually uses); `{phrase}` is \
+                     missing"
+                );
+            }
+            assert!(
+                raw.contains("'omitted'"),
+                "{label}: a shrunk brief MUST record what it dropped — otherwise the ladder turns \
+                 a loud failure into a brief that looks complete and is not"
+            );
+        }
+    }
+
+    /// The two size caps that bound the SAME payload live in two languages and must agree:
+    /// `MAX_MEM_CONTENT_BYTES` (Rust, L1) and `HIT_CONTENT_CAP` (Python, the Qdrant sidecar that
+    /// production actually routes through under `tool_override = true`). Nothing else pins them
+    /// together, so they could drift and make the byte-budget guard above measure the wrong limit.
+    #[test]
+    fn kb_size_caps_agree_across_both_backends() {
+        use crate::tools::native::MAX_MEM_CONTENT_BYTES;
+        let sidecar = include_str!("../../docker/semantic_kb_mcp.py");
+        let line = sidecar
+            .lines()
+            .find(|l| l.trim_start().starts_with("HIT_CONTENT_CAP"))
+            .expect("semantic_kb_mcp.py must define HIT_CONTENT_CAP");
+        // e.g. `HIT_CONTENT_CAP  = 8 * 1024          # 8 KB per hit`
+        let expr = line.split('=').nth(1).unwrap().split('#').next().unwrap().trim();
+        let value: usize = expr
+            .split('*')
+            .map(|p| p.trim().parse::<usize>().expect("numeric HIT_CONTENT_CAP factors"))
+            .product();
+        assert_eq!(
+            value, MAX_MEM_CONTENT_BYTES,
+            "HIT_CONTENT_CAP ({value}) != MAX_MEM_CONTENT_BYTES ({MAX_MEM_CONTENT_BYTES}). The \
+             same OperatingBrief is size-checked by both, so a divergence means the prompt's caps \
+             are correct for one deployment and wrong for the other."
+        );
+    }
+
+    #[test]
+    fn cos_prompts_use_content_not_value_for_kb_put() {
+        // kb_put requires `content`; `value` is silently dropped by additionalProperties:false
+        // and the write never persists. Fixed in the configs at v0.77.0 — but the guard was
+        // scoped to two files, so the templates kept shipping `value=` for ~40 releases.
+        for (label, raw) in COS_PROMPT_SOURCES {
+            let bad: Vec<usize> = kb_calls(raw)
+                .into_iter()
+                .filter(|(_, call, _)| call.contains("kb_put") && call.contains("value="))
+                .map(|(n, _, _)| n)
+                .collect();
+            assert!(
+                bad.is_empty(),
+                "{label}: kb_put uses 'value=' at line(s) {bad:?}; the parameter is 'content=' \
+                 and 'value=' is silently dropped, so the write never persists"
+            );
+        }
+    }
+
     #[test]
     fn cos_agents_toml_parses_cleanly() {
         let raw = include_str!("../cos.agents.toml");
@@ -1976,28 +2479,6 @@ allow_insecure_local = true
         let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
         let _overlay_cfg: Config = toml::from_str(overlay_raw)
             .expect("distro overlay cos.agents.toml must parse as a valid Config");
-    }
-
-    #[test]
-    fn cos_agents_toml_no_kb_put_value_param() {
-        // kb_put requires `content`, not `value`; the wrong name is silently
-        // ignored by additionalProperties:false and the write never persists.
-        let dev_raw = include_str!("../cos.agents.toml");
-        let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
-        for (label, raw) in [("dev", dev_raw), ("overlay", overlay_raw)] {
-            let bad_lines: Vec<_> = raw
-                .lines()
-                .enumerate()
-                .filter(|(_, l)| l.contains("kb_put") && l.contains("value="))
-                .collect();
-            assert!(
-                bad_lines.is_empty(),
-                "{} cos.agents.toml uses 'value=' in kb_put at lines {:?}; \
-                 the correct parameter name is 'content='",
-                label,
-                bad_lines.iter().map(|(n, _)| n + 1).collect::<Vec<_>>()
-            );
-        }
     }
 
     #[test]
@@ -2053,25 +2534,28 @@ allow_insecure_local = true
 
         let overlay_raw = include_str!("../../distro/overlay/etc/agentd/cos.agents.toml");
         for (label, raw) in [("dev", dev_raw), ("overlay", overlay_raw)] {
-            for (i, line) in raw.lines().enumerate() {
-                if !line.contains("kb_put") && !line.contains("kb_get") && !line.contains("kb_search") {
-                    continue;
-                }
-                // Extract the segment= value (single-quoted Python-style call notation).
-                if let Some(start) = line.find("segment='") {
-                    let rest = &line[start + 9..];
-                    if let Some(end) = rest.find('\'') {
-                        let seg = &rest[..end];
-                        assert!(
-                            known.contains(&seg),
-                            "{} line {}: unknown segment '{}'; \
-                             valid segments are {:?} — add it to [[memory.segments]] in cos.agents.toml",
-                            label,
-                            i + 1,
-                            seg,
-                            known
-                        );
-                    }
+            // Joined calls, so a wrapped `segment='...'` argument stays in scope.
+            for (line_no, call, _) in kb_calls(raw) {
+                // EVERY `segment='` in the joined block, not just the first: joining can merge
+                // two calls into one entry, and a single line can carry two calls — either way a
+                // "check the first occurrence" scan leaves the rest unvalidated.
+                let mut rest = call.as_str();
+                while let Some(start) = rest.find("segment='") {
+                    let after = &rest[start + 9..];
+                    let end = after.find('\'').unwrap_or_else(|| {
+                        panic!(
+                            "{label} line {line_no}: `segment='` has no closing quote inside the \
+                             captured call — the scanner cannot validate it, so fail loudly \
+                             instead of skipping: {call}"
+                        )
+                    });
+                    let seg = &after[..end];
+                    assert!(
+                        known.contains(&seg),
+                        "{label} line {line_no}: unknown segment '{seg}'; \
+                         valid segments are {known:?} — add it to [[memory.segments]] in cos.agents.toml"
+                    );
+                    rest = &after[end..];
                 }
             }
         }

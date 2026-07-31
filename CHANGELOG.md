@@ -3,6 +3,54 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.117.0] - 2026-07-29
+
+### Changed
+- **brief.1 — the morning brief's action list is addressable, and the brief now survives its own
+  size limit.** Three prompt edits to the Chief of Staff pipeline, plus the fixes three review
+  rounds found in those edits. **Read this first: the brief still re-lists items you already
+  handled.** That was brief.1's headline claim and it is withdrawn — see below.
+  - **Every action item now carries its Gmail `threadId`, and each row is one click from the
+    thread.** The Response Needed table gains a `Thread` column, and the Important and Open Items
+    lists gain the same link. Permalinks use `#all/` rather than `#inbox/` so a thread you finished
+    replying to (and therefore archived) still resolves. Open items are keyed by `open:{threadId}`
+    instead of `open:{date}:{N}`, so `ops:entities` stops accumulating a fresh entry per item per
+    morning; items with no thread use a deterministic slug.
+  - **What this does NOT do: stop handled items reappearing.** The carried-forward list is built by
+    `kb_search(segment='ops:briefs')`, which returns whole historical briefs; nothing reads the
+    `open:*` keys at all (single-segment search, no list/scan tool), nothing deletes an entry when
+    an item is resolved, and neither job can observe resolution — the curator has no Gmail access
+    and the inbox job's 24-hour query cannot tell "replied to" from "quiet". Tracked as `brief.2`.
+  - **The brief no longer vanishes when it gets too big.** At its own documented maxima the brief
+    measured 8 660 bytes against a hard 8 192-byte cap: the write failed, the curator found no
+    input and stopped, and there was no brief that morning with no visible cause. Caps are now
+    stated in **bytes** (the store measures bytes, so non-Latin subject lines silently blew a
+    limit stated in characters) and tightened to fit. If a brief still exceeds the cap, the inbox
+    job now sheds sender-written bytes first, drops the oldest items rather than the ones a sender
+    made sound urgent, records what it dropped, and the brief carries a `⚠ Shortened to fit` line
+    so a shortened brief cannot be mistaken for a complete one.
+  - **Sender-written text can no longer put its own links in your brief.** A subject line reading
+    `Payment overdue [Pay now](https://evil.example)` used to render as a live link. Every
+    email-derived field is now entity-escaped before it enters a bullet or a cell, and a Gmail
+    permalink is emitted only for a `threadId` matching `^[0-9a-f]{1,20}$`. These are model-level
+    rules, not enforcement: the durable fix is for the runtime to author the brief markdown from
+    the typed record (`brief-03`, `brief-04`).
+  - **All four shipped copies of these prompts now move together** — the Docker config, the QEMU
+    production config, and both `agentctl spawn` templates. Only one had been updated, so the QEMU
+    deployment would have kept the old behaviour. A separate long-standing bug surfaced while
+    widening the guards: the shipped `cos-curator` template passed `value=` to `kb_put` instead of
+    `content=`, so its knowledge-base writes had persisted nothing since v0.77.0.
+
+### Fixed
+- Guards that reported green while the bug they existed to catch was present. The prompt scanner
+  stopped reading a call after four lines and miscounted parentheses inside quoted arguments; the
+  open-item key check was satisfied by a comment; the link-security check grepped for a pattern
+  that appears three times per file, so deleting the actual rule changed nothing; and the size-cap
+  check verified two of nine caps, so raising one shipped a brief 1 765 bytes over the limit
+  without complaint. Each is now bound to the thing it claims to guard and verified by mutation.
+- The two size limits that bound the same payload — one in Rust, one in the Python knowledge-base
+  sidecar — are now asserted equal, so they cannot drift apart unnoticed.
+
 ## [v0.116.0] - 2026-07-29
 
 ### Changed

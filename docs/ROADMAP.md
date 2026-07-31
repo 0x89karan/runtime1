@@ -1268,6 +1268,13 @@ increments, friction-ordered, each independently shippable. Full design + premis
   evidence**; and the chain covers **egress (inference) calls only** — no tool calls, capability verdicts,
   approvals, cancels, or budget decisions. `THREAT_MODEL.md` §8.7 already said as much, so this line
   contradicted it. Plans: `docs/plans/ux.6a-declaim-and-detrap.md`, `docs/plans/ux.6b-signed-action-ledger.md`.
+  - ~~**brief.1**~~ **(v0.117.0)** ✅ shipped — Gmail `threadId` on every action item + a thread
+    permalink per row + provider-native open-item keys; the brief survives its own 8 KiB cap
+    (byte-stated caps, shed-and-retry with a guaranteed-fit floor, visible `⚠ Shortened to fit`).
+    **Criterion 1 NOT met and de-claimed:** handled items still reappear — nothing reads the
+    `open:*` keys, and neither job can observe resolution → `brief.2`. Gate the next step on the
+    one-week operator tally; if it is ~2 actions a morning, build nothing further on this track.
+    Plan: `docs/plans/connectors-action-queue.md`.
   - ~~**ux.6a**~~ **(v0.116.0)** ✅ shipped — de-claimed the receipt language repo-wide + closed the
     `evidence.jsonl` fail-closed boot trap (bounded 64 KiB tail resume, torn-tail repair, tail signature
     check that warns rather than refuses, rename-based segment rotation needing no format or verifier

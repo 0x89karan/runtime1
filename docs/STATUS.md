@@ -11,6 +11,41 @@ The roadmap (with acceptance criteria and what's next) lives in `docs/ROADMAP.md
 
 ---
 
+**brief.1 complete (v0.117.0).** The morning brief's action items are addressable — each carries its
+Gmail `threadId` and is one click from the thread — and the brief now survives its own size limit.
+**Its headline claim is withdrawn:** handled items still reappear (`brief.2`). Plan:
+`docs/plans/connectors-action-queue.md`; QA report: `.gstack/qa-reports/qa-report-agentos-cos-2026-07-29.md`.
+- **The premise was wrong, and five of six review passes said so independently** (Codex: `Reject`).
+  brief.1 assumed `open:{date}:{N}` keying caused the re-listing. Nothing reads those keys —
+  `kb_search` is single-segment and no list/scan/prefix tool exists in either backend, so `open:*` is
+  write-only by construction. The re-listing comes from `kb_search(segment='ops:briefs')` returning
+  whole historical briefs, nothing deletes a resolved item, and neither job can observe resolution.
+  Shipped as an instrument plus defect fixes, with criterion 1 explicitly OPEN.
+- **The brief was over its own cap before this shipped.** 8 660 B at the prompt's documented maxima
+  against a hard 8 192 B limit: write fails → curator finds no input → no brief that morning, no
+  visible cause. The first fix mis-sized it too (against raw JSON; `kb_put` measures the JSON-escaped
+  payload inside a provenance wrapper, ~600 B more) leaving 39 B of real margin. Now byte-stated caps,
+  a shed-and-retry ladder with a guaranteed-fit floor, and a `⚠ Shortened to fit` line so a shortened
+  brief is never mistaken for a complete one.
+- **Three rounds, and each round's fixes were the next round's defect source.** /review found 9
+  criticals in the original 30 lines; /qa found 2 in /review's fixes (driving a real `agentd` against a
+  fake provider); /ship's fix-review round found 9 in those, five of them **mutation-proven false
+  greens in guards written one round earlier** — a 4-line scanner window, parens counted inside string
+  literals, an assertion satisfied by a comment, a regex grep that matched two unrelated sites, and a
+  cap check covering 2 of 9 caps. All seven controls are now negative-controlled by mutation.
+- **The security fix initially guarded the wrong field.** `thread_id` was locked to
+  `^[0-9a-f]{1,20}$` while `subject`/`from`/`ask`/`summary` still reached markdown raw — a subject
+  reading `Payment overdue [Pay now](https://evil.example)` needed no escape trick. Now entity-escaped
+  by rule; `brief-03` re-rated P3 → P1, because a prompt rule is not enforcement.
+- **All four prompt copies now move together** (Docker, QEMU production, both spawn templates). Only
+  one had been updated. Widening the guards also surfaced that the shipped `cos-curator` template
+  passed `value=` to `kb_put`, so its KB writes had persisted nothing since v0.77.0.
+- **Prompt adherence is unverified and cannot be verified here** — no API key, no Docker, no OAuth
+  token, and faking Gmail would mean disabling the broker's SSRF controls. The first real brief is the
+  test. The one-week operator tally is the decision input for whether this track continues at all.
+
+---
+
 **ux.6a complete (v0.116.0).** De-claimed the receipt chain and closed the `evidence.jsonl` boot trap;
 no UI. Split from ux.6 at the /autoplan premise gate (both CEO voices RESHAPE); `ux.6b` (signed action
 ledger) deferred, named and specified. Closes `audit86-P2-4` and `audit-S5`, both filed against `run.1`,

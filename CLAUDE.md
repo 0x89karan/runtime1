@@ -24,11 +24,43 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.116.0 (shipped 2026-07-29)
+**Current version:** v0.117.0 (shipped 2026-07-29)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** ux.6a (v0.116.0) — **de-claimed the receipt chain and closed the `evidence.jsonl`
+**Latest shipped:** brief.1 (v0.117.0) — **the morning brief's action items are addressable, and the
+brief survives its own size limit. Its headline claim is WITHDRAWN.** Three prompt edits to the CoS
+pipeline (`agentd/cos.agents.toml` + the three other copies) gave every item its Gmail `threadId`, a
+thread permalink per row, and provider-native `open:{threadId}` keys instead of `open:{date}:{N}`.
+Plan: `docs/plans/connectors-action-queue.md`.
+- **The premise was wrong and five of six review passes found it independently** (Codex: `Reject`).
+  Handled items still re-list. Nothing reads the `open:*` keys — `kb_search` is single-segment and no
+  list/scan/prefix tool exists in either backend, so they are **write-only by construction**; the
+  re-listing comes from `kb_search(segment='ops:briefs')` returning whole historical briefs, nothing
+  deletes a resolved item, and neither job can observe resolution (curator has no Gmail; the inbox
+  job's 24 h query cannot tell "replied to" from "quiet"). **Criterion 1 is OPEN → `brief.2`.**
+  Do not let a future session re-derive this: trace the READ path before believing any KB re-key claim.
+- **The brief was over its own cap before this shipped** — 8 660 B at the prompt's documented maxima
+  against a hard 8 192 B, i.e. no brief that morning with no visible cause. The first fix mis-sized it
+  too: `kb_put` measures the JSON-escaped payload inside a provenance wrapper (~600 B more than raw
+  JSON), leaving 39 B of real margin. Caps are now in **bytes** (the store counts bytes, so non-Latin
+  subjects blew a character-stated limit), plus a shed-and-retry ladder with a guaranteed-fit floor and
+  a `⚠ Shortened to fit` line so a shortened brief is never mistaken for a complete one.
+- **Three rounds, and every round's fixes were the next round's defect source.** /review 9 criticals →
+  /qa 2 more (real `agentd` + fake provider) → /ship's fix-review round 9 more, **five of them
+  mutation-proven false greens in guards written one round earlier**: a 4-line scanner window, parens
+  counted inside string literals, an assertion a comment satisfied, a regex grep matching two unrelated
+  sites, and a cap check covering 2 of 9 caps. All seven controls are now mutation-verified.
+- **The security fix first guarded the wrong field:** `thread_id` was locked to `^[0-9a-f]{1,20}$`
+  while `subject`/`from`/`ask` still reached markdown raw — `Payment overdue [Pay now](https://evil…)`
+  in a subject needed no escape trick. Now entity-escaped by rule; **`brief-03` re-rated P3 → P1**
+  because a prompt rule is not enforcement (real fix: runtime-authored markdown, `brief-04`).
+- **Prompt adherence is UNVERIFIED and unverifiable here** (no API key, no Docker, no OAuth token;
+  faking Gmail means disabling the broker's SSRF controls). The first real brief is the test. **The
+  one-week operator tally decides whether this track continues at all** — if it is ~2 actions a
+  morning, build nothing further.
+
+**Prev:** ux.6a (v0.116.0) — **de-claimed the receipt chain and closed the `evidence.jsonl`
 boot trap.** ux.6 was planned as an "Evidence view" surfacing the signed chain under the roadmap's label
 "Provable accountability"; both CEO voices returned RESHAPE and the increment was **split at the /autoplan
 premise gate**: ux.6a (this) ships the honesty + durability half with **no UI**, and `ux.6b` (the signed
@@ -139,7 +171,16 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** ux.3b is CLOSED as ux.13-TUI (the palette struck). Next per the plan's CEO
+**Next (roadmap):** **brief.2 is NOT the automatic next step** — gate it on the one-week operator
+tally (see brief.1 above). Both CEO voices ranked the whole brief track BELOW three open items:
+(1) name mv design partners or strike mv (external gate 2026-10-01, needs 10 named humans + 3 booked
+demos, has zero of each, zero engineering); (2) `p7.7-ar-03` (~half a day — `HttpSource` hardcodes
+`egress_brokered`/`egress_rejected` to 0, so the cockpit reports a false `0 denied` now that ux.6a
+made denials real); (3) `audit-S3` (P1, no `SecretRewriter`). Also newly P1: **`brief-03`** —
+sender-written markdown reaches the operator's brief and escaping it is a prompt rule, not
+enforcement; the real fix (runtime-authored brief markdown from the typed `BriefRecord`) shares a
+landing zone with `brief-04` and the two are probably one increment.
+ux.3b is CLOSED as ux.13-TUI (the palette struck). Next per the plan's CEO
 sequencing: **ux.6 evidence** (the only queue item serving two products — cockpit + mv governance, EU AI
 Act Art.12), then evidence-gated ux.5/ux.7; Phase 11 skills + Phase 9 eBPF remain the two end-of-queue
 tracks. Also open: **audit86-P1-9** needs a standalone 20-minute scope decision (are inert wrong-tier

@@ -361,7 +361,10 @@ impl Tool for KvSet {
     }
 }
 
-const MAX_MEM_CONTENT_BYTES: usize = 8 * 1024; // 8 KiB per long-term memory entry
+// pub(crate) so the cos byte-budget guard in config.rs binds to the REAL limit rather than
+// duplicating 8192 (QA-1: the brief was 39 bytes under it, and a stale copy of the number
+// would have hidden that).
+pub(crate) const MAX_MEM_CONTENT_BYTES: usize = 8 * 1024; // 8 KiB per long-term memory entry
 
 #[async_trait]
 impl Tool for MemRemember {

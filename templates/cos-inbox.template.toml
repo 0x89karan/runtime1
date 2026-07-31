@@ -79,22 +79,45 @@ For each message ID (up to 20 most relevant), fetch full content:
     url='https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full')
 
 STEP 3 — Return a structured OperatingBrief as your final answer:
-Keep the JSON compact (total must be under 8 KB — it will be stored in a KB entry):
-  - summaries and ask fields: ≤ 120 characters each
-  - subject lines: ≤ 80 characters
-  - important: at most 12 entries (highest urgency first)
+Keep the JSON compact (total must be under 8 KiB). This template returns the brief as its final
+answer and writes nothing itself ([memory] is disabled and it has no KB tools), but whatever
+consumes it will store it in an 8 KiB KB entry — and the store measures the JSON-escaped payload
+plus a provenance wrapper, roughly 600 bytes more than the raw JSON, so an over-size brief fails
+that write and loses the whole thing. Every limit below is in BYTES,
+not characters, because that is what the store measures: ASCII is 1 byte per character, an
+accented Latin character costs 2 and most CJK characters cost 3, so truncate a non-Latin field
+to roughly a third of the stated length.
+  - summaries and ask fields: ≤ 100 bytes each
+  - subject lines: ≤ 80 bytes
+  - from fields: ≤ 60 bytes
+  - open item text: ≤ 100 bytes
+  - deadline: ≤ 20 bytes (ISO date or 'none' — never a sentence)
+  - focus_recommendation: ≤ 200 bytes
+  - important: at most 6 entries (highest urgency first)
   - response_needed: at most 8 entries
   - open_items: at most 10 entries
+
+Every important / response_needed / open_items entry carries "thread_id" — the Gmail `threadId`
+for that message, copied verbatim from the messages.list response (returned alongside every
+message `id`). It is what makes an item addressable, and it is how the operator gets one click to
+the thread. A Gmail threadId is lowercase hex and nothing else: it MUST match ^[0-9a-f]{1,20}$.
+NEVER invent, guess, derive, or reformat a thread_id — a wrong id renders as a valid-looking link
+that opens the WRONG thread. If you do not have the real value, or the item is not tied to a
+single thread, set thread_id to null.
 
 {
   "date": "YYYY-MM-DD",
   "important": [
-    { "from": "...", "subject": "...", "summary": "...", "urgency": "high|medium|low" }
+    { "from": "...", "subject": "...", "summary": "...", "urgency": "high|medium|low",
+      "thread_id": "<Gmail threadId, or null>" }
   ],
   "response_needed": [
-    { "from": "...", "subject": "...", "ask": "...", "deadline": "YYYY-MM-DD or 'none'" }
+    { "from": "...", "subject": "...", "ask": "...", "deadline": "YYYY-MM-DD or 'none' (≤20 bytes)",
+      "thread_id": "<Gmail threadId, or null>" }
   ],
-  "open_items": ["..."],
+  "open_items": [
+    { "text": "...", "thread_id": "<Gmail threadId, or null if not thread-bound>" }
+  ],
   "focus_recommendation": "...",
   "thread_count_reviewed": N,
   "skipped_count": N

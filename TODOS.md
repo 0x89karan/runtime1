@@ -205,6 +205,19 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
   releases publish fine after the hotfix.
 - **test-flake-01 (P2) [new; found in cap.2 /ship] — Full-suite `cargo test --workspace` is flaky under high parallelism.**
+  **brief.1 update (2026-07-29): a SECOND, mechanically-explained cluster in the same class —
+  `agentctl` `docker::tests`.** `detect_docker_context_requires_exit_zero_and_at_least_one_container`,
+  `kill_tail_kills_the_forked_grandchild_not_just_the_direct_child` and
+  `a_probe_whose_grandchild_holds_stdout_still_returns_within_the_deadline` failed 2-of-3 and then
+  3-of-9 on a loaded machine, and all three passed in a quieter run of the *same* tree. Mechanism is
+  concrete, not mysterious: `PROBE_TIMEOUT = Duration::from_secs(3)` (`agentctl/src/docker.rs:192`)
+  bounds a probe that spawns `/bin/sh` (a fake `docker` on `PATH`) and drains its pipe; under
+  contention that exceeds 3 s, `compose()` returns empty stdout, `detect_docker_context()` returns
+  `None`, and the `.expect("one container must be detected as a project")` panics.
+  **Corrects a stale note in `docs/plans/brief.1-handoff.md`**, which attributed these to "need a
+  live Docker daemon" — they use a fake `docker` on `PATH`, so the daemon is irrelevant (verified
+  failing with Docker Desktop DOWN *and* passing with it DOWN). Fix for this cluster specifically:
+  raise `PROBE_TIMEOUT` for tests or inject it, or put `docker::tests` behind `serial_test`.
   **ux.6a update (2026-07-29): independently reproduced AT THE MERGE BASE** (`92f208f7`, 2 of 8
   whole-suite runs), so it is confirmed pre-existing and must not be attributed to a diff that
   merely raises the hit rate. ux.6a adds ~30 fsync-heavy evidence tests to the same parallel
@@ -924,6 +937,81 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   `templates/github-agent.template.toml` is already correctly on the broker pattern — no fix
   needed there. Depends on: none.
 
+## brief.1 — Open items (from /review, 2026-07-29)
+
+- **brief.2 (P1) — The morning brief still re-lists items the operator already handled.**
+  This is brief.1's success criterion 1, and brief.1 does **not** deliver it. Found by /review
+  (5 of 6 independent passes; Codex returned `Reject` plus two `[P1]`s). brief.1's premise was
+  that `open:{date}:{N}` keying caused the re-listing. It does not: nothing reads those keys.
+  `kb_search` is scoped to a single segment (`docker/semantic_kb_mcp.py`) and there is no
+  list/scan/prefix tool, so `open:*` is **write-only by construction** — the re-key stops
+  `ops:entities` accumulating an entry per item per day, and nothing more. The re-listing comes
+  from the curator's `kb_search(segment='ops:briefs', …)`, which returns whole historical brief
+  JSONs each holding that day's entire `open_items` array, with no filter for what is now done.
+  Two structural blockers, either of which alone is fatal: (a) **nothing ever removes an entry
+  for a resolved item** — there is no `kb_delete`, and the Qdrant TTL sweep runs once at sidecar
+  process start; (b) **neither job can observe resolution** — the curator has no Gmail access, and
+  the inbox job only queries `q=newer_than:1d`, which cannot tell "replied to" from "quiet".
+  Note the naive fix is a trap: dropping the `ops:briefs` union makes carried-forward items
+  vanish the moment a thread goes quiet, which is worse than re-listing.
+  Likely shape: let the inbox job read the open set and check, per open thread, whether the newest
+  message is from the operator. Needs `{ KbRead = { segment = "ops:entities" } }` on `cos-inbox`
+  plus a per-thread Gmail read (read-only scope suffices), and an enumeration path for `open:*`.
+  **Gate this on the one-week tally** (`docs/plans/connectors-action-queue.md`): if the operator is
+  taking ~2 actions a morning, do not build it. Both CEO voices ranked this whole track below
+  `audit-S3`, naming mv design partners, and `p7.7-ar-03`.
+
+- **brief-04 (P2) [new, from /qa 2026-07-29] — the OperatingBrief byte budget depends on a model
+  counting UTF-8 bytes.** /qa proved on a real `agentd` that the caps are enforced in bytes at two
+  places (`MAX_MEM_CONTENT_BYTES` on the JSON-escaped-and-wrapped entry for L1, `HIT_CONTENT_CAP` on
+  raw content for the Qdrant sidecar) while the prompt can only *ask* the model to respect them. With
+  80-character CJK subject lines the brief reached 9 163 wrapped bytes against 8 192 and the write was
+  rejected — and an over-size write means no brief that morning. Mitigated in the prompt (caps restated
+  in bytes with the 2–3× multiplier spelled out, `important ≤6`, and a shrink-and-retry ladder in
+  STEP 4 that drops the lowest-urgency entries rather than failing), and pinned by
+  `config::tests::cos_operating_brief_at_documented_maxima_fits_the_kb_entry_limit` with ≥512 bytes of
+  required margin. But prompt-level byte budgeting cannot be made airtight. Durable fix: enforce on the
+  runtime side — have `kb_put` (or a thin wrapper the inbox job calls) truncate deterministically and
+  report what it dropped, instead of rejecting the whole entry. That turns a silent total loss into a
+  bounded, visible degradation. Evidence + measurements:
+  `.gstack/qa-reports/qa-report-agentos-cos-2026-07-29.md`.
+
+- **brief-01 (P3) — `templates/cos-inbox.template.toml` still fetches `format=full`.**
+  Line 79 instructs `messages/{id}?format=full`, which the real configs ban in capital letters
+  (`cos.agents.toml`: "NEVER request format=full: a single message can be 50–100 KB of base64 and
+  will blow your token budget and context window"). That guardrail was cap.2b-ar-02 and it never
+  reached the template catalogue. Pre-existing; left alone at /review because deciding whether the
+  template should mirror the metadata-only fetch or stay a simpler demo is a judgment call, not a
+  mechanical fix. Same file's `open_items` shape and thread-id handling *were* mirrored.
+
+- **brief-02 (P3) — Permalinks never reach Telegram.** The Thread column added by brief.1 exists
+  only in `~/.agentos-output/brief-{date}.md`. The Telegram bridge pushes `GET /api/v1/brief`
+  (`docker/telegram_mcp.py`), which is the runtime-authored `BriefRecord` (facts from `runs.redb`
+  plus a bounded model `narrative`) — a different artifact that has no thread field. If Telegram
+  is the surface the operator actually reads each morning, brief.1's criterion 2 is not met there.
+  `BriefRecord` is additively extensible (`runs/mod.rs` mandates `#[serde(default)]` on post-v1
+  fields, so no new table and no `format_version` bump), which makes this cheap if it matters.
+
+- **brief-03 (P1) [re-rated from P3 at /ship, 2026-07-29] — sender-controlled markdown reaches the
+  operator's brief, and escaping it is a model instruction rather than enforcement.** `from`,
+  `subject`, `ask`, `summary`, open-item `text`, `deadline` and `focus_recommendation` are all
+  written by whoever emailed the operator and land in bullets and table cells. A subject reading
+  `Payment overdue [Pay now](https://evil.example)` renders as a live attacker link — no escape
+  trick, no `thread_id` involvement, one email.
+  **Why the re-rate:** filed P3 on the assumption that the `thread_id` hex guard was the control.
+  /ship's security pass showed the guard covers the one field an attacker does *not* need. And
+  brief.1 made this worse before mitigating it: the brief previously contained no links at all, so
+  a bracketed link was anomalous; the new Thread column normalises `[open](https://mail.google.com/…)`
+  throughout the document. `THREAT_MODEL.md` §9.5's own argument — operator judgment cannot detect a
+  link whose text is decoupled from its destination — applies with more force to Subject than to
+  `thread_id`. A zero-cost phishing primitive into a document whose entire purpose is to be clicked,
+  next to a pipeline that legitimately asks the operator to open an OAuth URL, is not P3.
+  **Mitigated in-prompt now** (both configs instruct entity-escaping of `[ ] ( ) |` plus dropping a
+  leading `!`, pinned by `config::tests::cos_prompts_never_interpolate_unvalidated_thread_id_into_a_link`),
+  but a prompt rule is not enforcement. **Real fix:** have the runtime author the brief markdown from
+  the typed `BriefRecord` and escape there — same landing zone as `brief-04`, and the two should
+  probably be one increment.
+
 ## v0.60 whole-system audit (2026-07-06)
 
 Read-only audit: 7 parallel reviewers (Claude + Codex) across every crate + docs, main @ e2ec0e47.
@@ -1557,6 +1645,15 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
   validation, (b) diffs `[[memory.segments]]` names + classes, (c) diffs `[[agents]]` capability
   grants. Failure fails CI. Complements the Rust tests (which already check per-file correctness).
 - DX Review finding (2026-07-12): two-file maintenance is the deepest remaining DX friction for CoS operators.
+- **Partially addressed by brief.1 (v0.117.0) — NOT closed.** brief.1 added `COS_PROMPT_SOURCES` in
+  `agentd/src/config.rs` and now pins *prompt-text* invariants across **four** sources (both configs
+  plus both `templates/cos-*.template.toml`): open-item key scheme, the link-security rule, `content=`
+  vs `value=`, and the byte-budget caps. That closes the axis that actually bit — brief.1 shipped its
+  fix to one of four copies, and the QEMU production config would have kept the old behaviour. It does
+  **NOT** do what this item asks: no diff of capability sets, MCP server blocks, or segment
+  classes, and no `make lint-cos` target. Note the two files are deliberately structurally different
+  (the overlay has no semantic-kb sidecar, test-pinned by `cos_spawn_caps_subset.rs`), so a naive
+  whole-file diff is wrong — the remaining work is a *selective* structural comparison.
 
 **cos-ux-01 — TUI lacks per-agent progress and error visibility**
 - **Partially addressed by ux.2a (2026-07-13, "Attention"):** the Dashboard now shows an `ATTN`

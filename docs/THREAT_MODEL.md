@@ -766,6 +766,44 @@ a brief they know is machine-assembled. **North star (not built):** data-taint �
 untrusted data may not exercise irreversible authority — which would generalize this to future ingest
 flows (Telegram, webhooks) without hand-decomposing each pipeline.
 
+**Forged link destinations are a distinct case inside this residual, and operator judgment does NOT
+mitigate them (brief.1).** The paragraph above scopes the residual to misleading *prose*, where the
+mitigation is a reader who knows the brief is machine-assembled. brief.1 added the first clickable
+thing the brief ever contained — a Gmail thread permalink — and a link decouples what the operator
+*reads* (`open`) from where it *goes*. Reading skeptically cannot detect that. The value is
+model-supplied and derives from untrusted email, so without a charset guard a `thread_id` carrying
+`)` closes the markdown link early and the remainder forges a second, attacker-chosen link inside a
+document that asserts the host is `mail.google.com` — next to a pipeline that legitimately asks the
+operator to visit an OAuth URL (§8.3).
+
+**The invariant we are aiming at, stated separately from what is actually enforced today.** The
+*goal* is: no model-supplied value enters a link destination, link text, or table cell until it has
+matched an exact format. **That goal is NOT met.** What ships is two prompt-level rules in both
+`cos.agents.toml` copies:
+- `thread_id` — the only value that reaches a link *destination* — may be interpolated only when it
+  matches `^[0-9a-f]{1,20}$`, else the cell renders a literal dash.
+- Every other email-derived field (`from`, `subject`, `ask`, `summary`, open-item `text`,
+  `deadline`, `focus_recommendation`) must have `[ ] ( ) |` replaced by HTML entities and a leading
+  `!` dropped before entering a bullet or a cell, and may never be used as link text.
+
+Both rules are instructions to a model, so they are defence-in-depth, **not** a mechanical
+guarantee. `config::tests::cos_prompts_never_interpolate_unvalidated_thread_id_into_a_link` pins
+that the rules are *present and worded at the link site* — it cannot verify a model obeys them, and
+an earlier version of that test passed while the link rule had been deleted outright, because it
+grepped for a regex literal that also appears twice elsewhere in the file. Read "pinned by" as
+"a guard against silent deletion of the rule", nothing stronger. The durable fix is for the runtime
+to own permalink construction and escaping from a typed field (`BriefRecord` is already structured
+and additively extensible); that is `brief-04`/`brief-03` and is not built.
+
+**Why the second rule exists at all:** `thread_id` was never the cheapest path. A sender whose
+subject line reads `Payment overdue [Pay now](https://evil.example)` needed no escape trick — the
+subject was copied verbatim into a table cell. brief.1 made that materially worse before fixing it,
+because it normalised links in a document that previously had none, so a bracketed link stopped
+looking anomalous. **Related gaps still open and tracked, not closed:** escaping is prompt-level
+only (`brief-03`), and open-item content derived from untrusted email is read back into the curator
+every morning, so a stored injection persists across days in a context holding
+`FsWrite ./output` and `BriefPublish`.
+
 ---
 
 ## 9.6 Telegram reach: remote approve/deny writer (ux.12)
@@ -861,3 +899,4 @@ its own POST errors (never marks an approval resolved on a network failure).
 | Management API unauthenticated access (ux.0b+) | See §9 | Loopback guard defaults on; `cos`/`agent` network-segmented (ux.0b-ar-01, fixed); `allow_non_loopback` opt-in still unscoped rather than Docker-bridge-limited (ux.0b-ar-02, open); no auth until ux.5 |
 | Injected trigger grants live Gmail to a child (cap.2b) | See §9.5 | CLOSED: de-privileged cron trigger + sealed `run_job` (config-owned caps/task, completion-only delivery); no injection path to live credentials |
 | Injected curator writes a misleading brief (cap.2b) | See §9.5 | OPEN by design: brief authoring is the curator's job; social-engineering channel, detective controls only (flight log, receipts, operator judgment); north star = data-taint |
+| Forged link destination in the brief (brief.1) | See §9.5 | MITIGATED IN-PROMPT ONLY, not closed. Two model-level rules: `thread_id` may enter a link destination only if it matches `^[0-9a-f]{1,20}$`; every other email-derived field has `[ ] ( ) \|` entity-escaped before entering a cell and is never link text. A model instruction is not enforcement — the tests pin that the rules are present at the link site, not that they are obeyed. Operator judgment does NOT cover this class (link text is decoupled from destination). Durable fix (runtime-owned permalink + escaping from the typed `BriefRecord`) not built: `brief-03`/`brief-04` |
