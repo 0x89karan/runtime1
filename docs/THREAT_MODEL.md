@@ -294,20 +294,56 @@ namespace. A second fork before exec is needed to put the server in the new
 namespace. Deferred to a future increment.
 
 **BP-4: Landlock degrades silently on kernels < 5.13**
-— Severity: Low (QEMU target runs 6.x)
+— Severity: **Medium on the documented Mac/Docker path** (was rated Low on the assumption
+that the QEMU target's 6.x kernel is representative — it is not; see below)
 
 On kernels without `CONFIG_SECURITY_LANDLOCK`, Landlock compiles to a BestEffort
 no-op. The `EnforcementStatus` struct (added in p4.1) reports `landlock: false` in
 the `SandboxApplied` flight event so operators can detect degraded enforcement.
 
-**BP-4a: `Net{ports}` with Landlock ABI < V4 (kernel < 6.7)**
+**The severity re-rate (2026-07-31, observed on a live Mac deployment).** The old
+"Low (QEMU target runs 6.x)" rating measured the wrong deployment. The path this project
+*documents first* — `docs/cos-guide.html` and `docs/DEPLOYMENT.md`, Docker Desktop on an
+Apple-silicon Mac — reports **Landlock ABI v0, i.e. no Landlock at all**, permanently and by
+construction, not as a degradation to be fixed. Observed in `agentctl watch`'s System view:
 
-TCP port enforcement (`AllowNetConnect`) requires Landlock ABI V4 (Linux ≥ 6.7).
-On kernels < 6.7, if an MCP server declares `Net{ports:[...]}`, agentd falls back
-to `IsolateNetwork` (deny-all network), emits a `tracing::warn!`, and logs
-`landlock_net: false` in `SandboxApplied`. This is intentionally conservative:
-deny-all is safer than silently granting unrestricted network access when
-per-port enforcement is unavailable.
+```
+Sandbox:   applied
+! Degraded: landlock_net_unavailable
+! Degraded: spawn_enforcement_unavailable_arch
+Isolation: none (arch=aarch64 runsc=none landlock=false seccomp=false)
+```
+
+On that deployment every `FsRead`/`FsWrite`/`Net` grant on an MCP server is **declarative
+only**, and `DenySpawn` is additionally unavailable because the gate is `#[cfg(target_arch =
+"x86_64")]`. Containment there rests on the Docker boundary and on capability checks inside
+`agentd` (which are real and enforced), not on kernel enforcement. Note `Sandbox: applied`
+reads as reassuring and is not: it means rules were compiled and handed to the kernel, not
+that the kernel enforced them. `Isolation: none` is the line that matters.
+
+**BP-4a: `Net{ports}` with Landlock ABI < V4 (kernel < 6.7) — FAILS OPEN, not closed**
+
+TCP port enforcement (`AllowNetConnect`) requires Landlock ABI V4 (Linux ≥ 6.7). When an MCP
+server declares `Net{ports:[...]}` and V4 is unavailable, agentd **skips isolation entirely
+and the server keeps unrestricted network access.** It emits a `tracing::warn!` naming the
+detected ABI and logs `landlock_net: false` in `SandboxApplied`.
+
+> **Corrected 2026-07-31.** This section previously claimed agentd "falls back to
+> `IsolateNetwork` (deny-all network)" and called that "intentionally conservative: deny-all
+> is safer than silently granting unrestricted network access." **That was the opposite of
+> what the code does.** `agentd/src/main.rs:1477-1479` states the real policy in its own
+> words: *"Best-effort ALLOW: skip IsolateNetwork so the server retains network access,
+> preserving the operator's declared intent."* The runtime warning says the same thing out
+> loud: *"per-port enforcement skipped — server has unrestricted network access."*
+> The choice is defensible — a sidecar that declared `Net{ports:[443]}` needs 443 to do its
+> job, and denying all network would break it rather than protect it — but it is a
+> **fail-open** choice and this document must not describe it as fail-closed. Same defect
+> class as the receipt-chain over-claims ux.6a existed to remove.
+
+Practical consequence: on any host without Landlock V4 (including every Apple-silicon Mac
+running Docker Desktop), a compromised MCP sidecar's outbound network is bounded by the
+container's networking and by the credential broker's host allowlist — **not** by the
+`ports` list in its capability declaration.
 
 **BP-5: MCP server without `capabilities` runs fully unsandboxed**
 — Severity: Medium (mitigated by `mcp_require_capabilities = true`)

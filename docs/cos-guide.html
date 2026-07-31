@@ -851,6 +851,30 @@
       </div>
 
       <div class="note" style="margin-top:1rem">
+        <div class="note-label">On a Mac, kernel sandboxing is off — know what is actually holding the line</div>
+        <p>Press <code>[s]</code> in <code>agentctl watch</code> and you will see something like:</p>
+        <div class="code-block"><pre><code>Sandbox:   applied
+! Degraded: landlock_net_unavailable
+! Degraded: spawn_enforcement_unavailable_arch
+Isolation: none (arch=aarch64 runsc=none landlock=false seccomp=false)</code></pre></div>
+        <p>This is expected on Docker Desktop for Apple silicon and is not a misconfiguration you can
+        fix: Landlock is a Linux-kernel feature that is not available there, and the spawn-denial gate
+        is x86_64-only. <strong><code>Sandbox: applied</code> reads as reassuring and is not</strong> —
+        it means the rules were compiled and handed to the kernel, not that the kernel enforced them.
+        <code>Isolation: none</code> is the line that matters.</p>
+        <p><strong>What this means concretely.</strong> The <code>Net</code>, <code>FsRead</code> and
+        <code>FsWrite</code> grants you see on each MCP sidecar are <em>declarative only</em> here. A
+        sidecar declaring <code>Net{ports:[443]}</code> is not actually confined to port 443 —
+        per-port enforcement is skipped and it keeps unrestricted network access. What still holds:
+        the Docker network boundary, the credential broker's host allowlist (the OAuth sidecar can
+        only reach Google's domains), and every capability check inside <code>agentd</code> itself,
+        which is ordinary enforced Rust and unaffected by the kernel.</p>
+        <p>If you want kernel-level enforcement, that is the QEMU/Linux path in
+        <code>docs/DEPLOYMENT.md</code>, not Docker on a Mac. See <code>THREAT_MODEL.md</code> BP-4
+        and BP-4a.</p>
+      </div>
+
+      <div class="note" style="margin-top:1rem">
         <div class="note-label">Worth doing: run it for a week and count</div>
         <p>The brief is only worth its complexity if you act on it. For one week, after each morning's
         brief, note how many actions you actually took as a result &mdash; the thread links make that a
