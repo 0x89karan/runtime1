@@ -663,7 +663,7 @@ body {
 <div class="page-header">
   <div>
     <div class="page-title">AgentOS — Runtime Architecture</div>
-    <div class="page-subtitle">v0.63.0 · core vs. harness boundary · credential gateway · spend caps</div>
+    <div class="page-subtitle">v0.117.0 · core vs. harness boundary · credential gateway · sealed jobs · durable run history</div>
   </div>
   <div class="legend">
     <div class="legend-item">
@@ -748,6 +748,8 @@ body {
           </div>
           <div class="chip-note">cooperative · budget-bounded · checkpoint/restore</div>
           <div class="chip-note"><span class="hl">spawn_agent</span> / <span class="hl">send_message</span> A→A bus</div>
+          <div class="chip-note"><span class="hl">run_job</span> — <span class="amber">sealed jobs</span> (cap.2b): caps + task owned by config, never chosen by the caller; parent gets a completion signal, never the job's output</div>
+          <div class="chip-note">rolling budget window (ux.8′) — over-budget agents <span class="amber">defer</span>, they do not terminate</div>
         </div>
       </div>
 
@@ -760,7 +762,8 @@ body {
         <div class="chip-body">
           <div class="chip-note"><span class="hl">flight.jsonl</span> — append-only JSONL, every event</div>
           <div class="chip-note"><span class="amber">SSE fan-out</span> → <span class="amber">:7999/api/v1/stream</span> <span style="color:var(--text-dim)">(p7.7)</span></div>
-          <div class="chip-note">Ed25519 signed receipts on every tool result</div>
+          <div class="chip-note">Ed25519 receipt chain in <span class="hl">evidence.jsonl</span> — <span class="amber">model calls only</span>, NOT every tool result (ux.6a de-claim; THREAT_MODEL §8.7.1)</div>
+          <div class="chip-note">records <span class="amber">denials</span> too, since ux.6a wired native scheduler admission — edge-triggered per <span class="hl">(agent, reason)</span>, not per attempt</div>
         </div>
       </div>
 
@@ -823,6 +826,9 @@ body {
             <div class="tool-item">read_file</div>
             <div class="tool-item">write_file</div>
             <div class="tool-item">list_dir</div>
+            <div class="tool-item">run_job</div>
+            <div class="tool-item">runs_query</div>
+            <div class="tool-item">publish_brief</div>
           </div>
         </div>
       </div>
@@ -946,9 +952,11 @@ body {
 
       <!-- Storage line -->
       <div class="storage-chip">
-        <div class="storage-path">memory.redb &nbsp;·&nbsp; caps.redb</div>
+        <div class="storage-path">memory.redb &nbsp;·&nbsp; caps.redb &nbsp;·&nbsp; runs.redb &nbsp;·&nbsp; evidence.jsonl</div>
         <div class="storage-sub">/run/memory/ → Docker named vol  or  QEMU virtfs memory0</div>
         <div class="storage-sub">T1 + T2 share memory.redb · caps.redb holds per-agent spend counters (cred.4)</div>
+        <div class="storage-sub"><span class="amber">runs.redb</span> — durable run history (ux.11b) + BRIEFS table (ux.11c). Authored by agentd from authoritative scheduler transitions, written off-loop by a single run-writer lane; served at <span class="amber">/api/v1/runs</span> and <span class="amber">/api/v1/brief</span></div>
+        <div class="storage-sub"><span class="amber">evidence.jsonl</span> — signed receipt chain, genesis-anchored. Boot reads a bounded 64 KiB tail and repairs a torn tail rather than refusing (ux.6a); rotation writes independently-verifiable segments</div>
         <div class="storage-sub" style="margin-top:3px;">NAMESPACES table for O(k) listing · OV-1: both paths outside MCP sandbox prefix</div>
       </div>
 
@@ -974,6 +982,10 @@ body {
             <div class="mcp-row">
               <div class="mcp-name">cron_mcp.py</div>
               <div class="mcp-tools">wait_for_trigger · 5-field cron UTC + interval<br>poll-and-retry within MCP_TIMEOUT=30s</div>
+            </div>
+            <div class="mcp-row">
+              <div class="mcp-name">telegram_mcp.py</div>
+              <div class="mcp-tools">no-tools server (ux.12) — background thread, two-way reach<br>delivers GET /api/v1/brief · relays allowlisted approve/deny to the approvals API</div>
             </div>
             <div class="mcp-row">
               <div class="mcp-name">fs_watch_mcp.py</div>
