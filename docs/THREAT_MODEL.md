@@ -908,6 +908,43 @@ sidecar, so a sidecar/Telegram outage never auto-approves or blocks — approval
 TUI (canonical); undelivered digests are dropped (durable in runs.redb). The sidecar fails closed on
 its own POST errors (never marks an approval resolved on a network failure).
 
+## 9.7 The §9.2/§9.3 exposure is now permanent and reboot-surviving (attn.1a)
+
+**No new vulnerability class — a changed likelihood, recorded here because the likelihood is the
+whole argument §9.3 rests on.** attn.1a added `restart: unless-stopped` to the `cos` compose service
+plus `docker/com.agentos.cos.plist` (a launchd agent that, at login, runs `docker compose up -d cos`
+**only when no `cos` container exists** — an existing one, running or deliberately stopped, is left
+to Docker's own policy). Neither touches `bind_addr`, the loopback guard, or the approval gate. What changes is *duration*:
+the unauthenticated management API published at `127.0.0.1:7999` was previously live only while an
+operator had a foreground `docker compose up` / `docker run` in a terminal — a session they started,
+watched, and ended. It is now live across crashes, Docker restarts and (with the plist or Docker
+Desktop's start-at-login) host reboots, with no human in the loop and nothing on screen to remind
+them it is listening.
+
+Three consequences worth stating plainly:
+
+- **The localhost-CSRF window in §9.3 is now approximately always open.** That analysis ("any
+  webpage in the operator's own browser can already reach `http://localhost:7999`") was written when
+  the port was up during attended sessions. The exposure is unchanged in kind and much larger in
+  time. This strengthens, not weakens, the case for closing it at ux.5 — auth is still the only
+  control that actually closes it.
+- **`AGENTOS_APPROVAL_SECRET` matters more than it did.** cap.4 gates the whole mutating surface on
+  it, and the gate is the *only* thing standing between a browser page (or anything else on
+  `cos-net`) and spawn/inject/approve/deny. With the secret unset that surface is now permanently
+  open on loopback rather than open during a watched session. Set it.
+- **The launchd agent is a separate trust decision, and the plist says so.** Installing it makes the
+  checkout auto-execute at every login: `docker compose up -d cos` resolves `docker-compose.yml`
+  (which runs `privileged: true` with host bind mounts) and `.env` (which holds API keys) from
+  `WorkingDirectory`. Before, a hostile or accidental edit to the compose file — a pulled branch, a
+  bad merge, anything with write access to the tree — took effect only when the operator chose to
+  type the command; now it takes effect at the next login. Only install it on a checkout you control.
+  Its log paths deliberately live under `~/Library/Logs` rather than `/tmp`, because launchd opens
+  them `O_CREAT|O_APPEND` and follows symlinks, which makes a predictable name in a world-writable
+  directory a file-clobber primitive.
+
+Flagged by the `/review` security specialist (attn.1a). Like §9.4, this section *is* the fix: a
+documentation change recording an accepted likelihood increase, not a code change.
+
 ---
 
 ## 10. Summary table
@@ -932,7 +969,7 @@ its own POST errors (never marks an approval resolved on a network failure).
 | Credential header injection (cred.3+) | See §8.5 | Allow-list enforced (v0.61.0+); x-goog-user-project blocked (billing injection) |
 | Universal-tier credential access | See §8.6 | Not implemented; deferred to cred.4/5 |
 | Egress content scan | See §8.7 | NOT IMPLEMENTED; no credential-shaped token scanning in tool output |
-| Management API unauthenticated access (ux.0b+) | See §9 | Loopback guard defaults on; `cos`/`agent` network-segmented (ux.0b-ar-01, fixed); `allow_non_loopback` opt-in still unscoped rather than Docker-bridge-limited (ux.0b-ar-02, open); no auth until ux.5 |
+| Management API unauthenticated access (ux.0b+) | See §9 | Loopback guard defaults on; `cos`/`agent` network-segmented (ux.0b-ar-01, fixed); `allow_non_loopback` opt-in still unscoped rather than Docker-bridge-limited (ux.0b-ar-02, open); no auth until ux.5; **attn.1a made the exposure permanent + reboot-surviving rather than session-scoped — see §9.7** |
 | Injected trigger grants live Gmail to a child (cap.2b) | See §9.5 | CLOSED: de-privileged cron trigger + sealed `run_job` (config-owned caps/task, completion-only delivery); no injection path to live credentials |
 | Injected curator writes a misleading brief (cap.2b) | See §9.5 | OPEN by design: brief authoring is the curator's job; social-engineering channel, detective controls only (flight log, receipts, operator judgment); north star = data-taint |
 | Forged link destination in the brief (brief.1) | See §9.5 | MITIGATED IN-PROMPT ONLY, not closed. Two model-level rules: `thread_id` may enter a link destination only if it matches `^[0-9a-f]{1,20}$`; every other email-derived field has `[ ] ( ) \|` entity-escaped before entering a cell and is never link text. A model instruction is not enforcement — the tests pin that the rules are present at the link site, not that they are obeyed. Operator judgment does NOT cover this class (link text is decoupled from destination). Durable fix (runtime-owned permalink + escaping from the typed `BriefRecord`) not built: `brief-03`/`brief-04` |

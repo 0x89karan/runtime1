@@ -204,7 +204,118 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   BuildKit ≥0.16 that speaks the gha cache v2 API, OR switch to `type=registry` cache
   (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
   releases publish fine after the hotfix.
+- **attn.1a-01 (P1) [new, found by /review security specialist 2026-08-01] — `max_requests_per_agent` is a
+  process-lifetime counter, not a rate limit. Setting it on the CoS google provider SILENTLY KILLS Gmail
+  after ~1-2 weeks.** attn.1a-core shipped this cap at 400 and it was **removed at /review** before landing.
+  Verified mechanism, do not re-derive:
+  - The broker token for `google_oauth` is minted **once at boot** and attributed to a **static principal** —
+    `owning_agent_id()` (`main.rs:1667`) returns the single `[[agents]]` id (`cos-orchestrator`), **not** the
+    date-keyed `cos-inbox-YYYY-MM-DD` job child.
+  - The counter is an increment-only `AtomicU64` keyed `(agent_id, provider)` in `state.counters`
+    (`credential/mod.rs:1081-1095`). Its **only** clearing site is `deregister_token`
+    (`credential/mod.rs:1674`), whose **only** production caller is agentd **shutdown** (`main.rs:1374`).
+    No per-agent-terminal reset, no window, no management route (`reset-attention` clears health/token
+    cache only), never persisted to `caps.redb`.
+  - One inbox cycle costs ~1 `messages.list` + up to 50 metadata GETs ≈ **30-55 broker requests**. At 400 the
+    ceiling lands in **~7-13 days** of normal daily briefs, after which **every** Gmail call returns
+    `429 credential_cap_exceeded` until the container restarts. That is precisely the silent-stoppage failure
+    attn.1a exists to fix, caused by attn.1a — and `restart: unless-stopped` from the same commit is what
+    keeps the process alive long enough to hit the wall.
+  - **The security value was also overstated:** because the counter dies with the process and restart is now
+    automatic, a runaway or injected agent **resets its own ceiling by crashing**. The cap bounds one process
+    lifetime, not a day.
+  **Before setting this on any long-lived provider**, do one of: (a) reset per job run (call
+  `deregister_token`, or key the token per `run_job` child so each `cos-inbox-<date>` gets its own counter);
+  (b) make it windowed on the same 86400 s rollover as the budget window; or (c) size it explicitly as a
+  process-lifetime ceiling (~20 000 ≈ a year of daily cycles) and say so in the config comments.
+  **Whichever path, the test must drive >cap requests through the real gateway with one boot-minted token and
+  assert the reset happens** — a config-parity test that only checks the number is present and equal stays
+  green for all three shapes. (A parity test of exactly that inadequate shape was written and then removed
+  here; its design is worth reusing only as a *companion* to the behavioural test.)
+  Also note for the config comments when it lands: an explicit `0` means **deny all requests**, not
+  "unlimited" — absent/`None` is unlimited. `0` is the value an operator would most plausibly write meaning
+  "no limit", and it would fail the pipeline closed.
+
+- **attn.1a-04 (P2) [new, found by /ship plan audit 2026-08-01] — infra/triage runs still count into
+  the brief's own stats, so the liveness signal sits on a surface a sub-daily loop will corrupt.**
+  attn.1a's plan assigned this to attn.1a-core (as "M6") and it was dropped silently — caught only
+  because /ship's plan-completion audit compared the build record against the diff.
+  `publish_brief` counts every run terminal in window and sums `spend`
+  (`agentd/src/runs/store.rs:489-504`), including `still_running` unconditionally (`:492-494`); the
+  `start_reason != "config_seed"` check at `:494` is pre-existing and only guards still-running
+  config-seed rows. So once `attn.1b`'s 30-minute triage loop exists, ~48 extra children/day will
+  swamp `run_count`, `failed_count`, `spend_total` and the attention list — **on the very surface
+  attn.1a-core added `last successful cycle` reporting to.** Fix: exclude infra/triage children by
+  identity using the `config_seed` escape hatch already present at `:494`. **Must land WITH the loop
+  that creates the children, not before** — shipping it now would be dead code with no consumer,
+  which is the `ux.6a record_denied` pattern (zero production callers for a whole release). Test
+  T-M6 rides with it: assert 48 infra runs in the window do not displace brief attention items or
+  corrupt `spend_total`.
+
+- **attn.1a-02 (P2) [new, /review 2026-08-01] — nothing validates `docker-compose.yml` semantics in CI.**
+  `agentd/tests/compose_policy.rs` justifies its hand-rolled string matching by claiming "`docker compose
+  config` in CI is the real semantic check". **No workflow runs `docker compose` at all** — verified by grep
+  across `.github/workflows/`; `docker-smoke` only does `docker build` + `docker run`. So a structurally
+  invalid compose file (bad indentation, duplicate key) ships unvalidated. Fix: add a `docker compose config
+  -q` step to the `docker-smoke` job, which already has Docker available. The false claim was corrected in
+  the test header at /review; the gap it named is still open.
+
+- **attn.1a-03 (P2) [new, /review 2026-08-01; scope reduced 2026-08-01 at /document-release] — two
+  compose-block extractors, one shared helper missing.** The correctness half is **FIXED in the same
+  branch**: `service_block()` in `agentd/tests/compose_policy.rs` is now anchored to the `services:`
+  mapping and terminates on the first non-blank line indented under 4 spaces, with negative controls
+  pinning both original bugs (`service_block("cos-data")` must resolve nothing because it is a top-level
+  *volume*, and `semantic-kb-mcp`'s block must not absorb the trailing top-level `volumes:` key). Do not
+  re-derive the original description — it is stale. **What remains:** `agentd/src/main.rs:2408`
+  (`compose_management_port_is_loopback_pinned`) has a second line-based extractor doing the same job, and
+  the two still disagree about whether the header line is included. Fix: extract one shared helper.
+
 - **test-flake-01 (P2) [new; found in cap.2 /ship] — Full-suite `cargo test --workspace` is flaky under high parallelism.**
+  **attn.1a evidence (2026-08-01) — the original "flaky under high parallelism" framing is CONFIRMED,
+  and the class is wider than recorded: THREE distinct clusters fail non-deterministically.** Four
+  full/partial runs of the same tree in one session, machine saturated throughout (concurrent
+  `cargo clippy --workspace`, a second `cargo test --workspace`, Docker Desktop, and subagents):
+
+  | Run | Failed | `agentctl docker::tests` | `agentd scheduler::streaming` | `agentd/tests/mcp.rs` |
+  |---|---|---|---|---|
+  | A | **7× `mcp.rs`** | ok (690/690) | ok (911/911) | ✗ |
+  | B | 2× `scheduler::streaming` | ok | ✗ | ok |
+  | C | 2× `docker::tests` | ✗ | ok | ok |
+  | isolated | `docker::tests` ×2 | ✗ | ok (4/4) | — |
+  | E (/ship 2026-08-01) | 1× `scheduler::streaming` | ok | ✗ (1 of the 2) | ok |
+
+  The failures **move between clusters run to run**, which is the signature of load sensitivity rather
+  than a defect. All three clusters spawn subprocesses under bounded timeouts:
+  `docker.rs:192 PROBE_TIMEOUT = 3s` (fake `docker` on `PATH`), the scheduler streaming tests index
+  `state.agents`/`streamed_agents` by key and **panic rather than assert** when a spawn has not landed,
+  and `agentd/tests/mcp.rs` spawns real Python MCP servers (failures at `:63 :123 :184 :237 :323 :519
+  :630`).
+
+  **⚠ A WRONG CORRECTION WAS COMMITTED HERE AND THEN REVERTED — read this before re-deriving it.**
+  An earlier version of this entry claimed the `docker::tests` pair "fails reproducibly, is not a
+  flake, and the label has been hiding a real failure," on the strength of two isolated runs plus a
+  parent-commit run. That conclusion was **wrong**: run A shows the same pair passing 690/690 in the
+  same tree, and the "isolated" runs were not isolated in the way that mattered — 52 s for 9 tests
+  shows the machine was still saturated. Two red runs on a loaded machine are not evidence of a
+  deterministic failure. **Confirm a cluster is green on an idle machine before declaring anything
+  about it.**
+
+  Still worth doing, on the original framing: these panics are `unwrap`-shaped index lookups and hard
+  timeouts. Poll-with-deadline instead of indexing, and size the timeouts for a loaded CI box.
+
+  **attn.1a update (2026-08-01): the `agentd` scheduler cluster —
+  `scheduler::tests::streaming_dispatch_emits_flight_events_and_populates_streamed_agents`
+  (`scheduler.rs:5767`, "agent not found") and
+  `scheduler::tests::streaming_two_agents_populates_both_in_streamed_agents`
+  (`scheduler.rs:6108`, "no entry found for key").** Both failed in a full-workspace run and both
+  passed in the same tree when run isolated (`cargo test -p agentd --lib scheduler::tests::streaming`
+  → 4/4 ok). **Attributable load cause:** the full run was executing concurrently with a background
+  `cargo clippy --workspace --all-targets` and a second `cargo test --workspace` from the same
+  session, so the machine was oversubscribed — i.e. this instance was self-inflicted, not evidence of
+  a new defect. Recorded because it widens the known class beyond `agentctl docker::tests` into the
+  `agentd` scheduler's streaming tests, which index `state.agents`/`streamed_agents` by key and panic
+  rather than assert when a spawn has not landed yet. Both panics are `unwrap`-shaped index lookups;
+  if this recurs unprovoked, the fix is to poll-with-deadline for the key instead of indexing.
   **brief.1 update (2026-07-29): a SECOND, mechanically-explained cluster in the same class —
   `agentctl` `docker::tests`.** `detect_docker_context_requires_exit_zero_and_at_least_one_container`,
   `kill_tail_kills_the_forked_grandchild_not_just_the_direct_child` and

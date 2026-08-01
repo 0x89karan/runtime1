@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  attn.1a — launchd agent so the Chief of Staff survives a host reboot on macOS.
+
+  `restart: unless-stopped` in docker-compose.yml handles crashes and Docker
+  restarts. It does NOT handle a Mac reboot unless Docker Desktop is itself set to
+  start at login AND the compose project is brought up again. This plist closes that
+  last gap: at login it runs `docker compose up -d cos` ONLY IF no `cos` container
+  exists. Any existing container — running OR deliberately stopped — is left to
+  Docker's own `unless-stopped` policy, which is what preserves the off switch. See
+  the ProgramArguments note below for why a bare `up -d` would be wrong.
+
+  This is the macOS counterpart to distro/agentos-cos.service (Linux/QEMU).
+
+  INSTALL (from the repo root):
+      cp docker/com.agentos.cos.plist ~/Library/LaunchAgents/
+      # edit the two paths below to match your checkout and shell environment
+      launchctl load -w ~/Library/LaunchAgents/com.agentos.cos.plist
+
+  ⚠ TRUST CONSEQUENCE — read before installing.
+  This makes your CHECKOUT auto-execute at every login with no human in the loop.
+  `docker compose up -d cos` resolves docker-compose.yml (and .env, which holds your API
+  keys) from WorkingDirectory, and that compose file runs `privileged: true` with host bind
+  mounts. Before this, a hostile or accidental edit to docker-compose.yml — a pulled branch,
+  a bad merge, anything with write access to the tree — only took effect when you chose to
+  type the command. Now it runs at next login. Only install this on a checkout you control.
+
+  Log paths point at ~/Library/Logs (NOT /tmp): launchd opens them O_CREAT|O_APPEND and
+  FOLLOWS symlinks, so a predictable name in world-writable /tmp is a file-clobber primitive.
+  Edit the CHANGEME in both log paths to your own home directory.
+
+  VERIFY:
+      launchctl list | grep agentos
+      docker compose ps cos
+
+  UNINSTALL:
+      launchctl unload -w ~/Library/LaunchAgents/com.agentos.cos.plist
+      rm ~/Library/LaunchAgents/com.agentos.cos.plist
+
+  SECRETS — read this before installing.
+  launchd does NOT inherit your interactive shell environment, so ANTHROPIC_API_KEY
+  and OPENAI_API_KEY will NOT be present and the CoS will exit 1 at the entrypoint's
+  preflight check. Provide them via an `.env` file next to docker-compose.yml, which
+  compose reads automatically:
+
+      printf 'ANTHROPIC_API_KEY=sk-...\nOPENAI_API_KEY=sk-...\n' > .env
+      chmod 600 .env
+
+  `.env` is gitignored. Do NOT put keys in this plist: plists in ~/Library/LaunchAgents
+  are world-readable by default, and this file is checked into the repo. Keys belong in
+  the environment or in a 0600 file, never in config or code.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentos.cos</string>
+
+    <!-- EDIT: absolute path to your checkout. launchd has no shell, so no ~ or $HOME. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/CHANGEME/dev/GitHub/agentOS</string>
+
+    <!-- WHY THIS IS NOT A BARE `docker compose up -d cos`.
+         `up -d` is unconditional, so it would RESTART A CONTAINER THE OPERATOR
+         DELIBERATELY STOPPED — someone who ran `docker compose stop cos` to halt token
+         spend or contain a bad pipeline would find it running again after the next login.
+         That destroys the off switch, which is the whole reason docker-compose.yml uses
+         `restart: unless-stopped` rather than `always`. (Found by /review, Codex.)
+
+         So: only create the container if it does not EXIST. If it exists, Docker's own
+         `unless-stopped` policy already does the right thing when the daemon comes up —
+         it restores a running container and LEAVES A MANUALLY STOPPED ONE STOPPED. launchd
+         only needs to cover the case Docker cannot: no container at all (first run, or
+         after `docker compose down`).
+
+         The `docker info` wait is real and necessary: Docker Desktop's daemon can take
+         ~30 s after login to accept connections, and launchd fires RunAtLoad immediately.
+         ThrottleInterval cannot substitute for this (see its note below). Both loops are
+         bounded so a machine without Docker does not leave a shell spinning. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <!-- EDIT the docker path if yours differs (`which docker`). Docker.app's bundled
+             binary is often more stable than /usr/local/bin/docker, which is
+             group-admin-writable on many Macs. -->
+        <string>D=/usr/local/bin/docker; n=0; until "$D" info &gt;/dev/null 2&gt;&amp;1; do n=$((n+1)); [ "$n" -gt 60 ] &amp;&amp; { echo "docker daemon not ready after 5 min - giving up" &gt;&amp;2; exit 1; }; sleep 5; done; if [ -n "$("$D" compose ps -aq cos 2&gt;/dev/null)" ]; then echo "cos container exists - leaving it to Docker's restart policy (a manual stop stays stopped)"; exit 0; fi; n=0; until "$D" compose up -d cos; do n=$((n+1)); [ "$n" -gt 5 ] &amp;&amp; { echo "compose up failed 5 times - giving up, see docker compose logs cos" &gt;&amp;2; exit 1; }; echo "compose up failed, retry $n/5 in 30s" &gt;&amp;2; sleep 30; done</string>
+    </array>
+
+    <!-- Run once at login. compose `up -d` is idempotent, and `restart: unless-stopped`
+         keeps the container alive afterwards, so this must NOT be a KeepAlive daemon —
+         that would fight the operator's explicit `docker compose stop`. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+
+    <!-- Backstop only. ThrottleInterval bounds the minimum interval between SPAWNS of a
+         job; with KeepAlive false there is no respawn, so this is inert in normal
+         operation. The Docker-readiness wait is handled in ProgramArguments above. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/CHANGEME/Library/Logs/agentos-cos-launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/CHANGEME/Library/Logs/agentos-cos-launchd.err</string>
+</dict>
+</plist>

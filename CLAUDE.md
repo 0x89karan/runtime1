@@ -24,11 +24,50 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.117.0 (shipped 2026-07-29)
+**Current version:** v0.118.0 (shipped 2026-08-01)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** brief.1 (v0.117.0) — **the morning brief's action items are addressable, and the
+**Latest shipped:** attn.1a-core (v0.118.0) — **the CoS now stays running, and says when it
+hasn't.** The pipeline produced **three briefs in fifteen days** (09:13, 16:01, 02:55 — three
+unrelated times) and the cause was NOT the brief logic: `docker-compose.yml` had **no `restart:`
+policy on any service**, so it only ran while someone hand-typed `docker compose up`. The Linux/QEMU
+path had a partial equivalent all along; the Mac path — the one dogfooded — had nothing. Plan:
+`docs/plans/attn.1a-sub-daily-job-safety.md`.
+- **`restart: unless-stopped` on `cos`/`qdrant`/`semantic-kb-mcp`, deliberately NOT on `agent`** (a
+  run-to-completion one-shot a policy would restart-loop, re-spending tokens each exit). Plus log caps
+  — a restart policy without one is unbounded growth, since a failing container now reprints forever.
+  `agentd/tests/compose_policy.rs` pins the restart VALUE (so `restart: always`, which would make
+  `docker compose stop` un-stoppable, fails) and couples `restart:` to a log cap.
+- **⚠ Recreate required, or the whole thing is inert.** Docker fixes the policy at container
+  CREATION; `docker compose start` does NOT pick it up (measured at /qa, where all three live
+  containers still read `restart=no` while compose declared `unless-stopped`). `docker compose up -d`.
+  Without that note this increment would have been a silent no-op — its own failure mode.
+- **Staleness is on the READ path, not in the brief.** `GET /api/v1/brief` returns `server_now`;
+  `agentctl brief` prints `· written 3h ago` and a banner past 26 h. The plan had said to put
+  `last successful cycle` INSIDE the brief — **that cannot work**: a field written only on success can
+  never report that the pipeline stopped. Server's clock (so `--url` elsewhere isn't read as
+  staleness), `saturating_sub`, latest-only banner, `AGENTCTL_BRIEF_STALE_HOURS` for other cadences.
+- **A broker request cap was built and then WITHDRAWN at /review.** `max_requests_per_agent` is a
+  monotonic **process-lifetime** counter, not a rate limit (token minted once at boot → static
+  principal; cleared only at shutdown). At ~30–55 Gmail calls/cycle, 400 would have hard-`429`'d the
+  pipeline after ~7–13 days, with the new restart policy keeping the process alive to reach it — the
+  exact silent stoppage this increment prevents. `attn.1a-01` (P1) has the mechanism and three fix
+  shapes. **Do not set this on a long-lived provider without reading it first.**
+- **Review found 6 criticals + 15 informational; QA found the recreate gap; /ship's plan audit found
+  a silently-dropped item** (`M6`, now `attn.1a-04`). Three of the criticals were false-guarantee
+  COMMENTS of mine, and one fix for an untested wire contract was **itself vacuous** — it re-read the
+  key inside the test body, so a rename still passed. The house rule earned another instance: a guard
+  that has not been mutation-tested is assumed non-functional, and a mutation whose anchor misses
+  looks exactly like proof.
+- **`attn.1b` (the interrupt tier) is NOT ready** — 8 preconditions, two of them contradictions: a
+  no-`from` payload cannot support a VIP-sender night gate, and `^[0-9a-f]{1,20}$` accepts any
+  *attacker-owned* thread id so an injected email can buzz the phone at 03:00 with a link into a
+  thread the attacker wrote. Both CEO voices returned RESHAPE/DEFER on the tier (6/6 adverse); the
+  operator overrode at the premise gate (decision `5ef9f33a`) and that override stands, but 1b's
+  preconditions gate it.
+
+**Prev:** brief.1 (v0.117.0) — **the morning brief's action items are addressable, and the
 brief survives its own size limit. Its headline claim is WITHDRAWN.** Three prompt edits to the CoS
 pipeline (`agentd/cos.agents.toml` + the three other copies) gave every item its Gmail `threadId`, a
 thread permalink per row, and provider-native `open:{threadId}` keys instead of `open:{date}:{N}`.
@@ -171,8 +210,26 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **`attn.1a` — make sub-daily jobs safe, and make the CoS actually run**
-(`docs/plans/attn.1a-sub-daily-job-safety.md`). Ships no new capability; fixes verified root causes.
+**Next (roadmap):** **Run it for 14 days, then decide.** attn.1a-core removed the reason the CoS
+wasn't running; nothing further in the brief/attention track should be built until there is field data.
+1. `docker compose up -d cos` (**`up -d`, not `start`** — see the recreate note above), then leave it.
+2. The D4 measure from office hours: **does the operator stop checking email manually?** 14 days.
+   Paired computable proxy (needs `attn.2`): the already-handled rate of morning-brief items.
+3. `C4` acceptance criterion: if the observed interrupt-worthy rate is **≤3/week**, retire the
+   attention-router tier rather than tuning it. CLAUDE.md's standing gate: "if it is ~2 actions a
+   morning, build nothing further." The three briefs analysed at /autoplan ran ~3/week.
+
+**`attn.1b` is gated, not queued** — 8 preconditions in `docs/plans/attn.1-interrupt-tier.md`, two of
+them flat contradictions (see the attn.1a-core notes above). `attn.1a`'s deferred §3 (per-fire
+`child_id`) and §4 (`tzdata`/IANA timezone) ride WITH it, not before — nothing fires sub-daily until
+the triage loop exists, and shipping them early is the `ux.6a record_denied` pattern.
+
+Still the only irreversible item: **name mv design partners** (external gate 2026-10-01, needs 10
+named humans + 3 booked demos, has 0 and 0, zero engineering). The /autoplan CEO review found the
+pipeline **inside the brief files** — live threads with Mayfield, MIT and Kong (domain-verified), plus
+Microsoft/GitHub, NTT and Amex by name. Then: `brief-07` (sanitise `agentctl brief`, ~30 min);
+`p7.7-ar-03` (~half a day, kills a false `0 denied`). brief.3 returns ONLY in the reshaped
+one-typed-brief form — never as a second runtime renderer.
 
 **brief.1 IS VERIFIED WORKING — correcting a claim this file carried from 2026-07-30 to 2026-08-01.**
 That claim read: "`~/.agentos-output/` has two briefs in fifteen days… the real Response Needed table

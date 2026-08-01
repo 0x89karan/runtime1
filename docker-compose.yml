@@ -15,6 +15,30 @@ services:
     # FUSE requires privileged mode (needed for agentctl watch + /agents filesystem)
     privileged: true
     networks: [cos-net]
+    # attn.1a: the CoS is a STANDING service — it must come back after a crash, a
+    # Docker restart, and a host reboot. Without this it only ran while someone had
+    # hand-typed `docker compose up`, which is why ~/.agentos-output/ held three
+    # briefs in fifteen days. The Linux/QEMU path had a PARTIAL equivalent
+    # (`Restart=on-failure` in distro/agentos-cos.service, which does NOT cover a clean
+    # exit-0 the way `unless-stopped` does, and needs `systemctl enable` for boot); the Mac
+    # path had nothing at all.
+    # `unless-stopped`, not `always`: an explicit `docker compose stop` must STAY
+    # stopped, or the operator cannot turn the pipeline off.
+    # For reboot survival Docker Desktop itself must also be set to start at login,
+    # or use docker/com.agentos.cos.plist. See docs/RUNBOOK.md §11.12.
+    restart: unless-stopped
+    # attn.1a (/review, performance specialist): a restart policy without a log cap is
+    # unbounded disk growth. Docker's json-file default has NO max-size, and before
+    # `restart:` a failed cos exited ONCE and stopped writing. Now a permanently-failing
+    # cos (e.g. the real missing-OPENAI_API_KEY preflight exit) reprints its error block
+    # forever — Docker backs off to a 60 s ceiling, so ~1440 restarts/day of log with
+    # nothing reclaiming it. Capped here; compose_policy.rs couples the two policies so a
+    # future `restart:` cannot be added without one.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     # Management API (:7999, unauthenticated) — host loopback ONLY. Never
     # publish bare `7999:7999`; that exposes spawn/inject/approve/deny to the
     # LAN. See THREAT_MODEL.md for the Docker-bridge exposure this accepts.
@@ -78,6 +102,12 @@ services:
     # FUSE requires privileged mode (needed for /agents filesystem + agentctl watch)
     privileged: true
     networks: [agent-net]
+    # attn.1a: DELIBERATELY NO `restart:` POLICY — do not add one.
+    # Unlike cos, this service is a run-to-completion ONE-SHOT: it runs a single
+    # template (TEMPLATE_NAME + AGENT_TASK) and exits. `unless-stopped` would
+    # restart-loop a finished agent forever, re-running the task and re-spending
+    # tokens on every exit. A test in agentd/tests/compose_policy.rs asserts this
+    # service has no restart policy.
     # This service's templates (scout, librarian, ...) run untrusted/LLM-driven
     # workloads — on a separate network from `cos` (ux.0b-ar-01) so they can't
     # reach cos's unauthenticated management API. If you enable [management]
@@ -154,6 +184,23 @@ services:
     # No profile — always-on for CoS (email body semantic index, memory-routing).
     # On agent-net only: cos talks to qdrant via semantic-kb-mcp, not directly.
     networks: [agent-net]
+    # attn.1a: semantic-kb-mcp depends_on this with condition: service_healthy, and cos
+    # depends_on semantic-kb-mcp — so the chain is cos -> semantic-kb-mcp -> qdrant and
+    # qdrant staying dead blocks the CoS TRANSITIVELY, not directly. (Worth knowing: removing
+    # semantic-kb-mcp's depends_on would silently sever cos's dependency on qdrant.)
+    restart: unless-stopped
+    # attn.1a (/review, performance specialist): a restart policy without a log cap is
+    # unbounded disk growth. Docker's json-file default has NO max-size, and before
+    # `restart:` a failed cos exited ONCE and stopped writing. Now a permanently-failing
+    # cos (e.g. the real missing-OPENAI_API_KEY preflight exit) reprints its error block
+    # forever — Docker backs off to a 60 s ceiling, so ~1440 restarts/day of log with
+    # nothing reclaiming it. Capped here; compose_policy.rs couples the two policies so a
+    # future `restart:` cannot be added without one.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     volumes:
       - qdrant-data:/qdrant/storage
     # Qdrant is only reachable by services on agent-net — not exposed to the host.
@@ -174,6 +221,20 @@ services:
     # No profile — always-on for CoS. On both networks so both cos and agent can reach it:
     # cos (cos-net) → semantic-kb-mcp → qdrant (agent-net); agent (agent-net) → semantic-kb-mcp.
     networks: [cos-net, agent-net]
+    # attn.1a: same reasoning as qdrant — cos gates startup on this being healthy.
+    restart: unless-stopped
+    # attn.1a (/review, performance specialist): a restart policy without a log cap is
+    # unbounded disk growth. Docker's json-file default has NO max-size, and before
+    # `restart:` a failed cos exited ONCE and stopped writing. Now a permanently-failing
+    # cos (e.g. the real missing-OPENAI_API_KEY preflight exit) reprints its error block
+    # forever — Docker backs off to a 60 s ceiling, so ~1440 restarts/day of log with
+    # nothing reclaiming it. Capped here; compose_policy.rs couples the two policies so a
+    # future `restart:` cannot be added without one.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - OPENAI_API_KEY
       - EMBED_MODEL=${EMBED_MODEL:-text-embedding-3-small}

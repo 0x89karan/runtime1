@@ -194,6 +194,24 @@ agentctl watch --url http://localhost:7999
 cat ~/.agentos-output/brief-$(date +%Y-%m-%d).md
 ```
 
+**⚠ This `docker run --rm` is a test drive, not a standing service (attn.1a).** It runs in the
+foreground with no restart policy: it dies with the terminal, does not come back after a crash, and
+does not survive a reboot. That is exactly how `~/.agentos-output/` ended up with **three briefs in
+fifteen days**. For a CoS you actually rely on, use the compose service instead — it carries
+`restart: unless-stopped` and log caps:
+
+```bash
+docker compose up -d cos     # NOT `docker compose start` — see below
+```
+
+`docker compose up -d` is also the only way to pick the policy up on a container that already
+exists: Docker fixes the restart policy at container **creation**, so `docker compose start` leaves
+an old container on `restart=no`. Verify with
+`docker inspect agentos-cos-1 --format '{{.HostConfig.RestartPolicy.Name}}'` (want `unless-stopped`).
+Reboot survival needs one more step (Docker Desktop at login, or `docker/com.agentos.cos.plist`).
+Full procedure, the launchd `.env` requirement, and the "briefs stopped arriving" checklist:
+`docs/RUNBOOK.md` §11.12.
+
 **Reading the brief:** the `Thread` column links straight to each Gmail conversation, and a literal
 dash means the thread id was missing or malformed (fail-closed by design). **If the brief starts with
 `⚠ Shortened to fit`, it is incomplete** — a morning's mail exceeded the 8 KiB store limit, so the
@@ -302,6 +320,9 @@ docker pull ghcr.io/0x89karan/runtime1:full             # get the newest build
   <free-port>` — Desktop clients accept any loopback port; there is nothing to register.
 - **No brief after a few minutes:** check the cron fired and Gmail was reached —
   `jq 'select(.kind=="tool_call")' ~/.agentos-data/flight.jsonl | tail`.
+- **Briefs were arriving and then stopped:** the usual cause is that nothing was running, not a
+  pipeline bug. Run `agentctl brief` — since v0.118.0 it states every brief's age and prints
+  `⚠ STALE …` past 26 h. Then `docker compose ps cos`. Full checklist: `docs/RUNBOOK.md` §11.12.
 - **Can't `docker exec` to watch:** the container must have been started with `--name agentos-cos`.
 
 ---
@@ -448,6 +469,11 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now agentos-cos
 ```
 
+`enable` is what gives you boot survival — don't skip it for `start`. Note the unit's policy is
+`Restart=on-failure`, which is narrower than the Docker path's `restart: unless-stopped`: it does
+**not** restart a clean `exit 0`. If the CoS ever stops without failing, systemd leaves it stopped
+and the next thing you notice is a missing brief. `agentctl brief` now tells you (below).
+
 ### Step 7 — Monitor
 
 ```bash
@@ -465,7 +491,7 @@ agentctl watch --url http://localhost:7999   # in another terminal
 agentctl brief                                  # attention-first: failures/approvals + run IDs, then counts
 agentctl brief --url http://localhost:7999      # explicit endpoint (honors AGENTCTL_URL)
 agentctl brief --n 5                            # the last 5 briefs
-curl -s localhost:7999/api/v1/brief             # structured JSON: {brief, approvals_pending}
+curl -s localhost:7999/api/v1/brief             # structured JSON: {brief, approvals_pending, server_now}
 
 # Full brief markdown (written by the CoS in addition to the pull surface)
 ls /home/agentos/.agentos-output/brief-*.md
@@ -476,6 +502,14 @@ agentctl approve <id>           # approve pending requests
 agentctl deny <id> --reason ... # deny with reason
 # Or use agentctl watch [a] key for the interactive Approvals pane
 ```
+
+**Is the brief current? (attn.1a)** `agentctl brief` states the age on every render
+(`· written 3h ago`) and leads with `⚠ STALE — this brief is 8d 0h old; the pipeline has missed at
+least one daily cycle.` past 26 h. The age is computed from the server's own clock (`server_now` in
+the JSON above), so pointing `--url` at another host does not report clock skew as staleness. The
+26 h threshold assumes the default daily `TRIGGER_CRON`; on any other cadence set
+`AGENTCTL_BRIEF_STALE_HOURS` (hours; unset, unparseable or `0` falls back to 26) — see the table in
+`docs/RUNBOOK.md` §11.12.
 
 ---
 

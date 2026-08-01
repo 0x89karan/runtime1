@@ -63,7 +63,19 @@ remaining work — one increment per branch, `main` shippable between, each thro
 9. ~~**cred.7** (v0.84.0)~~ ✅ shipped — credential resilience (on top of broker mode).
 10. **Audit remediation** (from `docs/AUDIT-v0.86.md` §6/§9): ~~**audit.1** (v0.87.0)~~ ✅ shipped — P0 hotfix + guard batch (`docs/plans/audit.1-p0-hotfix-guards.md`) → ~~**ci.1** (v0.88.0)~~ ✅ shipped — CI tests the artifact (`docs/plans/ci.1-ci-tests-the-artifact.md`): workspace-wide CI, sidecar marker contract, docker-smoke + negative fixture, fail-closed release guards, nightly mock E2E, monthly qemu cron; broker E2E deferred as named `ci.2` (TODOS) → then cap.1/cap.2/run.1/par.1-2 interleave per the audit build order.
 11. **Track UX cockpit** (agentctl-client): ux.0 → ux.9 → ux.2a → ux.1 (all ✅ shipped) → **reshaped 2026-07-18 (office-hours "trust after absence", `docs/plans/0x89karan-ux-control-panel-design-*.md`): ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram digest+approve/deny) → cap.1 → ux.13 (Cancel + live budget/caps)**, then the tail (ux.3, ux.2b, ux.10) and evidence-gated expansions (ux.6, ux.5, ux.7). Turns the cockpit from watch-and-chat into a control panel. A second identity — the governed-agent-microVM **mv track** — shares agentd core. Its design record lives **outside this repo**, at `~/.gstack/projects/0x89karan-runtime1/0x89karan-mv-governed-agent-runtime-design-20260720-114634.md` (APPROVED 2026-07-20); the old `docs/plans/0x89karan-mv-*` pointer here was dangling and cost a /autoplan session a wrong premise. **External gate date: the earlier of mv.3 shipped or 2026-10-01** (named 2026-07-29 during ux.6a — it had never been recorded, and the design doc's own warning is that "an unnamed gate date is how 'deferred' becomes 'never'"). The gate needs 10 named humans and 3 booked demos; no `mv.*` increment is scheduled yet, and none should be until the gate work starts. **Correction on the record:** that doc estimates its demo package at "~2 days, everything exists" on the strength of "normal tool use → signed receipt" and "forbidden capability → denied + receipt". Neither action class is receipted, and before ux.6a no deny was reachable at all, so the estimate is wrong.
-12. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
+12. **Track ATTN** (attention routing over the CoS): ~~**attn.1a-core** (v0.118.0)~~ ✅ shipped —
+    made the CoS actually run (`restart: unless-stopped` + log caps + launchd, none of which existed on
+    the Mac path) and made a stopped pipeline visible (`server_now` on `GET /api/v1/brief`, age + a
+    26 h STALE banner in `agentctl brief`). **Recreate containers with `docker compose up -d` or it is
+    inert.** Reframed at office-hours 2026-08-01 from "morning brief" to **attention router**: three
+    tiers (interrupt / morning / never), Telegram as the interrupt channel, and D4 = "does the operator
+    stop checking email manually" over 14 days. **`attn.1b`** (the interrupt tier itself) is DEFERRED
+    behind 8 preconditions — both CEO voices returned RESHAPE/DEFER 6/6 and the operator overrode at
+    the premise gate, but two preconditions are contradictions (a no-`from` payload cannot support a
+    VIP-sender night gate; `^[0-9a-f]{1,20}$` accepts any attacker-owned thread id). `attn.1a` §3/§4
+    ride with 1b. Plans: `docs/plans/attn.1a-sub-daily-job-safety.md`,
+    `docs/plans/attn.1-interrupt-tier.md`. **Nothing further here until the 14-day tally.**
+13. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.
 

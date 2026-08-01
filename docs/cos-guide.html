@@ -604,10 +604,36 @@
   </div>
 
   <div class="whats-new">
-    <div class="whats-new-label">v0.117.0 — What's new for operators</div>
+    <div class="whats-new-label">v0.118.0 — What's new for operators</div>
     <p style="margin:0 0 .9rem"><em>Operator-visible changes only. The full per-release list lives in
     <code>CHANGELOG.md</code> — this section is deliberately not a second copy of it.</em></p>
     <ul>
+      <li><strong>The CoS now stays running — and tells you when it hasn't</strong>
+        <span class="step-tag tag-new">v0.118.0</span>
+        — <strong>read this first if you have been getting fewer briefs than you expected.</strong>
+        Between 2026-07-16 and 07-31 this pipeline produced <strong>three briefs in fifteen days</strong>,
+        at 09:13, 16:01 and 02:55 — three unrelated times, because each one happened whenever someone
+        had hand-typed <code>docker compose up</code>. The cause was not the brief logic: <strong>no
+        compose service had a <code>restart:</code> policy</strong>, so nothing survived a crash, a
+        Docker restart, or closing the laptop. (The Linux/QEMU path had a <em>partial</em> equivalent all
+        along — <code>Restart=on-failure</code>, which does not cover a clean exit-0; the Mac path had
+        nothing at all.) Now <code>cos</code>, <code>qdrant</code> and <code>semantic-kb-mcp</code>
+        carry <code>restart: unless-stopped</code> — an explicit <code>docker compose stop</code> still
+        stays stopped, so you keep the off switch.
+        <br><strong>⚠ You must recreate your containers or none of this applies.</strong> Docker fixes
+        the restart policy at container <em>creation</em>, so editing the compose file does nothing to
+        containers that already exist — and <code>docker compose start</code> does <em>not</em> pick it
+        up (measured). Run <code>docker compose up -d cos</code>, then confirm with
+        <code>docker inspect agentos-cos-1 --format '{{.HostConfig.RestartPolicy.Name}}'</code>.
+        <br><strong>For reboot survival you still need one thing:</strong> either enable
+        <em>Docker Desktop → Settings → General → Start Docker Desktop when you sign in</em>, or install
+        <code>docker/com.agentos.cos.plist</code> (see <code>RUNBOOK.md</code> §11.12 — note that launchd
+        does not inherit your shell, so your API keys must go in a <code>.env</code> file).
+        <br><strong>And <code>agentctl brief</code> now states the brief's age every time</strong>
+        (<code>· written 3h ago</code>), with a loud banner past 26&nbsp;h:
+        <code>⚠ STALE — this brief is 8d 0h old…</code>. Previously an eight-day-old brief rendered
+        identically to one written five minutes ago, so a stopped pipeline was invisible and stale
+        content read as today's news.</li>
       <li><strong>The brief's action items are addressable</strong> <span class="step-tag tag-new">v0.117.0</span>
         — every item now carries its Gmail <code>threadId</code>, the Response Needed table gained a
         <strong>Thread</strong> permalink column, and the Important / Open Items lists link too. See
@@ -739,7 +765,7 @@
     <div class="step">
       <div class="step-num">06</div>
       <div class="step-title">Start the CoS <span class="step-tag tag-new">updated</span></div>
-      <p>Set your API keys and run <strong>via <code>docker compose</code></strong>, not a bare <code>docker run</code> — since h8.1/memory-routing, <code>cos.agents.toml</code>'s semantic KB needs the <code>semantic-kb-mcp</code> sidecar (backed by Qdrant), and that hostname only resolves on the Compose network. A standalone <code>docker run</code> now fails immediately with a DNS error (<code>failed to lookup address information</code> for <code>semantic-kb-mcp</code>). <code>docker compose up cos</code> brings up <code>qdrant</code> + <code>semantic-kb-mcp</code> automatically as dependencies. <code>TRIGGER_INTERVAL=every 2m</code> fires the cron quickly for testing — change it to a cron expression like <code>0 8 * * *</code> for production use. The management API is bound to <code>127.0.0.1:7999</code> so <code>agentctl watch</code> can connect from your Mac terminal directly.</p>
+      <p>Set your API keys and run <strong>via <code>docker compose</code></strong>, not a bare <code>docker run</code> — since h8.1/memory-routing, <code>cos.agents.toml</code>'s semantic KB needs the <code>semantic-kb-mcp</code> sidecar (backed by Qdrant), and that hostname only resolves on the Compose network. A standalone <code>docker run</code> now fails immediately with a DNS error (<code>failed to lookup address information</code> for <code>semantic-kb-mcp</code>). <code>docker compose up cos</code> brings up <code>qdrant</code> + <code>semantic-kb-mcp</code> automatically as dependencies. The default schedule is the <strong>daily cron</strong> <code>TRIGGER_CRON=0 8 * * *</code> (08:00 UTC) — for a quick test set <code>TRIGGER_CRON= TRIGGER_INTERVAL="every 2m"</code> instead (interval mode needs <code>TRIGGER_CRON</code> explicitly emptied, and only accepts <code>every N(s|m|h)</code>; a cron expression there will not parse). The management API is bound to <code>127.0.0.1:7999</code> so <code>agentctl watch</code> can connect from your Mac terminal directly. <strong>Use <code>docker compose up -d cos</code> for a CoS you actually rely on</strong> — detached is what gets you the <code>restart: unless-stopped</code> policy working for you across crashes and Docker restarts; the foreground form below dies with the terminal.</p>
       <div class="code-block">
         <div class="code-header">
           <div class="code-dots"><span></span><span></span><span></span></div>
@@ -962,10 +988,10 @@ Isolation: none (arch=aarch64 runsc=none landlock=false seccomp=false)</code></p
   <div class="note">
     <div class="note-label">Notes</div>
     <ul>
-      <li><strong>Schedule:</strong> <code>TRIGGER_INTERVAL="every 2m"</code> (used above) only accepts <code>every N(s|m|h)</code>. For a daily brief use <code>-e "TRIGGER_CRON=0 8 * * *"</code> (08:00 UTC). A cron expression in <code>TRIGGER_INTERVAL</code> will not parse.</li>
+      <li><strong>Schedule:</strong> the compose default is the daily cron <code>TRIGGER_CRON=0 8 * * *</code> (08:00 UTC) — a bare <code>docker compose up cos</code> gets that, not a fast interval. For a quick test, <code>TRIGGER_CRON= TRIGGER_INTERVAL="every 2m" docker compose up cos</code> (the empty <code>TRIGGER_CRON=</code> is required; setting both is refused at startup). <code>TRIGGER_INTERVAL</code> only accepts <code>every N(s|m|h)</code> — a cron expression there will not parse. If you change the cadence, also set <code>AGENTCTL_BRIEF_STALE_HOURS</code> so <code>agentctl brief</code>'s staleness warning matches it (see <code>RUNBOOK.md</code> §11.12).</li>
       <li><strong>API key across shells:</strong> Compose's bare <code>- ANTHROPIC_API_KEY</code> (no <code>=value</code>) forwards it from the shell you <code>export</code>ed in — run <code>docker compose up cos</code> in that same terminal.</li>
       <li><strong>Talk to it interactively:</strong> instead of the autonomous cron brief, run the orchestrator REPL — <code>docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate</code>.</li>
-      <li><strong>Stopping:</strong> Ctrl+C triggers a graceful checkpoint. State is preserved in the <code>cos-data</code> volume (<code>/data</code> in the container) — the next run resumes from where it left off.</li>
+      <li><strong>Stopping:</strong> in the foreground form, Ctrl+C triggers a graceful checkpoint. If you started it detached (<code>up -d</code>), use <code>docker compose stop cos</code> — <code>restart: unless-stopped</code> deliberately leaves a manually stopped container stopped, so that is your off switch. Either way state is preserved in the <code>cos-data</code> volume (<code>/data</code> in the container) and the next run resumes from where it left off.</li>
       <li><strong>Google auth on subsequent runs:</strong> The refresh token in <code>google.json</code> is read by the credential broker; no browser re-auth needed. If the token expires, re-run <code>agentctl auth google</code> with the same flags.</li>
       <li><strong>Privacy — email embeddings:</strong> The CoS sends email body content (up to 8 KB per message) to OpenAI's Embeddings API for vectorisation. Review OpenAI's data usage policies before enabling on inboxes with sensitive content. To run without OpenAI (BM25 only), omit <code>OPENAI_API_KEY</code> and remove the semantic-kb block from <code>cos.agents.toml</code>.</li>
     </ul>

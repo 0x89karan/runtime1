@@ -693,14 +693,21 @@ checks — no shell exports needed.
 
 **Schedule (optional):**
 ```bash
-# Add to docker-compose.yml agent or cos environment block, or export in your shell:
-TRIGGER_INTERVAL="every 2m"   # cos default; accepts cron expressions too
+# The cos default is the DAILY cron — a bare `docker compose up cos` gets this:
+TRIGGER_CRON="0 8 * * *"      # 08:00 UTC. Keep the fire time away from 00:00 UTC.
+# Fast interval, for TESTING only. TRIGGER_CRON must be explicitly emptied (setting
+# both is refused at startup), and TRIGGER_INTERVAL accepts ONLY `every N(s|m|h)` —
+# a cron expression here will not parse:
+TRIGGER_CRON= TRIGGER_INTERVAL="every 2m"
 ```
+If you run anything other than the default daily cadence, set `AGENTCTL_BRIEF_STALE_HOURS`
+too — see §11.12.
 
 ### 11.4 First run (Docker — recommended)
 
 ```bash
-# Start the CoS (runs continuously; Ctrl-C to stop)
+# Start the CoS (runs continuously; Ctrl-C to stop). Foreground is right for a FIRST run —
+# you want to see the boot. For a CoS you rely on, use `docker compose up -d cos`; see §11.12.
 docker compose up cos
 
 # Watch in a second terminal, directly from the host (ux.0b: docker-compose.yml
@@ -762,10 +769,11 @@ The `output0` 9p mount at `/run/output` is readable from the host at `distro/bui
   (`From`, `Subject`, `Ask`) are entity-escaped by a rule the model is told to follow, not by code.
   Treat a link in the brief with the same suspicion you would give the original email.
 
-> **Before building anything further on the brief, run it for a week and count the actions you
-> actually take.** As of 2026-07-31 the pipeline has produced two briefs in fifteen days, so every
-> claim about how well it works is unmeasured (`brief-05`). If the answer is ~2 actions a morning,
-> read the inbox instead.
+> **Before building anything further on the brief, run it and count the actions you actually take.**
+> Between 2026-07-16 and 07-31 the pipeline produced **three briefs in fifteen days**, so every claim
+> about how well it works is unmeasured (`brief-05`). attn.1a found the cause — nothing was running
+> (§11.12) — so **fix that first, then start the tally**; the gate is 14 days of real briefs. If the
+> answer is ~2 actions a morning, read the inbox instead.
 
 ### 11.7 Verifying the trust story
 
@@ -954,6 +962,121 @@ secret_env   = "MY_API_SECRET"   # read from environment at startup
 ```
 
 Then grant the `credential:custom` capability to any agent that should use it.
+
+### 11.12 Keeping it running (attn.1a)
+
+**Read this if you are getting fewer briefs than you expect.** The most common cause is not
+the pipeline — it is that the stack was not running.
+
+Between 2026-07-16 and 2026-07-31, `~/.agentos-output/` accumulated **three briefs in fifteen
+days**, at 09:13, 16:01 and 02:55 — three unrelated wall-clock times, because each one
+happened whenever someone had hand-typed `docker compose up`. The cause: **no compose service
+had a `restart:` policy.** The Linux/QEMU path had a *partial* equivalent all along
+(`Restart=on-failure` in `distro/agentos-cos.service` — which does **not** cover a clean
+exit-0 the way `unless-stopped` does, and still needs `systemctl enable` for boot); the Mac
+path had nothing at all.
+
+### ⚠ You must RECREATE the containers, or none of this applies
+
+Docker fixes a container's restart policy and log config at **creation** time. Editing
+`docker-compose.yml` changes nothing about containers that already exist. Measured:
+
+```
+container created before the change   -> restart=no
+  docker compose start                -> restart=no      (still! start does NOT apply it)
+  docker compose up -d                -> Recreated, restart=unless-stopped, max-size=10m
+```
+
+So after pulling this change, run:
+
+```bash
+docker compose up -d cos          # recreates; `start` will NOT pick up the policy
+docker inspect agentos-cos-1 --format '{{.HostConfig.RestartPolicy.Name}}'   # want: unless-stopped
+```
+
+If you skip this, everything below is inert and the CoS still will not survive a crash —
+the exact failure this section exists to fix, silently.
+
+**What is fixed now.** `cos`, `qdrant` and `semantic-kb-mcp` all carry
+`restart: unless-stopped`, so they survive a crash and a Docker restart.
+`unless-stopped` rather than `always` is deliberate — an explicit `docker compose stop`
+**stays** stopped, or you could not turn the pipeline off.
+
+The `agent` service deliberately has **no** restart policy: it runs one template and exits, so
+a policy would restart-loop a finished agent and re-spend tokens on every exit. A test
+(`agentd/tests/compose_policy.rs`) asserts both halves.
+
+**Reboot survival needs one more step.** A restart policy does not help if Docker itself is not
+running. Either enable *Docker Desktop → Settings → General → Start Docker Desktop when you
+sign in*, or install the launchd agent:
+
+```bash
+cp docker/com.agentos.cos.plist ~/Library/LaunchAgents/
+# Edit FOUR things in the copy before loading it — the checked-in file has CHANGEME placeholders:
+#   1. WorkingDirectory        → the absolute path to your checkout (launchd has no ~ or $HOME)
+#   2. the `D=/usr/local/bin/docker` path in ProgramArguments, if `which docker` differs
+#   3. StandardOutPath         → /Users/<you>/Library/Logs/agentos-cos-launchd.log
+#   4. StandardErrorPath       → /Users/<you>/Library/Logs/agentos-cos-launchd.err
+# Leaving the CHANGEME log paths in place gives launchd unwritable paths and you lose the output.
+launchctl load -w ~/Library/LaunchAgents/com.agentos.cos.plist
+launchctl list | grep agentos     # verify
+```
+
+⚠ **launchd does not inherit your shell environment**, so `ANTHROPIC_API_KEY` and
+`OPENAI_API_KEY` will be missing and the entrypoint will exit 1. Put them in a `.env` file
+beside `docker-compose.yml` (compose reads it automatically, and it is gitignored):
+
+```bash
+printf 'ANTHROPIC_API_KEY=sk-...\nOPENAI_API_KEY=sk-...\n' > .env
+chmod 600 .env
+```
+
+Never put keys in the plist — files in `~/Library/LaunchAgents` are world-readable by default
+and that file is checked into the repo.
+
+**Telling whether it is actually alive.** `agentctl brief` now states the brief's age on every
+render, and flags a brief older than 26 h:
+
+```
+⚠ STALE — this brief is 8d 0h old; the pipeline has missed at least one daily cycle.
+  Everything below describes that window, not today. Check: docker compose ps cos
+```
+
+The threshold is 26 h, tied to the **default** daily schedule (`TRIGGER_CRON=0 8 * * *`): a
+healthy brief is under 24 h old, and the 2 h grace covers a slow cycle plus looking before the
+08:00 fire.
+
+⚠ **If you changed the cadence, set the threshold too.** `agentctl` cannot discover your cron —
+the management API does not report it. So on a non-default schedule, 26 h is wrong in one
+direction or the other:
+
+| Your `TRIGGER_CRON` | Problem at 26 h | Set |
+|---|---|---|
+| `0 8,17 * * *` (twice daily) | a missed cycle does **not** trip the banner | `AGENTCTL_BRIEF_STALE_HOURS=14` |
+| daily (default) | — | nothing |
+| slower than daily | **every healthy brief** reads STALE | e.g. `=170` for weekly |
+
+```bash
+export AGENTCTL_BRIEF_STALE_HOURS=14   # hours; unset, unparseable, or 0 falls back to 26
+```
+A **fresh** brief still says `· written 3h ago` — an absent warning is a weaker signal than a
+present timestamp, and it answers "am I looking at today's?" without knowing the threshold.
+
+The age comes from the server's clock (`server_now` on `GET /api/v1/brief`), not yours, so
+pointing `agentctl brief --url` at another host does not report clock skew as staleness. If you
+run an older `agentd` that does not send it, the age line is omitted rather than guessed.
+
+**Checklist when briefs stop arriving:**
+
+```bash
+docker compose ps cos                 # Up? or Exited?
+docker compose logs --tail=40 cos     # exit 1 at preflight usually means a missing API key
+agentctl brief                        # is it STALE? how old?
+ls -la ~/.agentos-output/             # what actually landed, and when
+```
+
+The most common `Exited (1)` is a missing `OPENAI_API_KEY` — the semantic KB requires it and
+the entrypoint fails closed rather than running a degraded pipeline.
 
 ---
 

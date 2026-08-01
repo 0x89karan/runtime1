@@ -11,7 +11,9 @@
 //!   POST /api/v1/approvals/:id/deny              → 200 | 400 | 404 | 503
 //!   GET  /api/v1/memory/:ns?limit=&offset=       → 200 [{key, value}, ...] paginated
 //!   GET  /api/v1/runs?from=&to=&agent_id=&parent_id=&status=&limit=  → 200 [RunRecord, ...] (ux.11b)
-//!   GET  /api/v1/brief[?n=K]                      → 200 {brief|briefs, approvals_pending} | 503 (ux.11c)
+//!   GET  /api/v1/brief[?n=K]                      → 200 {brief|briefs, approvals_pending, server_now} | 503 (ux.11c)
+//!     (`server_now` is the server's unix clock, added by attn.1a so a consumer can compute
+//!      brief age — `server_now - created_at` — and say "the pipeline has stopped running")
 //!   GET  /api/v1/events                          → 200 text/event-stream (SSE)
 //!   POST /api/v1/spawn                           → 200 | 400 | 503 (orch.1)
 //!   POST /api/v1/agents/:id/inject               → 200 | 400 | 503 (orch.1)
@@ -435,15 +437,31 @@ async fn route(
                 .filter_map(|p| p.split_once('='))
                 .find(|(k, _)| *k == "n")
                 .and_then(|(_, v)| v.parse().ok());
+            // attn.1a liveness: stamp the SERVER's clock into every brief response.
+            // A brief that is eight days old renders identically to one written five
+            // minutes ago, which is exactly how "three briefs in fifteen days" stayed
+            // invisible. The consumer computes age as `server_now - created_at`.
+            //
+            // Why the server's clock and not the client's: `agentctl brief --url` can
+            // point at another host, so differencing two different clocks would report
+            // skew as staleness. Both numbers here come from the same clock.
+            //
+            // Why a raw timestamp rather than a `stale` boolean: the freshness threshold
+            // depends on the operator's configured cron cadence, and this route does not
+            // know it. Ship the fact, let the renderer apply the policy.
+            let server_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let store = Arc::clone(store);
             match n {
                 Some(k) => match tokio::task::spawn_blocking(move || store.list_briefs(k)).await {
-                    Ok(Ok(briefs)) => json_response(StatusCode::OK, json!({ "briefs": briefs, "approvals_pending": approvals_pending })),
+                    Ok(Ok(briefs)) => json_response(StatusCode::OK, json!({ "briefs": briefs, "approvals_pending": approvals_pending, "server_now": server_now })),
                     Ok(Err(e))     => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
                     Err(e)         => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("brief query join: {e}")),
                 },
                 None => match tokio::task::spawn_blocking(move || store.latest_brief()).await {
-                    Ok(Ok(brief)) => json_response(StatusCode::OK, json!({ "brief": brief, "approvals_pending": approvals_pending })),
+                    Ok(Ok(brief)) => json_response(StatusCode::OK, json!({ "brief": brief, "approvals_pending": approvals_pending, "server_now": server_now })),
                     Ok(Err(e))    => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
                     Err(e)        => error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("brief query join: {e}")),
                 },
@@ -1565,6 +1583,61 @@ mod tests {
         assert_eq!(v["brief"]["failed_count"], 1);
         assert_eq!(v["brief"]["narrative"], "one failure overnight");
         assert_eq!(v["brief"]["items"][0]["agent_id"], "scout");
+    }
+
+    #[tokio::test]
+    async fn brief_stamps_server_now_on_both_the_single_and_list_arms() {
+        // attn.1a (/review, testing specialist — CRITICAL). `server_now` is the entire
+        // SERVER half of the staleness feature and had ZERO coverage on either arm.
+        // Mutation-proven at review time: deleting `"server_now": server_now` from the
+        // `?n=K` arm left all 53 management tests green AND clippy clean (the binding stayed
+        // used by the other arm). No test in the workspace had ever requested `?n=` at all.
+        //
+        // Why that matters more than a normal coverage gap: if the field vanishes,
+        // `agentctl` falls back to its deliberately-silent `None` path, the STALE banner
+        // never fires again, and a dead pipeline renders as a healthy one — the exact
+        // failure mode this increment exists to eliminate.
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _q) = crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap();
+        store.publish_brief(None, 100_000).unwrap();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let store = Arc::new(store);
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap());
+
+        for query in ["", "n=3"] {
+            let state = Arc::new(ApiState {
+                snapshot: Arc::new(RwLock::new(SchedulerSnapshot::default())),
+                memory_store: None,
+                runs_store: Some(Arc::clone(&store)),
+                broadcast_tx: tx.clone(),
+                recorder: Arc::clone(&recorder),
+                control_tx: None,
+                credential_gateway: None,
+                approval_secret: None,
+            });
+            let resp = route(state, Method::GET, "/api/v1/brief", query, &[]).await;
+            assert_eq!(resp.status(), StatusCode::OK, "query={query:?}");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // Bound it, don't merely check presence: a `json!(0)` or a stringified value
+            // would satisfy `.is_some()` and still break the age computation.
+            let now = v["server_now"].as_u64().unwrap_or_else(|| {
+                panic!(
+                    "query={query:?}: no integer `server_now`. agentctl computes brief age \
+                     as server_now - created_at; without it the STALE banner silently never \
+                     fires and a stopped pipeline reads as a healthy one."
+                )
+            });
+            assert!(
+                now >= before,
+                "query={query:?}: server_now {now} predates the request ({before})"
+            );
+        }
     }
 
     #[tokio::test]

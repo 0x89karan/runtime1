@@ -3,6 +3,66 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.118.0] - 2026-08-01
+
+### Fixed
+- **attn.1a-core — the Chief of Staff now stays running, and says when it hasn't.** The pipeline
+  produced **three briefs in fifteen days**, at 09:13, 16:01 and 02:55. The cause was not the brief
+  logic: `docker-compose.yml` had **no `restart:` policy on any service**, so the stack only ran
+  while someone had hand-typed `docker compose up`. The Linux/QEMU path had a partial equivalent all
+  along (`Restart=on-failure` in `distro/agentos-cos.service`, which does not cover a clean exit-0);
+  the Mac path — the one actually dogfooded — had nothing.
+  - `restart: unless-stopped` on `cos`, `qdrant` and `semantic-kb-mcp`. **Not** on `agent`, which is
+    a run-to-completion one-shot a policy would restart-loop forever, re-spending tokens on every
+    exit. `agentd/tests/compose_policy.rs` asserts both halves, and pins the *value* so
+    `restart: always` (which would make `docker compose stop` un-stoppable) fails.
+  - ⚠ **You must recreate your containers or none of this applies.** Docker fixes the restart policy
+    at container *creation*; `docker compose start` does **not** pick it up (measured). Run
+    `docker compose up -d cos` and verify with
+    `docker inspect agentos-cos-1 --format '{{.HostConfig.RestartPolicy.Name}}'`. Found at /qa,
+    where all three live containers still read `restart=no` while compose declared
+    `unless-stopped` — without this note the whole increment would have been a silent no-op.
+  - `docker/com.agentos.cos.plist` for reboot survival on macOS. It only creates a container that
+    does not **exist**, leaving Docker's own policy to govern the rest — so a deliberate
+    `docker compose stop` is **not** resurrected at next login, which is the off switch
+    `unless-stopped` was chosen to preserve. Bounded `docker info` readiness wait and bounded
+    retry; logs under `~/Library/Logs`, not symlink-followable `/tmp`.
+  - Log caps (`max-size: 10m`, `max-file: 3`) on the three restarting services. A restart policy
+    without one is unbounded disk growth: Docker's `json-file` default has no `max-size`, and a
+    permanently-failing container now reprints its error ~1440×/day forever. A test couples the two
+    so a future `restart:` cannot be added without a cap.
+
+### Added
+- **Brief staleness reporting.** `GET /api/v1/brief` now returns `server_now` (the server's unix
+  clock, on both the latest and `?n=K` arms), and `agentctl brief` states every brief's age
+  (`· written 3h ago`) plus a leading banner past 26 h:
+  `⚠ STALE — this brief is 8d 0h old; the pipeline has missed at least one daily cycle.`
+  Previously an eight-day-old brief rendered identically to one written five minutes ago, so a
+  stopped pipeline was invisible and stale content read as today's news.
+  - Age comes from the **server's** clock, so `agentctl brief --url` pointed at another host does not
+    report clock skew as staleness. `saturating_sub` keeps a forward clock jump from claiming a
+    584-billion-hour-old brief. Against an older `agentd` that does not send the field, the age line
+    is omitted rather than guessed.
+  - The banner is **latest-only**: `agentctl brief --n 3` raised a false "missed a cycle" alarm for
+    every historical entry, which are old by definition.
+  - `AGENTCTL_BRIEF_STALE_HOURS` overrides the threshold for non-default cadences (twice-daily can
+    miss a cycle without tripping 26 h; anything slower false-alarms). Unset, unparseable or `0`
+    falls back to 26 h. Resolved at the process boundary, so the test suite is not perturbed by the
+    operator's environment.
+
+### Notes
+- **A broker request cap was built and then withdrawn at review.** `max_requests_per_agent` is a
+  monotonic **process-lifetime** counter, not a rate limit — the broker token is minted once at boot
+  and attributed to a static principal, and the counter's only clearing site is agentd shutdown. At
+  ~30–55 Gmail calls per daily cycle a cap of 400 would have hard-`429`'d the pipeline after ~7–13
+  days and stayed broken until restart, with the new restart policy keeping the process alive long
+  enough to reach it — the exact silent stoppage this increment exists to prevent. Full mechanism and
+  three viable fix shapes recorded as `attn.1a-01` (P1).
+- Review found 6 criticals and 15 informational; QA found 1 more driving the real daemon and CLI.
+  Both CEO voices returned RESHAPE/DEFER on the parent `attn.1` interrupt tier (6/6 adverse); the
+  operator overrode at the premise gate and the increment was then split, with `attn.1b` gated on
+  eight preconditions. See `docs/plans/attn.1a-sub-daily-job-safety.md`.
+
 ## [v0.117.0] - 2026-07-29
 
 ### Changed

@@ -182,9 +182,16 @@ agentctl auth google \
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # 5. Start the cos service
-docker compose up -d cos
+docker compose up -d cos          # `up -d`, not `start` — see the note below
 docker compose logs -f cos        # watch the agent run
 ```
+
+**Keeping it running (v0.118.0).** `cos` carries `restart: unless-stopped`, so it survives a crash
+and a Docker restart — but Docker fixes the restart policy at container **creation**, so an existing
+container needs `docker compose up -d` (`docker compose start` will not pick it up). Reboot survival
+needs one more step (Docker Desktop at login, or `docker/com.agentos.cos.plist`). `agentctl brief`
+now states each brief's age and warns when the pipeline has missed a cycle. Procedure and the
+"briefs stopped arriving" checklist: [`docs/RUNBOOK.md`](docs/RUNBOOK.md) §11.12.
 
 Credentials provisioned by `agentctl auth google` are stored as
 `~/.agentos-secrets/google.json` (containing `client_id`, `client_secret`, and
