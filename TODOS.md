@@ -204,6 +204,35 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   BuildKit ≥0.16 that speaks the gha cache v2 API, OR switch to `type=registry` cache
   (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
   releases publish fine after the hotfix.
+- **attn.1a-05 (P1) [new, observed live on v0.118.0, 2026-08-02] — restarting an agent that is
+  parked mid-tool-call BRICKS it permanently, and `restart: unless-stopped` now walks into this by
+  itself.** Observed on the real CoS, not inferred. Full mechanism:
+  1. `wait_for_trigger` (`docker/cron_mcp.py:350`) sleeps until `min(next_fire, now+timeout_s)` and
+     returns `waiting` when it is not yet time, so the orchestrator loops on it. It is parked
+     **mid-tool-call ~99% of its life**.
+  2. A restart in that window checkpoints/restores a conversation whose last message is an assistant
+     turn ending in a `tool_use` block with **no following `tool_result`**.
+  3. The Anthropic Messages API rejects that shape outright:
+     `400 messages.125: tool_use ids were found without tool_result blocks immediately after:
+     toolu_01FonBTdyrQmHudK1ChQAHcZ`. The agent dies on its **first** inference after restore
+     (`agent_failed reason=inference_error`).
+  4. **It is self-perpetuating.** On shutdown it checkpoints the same poisoned history, so every
+     subsequent boot fails identically. Recovery required deleting BOTH `/data/checkpoint.json` and
+     `/data/checkpoint.json.restored` — a normal restart cannot escape it.
+  **NOT CoS-specific.** `checkpoint.rs` contains **zero** `tool_use`/`tool_result` handling (grep
+  verified), and `from_checkpoint` (`agent/mod.rs:300`) restores `messages: cp.messages` verbatim with
+  no validation. Any long park is exposed — including **`request_approval`**, the human-in-the-loop
+  gate: an agent parked awaiting an operator approval across a restart loses the approval AND dies.
+  **Severity is raised by attn.1a-core itself:** `restart: unless-stopped` (v0.118.0) makes restarts
+  automatic, so a crash while parked now self-inflicts this without anyone touching the container.
+  Before that change the trap needed a human to run a restart.
+  **Fix at `agent/mod.rs:300`:** on restore, if the trailing message is an assistant turn ending in a
+  `tool_use` with no matching `tool_result`, either synthesise a `tool_result` carrying an
+  "interrupted by restart" error (preferred — preserves turn structure and tells the model what
+  happened, so it can retry the call) or drop the trailing assistant message. **Test:** checkpoint a
+  task mid-tool-call, restore, and assert the first outbound inference request has no dangling
+  `tool_use` — mutation-verified by removing the guard.
+
 - **attn.1a-01 (P1) [new, found by /review security specialist 2026-08-01] — `max_requests_per_agent` is a
   process-lifetime counter, not a rate limit. Setting it on the CoS google provider SILENTLY KILLS Gmail
   after ~1-2 weeks.** attn.1a-core shipped this cap at 400 and it was **removed at /review** before landing.
