@@ -221,7 +221,17 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   manual run at 07:00 would silently cancel the 08:00 scheduled one.
   Also needs: a flight event so a manual fire is distinguishable from a scheduled one in the audit
   trail, and a note in RUNBOOK §11.12. An `agentctl` wrapper is optional sugar — the `touch` is the
-  contract. Spec: see `docs/plans/attn.2-manual-trigger.md`.
+  contract.
+  **SPECCED 2026-08-02 → issue #164, and it grew.** Once the operator read a brief for the first
+  time they added three more requirements — a re-run must "update the brief and bring it up to date.
+  not be destructive", and handled items must stop being listed, with a **manual override** for the
+  ones they dealt with off-thread. That makes this a worklist change, not a trigger: the full spec is
+  `docs/plans/attn.2-workable-brief.md`, staged 1–4 with the manual fire as Stage 2.
+  **Stage 1 is a correctness fix that stands alone and should ship first:** `write_file` truncates
+  (`tools/native.rs:157`), so a same-day re-run **destroys** the earlier brief — and the comment that
+  permits same-day re-runs (`scheduler.rs:2478`, "harmless — brief is log-append/LWW") is wrong about
+  the file. Needs `/autoplan` before any build; the capability question (curator has `FsWrite` on
+  `./output` but no `FsRead`) is deliberately left open for its security pass.
 
 - **attn.1a-05 (P1) [new, observed live on v0.118.0, 2026-08-02] — restarting an agent that is
   parked mid-tool-call BRICKS it permanently, and `restart: unless-stopped` now walks into this by
