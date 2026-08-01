@@ -204,6 +204,25 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   BuildKit ≥0.16 that speaks the gha cache v2 API, OR switch to `type=registry` cache
   (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
   releases publish fine after the hotfix.
+- **attn.2 (P1) [operator ask, restated 2026-08-02] — there is no way to fire the CoS on demand.**
+  The operator asked for this at the start of the 2026-08-01 session ("a way to see active and open
+  emails via a manual sync more than once a day") and again after the first daily cron proved
+  unusable. Today the only fire path is the cron, so testing a change means either waiting for
+  08:00 UTC or restarting — **and restarting is what triggers `attn.1a-05`**, so the obvious
+  workaround is the one thing that must not be used.
+  **Design (verified against the code, no new capability or API route needed):** `wait_for_trigger`
+  already wakes every `timeout_s` to poll (`docker/cron_mcp.py:350` — it sleeps to
+  `min(next_fire, now+timeout_s)`, then fires only if `now >= _NEXT_FIRE_TS`). Have it also check a
+  sentinel file on each wake; if present, unlink it and fire. Put the sentinel in the directory that
+  is **already bind-mounted to the host** (`~/.agentos-output` → `/data/output`, `docker-compose.yml`),
+  so the operator runs `touch ~/.agentos-output/.fire-now` with no new route, no new capability, and
+  **no restart**. Unlink-before-fire makes it single-shot and idempotent under a double touch.
+  Must not disturb the scheduled fire: a manual fire should NOT call `_advance_next_fire()`, or a
+  manual run at 07:00 would silently cancel the 08:00 scheduled one.
+  Also needs: a flight event so a manual fire is distinguishable from a scheduled one in the audit
+  trail, and a note in RUNBOOK §11.12. An `agentctl` wrapper is optional sugar — the `touch` is the
+  contract. Spec: see `docs/plans/attn.2-manual-trigger.md`.
+
 - **attn.1a-05 (P1) [new, observed live on v0.118.0, 2026-08-02] — restarting an agent that is
   parked mid-tool-call BRICKS it permanently, and `restart: unless-stopped` now walks into this by
   itself.** Observed on the real CoS, not inferred. Full mechanism:
