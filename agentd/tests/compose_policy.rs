@@ -278,3 +278,30 @@ fn service_block_extraction_is_not_vacuous() {
         "the final service block leaked into the top-level `volumes:` mapping"
     );
 }
+
+/// attn.2 R1 (/review): the sidecar must receive `SEMANTIC_DEGRADED` with an EMPTY default.
+///
+/// This one line is the sole production path into the sidecar's AUTO branch, and AUTO is the
+/// only path a key-less deployment takes — the cos entrypoint cannot export into a different
+/// container, and Compose cannot express "set this only when that other variable is empty".
+/// A `:-0` or `:-1` default would pin the mode and silently re-break the key-less boot back to
+/// fail-every-kb_put. Nothing else in the repo covers this file's runtime behaviour: this
+/// suite's own header notes no workflow runs `docker compose` at all.
+#[test]
+fn semantic_kb_passes_degraded_through_with_an_auto_default() {
+    let block = service_block("semantic-kb-mcp").expect("semantic-kb-mcp service missing");
+    let line = block
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.starts_with('#'))
+        .find(|l| l.starts_with("- SEMANTIC_DEGRADED"))
+        .expect(
+            "semantic-kb-mcp must pass SEMANTIC_DEGRADED through — it is the only production \
+             path into the sidecar's AUTO degrade branch",
+        );
+    assert_eq!(
+        line, "- SEMANTIC_DEGRADED=${SEMANTIC_DEGRADED:-}",
+        "the default must expand EMPTY so the sidecar resolves AUTO from its own \
+         OPENAI_API_KEY; a `:-0`/`:-1` default pins the mode and re-breaks the key-less boot"
+    );
+}

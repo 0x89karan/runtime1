@@ -174,7 +174,8 @@ docker pull ghcr.io/0x89karan/runtime1:full
 
 # 6. Start the CoS — keep the `export` and `docker run` in the SAME terminal
 export ANTHROPIC_API_KEY=sk-ant-...
-export OPENAI_API_KEY=sk-...          # required for semantic KB (email body embeddings)
+export OPENAI_API_KEY=sk-...          # OPTIONAL — enables semantic KB search. Without it
+                                      # the CoS boots DEGRADED: the brief works, kb_search is off.
 docker run --rm -it \
   --name agentos-cos \
   --privileged \

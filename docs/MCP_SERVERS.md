@@ -445,13 +445,14 @@ This uses three containers: `agent` (agentd), `qdrant` (vector store), and
 
 | Var | Default | Description |
 |-----|---------|-------------|
-| `OPENAI_API_KEY` | *(required unless `MOCK_EMBEDDINGS=1`)* | OpenAI embedding API key. |
+| `OPENAI_API_KEY` | *(optional)* | OpenAI embedding API key. Absent → the server auto-enters degraded mode (see `SEMANTIC_DEGRADED`). |
 | `EMBED_MODEL` | `text-embedding-3-small` | Embedding model (1536 dims). |
 | `QDRANT_URL` | `http://qdrant:6333` | Qdrant base URL. Must resolve to a private/loopback address (SSRF guard at startup). |
-| `MOCK_EMBEDDINGS` | `0` | Set to `1` to use zero vectors instead of calling the embeddings API (testing only). |
+| `MOCK_EMBEDDINGS` | `0` | **Testing only.** Zero vectors, full functionality, real collection names. The self-tests run under this. |
+| `SEMANTIC_DEGRADED` | *(auto)* | **Production no-key mode**, distinct from `MOCK_EMBEDDINGS`. Unset = AUTO: on when `OPENAI_API_KEY` is absent. `kb_put`/`kb_get` keep working (point lookups by key), `kb_search` returns an *explicit empty* rather than arbitrary nearest-neighbours, and writes are namespaced to `kbdegraded_*` so real embeddings are never mixed with zero vectors. Set `1`/`0` to force. |
 | `PORT` | `8020` | HTTP port the MCP server listens on. |
 | `SEMANTIC_MAX_AGE_DAYS` | `30` | Evict entries older than N days at startup (`0` disables). |
-| `SEMANTIC_MAX_ENTRIES` | `10000` | Evict oldest entries beyond this count per namespace (`0` disables). |
+| `SEMANTIC_MAX_ENTRIES` | `10000` | Evict oldest entries beyond this count per namespace (`0` disables).  **Not yet implemented — the env var is a no-op; eviction is TTL-only.** |
 
 ### TOML config snippet
 

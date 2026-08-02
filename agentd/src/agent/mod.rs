@@ -295,6 +295,155 @@ impl AgentTask {
         }
     }
 
+    /// Repair a restored conversation so it satisfies the Messages API's pairing rule:
+    /// every `tool_use` must be answered by a `tool_result` in the following user turn.
+    ///
+    /// **attn.2 R2 / attn.1a-05.** A checkpoint taken while a tool call was in flight stores an
+    /// assistant turn ending in an unanswered `tool_use`. Replaying it verbatim makes the very
+    /// next inference fail with *"tool_use ids were found without tool_result blocks"*, the agent
+    /// goes `failed`, and — because the failure path checkpoints again on shutdown — it
+    /// re-poisons its own checkpoint, so every later boot repeats it. This is not a rare
+    /// shutdown race: `default_checkpoint_interval_turns()` is 1 and the periodic write snapshots
+    /// every agent, so while a child burns its turns, each write captures the parent mid-call.
+    ///
+    /// `live_call_ids` is the crux and the reason this cannot live in `from_checkpoint`, which
+    /// sees only one agent's checkpoint. A dangling `tool_use` is **legitimate** when the
+    /// scheduler has durable state promising to answer it later:
+    ///   * `awaiting` — the parent called `run_job`/`spawn_agent`; the child's completion
+    ///     delivers a `ToolResult` for that `call_id`.
+    ///   * `pending_approvals` — the agent called `request_approval`; grant or reject delivers.
+    ///
+    /// Answering those here would be actively harmful: the real result arrives later and lands
+    /// as a `tool_result` with no matching `tool_use`, which is the same API error from the
+    /// other side. So live ids are left strictly alone.
+    ///
+    /// Only genuinely **orphaned** ids are repaired — a call interrupted before the scheduler
+    /// recorded any promise to answer it. They get a synthetic error `tool_result` rather than
+    /// having their blocks stripped, because stripping the only block from a tool-only assistant
+    /// turn leaves `blocks: []`, which the API rejects for a different reason. Appending is also
+    /// honest: the model is told the call was interrupted instead of silently losing it.
+    ///
+    /// Returns the repaired ids so the caller can record them.
+    pub fn repair_dangling_tool_uses(
+        messages: &mut Vec<Msg>,
+        live_call_ids: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        fn tool_use_ids(m: &Msg) -> Vec<String> {
+            m.blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        // Plan: per assistant turn, which of its tool_use ids are unanswered.
+        let mut plan: Vec<(usize, Vec<String>)> = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            if m.role != Role::Assistant {
+                continue;
+            }
+            let ids = tool_use_ids(m);
+            if ids.is_empty() {
+                continue;
+            }
+
+            // A turn holding even ONE live id is left entirely alone (/review, security
+            // specialist). Repairing only the orphan would insert a user turn now, and the
+            // live call's real result later arrives via `provide_tool_results`, which always
+            // pushes a NEW user turn — giving assistant[live, orphan] / user[orphan] /
+            // user[live], where the live tool_use is no longer answered in the turn
+            // immediately after it. That is the same 400 this function exists to prevent.
+            // Unreachable today because every awaiting-producing tool is sole-only
+            // (`reject_batched_sole_tool` answers the whole batch if one is co-batched), but
+            // nothing here depends on that, so do not rely on it.
+            if ids.iter().any(|id| live_call_ids.contains(id)) {
+                continue;
+            }
+
+            // "Answered" means answered in the IMMEDIATELY FOLLOWING user turn — the rule the
+            // provider actually enforces (/review, maintainability specialist). Scanning the
+            // whole history instead would treat a result that landed a turn too late as
+            // satisfied and ship the same 400. That shape is reachable: `push_user_turn` and
+            // an orchestration inject both put a plain user turn between an assistant
+            // tool_use and its result.
+            let answered: std::collections::HashSet<&str> = messages
+                .get(i + 1)
+                .filter(|n| n.role == Role::User)
+                .map(|n| {
+                    n.blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let orphaned: Vec<String> =
+                ids.into_iter().filter(|id| !answered.contains(id.as_str())).collect();
+            if !orphaned.is_empty() {
+                plan.push((i, orphaned));
+            }
+        }
+
+        let repaired: Vec<String> = plan.iter().flat_map(|(_, ids)| ids.clone()).collect();
+
+        // Apply back-to-front so earlier indices stay valid.
+        for (idx, ids) in plan.into_iter().rev() {
+            // The API requires the following user turn to BEGIN with tool_result blocks, in
+            // the same order as the assistant turn's tool_use blocks. Rebuild that leading
+            // run rather than prepending or appending blindly: a turn can already carry a
+            // trailing `Block::Text` (an inject), and blind prepend/append breaks either the
+            // leading-run rule or the same-order rule.
+            let order = tool_use_ids(&messages[idx]);
+            let synthetic: Vec<Block> = ids
+                .into_iter()
+                .map(|id| Block::ToolResult {
+                    tool_use_id: id,
+                    content: "Interrupted by a restart before this tool produced a result. \
+                              No result is available — do not assume it succeeded; re-run it if \
+                              the outcome still matters."
+                        .to_string(),
+                    is_error: true,
+                })
+                .collect();
+
+            // A partially-answered batch already has a user turn holding the siblings'
+            // results; the missing ones must join THAT turn, not a new one after it.
+            let merge_into_next = messages
+                .get(idx + 1)
+                .map(|n| {
+                    n.role == Role::User
+                        && n.blocks.iter().any(|b| matches!(b, Block::ToolResult { .. }))
+                })
+                .unwrap_or(false);
+
+            if merge_into_next {
+                let next = &mut messages[idx + 1];
+                let (mut results, others): (Vec<Block>, Vec<Block>) = next
+                    .blocks
+                    .drain(..)
+                    .partition(|b| matches!(b, Block::ToolResult { .. }));
+                results.extend(synthetic);
+                results.sort_by_key(|b| match b {
+                    Block::ToolResult { tool_use_id, .. } => {
+                        order.iter().position(|id| id == tool_use_id).unwrap_or(usize::MAX)
+                    }
+                    _ => usize::MAX,
+                });
+                results.extend(others);
+                next.blocks = results;
+            } else {
+                messages.insert(idx + 1, Msg { role: Role::User, blocks: synthetic });
+            }
+        }
+
+        repaired
+    }
+
     /// Restore an agent from a checkpoint, using `specs` from the current registry
     /// rather than the saved specs (guards against stale tool lists after restart).
     pub fn from_checkpoint(
@@ -335,6 +484,13 @@ impl AgentTask {
     /// Total tokens consumed so far (input + output). Used by the snapshot.
     pub fn context_tokens(&self) -> u64 {
         self.total_input + self.total_output
+    }
+
+    /// Read-only view of the conversation history. TEST-ONLY today: the restore-repair path
+    /// mutates `AgentCheckpoint.messages` directly, before `from_checkpoint` is ever called,
+    /// so it does not flow through here. Kept public for assertions; the agent owns mutation.
+    pub fn messages(&self) -> &[Msg] {
+        &self.messages
     }
 
     /// Spend within the current budget window (ux.8′): lifetime minus the window
@@ -2115,6 +2271,274 @@ mod tests {
         let task = AgentTask::from_checkpoint(cp, vec![]);
         assert!(task.terminal, "orchestrated waiting agent must restore as terminal=true");
         assert_eq!(task.agent_id, "orch-01");
+    }
+
+    // ── attn.2 R2 / attn.1a-05: dangling tool_use repair on restore ──────────────
+    // These pin the pairing invariant the Messages API enforces. Note the /qa harness
+    // uses a FAKE provider that does NOT enforce tool_use/tool_result pairing, so an
+    // integration test there would pass against a still-broken history. The invariant
+    // has to be asserted directly, here.
+
+    fn live(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every tool_use in the history is answered in the immediately-following user turn.
+    /// This is exactly what the provider checks.
+    fn assert_well_paired(messages: &[Msg]) {
+        for (i, m) in messages.iter().enumerate() {
+            if m.role != Role::Assistant {
+                continue;
+            }
+            for b in &m.blocks {
+                if let Block::ToolUse { id, .. } = b {
+                    let answered = messages.get(i + 1).is_some_and(|n| {
+                        n.role == Role::User
+                            && n.blocks.iter().any(|nb| {
+                                matches!(nb, Block::ToolResult { tool_use_id, .. }
+                                         if tool_use_id == id)
+                            })
+                    });
+                    assert!(answered, "tool_use {id} has no tool_result in the next user turn");
+                }
+            }
+            assert!(!m.blocks.is_empty(), "assistant turn {i} has empty blocks — the API rejects this");
+        }
+    }
+
+    fn tool_only_assistant(id: &str) -> Msg {
+        Msg {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: id.to_string(),
+                name: "run_job".to_string(),
+                input: json!({}),
+            }],
+        }
+    }
+
+    #[test]
+    fn repair_answers_an_orphaned_tool_use() {
+        let mut msgs = vec![
+            Msg { role: Role::User, blocks: vec![Block::Text { text: "go".into() }] },
+            tool_only_assistant("toolu_orphan"),
+        ];
+        let repaired = AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&[]));
+        assert_eq!(repaired, vec!["toolu_orphan".to_string()]);
+        assert_well_paired(&msgs);
+        let last = msgs.last().unwrap();
+        assert_eq!(last.role, Role::User);
+        assert!(matches!(&last.blocks[0],
+                Block::ToolResult { tool_use_id, is_error, .. }
+                if tool_use_id == "toolu_orphan" && *is_error));
+    }
+
+    /// THE negative control. A dangling tool_use that the scheduler has promised to answer
+    /// (run_job/spawn_agent await, or a parked approval) must be left untouched. Answering it
+    /// here would make the real result arrive later as a tool_result with no matching
+    /// tool_use — the same 400, from the other side.
+    #[test]
+    fn repair_leaves_live_awaited_calls_alone() {
+        let mut msgs = vec![
+            Msg { role: Role::User, blocks: vec![Block::Text { text: "go".into() }] },
+            tool_only_assistant("toolu_awaited"),
+        ];
+        let before = msgs.len();
+        let repaired =
+            AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&["toolu_awaited"]));
+        assert!(repaired.is_empty(), "a promised call must not be repaired: {repaired:?}");
+        assert_eq!(msgs.len(), before, "no turn may be appended for a live call");
+    }
+
+    #[test]
+    fn repair_is_a_noop_when_every_call_is_already_answered() {
+        let mut msgs = vec![
+            tool_only_assistant("toolu_done"),
+            Msg {
+                role: Role::User,
+                blocks: vec![Block::ToolResult {
+                    tool_use_id: "toolu_done".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let snapshot = format!("{:?}", msgs);
+        let repaired = AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&[]));
+        assert!(repaired.is_empty());
+        assert_eq!(format!("{:?}", msgs), snapshot, "answered history must not be rewritten");
+    }
+
+    /// A partially-answered batch: the missing result must join the EXISTING user turn.
+    /// Inserting a second user turn after it would leave the first tool_use answered in a
+    /// turn that is no longer adjacent to its assistant message.
+    #[test]
+    fn repair_merges_into_a_partial_result_turn() {
+        let mut msgs = vec![
+            Msg {
+                role: Role::Assistant,
+                blocks: vec![
+                    Block::ToolUse { id: "a".into(), name: "t".into(), input: json!({}) },
+                    Block::ToolUse { id: "b".into(), name: "t".into(), input: json!({}) },
+                ],
+            },
+            Msg {
+                role: Role::User,
+                blocks: vec![Block::ToolResult {
+                    tool_use_id: "a".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let repaired = AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&[]));
+        assert_eq!(repaired, vec!["b".to_string()]);
+        assert_eq!(msgs.len(), 2, "must merge into the existing user turn, not insert a new one");
+        assert_well_paired(&msgs);
+    }
+
+    /// Mixed text + tool_use: repairing must not strip the assistant's prose, and must not
+    /// leave the turn with empty blocks (which the API rejects for a different reason).
+    #[test]
+    fn repair_preserves_assistant_text_and_never_empties_a_turn() {
+        let mut msgs = vec![Msg {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::Text { text: "calling the tool now".into() },
+                Block::ToolUse { id: "x".into(), name: "t".into(), input: json!({}) },
+            ],
+        }];
+        AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&[]));
+        assert!(
+            matches!(&msgs[0].blocks[0], Block::Text { text } if text == "calling the tool now"),
+            "assistant prose must survive the repair"
+        );
+        assert_well_paired(&msgs);
+    }
+
+    /// A turn mixing a promised and an orphaned call is left ENTIRELY alone.
+    ///
+    /// Answering only the orphan would be worse than doing nothing: the live call's real
+    /// result arrives later via `provide_tool_results`, which pushes its own user turn, so the
+    /// history becomes assistant[live, orphan] / user[orphan] / user[live] and the live
+    /// tool_use is no longer answered in the turn immediately after it — the same 400 this
+    /// function removes. Leaving the turn intact keeps the real delivery adjacent.
+    #[test]
+    fn repair_leaves_a_mixed_live_and_orphaned_turn_entirely_alone() {
+        let mut msgs = vec![Msg {
+            role: Role::Assistant,
+            blocks: vec![
+                Block::ToolUse { id: "promised".into(), name: "run_job".into(), input: json!({}) },
+                Block::ToolUse { id: "orphan".into(), name: "read_file".into(), input: json!({}) },
+            ],
+        }];
+        let before = msgs.len();
+        let repaired = AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&["promised"]));
+        assert!(repaired.is_empty(),
+            "a turn containing a live call must not be rewritten at all, got {repaired:?}");
+        assert_eq!(msgs.len(), before,
+            "no user turn may be inserted after a turn holding a live call — the real result \
+             must stay adjacent to its tool_use");
+    }
+
+    /// Two interrupted assistant turns in one history. The plan is applied `.rev()` precisely
+    /// so that inserting after the later turn cannot shift the earlier turn's index; applying
+    /// it front-to-back would land the second repair after the WRONG assistant message,
+    /// leaving a still-unpaired history on the fail-closed restore path. Every other repair
+    /// test has exactly one orphaned turn, so none of them exercise the ordering — deleting
+    /// `.rev()` left the whole suite green until /review's testing specialist proved it.
+    #[test]
+    fn repair_handles_multiple_orphaned_turns_without_shifting_indices() {
+        let mut msgs = vec![
+            tool_only_assistant("toolu_first"),
+            Msg { role: Role::User, blocks: vec![Block::Text { text: "inject".into() }] },
+            tool_only_assistant("toolu_second"),
+        ];
+        let repaired = AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&[]));
+        assert_eq!(
+            repaired,
+            vec!["toolu_first".to_string(), "toolu_second".to_string()],
+            "both interrupted turns must be repaired"
+        );
+        assert_well_paired(&msgs);
+        // Each synthetic result must sit immediately after ITS OWN assistant turn.
+        for id in ["toolu_first", "toolu_second"] {
+            let ai = msgs
+                .iter()
+                .position(|m| {
+                    m.blocks.iter().any(
+                        |b| matches!(b, Block::ToolUse { id: bid, .. } if bid == id),
+                    )
+                })
+                .unwrap_or_else(|| panic!("{id} vanished from the history"));
+            assert!(
+                matches!(&msgs[ai + 1].blocks[0],
+                         Block::ToolResult { tool_use_id, .. } if tool_use_id == id),
+                "{id}'s result is not in the turn immediately after its own tool_use — the \
+                 plan was applied front-to-back and the indices shifted"
+            );
+        }
+    }
+
+    /// A result that exists but landed a turn TOO LATE must still be repaired.
+    /// Scanning the whole history for "is this id answered anywhere" would call this healthy
+    /// and ship a 400, because the provider only accepts results in the turn immediately
+    /// after the tool_use. Reachable via `push_user_turn` or an orchestration inject.
+    #[test]
+    fn repair_treats_a_misplaced_tool_result_as_unanswered() {
+        let mut msgs = vec![
+            tool_only_assistant("toolu_late"),
+            Msg { role: Role::User, blocks: vec![Block::Text { text: "an inject".into() }] },
+            Msg {
+                role: Role::User,
+                blocks: vec![Block::ToolResult {
+                    tool_use_id: "toolu_late".into(),
+                    content: "arrived too late".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let repaired = AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&[]));
+        assert_eq!(repaired, vec!["toolu_late".to_string()],
+            "a result one turn too late does not satisfy the provider's adjacency rule");
+        assert_well_paired(&msgs);
+    }
+
+    /// The merged turn must BEGIN with tool_results, in the assistant turn's tool_use order,
+    /// even when it already carries a trailing text block from an inject.
+    #[test]
+    fn repair_rebuilds_the_leading_result_run_in_tool_use_order() {
+        let mut msgs = vec![
+            Msg {
+                role: Role::Assistant,
+                blocks: vec![
+                    Block::ToolUse { id: "a".into(), name: "t".into(), input: json!({}) },
+                    Block::ToolUse { id: "b".into(), name: "t".into(), input: json!({}) },
+                    Block::ToolUse { id: "c".into(), name: "t".into(), input: json!({}) },
+                ],
+            },
+            Msg {
+                role: Role::User,
+                blocks: vec![
+                    Block::ToolResult { tool_use_id: "c".into(), content: "ok".into(), is_error: false },
+                    Block::Text { text: "an inject landed here".into() },
+                ],
+            },
+        ];
+        AgentTask::repair_dangling_tool_uses(&mut msgs, &live(&[]));
+        let ids: Vec<&str> = msgs[1].blocks.iter().filter_map(|b| match b {
+            Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(ids, vec!["a", "b", "c"],
+            "results must be ordered to match the assistant turn's tool_use order");
+        // The leading run must be unbroken: every block before the first non-result is a result.
+        let first_non_result = msgs[1].blocks.iter()
+            .position(|b| !matches!(b, Block::ToolResult { .. }))
+            .unwrap_or(msgs[1].blocks.len());
+        assert_eq!(first_non_result, 3,
+            "all three tool_results must form the LEADING run; a text block must not split it");
+        assert_well_paired(&msgs);
     }
 
     #[test]

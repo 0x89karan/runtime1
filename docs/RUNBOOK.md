@@ -668,6 +668,42 @@ Google Cloud Console setup (one-time):
 3. **Credentials → Create → OAuth client ID** → Application type: **Desktop app**.
 4. Copy the **Client ID** and **Client Secret**.
 
+**Which keys are actually required (attn.2 R1):**
+
+| Key | Required? | Without it |
+|-----|-----------|-----------|
+| `ANTHROPIC_API_KEY` | **yes** | no inference, nothing runs |
+| Google OAuth (`/run/secrets/google.json`) | **yes** | boot **fails closed** — no Gmail means no brief |
+| `OPENAI_API_KEY` | **no** | boot **warns** and runs DEGRADED (below) |
+
+**Degraded mode.** Before attn.2 R1 a missing `OPENAI_API_KEY` was a hard `exit 1`. Combined
+with v0.118.0's `restart: unless-stopped` that became a restart loop — observed in the field as
+`Exited (1)`, `RestartCount=10`, with the CoS down for a day. The key only ever bought semantic
+`kb_search`; `kb_put` and `kb_get` are point lookups by key and the morning brief needs only
+those. So it now degrades instead:
+
+- **Working:** Gmail read, KB writes, KB point lookups, brief authoring, `publish_brief`.
+- **Off:** `kb_search` returns an *explicit empty*. That is **not** "no matches" — cross-brief
+  carry-forward is off. It never returns arbitrary hits, because with zero vectors every point
+  is equidistant and Qdrant would happily return resolved items as if they were open.
+- **Isolated:** degraded writes go to `kbdegraded_*` Qdrant collections. Real embeddings in
+  `kb_*` are untouched, so setting the key later restores full search with the old data intact.
+  **The converse also holds and is the part to know:** entries written *while* degraded live in
+  `kbdegraded_*` and are **not visible** once the key is set — reads resolve through the
+  current mode's prefix. TTL eviction sweeps both namespaces, so they do not accumulate
+  forever, but if you want them gone immediately drop the `kbdegraded_*` collections after
+  recovery. For the CoS this is benign: the inbox job and the curator run in the same mode
+  within a cycle, and cross-brief carry-forward is off while degraded anyway.
+
+You will see this at boot:
+
+```
+WARNING: OPENAI_API_KEY is not set — starting in DEGRADED mode.
+```
+
+To force the mode either way (e.g. to reproduce the no-key path with a key present), set
+`SEMANTIC_DEGRADED=1` or `=0`. Unset means auto-detect.
+
 ### 11.3 Credentials (cred.3.2 — current flow)
 
 **One-time setup on the Mac host:**
@@ -1023,7 +1059,7 @@ launchctl list | grep agentos     # verify
 ```
 
 ⚠ **launchd does not inherit your shell environment**, so `ANTHROPIC_API_KEY` and
-`OPENAI_API_KEY` will be missing and the entrypoint will exit 1. Put them in a `.env` file
+`ANTHROPIC_API_KEY` will be missing and the entrypoint will exit 1. Put it in a `.env` file
 beside `docker-compose.yml` (compose reads it automatically, and it is gitignored):
 
 ```bash
@@ -1075,8 +1111,12 @@ agentctl brief                        # is it STALE? how old?
 ls -la ~/.agentos-output/             # what actually landed, and when
 ```
 
-The most common `Exited (1)` is a missing `OPENAI_API_KEY` — the semantic KB requires it and
-the entrypoint fails closed rather than running a degraded pipeline.
+The most common `Exited (1)` is a missing `ANTHROPIC_API_KEY`, or an absent
+`/run/secrets/google.json`. Both fail the boot closed on purpose: no model means nothing runs,
+and no Gmail means no brief, so a degraded pipeline would emit empty briefs forever. A missing
+`OPENAI_API_KEY` is **not** in this category since attn.2 R1 — it warns and runs degraded
+(§11.2). If `Exited (1)` recurs with `RestartCount` climbing, read the last 30 log lines before
+assuming a loop is the cause; `restart: unless-stopped` retries a fatal preflight indefinitely.
 
 ---
 

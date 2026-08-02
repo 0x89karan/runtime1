@@ -89,6 +89,35 @@ fn default_deliver_content() -> bool {
     true
 }
 
+/// Repair a restoring agent's dangling tool calls and record what was repaired.
+///
+/// attn.2 R2. Extracted because both restore loops (TOML agents and checkpoint-only children)
+/// need it identically, and a duplicated copy meant a change to the event shape had to be made
+/// twice — with only one of the two copies under test.
+///
+/// Recorded as `AgentRestored`, NOT `Error` (/review, maintainability specialist). This is a
+/// successful self-heal on a path the agent then survives, and
+/// `agentctl/src/watch/inspector.rs:is_error_event` matches `"kind":"error"` to drive both the
+/// Inspector's Errors filter and the red row colour — so recording it as an error would make
+/// every self-healed boot read to the operator as a failure. `agent_restored` already exists
+/// and is documented in `CONVENTIONS.md`, so this adds no new kind and trips no build gate.
+fn repair_and_record(
+    agent_id: &str,
+    cp_agent: &mut crate::checkpoint::AgentCheckpoint,
+    live_call_ids: &std::collections::HashSet<String>,
+    recorder: &FlightRecorder,
+) {
+    let repaired = AgentTask::repair_dangling_tool_uses(&mut cp_agent.messages, live_call_ids);
+    if repaired.is_empty() {
+        return;
+    }
+    recorder.record(agent_id, Some(cp_agent.turn), EventKind::AgentRestored, json!({
+        "stage": "restore_repair",
+        "reason": "interrupted tool calls had no result at checkpoint time",
+        "repaired_call_ids": repaired,
+    }));
+}
+
 /// An agent parked waiting for operator approval via /agents/control.
 struct ParkedApproval {
     agent_id:   String,
@@ -329,6 +358,45 @@ impl Scheduler {
                 .map(|a| (a.agent_id.clone(), a))
                 .collect();
 
+            // attn.2 R2 / attn.1a-05 — the call_ids the scheduler has promised to answer.
+            // Built HERE because this is the only place that sees both the per-agent
+            // checkpoints and the scheduler's own awaiting/pending_approvals state;
+            // `AgentTask::from_checkpoint` takes one agent and cannot know any of this.
+            // A dangling tool_use in this set is legitimate and must be left alone —
+            // repairing it would make the eventual real result arrive as a tool_result
+            // with no matching tool_use, the same API error from the other side.
+            //
+            // An await is only a PROMISE if the child will still exist to fulfil it
+            // (/review, Codex adversarial P1). `handle_agent_terminal` is the only thing
+            // that delivers a child result, and it only runs for an agent that exists, so
+            // an await naming an absent child is dead. Counting it as live would suppress
+            // the repair AND (via the seed skip) park the parent forever — strictly worse
+            // than the 400 this increment removes.
+            //
+            // The membership set must be the agents that will END UP in `state.agents`, not
+            // just the checkpointed ones (/review, maintainability specialist). `state.agents`
+            // is a superset: it also holds TOML agents built fresh by `AgentTask::new` when
+            // the checkpoint had no entry for them. Filtering on `cp_map` alone while the
+            // awaiting-drop below filters on `state.agents` made the two disagree for exactly
+            // that difference — the repair would answer the call as orphaned while the await
+            // was KEPT, so the child's eventual real result would arrive as a second
+            // tool_result with no matching tool_use. That is the "same 400 from the other
+            // side" these comments warn about, produced by the fix itself.
+            let mut will_exist: std::collections::HashSet<String> =
+                cp_map.keys().cloned().collect();
+            will_exist.extend(
+                agent_configs
+                    .iter()
+                    .filter(|c| c.tier != AgentTier::Universal)
+                    .map(|c| c.id.clone()),
+            );
+            let live_call_ids: std::collections::HashSet<String> = cp_awaiting
+                .iter()
+                .filter(|e| will_exist.contains(&e.child_id))
+                .map(|e| e.call_id.clone())
+                .chain(cp_pending_approvals.iter().map(|e| e.call_id.clone()))
+                .collect();
+
             let mut universal_ids_cp: std::collections::HashSet<String> = std::collections::HashSet::new();
             for cfg in agent_configs {
                 anyhow::ensure!(
@@ -347,7 +415,8 @@ impl Scheduler {
                     continue;
                 }
                 let specs = registry.filtered_specs(cfg.capabilities.as_deref());
-                let task = if let Some(cp_agent) = cp_map.remove(&cfg.id) {
+                let task = if let Some(mut cp_agent) = cp_map.remove(&cfg.id) {
+                    repair_and_record(&cfg.id, &mut cp_agent, &live_call_ids, &recorder);
                     AgentTask::from_checkpoint(cp_agent, specs)
                 } else {
                     AgentTask::new(&cfg.id, &cfg.task, &cfg, model_cfg, specs)
@@ -355,13 +424,14 @@ impl Scheduler {
                 agents.insert(cfg.id.clone(), task);
             }
             // Remaining entries are dynamically-spawned children not in TOML.
-            for (id, cp_agent) in cp_map {
+            for (id, mut cp_agent) in cp_map {
                 anyhow::ensure!(
                     !agents.contains_key(&id),
                     "duplicate agent id from checkpoint: {}",
                     id
                 );
                 let specs = registry.filtered_specs(cp_agent.cfg.capabilities.as_deref());
+                repair_and_record(&id, &mut cp_agent, &live_call_ids, &recorder);
                 let task = AgentTask::from_checkpoint(cp_agent, specs);
                 agents.insert(id, task);
             }
@@ -571,7 +641,26 @@ impl Scheduler {
             state.spawn_depths = r.spawn_depths;
             state.parent_map   = r.parent_map;
             state.approval_seq = r.approval_seq;
+            // attn.2 R2 (/review, Codex adversarial P1) — drop DEAD awaiting entries.
+            // An entry whose child is absent from the restored agent set can never be
+            // delivered: `handle_agent_terminal` is the only thing that answers it, and it
+            // only runs for an agent that exists. Keeping such an entry would be worse than
+            // the bug this increment fixes — the parent's dangling tool_use is treated as
+            // "promised" (so the repair skips it) AND the parent is skipped by the seed loop,
+            // so it parks silently forever, re-checkpointing the poison. Before R2 the same
+            // state at least failed fast and visibly with a 400.
+            // Dropping the entry makes it fail FORWARD: the repair answers the orphaned call
+            // with an error result and the parent is seeded and runs.
             for entry in r.awaiting {
+                if !state.agents.contains_key(&entry.child_id) {
+                    recorder.record(&entry.parent_id, None, EventKind::Error, json!({
+                        "stage": "restore",
+                        "error": "awaiting child absent from restored agents — dropping dead await",
+                        "child_id": &entry.child_id,
+                        "call_id":  &entry.call_id,
+                    }));
+                    continue;
+                }
                 state.awaiting.insert(entry.child_id, AwaitingParent {
                     parent_id: entry.parent_id,
                     call_id:   entry.call_id,
@@ -679,6 +768,23 @@ impl Scheduler {
             .values()
             .map(|pa| pa.agent_id.clone())
             .collect();
+        // attn.2 R2.1 / attn.1a-05 — a restored PARENT waiting on a child must not be
+        // re-stepped either. `awaiting` is keyed by CHILD id, so the parents are in
+        // `.values()`, not the keys; reaching for `contains_key` here is the same mistake
+        // that produced the ux.13 cancel P0.
+        //
+        // This is the bug that actually bricked the CoS. The trigger calls `run_job` and
+        // parks in `awaiting` without being enqueued, so on restore it was re-stepped,
+        // reached `step_need_infer`, and shipped its dangling `run_job` tool_use to the
+        // provider. Repairing messages alone does NOT fix it: the trigger would infer
+        // cleanly, its prompt would tell it to `run_job` again — a duplicate, fully-paid
+        // cycle — and the original child's result would then arrive for a call_id no
+        // longer present. Both halves are required.
+        let awaiting_parent_ids: std::collections::HashSet<String> = state
+            .awaiting
+            .values()
+            .map(|a| a.parent_id.clone())
+            .collect();
         let ids: Vec<String> = state.agents.keys().cloned().collect();
         for id in ids {
             state.spawn_depths.entry(id.clone()).or_insert(0);
@@ -688,6 +794,9 @@ impl Scheduler {
             }
             if state.waiting.contains(&id) {
                 continue; // Restored orchestrated agent parked between turns — do not re-step.
+            }
+            if awaiting_parent_ids.contains(&id) {
+                continue; // Restored parent awaiting a child result — the child delivers it.
             }
             let priority = state.agents[&id].priority();
             let cap_set = state.agents[&id].cap_set_cloned();
@@ -6801,6 +6910,305 @@ mod tests {
         assert!(
             log.contains("\"retries\":1"),
             "retries field must be 1 in the event payload"
+        );
+    }
+
+    // ── attn.2 R2 / attn.1a-05 tests ──────────────────────────────────────────
+
+    /// Build a checkpoint whose agent is parked mid-`run_job`: the assistant turn ends in an
+    /// unanswered `tool_use`, and `awaiting` records the scheduler's promise to answer it.
+    /// This is exactly the shape the CoS trigger checkpoints in — and because
+    /// `default_checkpoint_interval_turns()` is 1, it is captured on every turn of a cycle.
+    ///
+    /// `child_present` decides whether the await is LIVE or DEAD. Only an await whose child
+    /// still exists can ever be delivered (`handle_agent_terminal` is the sole delivery path
+    /// and runs only for an existing agent), so the two cases must behave oppositely:
+    /// live → skip the parent and preserve its dangling call; dead → drop the await, repair
+    /// the now-orphaned call, and let the parent run.
+    fn checkpoint_parked_mid_run_job(
+        parent: &str, child: &str, call_id: &str, child_present: bool,
+    ) -> SchedulerCheckpoint {
+        use crate::inference::{Block, Msg, Role};
+        let ids: Vec<&str> = if child_present { vec![parent, child] } else { vec![parent] };
+        let mut cp = minimal_scheduler_checkpoint(&ids);
+        cp.agents[0].messages.push(Msg {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                id: call_id.to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-inbox" }),
+            }],
+        });
+        // NB: the child is left NON-terminal on purpose. A terminal child would be delivered
+        // to the parent immediately without ever inferring, so the parent's inference would
+        // legitimately be the first one in the log and the ordering assertion in
+        // `restored_awaiting_parent_is_not_reseeded` would fail for a reason that is not the
+        // bug. A live child must actually run, which is also the realistic shape.
+        cp.awaiting = vec![crate::checkpoint::AwaitingEntry {
+            child_id:  child.to_string(),
+            parent_id: parent.to_string(),
+            call_id:   call_id.to_string(),
+            deliver_content: false,
+        }];
+        cp
+    }
+
+    /// A gateway that enforces the provider's tool_use/tool_result pairing rule.
+    ///
+    /// `MockGateway` accepts any history, and so does the `/qa` fake provider — so a test can
+    /// go green against a conversation the real API rejects with 400. That is the exact
+    /// false-green shape attn.1a-05 hid behind, so the invariant is ENFORCED here rather than
+    /// assumed. Rejects when the last message is an assistant turn carrying a `tool_use` with
+    /// no matching `tool_result`, which is the literal condition behind
+    /// "tool_use ids were found without tool_result blocks".
+    ///
+    /// This is also a deterministic observable: seed order comes from HashMap iteration, so
+    /// "who inferred first" is not stable and cannot be asserted on.
+    struct PairingCheckGateway {
+        responses: Arc<Mutex<Vec<InferenceResponse>>>,
+        rejected:  Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PairingCheckGateway {
+        fn new(responses: Vec<InferenceResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses)),
+                rejected:  Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl InferenceGateway for PairingCheckGateway {
+        async fn infer(&self, req: InferenceRequest) -> anyhow::Result<InferenceResponse> {
+            use crate::inference::{Block, Role};
+            if let Some(last) = req.messages.last() {
+                if last.role == Role::Assistant {
+                    let dangling: Vec<String> = last
+                        .blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::ToolUse { id, .. } => Some(id.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !dangling.is_empty() {
+                        self.rejected.lock().unwrap().extend(dangling.clone());
+                        return Err(anyhow::anyhow!(
+                            "400 messages: tool_use ids were found without tool_result blocks \
+                             immediately after: {dangling:?}"
+                        ));
+                    }
+                }
+            }
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                return Err(anyhow::anyhow!("PairingCheckGateway: no more responses queued"));
+            }
+            Ok(q.remove(0))
+        }
+        fn model_id(&self) -> &str { "pairing-check" }
+    }
+
+    /// R2.1 — a restored parent awaiting a child must NOT be re-stepped by the seed loop.
+    /// Re-stepping is what shipped the dangling `run_job` tool_use to the provider and
+    /// bricked the CoS; it would also run a second, fully-paid cycle.
+    #[tokio::test]
+    async fn restored_awaiting_parent_is_not_reseeded() {
+        let cp = checkpoint_parked_mid_run_job("trigger", "cos-inbox-2026-08-02", "toolu_rj", true);
+        let gw = PairingCheckGateway::new(vec![
+            end_turn("child answer", 1, 1),
+            end_turn("parent continues", 1, 1),
+        ]);
+        let rejected = Arc::clone(&gw.rejected);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("trigger", "orchestrate")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+
+        // Assert COMPLETION, not just "we waited". A skip arm that parks an agent forever
+        // would be a worse regression than the 400 it replaces — the old behaviour at least
+        // failed fast.
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), sched.run()).await;
+        assert!(completed.is_ok(),
+            "scheduler hung with a live awaiting-parent — the skip arm must not deadlock the \
+             run loop");
+
+        // The provider-accurate observable: the parent must never have been handed a history
+        // whose final assistant turn still carries an unanswered tool_use. Asserting on WHICH
+        // agent inferred first cannot work — seed order is HashMap iteration order.
+        let r = rejected.lock().unwrap();
+        assert!(
+            r.is_empty(),
+            "an agent was stepped while its tool_use was still unanswered ({r:?}). That is the \
+             attn.1a-05 brick: the seed loop must skip a parent that is awaiting a child, and \
+             the restore repair must answer any genuinely orphaned call."
+        );
+    }
+
+    /// R2.1 fail-forward — a DEAD await (child absent from the restored set) must NOT park the
+    /// parent. Nothing can ever deliver it: `handle_agent_terminal` is the only delivery path
+    /// and it runs only for an agent that exists. Treating it as live would suppress the repair
+    /// AND skip the parent, leaving it silent forever while re-checkpointing the poison —
+    /// strictly worse than the 400 this increment removes. Found independently by the Codex
+    /// adversarial pass and the security specialist during /review.
+    #[tokio::test]
+    async fn restored_parent_with_dead_await_resumes_instead_of_parking() {
+        use crate::inference::Block;
+        let cp = checkpoint_parked_mid_run_job("trigger", "ghost-child", "toolu_dead", false);
+        let gw = MockGateway::new(vec![end_turn("parent recovered", 1, 1)]);
+        let queue = Arc::clone(&gw.responses);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("trigger", "orchestrate")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+
+        let answered = sched.agents["trigger"].messages().iter().any(|m| {
+            m.blocks.iter().any(|b| matches!(b,
+                Block::ToolResult { tool_use_id, is_error, .. }
+                if tool_use_id == "toolu_dead" && *is_error))
+        });
+        assert!(answered,
+            "a dead await must be dropped so the repair answers the orphaned call; leaving it \
+             live suppresses the repair and parks the parent forever");
+
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), sched.run()).await;
+        assert!(completed.is_ok(), "scheduler hung on a dead await");
+        assert_eq!(queue.lock().unwrap().len(), 0,
+            "the parent must be seeded and RUN once its dead await is dropped — parking it \
+             silently is the regression this test exists to prevent");
+
+        // The dead await is dropped inside `run()` (that is where scheduler state is
+        // restored), so this must be asserted after it. It IS a genuine anomaly, so unlike the
+        // self-heal above it stays EventKind::Error and should read red in the cockpit.
+        let log = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        let ev = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["data"]["child_id"] == "ghost-child")
+            .expect("dropping a dead await must be recorded — silently mutating restored \
+                     scheduler state is exactly the invisibility this increment fights");
+        assert_eq!(ev["kind"], "error", "a dead await is a real anomaly and should read red");
+        assert_eq!(ev["data"]["call_id"], "toolu_dead");
+    }
+
+    /// Negative control for the above. Without this, deleting the whole seed loop would
+    /// make `restored_awaiting_parent_is_not_reseeded` pass vacuously.
+    #[tokio::test]
+    async fn restored_agent_with_no_pending_await_is_still_seeded() {
+        let cp = minimal_scheduler_checkpoint(&["plain"]);
+        let gw = MockGateway::new(vec![end_turn("done", 1, 1)]);
+        let queue = Arc::clone(&gw.responses);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("plain", "ordinary task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), sched.run()).await;
+
+        assert_eq!(
+            queue.lock().unwrap().len(), 0,
+            "an ordinary restored agent MUST still be seeded; if it is not, the skip arm is \
+             over-broad and the previous test proves nothing"
+        );
+    }
+
+    /// R2.2 — restore repairs an ORPHANED dangling call (no scheduler promise to answer it),
+    /// so the next inference is well-formed instead of 400-ing.
+    #[test]
+    fn restore_repairs_an_orphaned_dangling_tool_use() {
+        use crate::inference::{Block, Role};
+        // Same parked shape, but with NO awaiting entry — nothing will ever answer it.
+        let mut cp = checkpoint_parked_mid_run_job("solo", "unused", "toolu_orphan", false);
+        cp.awaiting.clear();
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("solo", "task")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+
+        // The self-heal must be RECORDED — it is the operator's only trace of it — and it
+        // must NOT be an error event: `agentctl/src/watch/inspector.rs:is_error_event` matches
+        // "kind":"error" to drive the Errors filter and the red row colour, so recording a
+        // successful repair as an error paints every self-healed boot as a failure.
+        let log = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        let ev = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["data"]["stage"] == "restore_repair")
+            .expect("the restore repair must emit a flight event");
+        assert_eq!(ev["kind"], "agent_restored",
+            "must not be `error` — that would paint a successful self-heal red in the cockpit");
+        assert_eq!(ev["agent"], "solo", "the JSONL field is `agent`, not `agent_id`");
+        assert_eq!(ev["data"]["repaired_call_ids"], serde_json::json!(["toolu_orphan"]));
+
+        let msgs = sched.agents["solo"].messages();
+        let last = msgs.last().expect("history must not be empty");
+        assert_eq!(last.role, Role::User, "an orphaned call must be answered by a user turn");
+        assert!(
+            last.blocks.iter().any(|b| matches!(b,
+                Block::ToolResult { tool_use_id, is_error, .. }
+                if tool_use_id == "toolu_orphan" && *is_error)),
+            "orphaned toolu_orphan must receive a synthetic error tool_result on restore"
+        );
+    }
+
+    /// R2.2 negative control — a dangling call the scheduler HAS promised to answer must be
+    /// left alone. Repairing it would make the child's real result arrive as a tool_result
+    /// with no matching tool_use: the same API error, from the other side.
+    #[test]
+    fn restore_does_not_repair_a_live_awaited_call() {
+        use crate::inference::Block;
+        let cp = checkpoint_parked_mid_run_job("trigger", "child-1", "toolu_live", true);
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![agent_cfg("trigger", "orchestrate")],
+            &model_cfg(),
+            unlimited(),
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        ).unwrap();
+
+        let answered = sched.agents["trigger"].messages().iter().any(|m| {
+            m.blocks.iter().any(|b| matches!(b,
+                Block::ToolResult { tool_use_id, .. } if tool_use_id == "toolu_live"))
+        });
+        assert!(
+            !answered,
+            "a call recorded in `awaiting` must NOT be answered by the restore repair — the \
+             child delivers it later, and a duplicate answer is the same 400 in reverse"
         );
     }
 

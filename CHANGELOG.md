@@ -3,6 +3,99 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.119.0] - 2026-08-01
+
+### Fixed
+- **attn.2 R1 — a missing `OPENAI_API_KEY` no longer fails the boot, and no longer restart-loops.**
+  `docker/entrypoint.sh` exited 1 when the key was absent. Once v0.118.0 added
+  `restart: unless-stopped`, that turned a missing env var into a loop — observed in the field as
+  `Exited (1)`, `RestartCount=10`, with the CoS down for a day. The asymmetry with the Google check
+  is deliberate and preserved: **no Gmail means no brief, so that one still fails closed.** An
+  embeddings key only ever bought semantic `kb_search`; `kb_put`/`kb_get` are point lookups by
+  UUID5 of the key and the morning brief needs only those.
+  - The preflight now **warns** and the sidecar runs degraded. `SEMANTIC_DEGRADED` is tri-state and
+    defaults to AUTO: `semantic-kb-mcp` is a *separate container*, so the `cos` entrypoint cannot
+    export into it and Compose cannot express "set this only when that other variable is empty".
+    The process that knows whether it has a key decides. Explicit `1`/`0` always wins.
+  - Kept deliberately distinct from `MOCK_EMBEDDINGS`, which stays a **testing** flag (zero vectors,
+    full functionality, real collection names — the self-tests run under it). Conflating the two
+    would break the suite and overload a test flag with production meaning.
+  - **`kb_search` returns an explicit empty under degradation, short-circuiting before Qdrant.**
+    This is the load-bearing part. With zero vectors every point is equidistant, so a
+    nearest-neighbour search returns arbitrary points — which the curator renders as
+    `## Open Items (carried forward)`. Un-guarded degradation would replace an honest "nothing
+    carried forward" with resolved items presented to the operator as open.
+  - **Degraded writes are namespaced to `kbdegraded_*`.** Mixing zero vectors into a collection
+    holding real embeddings destroys its search quality permanently, and restoring the key does not
+    undo it. Isolating by name makes a degraded run fully reversible.
+  - `EFFECTIVE_EMBED_DIM` pins the writer and the collection to one width. `_embed` fell back to
+    1536 while `_ensure_collection` used a bare `EMBED_DIM`, so an unlisted `EMBED_MODEL` created a
+    dim-0 collection that then rejected every write. Latent before; R1 makes that path reachable.
+  - Four new sidecar self-tests (T21–T25), each mutation-verified: dropping the search guard,
+    dropping namespace isolation, reverting to the bare `EMBED_DIM`, and conflating the two flags
+    all fail the suite.
+- **attn.2 R2 (`attn.1a-05`) — an agent checkpointed mid-tool-call no longer bricks on restore.**
+  The Messages API rejects an assistant turn ending in an unanswered `tool_use`, the agent died on
+  its first inference after restore, and because the failure path checkpoints again on shutdown it
+  re-poisoned its own checkpoint — so every later boot repeated it. **Two fixes; either alone leaves
+  a live bug:**
+  - **R2.1** the seed loop skipped agents parked on approvals and agents in `state.waiting`, but had
+    **no arm for a parent awaiting a child**, though `state.awaiting` is restored. The CoS trigger
+    parks exactly that way when it calls `run_job`. Repairing messages alone would let it infer
+    cleanly, call `run_job` a second time (a duplicate, fully-paid cycle), and then 400 anyway when
+    the original child's result arrived for a `call_id` no longer present.
+  - **R2.2** `AgentTask::repair_dangling_tool_uses`, called at the `from_checkpoint` **call site** in
+    `scheduler.rs` — not inside `from_checkpoint`, which sees a single agent and cannot know which
+    dangling ids the scheduler has promised to answer. Ids in `awaiting`/`pending_approvals` are left
+    strictly alone: answering them would make the real result arrive as a `tool_result` with no
+    matching `tool_use`, the same API error from the other side. Only orphaned ids get a synthetic
+    error result — appended, not stripped, because stripping the only block from a tool-only turn
+    leaves empty content, which the API also rejects.
+  - Not a rare shutdown race: `default_checkpoint_interval_turns()` is **1** and the periodic write
+    snapshots every agent, so while a child burns its turns, *every* checkpoint captures the parent
+    mid-call.
+  - 10 new tests, mutation-verified 4/4 — including the `.keys()`-instead-of-`.values()` slip on
+    `awaiting` that produced the ux.13 cancel P0.
+
+### Corrected
+- **`TODOS.md` `attn.1a-05` claimed a restart loses a pending `request_approval`. That is false.**
+  `ParkedApproval` is checkpointed and the seed loop already skipped those agents. The real gap was
+  the awaiting-parent arm above. Corrected in place rather than left for a future session.
+- Docs stating `OPENAI_API_KEY` is required (`docs/DEPLOYMENT.md`, `docs/MCP_SERVERS.md`,
+  `docker-compose.yml` ×4 comments) now say optional, and `docs/RUNBOOK.md` §11.2 gains a
+  required-vs-optional key table plus a degraded-mode section.
+
+### Verified
+
+- **`/review`: 16 findings applied, 4 of them mutation-proven false greens.** One was a test written
+  during that same review round: it read `v["agent_id"]` from the flight log where the field
+  serialises as `agent`, making the assertion unfailable — deleting the entire seed-skip arm left the
+  suite green. Replaced the ordering heuristic (unusable: seed order is `HashMap` iteration) with a
+  `PairingCheckGateway` that enforces the provider's `tool_use`/`tool_result` rule, which also closes
+  the gap that `MockGateway` and the `/qa` fake accept histories the real API rejects. Tests 15 → 27;
+  14 mutations run, all caught.
+- **`/qa`: 5 runtime tests against real infrastructure, each with a negative control.** Keyless boot
+  gets past the preflight in a real container (`agentd check --strict: 0 errors`, credential gateway
+  up); removing `google.json` still exits 1 with `agentd` never starting; degraded `kb_search` returns
+  an explicit empty against a real Qdrant while a seeded real collection stays untouched — and the
+  same build with the guard removed returns a hit at `score=0.0`; and restore survival proven against
+  the real `agentd` binary, where the pre-fix build (compiled from `main` in a worktree) reproduces
+  the production 400 verbatim and the fixed build completes.
+
+### Added
+
+- **`docs/AUDIT-v0.118.md`** — a five-lane audit (docs-vs-code, security/threat-model, test
+  integrity, runtime correctness, product state), every finding carrying a `file:line` quote from
+  both sides. **Its headline blocks the brief track:** context paging is keyed to `token_budget`, a
+  spend ceiling, rather than the model's context window, so paging can never fire and the pipeline
+  burns its daily window without emitting a brief. Measured on the live volume, not read: 65
+  inference requests in 29 minutes, 417,638 tokens, zero `memory_paged`, `output/` empty. Filed as
+  `audit118-R1` (P0) with seven more items. Also restores `docs/AUDIT-v0.97.md`, cited by CLAUDE.md
+  but absent from the tree (it vanished in a squash with no deletion commit).
+- **`.gitignore` now covers `.env`.** `.env.example` is tracked and the deployment docs instruct
+  copying it and filling in real keys, so a single `git add -A` after following the documented setup
+  committed your API keys. Negative-checked that `.env.example` itself stays tracked.
+
 ## [v0.118.0] - 2026-08-01
 
 ### Fixed

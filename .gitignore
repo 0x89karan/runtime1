@@ -29,3 +29,10 @@ output/
 .DS_Store
 .gstack/
 __pycache__/
+
+# Secrets. .env.example is committed as a template and DEPLOYMENT.md tells you to
+# copy it to .env and fill in real keys — so .env must never be committable.
+# Audit v0.118: .env was not ignored while .env.example shipped with those instructions.
+.env
+.env.*
+!.env.example

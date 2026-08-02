@@ -24,13 +24,51 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.118.0 (shipped 2026-08-01)
+**Current version:** v0.119.0 (shipped 2026-08-01)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** attn.1a-core (v0.118.0) — **the CoS now stays running, and says when it
-hasn't.** The pipeline produced **three briefs in fifteen days** (09:13, 16:01, 02:55 — three
-unrelated times) and the cause was NOT the brief logic: `docker-compose.yml` had **no `restart:`
+**Latest shipped:** attn.2 R1+R2 (v0.119.0) — **the CoS boots without an embeddings key and
+survives restore. It still cannot produce briefs — see the audit finding below.** Plan:
+`docs/plans/attn.2-workable-brief.md` (issue #164, reshaped at the /autoplan premise gate from
+four stages to five corrected items; only R1 and R2 are built).
+- **R1: `OPENAI_API_KEY` is no longer a boot gate.** `entrypoint.sh` exited 1 without it, and
+  v0.118.0's `restart: unless-stopped` turned that into a **ten-restart loop** (measured:
+  `Exited(1)`, `RestartCount=10`, CoS down a day). The key only ever bought semantic `kb_search`;
+  `kb_put`/`kb_get` are point lookups the brief needs. **The Google gate still fails closed** — no
+  Gmail means no brief — and `agentd/tests/entrypoint_gates.rs` now pins that asymmetry.
+- **Degradation is honest, not silent.** `kb_search` returns an *explicit empty* rather than
+  arbitrary nearest-neighbours: with zero vectors every point is equidistant, so un-guarded it
+  returns resolved items rendered as "Open Items (carried forward)". Proven at /qa against a real
+  Qdrant — the un-guarded build returns a hit at `score=0.0`. Degraded writes go to
+  `kbdegraded_*`, so real embeddings are untouched and TTL eviction sweeps both namespaces.
+  `SEMANTIC_DEGRADED` is tri-state and defaults to AUTO because the sidecar is a **separate
+  container** the cos entrypoint cannot export into.
+- **R2: `attn.1a-05` closed, both halves.** The seed loop skipped approval-parked agents and
+  `state.waiting` but had **no arm for a parent awaiting a child** — which is how the CoS trigger
+  parks on `run_job`. Plus a state-aware repair at the `from_checkpoint` **call site** (not inside
+  it — that function cannot see which dangling ids the scheduler has promised to answer). Proven at
+  /qa against the real binary: the pre-fix build reproduces the production 400 verbatim, the fixed
+  build completes. **Correction: the TODOS claim that a restart loses a pending `request_approval`
+  was false** — approvals were already checkpointed and seed-skipped.
+- **⚠ THE PIPELINE STILL CANNOT PRODUCE BRIEFS.** `docs/AUDIT-v0.118.md` R1 (measured, not read):
+  context paging is keyed to `token_budget`, a **spend ceiling**, not the model's context window —
+  there is no `context_window` concept in the codebase. The Hard threshold sits at 4.5e9 retained
+  tokens for the orchestrator against a 200k window, so paging can never fire. Live measurement:
+  **65 inference requests in 29 minutes, 417,638 tokens, zero `memory_paged`, `output/` empty.**
+  Spend is quadratic in turns. **Fix this before bringing the stack up** — otherwise it boots,
+  survives restarts, and still emits nothing while burning the daily window in 2–3 hours.
+- **Also open from the same audit:** the R2 repair runs only on the restore path, but the live 400
+  loop was in-memory — the pairing check must run before every `InferenceRequest`.
+- **/review found 16 issues including 4 mutation-proven false greens, one of them a test I wrote
+  during that same review** (it read `v["agent_id"]` when the field serialises as `agent`, making
+  the assertion unfailable). Lesson recorded: mutation-verifying a test and then rewriting it voids
+  the proof. 27 tests, 14 mutations, all caught.
+
+**Prev:** attn.1a-core (v0.118.0) — **the CoS now stays running, and says when it
+hasn't.** The pipeline produced **three briefs in fifteen days** — note the audit has since shown
+those timestamps are *two overwrites plus one write*, not three runs, so there were at least five
+runs. The cause was NOT the brief logic: `docker-compose.yml` had **no `restart:`
 policy on any service**, so it only ran while someone hand-typed `docker compose up`. The Linux/QEMU
 path had a partial equivalent all along; the Mac path — the one dogfooded — had nothing. Plan:
 `docs/plans/attn.1a-sub-daily-job-safety.md`.
@@ -210,11 +248,21 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **Run it for 14 days, then decide.** attn.1a-core removed the reason the CoS
-wasn't running; nothing further in the brief/attention track should be built until there is field data.
-1. `docker compose up -d cos` (**`up -d`, not `start`** — see the recreate note above), then leave it.
-2. The D4 measure from office hours: **does the operator stop checking email manually?** 14 days.
-   Paired computable proxy (needs `attn.2`): the already-handled rate of morning-brief items.
+**Next (roadmap):** **Fix the context window FIRST, then run it for 14 days.** Do NOT start the
+14-day measure yet — `docs/AUDIT-v0.118.md` R1 shows the pipeline cannot produce briefs as
+configured, so the measure would record a drought caused by a known bug and teach us nothing.
+1. **`AUDIT-v0.118.md` R1 — a real `context_window`, separate from `token_budget`.** This is the
+   blocker. Paging is keyed to the spend ceiling, so it never fires; measured 417,638 tokens in 29
+   minutes with `output/` empty. Its own increment; also fold in R2's runtime gap (the pairing check
+   before every `InferenceRequest`, not only on restore) since it is the same subsystem.
+2. **Then** `docker compose up -d cos` (**`up -d`, not `start`** — see the recreate note above) and
+   leave it. Booting before step 1 burns roughly 4M tokens a day and still emits nothing.
+3. The D4 measure from office hours: **does the operator stop checking email manually?** 14 days.
+   Paired computable proxy (needs `attn.2` R3): the already-handled rate of morning-brief items.
+
+**In parallel, needing zero engineering:** name mv design partners. Gate 2026-10-01 (61 days at time
+of writing), 0 of 10 named, 0 of 3 demos. Candidate contacts are already inside the briefs on disk.
+Both CEO voices ranked this above the whole brief track, twice.
 3. `C4` acceptance criterion: if the observed interrupt-worthy rate is **≤3/week**, retire the
    attention-router tier rather than tuning it. CLAUDE.md's standing gate: "if it is ~2 actions a
    morning, build nothing further." The three briefs analysed at /autoplan ran ~3/week.

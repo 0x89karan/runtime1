@@ -204,7 +204,67 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   BuildKit ≥0.16 that speaks the gha cache v2 API, OR switch to `type=registry` cache
   (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
   releases publish fine after the hotfix.
-- **attn.2 (P1) [operator ask, restated 2026-08-02] — there is no way to fire the CoS on demand.**
+- **audit118-R1 (P0) [AUDIT-v0.118, measured] — context paging is keyed to `token_budget` (a SPEND
+  ceiling), not the model's context window. The CoS cannot produce briefs.** There is no
+  `context_window` concept in the codebase. `context.rs:43` divides retained tokens by
+  `token_budget`; `agent/mod.rs:813` passes `self.cfg.token_budget`. With HARD_THRESHOLD 0.90 and the
+  shipped budgets, Hard fires at 4.5e9 / 1.35M / 450k retained against a 200k window — 22,500× too
+  high for the orchestrator, so paging never fires. **Measured on the live volume: 65 inference
+  requests in 29 min, 417,638 tokens, msg_count 121→126 monotonic, zero `memory_paged`, `output/`
+  empty.** Spend is quadratic in turns. Independent of and unaddressed by attn.1a's restart fix.
+  Fix: a real `context_window` config field, defaulted per model, threaded to `assess()`.
+- **audit118-R2 (P1) [AUDIT-v0.118] — the dangling-`tool_use` repair runs only on the restore path.**
+  attn.2 R2 fixed restore, but the live 400 loop was in-memory (no `checkpoint.json` in the volume).
+  `repair_dangling_tool_uses` is reachable only from `repair_and_record` at `scheduler.rs:419`/`:434`.
+  Fix: run the pairing check before every `InferenceRequest`. Small; belongs with audit118-R1.
+- **audit118-R3 (P1) [AUDIT-v0.118] — three PRODUCT-THESIS security claims the code does not
+  implement.** `:63` network-namespace egress confinement (`universal.rs:68` passes
+  `--network=host`); `:65` eBPF syscall auditing (no eBPF exists); `:69`/`:108` per-tool approval
+  gates (`config.rs:495` — the action is passed BY the agent to an ordinary tool). Also
+  `THREAT_MODEL.md:258` lists `IsolateMount` under "what the sandbox enforces" with zero production
+  callers, and `:139` bases the checkpoint risk-window on `CheckpointStore::remove()`, which does not
+  exist. Outward-facing doc; fix the claims or build the controls.
+- **audit118-R4 (P1) [AUDIT-v0.118, mutation-proven] — vacuous self-matching test guards, 5th
+  instance.** `credential/mod.rs` does `include_str!("mod.rs")` and asserts on bare literals that its
+  own assertion text satisfies. Proven: deleting the 502 Err arm and removing the OAuth refresh
+  timeout both left the suite green. Worst: `cos_spawn_caps_subset.rs:49-59` matches
+  `Capability::Mcp { .. }` — a wildcard — while guarding the cap.2b P1-10 criterion, so a
+  `shell_exec` grant to the schedule-exposed trigger passes. Fix: scan only the production region
+  (`.split("#[cfg(test)]").next()`), and pin the server name in the capability arm.
+- **audit118-R5 (P1) [AUDIT-v0.118] — `mcp.rs:382` byte-slices a `&str`.**
+  `&raw.trim()[..raw.trim().len().min(256)]` panics on a multi-byte boundary; `panic = "abort"` + PID
+  1 = full-system failure. The correct version is at `mcp.rs:821` **in the same file**. One line.
+  Same class as the ux.6a `hex_decode` boot panic.
+- **audit118-R6 (P1) [AUDIT-v0.118] — `CompletedTruncated` makes the durable record contradict the
+  outcome.** `agent/mod.rs:976` emits `AgentCompleted` on both branches; `scheduler.rs:2170` converts
+  the effect to a failure and emits nothing (`AgentFailed` appears only at `:741`/`:753`/`:962`). So
+  `flight.jsonl` says completed while `runs.redb` says failed. Fix: give it a kind, or emit
+  `AgentFailed`.
+- **audit118-R7 (P2) [AUDIT-v0.118, mutation-proven] — `EventKind::ALL` is not compile-time
+  exhaustive.** Adding a variant to the enum + `as_str()` + `touch()` but not `ALL` compiles and
+  leaves every guard green, because `all_is_exhaustive` iterates `ALL` to check `ALL`. All three
+  consumers are downstream of the same unenforced array. Fix: generate `ALL` from the `as_str()`
+  match. Repairs four guards at once.
+- **audit118-R8 (P2) [AUDIT-v0.118] — docs that fail if followed literally.** The
+  `MCP_SERVERS.md:173` `[capabilities]` snippet is a top-level table serde silently drops;
+  `passenv = ["BRAVE_SEARCH_API_KEY"]` is blocklisted at `mcp.rs:46` and ships in two templates;
+  `RUNBOOK.md:916` tells the operator to `rm checkpoint.json` to clear spend (the window self-resets
+  and the file holds live run state); `cos.agents.toml:52` greps for `egress_rejected` when the kind
+  is `egress_denied`; `README.md:17` Status is 52 releases stale; `AGENTD_MANAGEMENT_ENABLED` and
+  `SIDECAR_SECRET` are undocumented. Full list in `docs/AUDIT-v0.118.md` R6.
+
+- **attn.2 (P1) — R1+R2 SHIPPED (v0.119.0); R3/R4/R5 still open. Original ask: there is no way
+  to fire the CoS on demand.**
+  **Shipped in v0.119.0:** R1 (a missing `OPENAI_API_KEY` no longer fails the boot; degrades
+  honestly with `kb_search` returning an explicit empty and writes namespaced to
+  `kbdegraded_*`) and R2 (`attn.1a-05` closed — awaiting-parent seed skip + state-aware
+  dangling-`tool_use` repair at the `from_checkpoint` call site).
+  **Still open:** R3 (inbox-scoped Gmail query so archive means handled, dedup Important vs
+  Response Needed, narrowed escaping, `suppressed_count`), R4 (non-destructive brief writes —
+  needs a `{ts}` token in `Job::render()`, which only substitutes `{date}`), R5 (the manual
+  fire itself — and its sentinel must NOT live in curator-writable `./output`).
+  **Blocked behind `AUDIT-v0.118.md` R1**: none of R3–R5 can be measured while paging is keyed
+  to the spend budget and the pipeline burns its window without emitting a brief.
   The operator asked for this at the start of the 2026-08-01 session ("a way to see active and open
   emails via a manual sync more than once a day") and again after the first daily cron proved
   unusable. Today the only fire path is the cron, so testing a change means either waiting for
@@ -233,7 +293,7 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   the file. Needs `/autoplan` before any build; the capability question (curator has `FsWrite` on
   `./output` but no `FsRead`) is deliberately left open for its security pass.
 
-- **attn.1a-05 (P1) [new, observed live on v0.118.0, 2026-08-02] — restarting an agent that is
+- ~~**attn.1a-05 (P1)**~~ **[FIXED — attn.2 R2, see below] — restarting an agent that is
   parked mid-tool-call BRICKS it permanently, and `restart: unless-stopped` now walks into this by
   itself.** Observed on the real CoS, not inferred. Full mechanism:
   1. `wait_for_trigger` (`docker/cron_mcp.py:350`) sleeps until `min(next_fire, now+timeout_s)` and
@@ -250,8 +310,26 @@ are defined in `docs/AUDIT-v0.86.md §6`.
      `/data/checkpoint.json.restored` — a normal restart cannot escape it.
   **NOT CoS-specific.** `checkpoint.rs` contains **zero** `tool_use`/`tool_result` handling (grep
   verified), and `from_checkpoint` (`agent/mod.rs:300`) restores `messages: cp.messages` verbatim with
-  no validation. Any long park is exposed — including **`request_approval`**, the human-in-the-loop
-  gate: an agent parked awaiting an operator approval across a restart loses the approval AND dies.
+  no validation. Any long park is exposed.
+  **⚠ ONE CLAIM IN THIS ENTRY WAS WRONG** (found at /autoplan, 2026-08-02): "an agent parked awaiting
+  an operator approval across a restart loses the approval AND dies" is FALSE. `ParkedApproval` is
+  checkpointed (`checkpoint.rs:127-129`) and the seed loop already skips those agents
+  (`scheduler.rs:686-688`). The real gap was narrower and different: the seed loop skips
+  approval-parked agents and `state.waiting`, but had **no arm for a parent awaiting a child**, even
+  though `state.awaiting` IS restored. The CoS trigger parks exactly that way when it calls
+  `run_job`, so on restore it was re-stepped and shipped its dangling `run_job` tool_use.
+  **FIXED in attn.2 R2, both halves — either alone leaves a live bug:**
+  - **R2.1** an awaiting-parent skip arm in the seed loop. Without it, repairing messages alone lets
+    the trigger infer cleanly, call `run_job` a second time (a duplicate, fully-paid cycle), and then
+    400 anyway when the original child's result arrives for a call_id no longer present.
+  - **R2.2** `AgentTask::repair_dangling_tool_uses`, called at the `from_checkpoint` CALL SITE in
+    `scheduler.rs` — not inside `from_checkpoint`, which sees one agent and cannot know which
+    dangling ids the scheduler has promised to answer. Ids in `awaiting`/`pending_approvals` are left
+    strictly alone (answering them would make the real result land as a `tool_result` with no
+    matching `tool_use` — the same 400 in reverse); only orphaned ids get a synthetic error result.
+  Also worth recording: this was never a rare shutdown race. `default_checkpoint_interval_turns()`
+  is **1** (`config.rs:449-451`) and the periodic write snapshots every agent, so while a child burns
+  its turns, **every** checkpoint captures the parent mid-call.
   **Severity is raised by attn.1a-core itself:** `restart: unless-stopped` (v0.118.0) makes restarts
   automatic, so a crash while parked now self-inflicts this without anyone touching the container.
   Before that change the trap needed a human to run a restart.

@@ -77,6 +77,44 @@ OPENAI_KEY      = os.environ.get("OPENAI_API_KEY", "")
 EMBED_MODEL     = os.environ.get("EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIM       = _EMBED_MODEL_DIMS.get(EMBED_MODEL, 0)  # 0 = unknown model
 MOCK_EMBED      = os.environ.get("MOCK_EMBEDDINGS", "0") == "1"
+# attn.2 R1: production degrade mode, distinct from MOCK_EMBEDDINGS on purpose.
+#   MOCK_EMBEDDINGS  = a TESTING flag. Deterministic zero vectors, full functionality,
+#                      real collection names. The self-tests below run under it.
+#   SEMANTIC_DEGRADED = a PRODUCTION flag, set when OPENAI_API_KEY is absent. Also uses zero
+#                      vectors so kb_put/kb_get (point lookups by UUID5 of the key) keep
+#                      working, but additionally (a) makes kb_search return an explicit empty
+#                      rather than arbitrary nearest-neighbours, and (b) namespaces collections
+#                      apart so zero vectors never land in a collection holding real ones.
+# Conflating them would break the self-tests AND overload a test flag with production meaning.
+#
+# Tri-state, and AUTO is the default on purpose. This sidecar is a separate container from
+# `cos`, so the cos entrypoint cannot export a variable into it, and Compose cannot express
+# "set this only when OPENAI_API_KEY is empty". Requiring the operator to keep two settings in
+# sync is a footgun: forget the second and you get the old failure (every kb_put erroring)
+# instead of clean degradation. This process already knows whether it has a key, so it decides.
+# An explicit value always wins, and the startup banner states which mode is active.
+def _resolve_degraded(raw: str, has_key: bool, mock: bool) -> bool:
+    """Resolve the tri-state. Pure so it can be table-tested: the AUTO branch is the ONLY
+    path a key-less deployment takes (compose sends an empty string), and it previously had
+    no coverage at all — replacing this whole block with `False` left every test green while
+    killing the feature outright."""
+    v = raw.strip().lower()
+    if v in ("1", "true", "yes"):
+        return True
+    if v in ("0", "false", "no"):
+        return False
+    # AUTO: no key and not a mock/test run → degrade rather than fail every call.
+    return (not has_key) and (not mock)
+
+
+SEMANTIC_DEGRADED = _resolve_degraded(
+    os.environ.get("SEMANTIC_DEGRADED", ""), bool(OPENAI_KEY), MOCK_EMBED
+)
+# Single source of truth for vector width. `_embed` used `EMBED_DIM or 1536` while
+# `_ensure_collection` used a bare `EMBED_DIM`, so an unlisted EMBED_MODEL created a dim-0
+# collection and then wrote 1536-dim vectors into it. Latent while the compose default is a
+# known model; R1 makes the zero-vector path production-reachable, so pin both to one value.
+EFFECTIVE_EMBED_DIM = EMBED_DIM or 1536
 PORT            = int(os.environ.get("PORT", "8020"))
 SIDECAR_SECRET  = os.environ.get("SIDECAR_SECRET", "")  # optional inbound auth token
 SEMANTIC_MAX_AGE_DAYS = int(os.environ.get("SEMANTIC_MAX_AGE_DAYS", "30"))
@@ -153,9 +191,9 @@ def _validate_segment(segment: str) -> None:
 # ── Embedding ─────────────────────────────────────────────────────────────────
 
 def _embed(texts: list[str]) -> list[list[float]]:
-    """Return embeddings for a list of texts. Uses mock zeros when MOCK_EMBED is set."""
-    if MOCK_EMBED:
-        return [[0.0] * (EMBED_DIM or 1536) for _ in texts]
+    """Return embeddings for a list of texts. Uses zeros under MOCK_EMBED or SEMANTIC_DEGRADED."""
+    if MOCK_EMBED or SEMANTIC_DEGRADED:
+        return [[0.0] * EFFECTIVE_EMBED_DIM for _ in texts]
     if not OPENAI_KEY:
         raise RuntimeError(
             "OPENAI_API_KEY is not set and MOCK_EMBEDDINGS is not '1'. "
@@ -218,6 +256,17 @@ def _qdrant(path: str, method: str = "GET", body: dict | None = None) -> dict:
         if len(body_bytes) > MAX_QDRANT_RESPONSE:
             raise RuntimeError(f"Qdrant {method} {path} → HTTP {e.code}: error body too large") from e
         raise RuntimeError(f"Qdrant {method} {path} → HTTP {e.code}: {body_bytes.decode('utf-8', errors='replace')}") from e
+    except (urllib.error.URLError, OSError) as e:
+        # attn.2 R1 (/review, maintainability specialist). Only HTTPError was normalised, so a
+        # connection refusal, DNS failure or socket timeout raised URLError — which is NOT a
+        # RuntimeError, so every `except RuntimeError` in this file silently missed it and the
+        # exception escaped. At startup that killed the process from `_evict_all_collections`,
+        # whose handler says "Qdrant not reachable yet — skip eviction" and could never
+        # actually catch that case. With `restart: unless-stopped` now on the sidecar, a
+        # restart while Qdrant is still coming up became an unbounded crash loop — exactly the
+        # failure class R1 exists to remove, reintroduced one layer down.
+        # HTTPError is a URLError subclass, so it must stay matched by the arm above.
+        raise RuntimeError(f"Qdrant {method} {path} unreachable: {e}") from e
 
 
 def _collection_name(segment: str) -> str:
@@ -237,9 +286,30 @@ def _collection_name(segment: str) -> str:
     current segment set (mail:raw, ops:entities, ops:briefs, project:meta, project:research)
     sanitizes to five distinct names — see test_t20 for the injectivity fence. Revisit
     (fold the segment into `_point_id`, or hash the raw segment) before adding a segment
-    that differs from an existing one only by a sanitized character."""
+    that differs from an existing one only by a sanitized character.
+
+    NOTE (attn.2 R1.4): under SEMANTIC_DEGRADED the prefix becomes `kbdegraded_`, so zero
+    vectors are written to a SEPARATE collection. Without this, a degraded run mixes zero
+    vectors into a collection holding real embeddings and permanently destroys its search
+    quality — restoring OPENAI_API_KEY does not undo it, and nothing detects it. Isolating by
+    name means a degraded run is fully reversible: set the key, and the real collection is
+    exactly as it was. MOCK_EMBEDDINGS deliberately does NOT change the name, so the
+    self-tests keep exercising the real mapping (see test_t20)."""
     safe = re.sub(r"[^A-Za-z0-9_]", "_", segment)
-    return f"kb_{safe}"
+    return f"{_collection_prefix()}{safe}"
+
+
+def _collection_prefix() -> str:
+    """The collection-name prefix for the CURRENT mode. Single source of truth so that
+    anything deriving a name stays in step with what `_collection_name` writes."""
+    return "kbdegraded_" if SEMANTIC_DEGRADED else "kb_"
+
+
+# Every prefix this server has ever written, regardless of current mode. The retention
+# sweep must cover all of them: a collection written in one mode is invisible to the other
+# mode's reads, and if it were also invisible to eviction it would live forever. Note
+# "kbdegraded_" does NOT start with "kb_" ('d' != '_'), so listing both is required.
+_ALL_COLLECTION_PREFIXES = ("kb_", "kbdegraded_")
 
 
 def _ensure_collection(segment: str) -> None:
@@ -257,7 +327,10 @@ def _ensure_collection(segment: str) -> None:
             method="PUT",
             body={
                 "vectors": {
-                    "size": EMBED_DIM,
+                    # EFFECTIVE_EMBED_DIM, not EMBED_DIM: `_embed` already falls back to 1536
+                    # for an unlisted model, so a bare EMBED_DIM here created a dim-0
+                    # collection that then rejected every 1536-dim write.
+                    "size": EFFECTIVE_EMBED_DIM,
                     "distance": "Cosine",
                 }
             },
@@ -350,6 +423,21 @@ def _handle_kb_search(args: dict) -> dict:
     _validate_segment(segment)
     if not query:
         return {"hits": [], "segment": segment, "query": query}
+
+    # attn.2 R1.3 — degraded mode must return an EXPLICIT empty, never arbitrary hits.
+    # Every stored vector and the query vector are zeros, so Qdrant's nearest-neighbour
+    # search returns `limit` arbitrary points at meaningless scores. The CoS curator renders
+    # whatever comes back as "## Open Items (carried forward)", so without this guard a
+    # degraded run replaces an honest "nothing carried forward" with confident noise —
+    # resolved items from up to SEMANTIC_MAX_AGE_DAYS ago, presented to the operator as open.
+    # A silent wrong answer is strictly worse than the empty result it would replace.
+    if SEMANTIC_DEGRADED:
+        return {
+            "hits": [], "segment": segment, "query": query,
+            "note": "semantic search unavailable (degraded mode: no embeddings key) — "
+                    "this is an explicit empty, NOT a statement that the segment has no matches",
+        }
+
     limit = max(1, min(limit, MAX_SEARCH_HITS))
 
     # Ensure collection exists (search on missing collection → error).
@@ -385,14 +473,27 @@ def _handle_kb_search(args: dict) -> dict:
 # ── Eviction ──────────────────────────────────────────────────────────────────
 
 def _evict_segment(segment: str) -> int:
-    """Remove entries older than SEMANTIC_MAX_AGE_DAYS from this segment's collection.
+    """Evict this segment's collection IN THE CURRENT MODE. Convenience wrapper over
+    `_evict_collection` for callers that hold a segment rather than a collection name."""
+    return _evict_collection(_collection_name(segment))
+
+
+def _evict_collection(cname: str) -> int:
+    """Remove entries older than SEMANTIC_MAX_AGE_DAYS from a collection, BY NAME.
+
+    Takes the name rather than a segment on purpose (attn.2 R1, /review). The old code
+    resolved segment -> name via `_collection_name`, which R1 made mode-dependent, so the
+    startup sweep enumerated the real `kb_*` collections and then issued every delete
+    against `kbdegraded_*`. Real collections went un-evicted for the whole degraded window
+    and degraded ones were only swept when a real collection of the same name happened to
+    exist. Passing the enumerated name straight through removes the round-trip entirely.
+
     Returns the number of entries deleted.
     Note: SEMANTIC_MAX_ENTRIES count-based eviction is not yet implemented (env var is a
     no-op). TTL-only for now; add count-based pass here when needed."""
     import time as _time
     if SEMANTIC_MAX_AGE_DAYS <= 0:
         return 0
-    cname = _collection_name(segment)
     try:
         _qdrant(f"/collections/{cname}")
     except RuntimeError:
@@ -437,13 +538,20 @@ def _evict_all_collections() -> None:
         collections = [c["name"] for c in result.get("result", {}).get("collections", [])]
     except RuntimeError:
         return  # Qdrant not reachable yet — skip eviction
+    # Sweep BOTH namespaces, always, and evict each collection by its own name.
+    # attn.2 R1 (/review): this was a hardcoded "kb_" prefix plus cname[3:], then
+    # _evict_segment re-derived the name through the mode-dependent _collection_name. Two
+    # bugs fell out: in degraded mode the sweep enumerated the REAL kb_* collections but
+    # deleted from kbdegraded_*, so real data went un-evicted for the whole degraded window;
+    # and kbdegraded_* was never enumerated in either mode ("kbdegraded_x".startswith("kb_")
+    # is False), so once a key was restored those collections were orphaned — unreachable by
+    # kb_get/kb_search AND exempt from retention. Sweeping both prefixes keeps the TTL
+    # promise across a mode flip in either direction.
     for cname in collections:
-        # Strip the "kb_" prefix to get the segment name
-        if not cname.startswith("kb_"):
+        if not any(cname.startswith(p) for p in _ALL_COLLECTION_PREFIXES):
             continue
-        segment = cname[3:]
         try:
-            deleted = _evict_segment(segment)
+            deleted = _evict_collection(cname)
             if deleted:
                 print(
                     f"semantic_kb_mcp.py: evicted {deleted} old entries from {cname}",
@@ -1017,9 +1125,205 @@ class SelfTests(unittest.TestCase):
         self.assertEqual(len(set(names)), len(names),
                          f"live segments collide under sanitization: {names}")
 
+    # ── attn.2 R1: degraded mode (no OPENAI_API_KEY) ─────────────────────────
+    # These pin the three properties that make running without an embeddings key SAFE
+    # rather than silently wrong. Each is mutation-verified in the commit message.
+
+    # T21 (R1.3): degraded kb_search returns an EXPLICIT empty, never arbitrary neighbours.
+    # This is the load-bearing one. With zero vectors everywhere, Qdrant's nearest-neighbour
+    # search happily returns `limit` arbitrary points, and the curator renders them as
+    # "Open Items (carried forward)" — resolved items presented to the operator as open.
+    # The guard must fire BEFORE any Qdrant call, so a stubbed _qdrant that would return
+    # hits proves the short-circuit rather than an incidentally-empty collection.
+    def test_t21_degraded_kb_search_returns_explicit_empty_not_arbitrary_hits(self):
+        called = []
+
+        def fake_qdrant(path, method="GET", body=None):
+            called.append(path)
+            return {"result": [{"id": "x", "score": 0.99,
+                                "payload": {"key": "stale-item", "content": "RESOLVED weeks ago"}}]}
+
+        orig_q, orig_deg = globals()["_qdrant"], globals()["SEMANTIC_DEGRADED"]
+        globals()["_qdrant"] = fake_qdrant
+        globals()["SEMANTIC_DEGRADED"] = True
+        try:
+            result = _handle_kb_search({"segment": "ops:briefs", "query": "open items", "limit": 10})
+            self.assertEqual(result["hits"], [],
+                             "degraded search must return NO hits; returning arbitrary "
+                             "nearest-neighbours would surface resolved items as open")
+            self.assertIn("note", result, "degraded empty must be labelled, not bare")
+            self.assertIn("unavailable", result["note"].lower())
+            self.assertEqual(called, [],
+                             "degraded search must short-circuit BEFORE touching Qdrant; "
+                             "a Qdrant round-trip means the guard is placed too late")
+        finally:
+            globals()["_qdrant"] = orig_q
+            globals()["SEMANTIC_DEGRADED"] = orig_deg
+
+    # T22 (R1.4): degraded writes are namespaced away from real embeddings.
+    def test_t22_degraded_mode_isolates_collection_namespace(self):
+        orig = globals()["SEMANTIC_DEGRADED"]
+        try:
+            globals()["SEMANTIC_DEGRADED"] = True
+            degraded = _collection_name("ops:briefs")
+            globals()["SEMANTIC_DEGRADED"] = False
+            real = _collection_name("ops:briefs")
+            self.assertNotEqual(degraded, real,
+                                "degraded zero-vectors must not share a collection with real "
+                                "embeddings — mixing them permanently destroys search quality "
+                                "and restoring the key does not undo it")
+            self.assertEqual(real, "kb_ops_briefs")
+            self.assertEqual(degraded, "kbdegraded_ops_briefs")
+            self.assertRegex(degraded, r"^[A-Za-z0-9_]+$",
+                             "degraded collection name must still be Qdrant-legal")
+        finally:
+            globals()["SEMANTIC_DEGRADED"] = orig
+
+    # T23: negative control for T22 — MOCK_EMBEDDINGS must NOT change the namespace.
+    # Without this, someone "simplifying" the two flags into one would silently reroute
+    # every self-test above onto a different collection and T20 would start lying.
+    def test_t23_mock_embeddings_alone_does_not_change_namespace(self):
+        self.assertTrue(MOCK_EMBED, "self-tests are expected to run under MOCK_EMBEDDINGS=1")
+        self.assertFalse(SEMANTIC_DEGRADED, "self-tests must not run in degraded mode")
+        self.assertEqual(_collection_name("ops:briefs"), "kb_ops_briefs",
+                         "MOCK_EMBEDDINGS is a TESTING flag and must leave the real "
+                         "collection mapping intact; only SEMANTIC_DEGRADED namespaces apart")
+
+    # T24 (R1.5): the collection is declared with the SAME width the writer produces.
+    # Must be exercised with an UNLISTED model, where EMBED_DIM is 0 and
+    # EFFECTIVE_EMBED_DIM is 1536 — under the default model both are 1536, so a test that
+    # only compares them there would still pass if `_ensure_collection` regressed to a bare
+    # `EMBED_DIM`. Force them apart so the assertion can actually fail.
+    def test_t24_collection_declared_with_effective_dim_not_raw_embed_dim(self):
+        captured = {}
+
+        def fake_qdrant(path, method="GET", body=None):
+            if method == "GET":
+                raise RuntimeError("404 not found")  # force the create path
+            captured["body"] = body
+            return {}
+
+        orig_q   = globals()["_qdrant"]
+        orig_dim = globals()["EMBED_DIM"]
+        orig_eff = globals()["EFFECTIVE_EMBED_DIM"]
+        globals()["_qdrant"] = fake_qdrant
+        globals()["EMBED_DIM"] = 0          # simulate an unlisted EMBED_MODEL
+        globals()["EFFECTIVE_EMBED_DIM"] = 1536
+        try:
+            _ensure_collection("dim-test-seg")
+            size = captured["body"]["vectors"]["size"]
+            self.assertEqual(size, 1536,
+                             "collection must be created with EFFECTIVE_EMBED_DIM; a bare "
+                             "EMBED_DIM yields a dim-0 collection that rejects every 1536-dim "
+                             "write with a Qdrant 400")
+            self.assertNotEqual(size, 0, "dim-0 collection is the bug this test exists for")
+        finally:
+            globals()["_qdrant"] = orig_q
+            globals()["EMBED_DIM"] = orig_dim
+            globals()["EFFECTIVE_EMBED_DIM"] = orig_eff
+
+    # T26 (R1, /review): TTL eviction sweeps BOTH namespaces and evicts BY NAME.
+    # The old scanner hardcoded "kb_" / cname[3:] and then let _evict_segment re-derive the
+    # name through the mode-dependent _collection_name. That produced two bugs: in degraded
+    # mode it enumerated the REAL collections but deleted from the degraded ones, and
+    # kbdegraded_* was never enumerated in either mode. Assert the collection NAMES passed to
+    # the evictor, in both modes — that pins "no re-derivation" as well as "both prefixes".
+    def test_t26_eviction_sweeps_both_namespaces_by_name(self):
+        seen = []
+
+        def fake_qdrant(path, method="GET", body=None):
+            if path == "/collections":
+                return {"result": {"collections": [
+                    {"name": "kb_ops_briefs"},
+                    {"name": "kbdegraded_ops_briefs"},
+                    {"name": "unrelated_thing"},
+                ]}}
+            return {}
+
+        orig_q, orig_ev = globals()["_qdrant"], globals()["_evict_collection"]
+        orig_deg = globals()["SEMANTIC_DEGRADED"]
+        globals()["_qdrant"] = fake_qdrant
+        globals()["_evict_collection"] = lambda cn: (seen.append(cn), 0)[1]
+        try:
+            for degraded in (True, False):
+                globals()["SEMANTIC_DEGRADED"] = degraded
+                seen.clear()
+                _evict_all_collections()
+                self.assertEqual(
+                    sorted(seen), ["kb_ops_briefs", "kbdegraded_ops_briefs"],
+                    f"with SEMANTIC_DEGRADED={degraded} the sweep must cover BOTH namespaces "
+                    f"and pass each collection's OWN name through; got {seen}")
+                self.assertNotIn("unrelated_thing", seen,
+                                 "non-KB collections must not be touched")
+        finally:
+            globals()["_qdrant"] = orig_q
+            globals()["_evict_collection"] = orig_ev
+            globals()["SEMANTIC_DEGRADED"] = orig_deg
+
+    # T27 (/review): an unreachable Qdrant must surface as RuntimeError, not URLError.
+    # Every caller in this file guards with `except RuntimeError` — including
+    # `_evict_all_collections`, whose handler literally says "Qdrant not reachable yet — skip
+    # eviction" and could never catch that case, so startup died instead. Verified live: the
+    # pre-fix module exits with `URLError: Connection refused`; the fixed one boots and serves.
+    def test_t27_unreachable_qdrant_raises_runtimeerror_not_urlerror(self):
+        import urllib.error
+        # setUp swaps in a mock; `self._orig_qdrant` is the REAL function, which is what
+        # this test is about. Point it at a closed port on loopback (fast refusal, no DNS).
+        orig_url = globals()["QDRANT_URL"]
+        globals()["QDRANT_URL"] = "http://127.0.0.1:59999"
+        globals()["_qdrant"] = self._orig_qdrant
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                self._orig_qdrant("/collections")
+            self.assertNotIsInstance(ctx.exception, urllib.error.URLError,
+                                     "must be NORMALISED to RuntimeError, not re-raised as "
+                                     "URLError — every caller here guards on RuntimeError")
+            self.assertIn("unreachable", str(ctx.exception).lower())
+            # And the startup sweep must survive it rather than killing the process: its
+            # handler claims "Qdrant not reachable yet — skip eviction" and must be true.
+            _evict_all_collections()
+        finally:
+            globals()["QDRANT_URL"] = orig_url
+            globals()["_qdrant"] = self._mock_qdrant
+
+    # T28 (/review): the tri-state resolution itself. Previously untested — replacing the
+    # whole derivation with `SEMANTIC_DEGRADED = False` left 26/26 green while killing the
+    # feature, because every other degraded test pokes the global directly. The empty-string
+    # AUTO row is the one docker-compose.yml actually sends.
+    def test_t28_degraded_tri_state_resolution(self):
+        cases = [
+            ("",      False, False, True,  "AUTO with no key must degrade — this is what compose sends"),
+            ("",      True,  False, False, "AUTO with a key must stay in full mode"),
+            ("",      False, True,  False, "AUTO under MOCK_EMBEDDINGS must not degrade (self-tests)"),
+            ("1",     True,  False, True,  "explicit 1 forces degraded even with a key"),
+            ("true",  True,  False, True,  "truthy words accepted"),
+            (" YES ", True,  False, True,  "value is stripped and lowercased"),
+            ("0",     False, False, False, "explicit 0 forces the old fail-every-call behaviour"),
+            ("no",    False, False, False, "falsey words accepted"),
+            ("garbage", False, False, True, "an unrecognised value falls through to AUTO"),
+        ]
+        for raw, has_key, mock, want, why in cases:
+            self.assertEqual(
+                _resolve_degraded(raw, has_key, mock), want,
+                f"SEMANTIC_DEGRADED={raw!r} has_key={has_key} mock={mock}: {why}")
+
+    # T25 (R1.5): the writer's width equals the declared width under the real config.
+    def test_t25_embed_width_matches_declared_width(self):
+        self.assertGreater(EFFECTIVE_EMBED_DIM, 0,
+                           "a dim-0 collection rejects every write with a Qdrant 400")
+        self.assertEqual(len(_embed(["probe"])[0]), EFFECTIVE_EMBED_DIM,
+                         "embedding width must match the declared collection size")
+
 
 def _run_self_tests():
     print("semantic_kb_mcp.py: running self-tests...", file=sys.stderr)
+    # Hermetic w.r.t. the mode globals (/review). docker-compose.yml tells operators to set
+    # SEMANTIC_DEGRADED=1 "to reproduce the no-key path"; doing that and then running the
+    # suite used to produce five unrelated failures, because most tests assume full mode and
+    # set/restore the global themselves. Force the baseline here; T23 asserts the forcing
+    # actually happened, and the degraded tests still flip the global per-test.
+    globals()["SEMANTIC_DEGRADED"] = False
+    globals()["MOCK_EMBED"] = True
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromTestCase(SelfTests)
     runner = unittest.TextTestRunner(verbosity=2, stream=sys.stderr)
@@ -1045,11 +1349,22 @@ if __name__ == "__main__":
         print(f"semantic_kb_mcp.py: FATAL — {e}", file=sys.stderr)
         sys.exit(1)
 
-    if not OPENAI_KEY and not MOCK_EMBED:
+    if SEMANTIC_DEGRADED:
+        print(
+            "semantic_kb_mcp.py: DEGRADED — running without embeddings (OPENAI_API_KEY absent).\n"
+            "    WORKING:  kb_put and kb_get (point lookups by key). The morning brief needs\n"
+            "              only these, so the CoS pipeline is fully functional.\n"
+            "    OFF:      kb_search returns an explicit empty. It does NOT mean 'no matches'.\n"
+            f"    ISOLATED: writes go to `kbdegraded_*` collections, so real embeddings in\n"
+            "              `kb_*` are untouched and set OPENAI_API_KEY to restore them intact.",
+            file=sys.stderr,
+        )
+    elif not OPENAI_KEY and not MOCK_EMBED:
         print(
             "semantic_kb_mcp.py: WARNING — OPENAI_API_KEY is not set. "
             "kb_put and kb_search will fail until OPENAI_API_KEY is provided. "
-            "Set MOCK_EMBEDDINGS=1 to use zero vectors for testing.",
+            "Set MOCK_EMBEDDINGS=1 to use zero vectors for testing, or SEMANTIC_DEGRADED=1 "
+            "to run the brief pipeline without semantic search.",
             file=sys.stderr,
         )
 

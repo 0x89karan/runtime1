@@ -219,18 +219,36 @@ case "${1:-shell}" in
     fi
 
     # Semantic KB (memory-routing): email bodies are indexed via OpenAI text-embedding-3-small.
+    #
+    # attn.2 R1 — this is a WARNING, not a boot gate, and the asymmetry with the Google check
+    # above is deliberate. No Gmail means no brief, so that one fails closed and must stay
+    # that way. An embeddings key buys only semantic kb_search; kb_put and kb_get are point
+    # lookups by UUID5 of the key and work without it, and the morning brief needs only those.
+    # Failing the boot here made a convenience dependency fatal on the critical path — and
+    # once v0.118.0 added `restart: unless-stopped`, fatal became a restart loop (observed:
+    # RestartCount=10, ExitCode=1, with the CoS down for a day).
     if [ -z "${OPENAI_API_KEY:-}" ]; then
       echo ""
-      echo "  ERROR: OPENAI_API_KEY is not set."
+      echo "  WARNING: OPENAI_API_KEY is not set — starting in DEGRADED mode."
       echo ""
-      echo "  The CoS semantic KB requires an OpenAI API key for email embeddings."
-      echo "  Add it to your environment:"
-      echo "    export OPENAI_API_KEY=sk-..."
+      echo "    WORKING:  the morning brief. Gmail read, KB writes, KB point lookups,"
+      echo "              brief authoring and publish all function normally."
+      echo "    OFF:      semantic kb_search. It returns an explicit empty, which is NOT"
+      echo "              the same as 'no matches' — carry-forward across briefs is off."
+      echo "    ISOLATED: degraded writes go to separate 'kbdegraded_*' Qdrant collections,"
+      echo "              so any real embeddings you already have are left untouched."
       echo ""
-      echo "  Or pass it to docker compose:"
-      echo "    OPENAI_API_KEY=sk-... docker compose up cos"
+      echo "    NOTE:     entries written while degraded stay in 'kbdegraded_*' and are NOT"
+      echo "              visible once the key is set. TTL eviction still covers them."
       echo ""
-      exit 1
+      echo "  To enable semantic search:"
+      echo "    export OPENAI_API_KEY=sk-...   # then: docker compose up -d cos"
+      echo ""
+      # Deliberately NOT exporting a mode variable here (/review). The semantic-kb sidecar is
+      # a SEPARATE container reached over HTTP, so nothing this container exports can affect
+      # it, and no process inside this container reads such a variable. The sidecar decides
+      # for itself: SEMANTIC_DEGRADED is tri-state there and defaults to AUTO, which degrades
+      # exactly when OPENAI_API_KEY is absent. See docker/semantic_kb_mcp.py.
     fi
     fi  # end of credential preflights (skipped under DRY_RUN_ONLY)
 

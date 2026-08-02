@@ -30,7 +30,7 @@ services:
     # attn.1a (/review, performance specialist): a restart policy without a log cap is
     # unbounded disk growth. Docker's json-file default has NO max-size, and before
     # `restart:` a failed cos exited ONCE and stopped writing. Now a permanently-failing
-    # cos (e.g. the real missing-OPENAI_API_KEY preflight exit) reprints its error block
+    # cos (e.g. a missing Google credential, which still fails closed) reprints its block
     # forever — Docker backs off to a 60 s ceiling, so ~1440 restarts/day of log with
     # nothing reclaiming it. Capped here; compose_policy.rs couples the two policies so a
     # future `restart:` cannot be added without one.
@@ -69,7 +69,11 @@ services:
       # explicitly empty TRIGGER_CRON= passes through empty and interval mode works.
       - TRIGGER_CRON=${TRIGGER_CRON-0 8 * * *}
       - TRIGGER_INTERVAL=${TRIGGER_INTERVAL-}
-      # OpenAI API key — required for semantic KB (email embeddings via text-embedding-3-small).
+      # OpenAI API key — OPTIONAL since attn.2 R1. Enables semantic KB search (email
+      # embeddings via text-embedding-3-small). Without it the boot WARNS instead of
+      # exiting and the pipeline runs degraded: the morning brief is unaffected, only
+      # kb_search is off. Previously this was a hard boot gate, which turned into a
+      # restart loop once `restart: unless-stopped` landed.
       - OPENAI_API_KEY
       # Telegram reach (ux.12) — OPTIONAL. Set all three to enable the two-way bridge
       # (brief delivery + approve/deny from your phone). Omit them and cos runs without
@@ -177,8 +181,11 @@ services:
 
   # ── Semantic KB sidecar (h8.1 / memory-routing) ──────────────────────────────
   # Always-on for the CoS: stores email bodies as OpenAI text-embedding-3-small vectors
-  # in Qdrant. OPENAI_API_KEY is required. Both qdrant and semantic-kb-mcp start
-  # unconditionally — there is no profile gate.
+  # in Qdrant. Both qdrant and semantic-kb-mcp start unconditionally — no profile gate.
+  # attn.2 R1: OPENAI_API_KEY is NO LONGER required to boot. Without it the sidecar runs
+  # degraded — kb_put/kb_get (point lookups) still work so the morning brief is unaffected,
+  # kb_search returns an explicit empty, and writes are namespaced to `kbdegraded_*` so real
+  # embeddings are never mixed with zero vectors. Set the key to get semantic search back.
   qdrant:
     image: qdrant/qdrant:v1.13.6
     # No profile — always-on for CoS (email body semantic index, memory-routing).
@@ -192,7 +199,7 @@ services:
     # attn.1a (/review, performance specialist): a restart policy without a log cap is
     # unbounded disk growth. Docker's json-file default has NO max-size, and before
     # `restart:` a failed cos exited ONCE and stopped writing. Now a permanently-failing
-    # cos (e.g. the real missing-OPENAI_API_KEY preflight exit) reprints its error block
+    # cos (e.g. a missing Google credential, which still fails closed) reprints its block
     # forever — Docker backs off to a 60 s ceiling, so ~1440 restarts/day of log with
     # nothing reclaiming it. Capped here; compose_policy.rs couples the two policies so a
     # future `restart:` cannot be added without one.
@@ -226,7 +233,7 @@ services:
     # attn.1a (/review, performance specialist): a restart policy without a log cap is
     # unbounded disk growth. Docker's json-file default has NO max-size, and before
     # `restart:` a failed cos exited ONCE and stopped writing. Now a permanently-failing
-    # cos (e.g. the real missing-OPENAI_API_KEY preflight exit) reprints its error block
+    # cos (e.g. a missing Google credential, which still fails closed) reprints its block
     # forever — Docker backs off to a 60 s ceiling, so ~1440 restarts/day of log with
     # nothing reclaiming it. Capped here; compose_policy.rs couples the two policies so a
     # future `restart:` cannot be added without one.
@@ -237,6 +244,13 @@ services:
         max-file: "3"
     environment:
       - OPENAI_API_KEY
+      # attn.2 R1: unset (the default) means AUTO — the sidecar degrades by itself when
+      # OPENAI_API_KEY is absent, because Compose cannot express "set this only when that
+      # other variable is empty" and this is a different container from cos, so the cos
+      # entrypoint cannot export into it. Set to 1 to force degraded mode even with a key
+      # (useful to reproduce the no-key path), or 0 to force the old fail-every-call
+      # behaviour. See docker/semantic_kb_mcp.py for the tri-state.
+      - SEMANTIC_DEGRADED=${SEMANTIC_DEGRADED:-}
       - EMBED_MODEL=${EMBED_MODEL:-text-embedding-3-small}
       - QDRANT_URL=http://qdrant:6333
       - SEMANTIC_MAX_AGE_DAYS=${SEMANTIC_MAX_AGE_DAYS:-30}
