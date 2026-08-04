@@ -2375,4 +2375,57 @@ mod tests {
             "kb_search without KbRead cap must be denied; got: {err}"
         );
     }
+
+    // ── PublishBrief::invoke — suppressed_count parsing ─────────────────────────
+    //
+    // Found by the ship-workflow adversarial + coverage passes: this parsing had ZERO
+    // test coverage — not even the valid-integer happy path went through the tool's
+    // invoke(), only through BriefPublisher::publish/RunsStore::publish_brief directly.
+
+    async fn publish_brief_tool() -> (PublishBrief, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap().0);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(crate::runs::run_writer(rx, std::sync::Arc::clone(&store)));
+        let publisher = crate::runs::RunTracker::new(tx).brief_publisher();
+        (PublishBrief { publisher }, dir)
+    }
+
+    #[tokio::test]
+    async fn publish_brief_passes_a_valid_integer_through() {
+        let (tool, _dir) = publish_brief_tool().await;
+        let raw = tool
+            .invoke(json!({"suppressed_count": 7}), &ctx())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["suppressed_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn publish_brief_malformed_suppressed_count_coerces_to_absent_not_an_error() {
+        // Documents (rather than merely implies) the current behaviour: `as_u64()` returns
+        // None for a negative number, a float, or a string, and PublishBrief treats that
+        // exactly like the field being absent — it does NOT error and does NOT collapse to
+        // Some(0). A model that miscomputes `max(0, resultSizeEstimate - fetched)` into a
+        // negative number gets "not reported", not "0 reported" — silently losing the
+        // signal rather than reporting a wrong one. Same trust tier as `narrative`
+        // (runs/mod.rs's own doc comment): this is the accepted, documented tradeoff, not a
+        // gap this test is asking to be closed — it exists so a future change to `.as_u64()`
+        // parsing can't silently start erroring, panicking, or coercing to Some(0) instead.
+        let (tool, _dir) = publish_brief_tool().await;
+        for bad in [json!(-3), json!(2.5), json!("7")] {
+            let raw = tool
+                .invoke(json!({"suppressed_count": bad}), &ctx())
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                v["suppressed_count"].is_null(),
+                "malformed suppressed_count {bad:?} must coerce to absent (null), not error \
+                 or silently become 0 — got {:?}",
+                v["suppressed_count"]
+            );
+        }
+    }
 }

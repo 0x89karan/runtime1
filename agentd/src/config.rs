@@ -2307,6 +2307,50 @@ allow_insecure_local = true
         }
     }
 
+    /// Pins the R3.1/R3.2/R3.4 prompt fixes that have no OTHER code-level guard. Found by
+    /// the ship-workflow coverage audit: these three instructions were added by attn.2 R3
+    /// with zero `COS_PROMPT_SOURCES` assertion, unlike every other measured fix this
+    /// session (the `{ts}` substitution, the R3.3 escape narrowing). The CLASSIFICATION
+    /// RULE specifically fixes a SHIPPED, MEASURED bug (an item appearing in both
+    /// `important` and `response_needed`, so it rendered twice) — exactly the class of fix
+    /// this file's house rule says must be pinned, and until now it was not: a future edit
+    /// could silently reintroduce the double-listing with zero CI signal.
+    #[test]
+    fn cos_prompts_pin_the_r3_inbox_fixes() {
+        for (label, raw) in COS_PROMPT_SOURCES
+            .iter()
+            .filter(|(l, _)| *l == "dev" || *l == "overlay")
+        {
+            assert!(
+                raw.contains("q=in%3Ainbox"),
+                "{label}: the inbox query must be the percent-encoded in:inbox scope (R3.1) — \
+                 the recency-windowed q=newer_than:1d it replaced made an un-archived old \
+                 thread vanish after one day, which is worse than a duplicate listing"
+            );
+            assert!(
+                !raw.contains("&q=newer_than:1d"),
+                "{label}: the old recency-bound query must not reappear in the LIVE \
+                 oauth_call_api URL (R3.1 regression) — the bare substring \"q=newer_than:1d\" \
+                 legitimately appears elsewhere in this file's own prose explaining the R3.1/R3.5 \
+                 correction, so this checks the URL-form (with its leading '&') specifically"
+            );
+            assert!(
+                raw.contains("EXACTLY ONE of 'important' or 'response_needed'"),
+                "{label}: the CLASSIFICATION RULE (R3.2) fixes a MEASURED shipped bug — an \
+                 item that was urgent AND needed a reply rendered in both arrays, so it \
+                 appeared twice in the brief. Losing this instruction silently reintroduces \
+                 that exact double-listing with no test to catch it."
+            );
+            assert!(
+                raw.contains("suppressed_count = max(0, resultSizeEstimate"),
+                "{label}: R3.4's suppressed_count computation (from Gmail's own \
+                 resultSizeEstimate, zero extra API calls per decision D2) must stay present \
+                 — without it the field silently stops being computed and every brief reports \
+                 'not reported' regardless of real suppression"
+            );
+        }
+    }
+
     /// Regression: QA-1 — the OperatingBrief at its documented maxima must fit the store.
     /// Found by /qa on 2026-07-29 driving a real agentd against a fake provider.
     /// Report: .gstack/qa-reports/qa-report-agentos-cos-2026-07-29.md

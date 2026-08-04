@@ -258,12 +258,20 @@ fn render_brief(
 /// Called from BOTH `render_brief` branches (quiet-night early-return and the normal
 /// path) — R3.4-ar-02 found that only the normal path called this, so a quiet run_count
 /// silently hid a real suppressed_count.
+///
+/// ⚠ CORRECTED (ship-review, adversarial pass): the zero-case wording used to read "all
+/// matching mail reviewed". That overclaims — `suppressed_count` measures ONLY messages
+/// excluded by the 50-message Gmail FETCH cap (`cos.agents.toml` STEP 2); it says nothing
+/// about the SEPARATE 20-message ANALYSIS cap ("Analyze up to 20 messages") the same
+/// prompt applies after fetching. `suppressed_count=0` with 45 fetched-but-only-20-analyzed
+/// messages is an honest report of the field's own definition, not evidence "all matching
+/// mail was reviewed" — so the line no longer claims that.
 fn push_suppressed_count_line(out: &mut String, brief: &Value) {
     if let Some(suppressed) = brief["suppressed_count"].as_u64() {
         if suppressed > 0 {
             out.push_str(&format!("  ⚠ {suppressed} suppressed (exceeded Gmail fetch cap)\n"));
         } else {
-            out.push_str("  ✓ 0 suppressed (all matching mail reviewed)\n");
+            out.push_str("  ✓ 0 suppressed (fetch cap not exceeded)\n");
         }
     }
 }
@@ -373,7 +381,7 @@ mod tests {
             "items": [], "suppressed_count": 0
         });
         let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
-        assert!(s.contains("✓ 0 suppressed (all matching mail reviewed)"));
+        assert!(s.contains("✓ 0 suppressed (fetch cap not exceeded)"));
     }
 
     #[test]

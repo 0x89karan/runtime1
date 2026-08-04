@@ -1283,6 +1283,35 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   CI is green while an operator using `agentctl spawn cos-curator` gets none of these fixes.
   Same fix shape as cos-dev-03: mirror the fixes into both templates, or add an explicit banner
   in each stating they are a stripped-down demo, not the hardened path. Depends on: none.
+- **attn.2-ts-01 (P2) — `{ts}` collision resistance rests on the wall clock, not a monotonic
+  identifier.** Found at /ship's adversarial pass (Codex + Claude subagent, cross-model
+  agreement, 2026-08-04): `dispatch_run_job`'s nanosecond-resolution `%H%M%S%9f` (the QA fix
+  in this same increment, replacing 1-second `%H%M%S` after a live-driven collision) shrinks
+  the same-day-refire collision window from "one wall-clock second" to "the same nanosecond",
+  but does not eliminate it — a repeated or backward-stepped system clock (NTP correction, VM
+  clock skew) can still produce two identical `ts` values, silently reproducing the exact
+  overwrite R4 exists to prevent, now at much lower but nonzero probability. A scheduler-owned
+  monotonic sequence number, per-run UUID, or an explicit uniqueness check + retry on
+  `dispatch_run_job`'s existing collision guard would close this fully. Not fixed here: R3+R4's
+  stated scope was "non-destructive for a same-day re-fire under normal operation", not
+  "collision-proof under adversarial clock manipulation" — the nanosecond fix already closes
+  the measured, reproduced failure mode; this is defense-in-depth for a much rarer trigger.
+  Revisit before/with attn.2-R5 (manual fire), which is expected to make rapid re-fires routine
+  rather than exceptional. Depends on: none.
+- **attn.2-esc-01 (P3) — the sender-text neutralisation rule has never covered `<`/`>`, in
+  either the pre- or post-R3.3 entity list.** Found at /ship's adversarial pass (Claude
+  subagent): verified against `git show <pre-attn.2-commit>:agentd/cos.agents.toml` — the
+  ORIGINAL 5-entity rule (`[` `]` `(` `)` `|`) never named `<`/`>` either, so R3.3's narrowing
+  to 3 entities did not regress or "reopen" anything; this is a pre-existing gap, not
+  introduced by this PR. Sender-controlled email text (`from`/`subject`/`ask`/`summary`/
+  open-item `text`/`focus_recommendation`) can still carry raw `<`/`>`, which is latent (not
+  live) against today's consumers — a terminal `cat` and the ratatui TUI do not interpret
+  HTML — but would become a live HTML/script-injection vector for any future consumer that
+  renders the brief as HTML (a web viewer, a markdown-to-HTML bridge). This is the same
+  documented limitation as `brief-03`/`brief-04` ("escaping is a prompt rule, not code
+  enforcement" — the real fix is runtime-authored markdown from the typed `BriefRecord`, not
+  another prompt-text patch) — file alongside that work rather than as a standalone escape-
+  list addition. Depends on: brief-04 (runtime-authored brief markdown).
 
 ## brief.1 — Open items (from /review, 2026-07-29)
 
