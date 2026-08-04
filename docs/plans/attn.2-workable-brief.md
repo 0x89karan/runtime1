@@ -522,3 +522,153 @@ the build works from corrected requirements. Both eng voices recommended R1+R2 o
 overrode at the final gate and chose full R1–R5 scope.** That override is recorded, not re-argued.
 
 NO UNRESOLVED DECISIONS
+
+---
+
+## Phase 1 CEO Review — R3/R4/R5 (2026-08-04, /autoplan)
+
+**Scope:** R3, R4, R5 only. R1/R2 shipped v0.119.0, not re-opened.
+
+### Dual voices
+
+**Codex** (bottom line): build R4 now, split R3, do NOT build R5 as specified before attn.4.
+R5's sentinel is "manual schedule hint," not manual fire — it is read inside
+`handle_wait_for_trigger`, which only runs when the trigger agent is alive and polling. The plan's
+own text admits `touch` is a silent no-op if the trigger is failed/deferred/cancelled — exactly
+attn.4's failure mode. The plan's own line 299 already names the alternative ("make the fire a
+control-API verb") and drops it in one clause. Also: R4's "no content lost" is false for the KB
+side — `kb_put(segment='ops:briefs', key='{date}', ...)` has no `{ts}`, confirmed at
+`cos.agents.toml:481`; only the file gets timestamped.
+
+**Claude subagent** (independent, no prior-phase context): same conclusion via different evidence.
+Found `~/.agentos-output/.fire-now` already exists on disk, **0 bytes, 3 days stale** (verified:
+`mtime=Aug 1 11:29:13`) — AC14 (unlink-without-firing at init) is not a nicety, it is the
+difference between R5 shipping safely and firing an unrequested cycle the instant it deploys.
+Found a NEW gap neither the plan nor Codex named: a manually-fired child is not a `config_seed`
+row, so `publish_brief`'s stats aggregation (`runs/store.rs:489-504`) folds it into
+`run_count`/`spend_total` — the exact corruption `attn.1a-04` (TODOS.md:429) already named for the
+*future* attn.1b loop, reintroduced NOW by R5. Also found `resultSizeEstimate` on Gmail's existing
+`messages.list` response already gives R3.4's suppressed-count for free — no second call needed.
+Also found `TRIGGER_MAX_WAIT_S` is ALREADY a live, unfixed instance of the exact env-var-parity bug
+R5 must not repeat (`passenv`'d at `cos.agents.toml:194`, absent from `docker-compose.yml`).
+
+All four decisive claims (KB key has no `{ts}`, `.fire-now` stale on disk, `TRIGGER_MAX_WAIT_S`
+missing from compose, the `reset-attention`/`inject` route precedent) were independently
+re-verified against the code before this gate.
+
+### CEO DUAL VOICES — CONSENSUS TABLE
+
+```
+  Dimension                            Claude    Codex    Consensus
+  ──────────────────────────────────── ───────── ───────── ─────────
+  1. Premises valid?                   R3/R4 yes R3/R4 yes CONFIRMED (R3/R4)
+                                        R5 no     R5 no     CONFIRMED (R5 premise weak)
+  2. Right problem to solve?           yes       yes       CONFIRMED
+  3. Scope calibration correct?        R5 over-  R5 wrong  CONFIRMED — R5 needs reshaping
+                                        built     mechanism
+  4. Alternatives explored?            no (D1)   no (API   CONFIRMED — both name the SAME
+                                                  verb)     missed alternative independently
+  5. 6-month regret?                   R5 medium R5        CONFIRMED
+                                                  foolish
+```
+
+**Both models independently converged on the same architectural fix for R5** (sentinel →
+management-API verb), via different evidence paths. This is a **USER CHALLENGE**: both models
+agree the user's stated direction (build R3+R4+R5 now, as written) should change for R5
+specifically.
+
+### Scope decisions (cherry-picks, presented to operator — not auto-decided)
+
+- **D1** — R5: filesystem sentinel (as written) vs. management-API verb (`management.rs` already
+  has 3 precedent routes: `inject`, `cancel`, `reset-attention` — all unauthenticated-but-
+  network-scoped, same threat posture R5 needs). API verb removes 4 edge-case surfaces the sentinel
+  carries (stale-at-init, catch-up race, lossy unlink-then-touch, 3-site env-var parity) at the cost
+  of requiring network reachability to :7999 instead of a bare file touch.
+- **D2** — R3.4: derive `suppressed_count` from Gmail's existing `resultSizeEstimate` (free, zero
+  new broker requests, moots the `attn.1a-01` interaction entirely) vs. the plan's original second
+  `-in:inbox` call.
+- **New finding, not in original plan** — R5 (either shape) needs a `config_seed`-style stats
+  exclusion or an explicit RUNBOOK note accepting `run_count`/`spend_total` inflation.
+- **New finding** — R3.2's null-`thread_id` dedup case has no specified matching rule.
+
+### Completion Summary
+
+Both CEO voices ran to completion; 4 decisive claims independently re-verified against the code.
+No disagreement between Codex and the Claude subagent on any dimension. Recommendation: **Approach
+C** — ship R3+R4 now (zero shared surface with attn.4, and R4 is an active data-loss bug that has
+already fired twice in 3 days of real production data), reshape R5 per D1 before building it.
+
+---
+
+## R5 REDESIGNED — management-API verb (accepted D1, replaces the sentinel design above)
+
+**Gate decision (2026-08-04):** Approach C. R3+R4 ship as specified (R3.4 uses D2). R5 is rebuilt
+as an HTTP verb on the existing management API, not a filesystem sentinel.
+
+### Architecture, verified against the code (not assumed)
+
+`dispatch_run_job` (`scheduler.rs:2510`) is the function a real `run_job` tool-use call reaches.
+Traced its dependency on a live parent:
+
+- **Capability check** uses `parent_cap_set`, an argument — no live-agent lookup required.
+- **Success path** (job lookup, depth limit, child-id derivation, child spawn) degrades
+  gracefully for a parent that doesn't exist: `state.spawn_depths.get(&parent_id)...unwrap_or(0)`,
+  `state.agents.get(&parent_id).map(...).unwrap_or_default()` for model_cfg. Verified at
+  `scheduler.rs:2570-2622`.
+- **Completion delivery** (`scheduler.rs:1368-1412`, where a finished child looks up its
+  `AwaitingParent`) computes `parent_live = state.agents.contains_key(&parent_id) && ...` and
+  **cleanly no-ops delivery if false** — it still records `AgentChildResultDelivered`, it just
+  skips re-stepping. Verified at `scheduler.rs:1408-1412`.
+
+**Conclusion: the API route must use a synthetic parent id that is NEVER a real `AgentTask`** —
+e.g. `"manual-fire"`, not `"cos-orchestrator"`. Reusing the real trigger's id would risk injecting
+a `call_id`-labeled `tool_result` into the trigger's own transcript with no matching `tool_use` if
+the trigger happens to be live and parked at the moment of the API call — the same malformed-
+transcript risk class attn.3 (v0.120.0) just fixed on the checkpoint side. A synthetic id that is
+never a live agent makes `parent_live` always false, so delivery is a clean no-op that only
+records the flight event — no transcript is ever touched.
+
+### R5 acceptance criteria (revised — replaces the sentinel-shaped ACs 13-17 above)
+
+- **New route:** `POST /api/v1/cos/fire` (or similar — Eng review names it), same
+  unauthenticated-but-network-scoped posture as `/api/v1/agents/:id/inject` and
+  `/api/v1/credentials/:provider/reset-attention`.
+- Calls `dispatch_run_job` (or a thin wrapper) with `parent_id = "manual-fire"` (a label, never a
+  real agent), `parent_cap_set = Some(vec![Capability::RunJob])` (config-derived, matching what
+  cap.2b already grants the real trigger — no widening), `job_id` fixed to `"cos-inbox"` (the
+  curator fires itself via the existing inbox→curator handoff, OR the route fires both in sequence
+  — Eng review decides).
+- **Collision guard already exists and is reused, not rebuilt**: step 5's
+  `state.agents.contains_key(&child_id) || state.outcomes.contains_key(&child_id)` check is
+  identical whether the caller was the LLM trigger or this new route — a manual fire racing a
+  scheduled fire on the same date collides exactly like two scheduled fires would.
+- **Stats exclusion (new finding from Phase 1, not in the original R5 scope at all):** a
+  manually-fired child must not corrupt `run_count`/`spend_total` the way `attn.1a-04`
+  (TODOS.md:429) already names for the future attn.1b loop. `run_tracker.open()` at
+  `scheduler.rs:2638` needs a `start_reason` distinct from `"run_job"` for this path — e.g.
+  `"manual_fire"` — so `publish_brief`'s stats aggregation (`runs/store.rs:489-504`, the same
+  `!= "config_seed"` filter pattern) can exclude it the same way.
+- **No filesystem sentinel, no new capability, no new env var, no 3-site config-parity
+  requirement** — this removes AC13-17 (stale-init, catch-up race, lossy unlink, env-var parity)
+  entirely. They do not apply to an HTTP route.
+- **New observability event** (Phase 1 Section 8 finding): `ManualFireTriggered{child_id, source}`
+  recorded at the route handler, before dispatch — so a brief with an unusual `run_count` is
+  traceable to "someone hit the endpoint on this date," not silent.
+
+### R3.4 revised (D2 accepted)
+
+`suppressed_count` is derived from Gmail's `resultSizeEstimate` field on the STEP 2
+`messages.list` response already being fetched — **not** a second `-in:inbox` call. Zero new
+broker requests; moots the `attn.1a-01` interaction the original R3.4 raised.
+
+### Open questions for Phase 3 (Eng review) — do not resolve these in CEO synthesis
+
+1. Exact route path and method naming (`/api/v1/cos/fire` vs. matching `/api/v1/agents/...`
+   conventions elsewhere).
+2. Does the route dispatch `cos-inbox` only (letting the existing inbox→curator handoff carry
+   the rest) or both jobs explicitly? The real trigger's prompt calls them sequentially with a
+   completion-signal wait in between — does a single HTTP call need to replicate that wait, or
+   fire-and-forget both?
+3. `start_reason = "manual_fire"` — confirm `run_tracker.open()`'s signature accepts an arbitrary
+   string here today, or whether it needs a typed enum change.
+4. R3.2's null-`thread_id` dedup matching rule (Phase 1 Section 4 gap, still unresolved).
