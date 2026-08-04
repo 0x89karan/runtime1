@@ -24,11 +24,69 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.119.0 (shipped 2026-08-01)
+**Current version:** v0.120.0 (shipped 2026-08-03)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** attn.2 R1+R2 (v0.119.0) — **the CoS boots without an embeddings key and
+**Latest shipped:** attn.3 (v0.120.0) — **a SIGTERM mid-tool-call no longer persists a
+transcript the provider rejects, and the numbers that decide paging are now in the log. The brief
+is still NOT expected to appear — that is `attn.4`.** Plan:
+`docs/plans/attn.3-real-context-window.md`.
+- **THREE premises were falsified during this increment, two of them mine and one the audit's.**
+  The increment was planned as "give paging a real context window" (`audit118-R1`). Codex's CEO
+  voice asked for a cheap diagnostic first; the live `agentos_cos-data` volume still existed, so it
+  was run — and it killed the plan. **Do not re-derive this: measure the retained curve before
+  believing any paging claim.**
+- **What the volume actually says** (29 min, `flight.jsonl`): only `cos-orchestrator` ever ran —
+  `cos-inbox`/`cos-curator` appear **zero** times, so there was no brief because the jobs never
+  fired. **All 63 tool calls are the same call**, `wait_for_trigger(timeout_s=20)`, each answering
+  "next fire 14 h from now". 414,016 input tokens **to wait**. Zero `memory_paged`, zero budget or
+  defer events.
+- **`audit118-R1` demoted P0 → P2 and BLOCKED.** Retained context at the failure was **11,569**
+  tokens against a would-be corrected trigger of 172,627 — **15× away** — and with the measured
+  ~159 tokens/poll-pair the global budget dies at turn ~355 while paging first fires at ~1,086, so
+  the fix is **arithmetically inert on the agent the audit headlined**. Its "independent,
+  **sufficient** explanation" for the drought is **withdrawn**. It is also *blocked*, not deferred:
+  **paging is lossy** (`cap_short_term` drains silently, `distill_on_complete` defaults false and is
+  unset for the CoS, nothing recalls `short_term` in-run), so enabling it on `cos-inbox` would
+  silently drop the oldest emails — "no brief" becomes "quietly incomplete brief" with
+  `memory_paged` in the log looking like the fix working. Fixing R1 alone is an **active regression**.
+- **`audit118-R2`'s premise was also wrong.** It said the 400 loop was in-memory ("no
+  `checkpoint.json` in the volume"); the volume holds 65 `agent_checkpointed` and 2
+  `agent_restored`, with the 400 landing **one second after each restore**, twice. Restore path —
+  already fixed by attn.2. **The in-loop repair was built and then WITHDRAWN**: no producer could be
+  demonstrated, and it would have **removed the circuit breaker** that currently kills the runaway
+  trigger at ~29 min instead of letting it burn to the 10M ceiling.
+- **What shipped instead:** the real producer is **SIGTERM landing mid-tool-call** (dispatched
+  18:13:31, SIGTERM 18:13:47, 63 `tool_call` vs 62 `tool_result`). `build_scheduler_checkpoint` now
+  seals it, **on the checkpoint COPY, never the live transcript** — which also makes attn.2's
+  "Interrupted by a restart" wording literally true. Plus `retained_tokens_est` / `paging_limit` /
+  `paging_limit_source` on `inference_request`, named that way because R1 is open and the value IS a
+  spend ceiling; `context_limit` holding 5e9 would teach the next reader the window is 5e9.
+- **/qa drove the real binary across five arms and corrected the brief again.** SIGTERM mid-FIFO-read
+  → on-disk checkpoint **pairing violations: NONE**, restart clean (`agent_restored →
+  inference_request → agent_completed`, zero errors). **My negative control was wrong:**
+  `c02a376c~1` does not draw the 400 because it already carries attn.2's restore repair; QA built a
+  third arm at `71414e9f~1` (pre-attn.2) which reproduces the production error verbatim. So the
+  malformed **checkpoint** reproduces at the stated baseline and the **400** was already fixed one
+  increment earlier — **attn.3 is defence-in-depth, not the sole fix.** Two unrequested arms also
+  passed: a legacy bad checkpoint fed to the new binary still self-heals, and a *promised*
+  `spawn_agent` call is correctly **not** sealed.
+- **/review found 7 defects, four of them mutation-proven false greens in guards written one round
+  earlier — two of those mine, in this increment.** A duplicate `agent_checkpointed`; a
+  `catch_unwind` precondition; unguarded position-sensitivity (**found because a subtle mutation
+  SURVIVED** while delete-the-code was caught); `retained_tokens_est` logged pre-paging with an
+  `is_u64()` assertion that hardcoding `0` could not fail; and a fixture with **zero `tool_use`
+  blocks** because it omitted a `step()` the helper above it warns about. Lesson recorded: mutate
+  guards *subtly*, not just by deletion.
+- **Honest limits, in the code and the RUNBOOK:** restore is **at-least-once** for tool side effects,
+  not exactly-once (`checkpoint_interval_turns` defaults to 1 and all agents are snapshotted on any
+  agent's tool boundary); the checkpoint writer does not apply the dead-child filter the restore path
+  does; and a clean checkpoint does **not** prove a live agent is healthy. `attn.3-qa-01` (P2) files
+  the one defect left open — `repair_and_record` still double-emits `agent_restored`, the same class
+  /review fixed one function over.
+
+**Prev:** attn.2 R1+R2 (v0.119.0) — **the CoS boots without an embeddings key and
 survives restore. It still cannot produce briefs — see the audit finding below.** Plan:
 `docs/plans/attn.2-workable-brief.md` (issue #164, reshaped at the /autoplan premise gate from
 four stages to five corrected items; only R1 and R2 are built).
@@ -248,17 +306,28 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **Fix the context window FIRST, then run it for 14 days.** Do NOT start the
-14-day measure yet — `docs/AUDIT-v0.118.md` R1 shows the pipeline cannot produce briefs as
-configured, so the measure would record a drought caused by a known bug and teach us nothing.
-1. **`AUDIT-v0.118.md` R1 — a real `context_window`, separate from `token_budget`.** This is the
-   blocker. Paging is keyed to the spend ceiling, so it never fires; measured 417,638 tokens in 29
-   minutes with `output/` empty. Its own increment; also fold in R2's runtime gap (the pairing check
-   before every `InferenceRequest`, not only on restore) since it is the same subsystem.
-2. **Then** `docker compose up -d cos` (**`up -d`, not `start`** — see the recreate note above) and
-   leave it. Booting before step 1 burns roughly 4M tokens a day and still emits nothing.
-3. The D4 measure from office hours: **does the operator stop checking email manually?** 14 days.
-   Paired computable proxy (needs `attn.2` R3): the already-handled rate of morning-brief items.
+**Next (roadmap):** **attn.4 — scheduler-native cron. This is what brings the brief back.**
+Do NOT bring the stack up first and do NOT start the 14-day measure yet.
+1. **`attn.4` (P1) — give `[[jobs]]` a schedule and fire them from the scheduler**, so no LLM sits
+   on the schedule boundary. Measured: the trigger burns **~3,456 inference calls/day** to watch a
+   clock (63/63 tool calls in a 29-min window were `wait_for_trigger`, 414k tokens **to wait**), and
+   that is what empties the 10M/24h window in ~2.6 h. Rejected at the gate: raising `MCP_TIMEOUT`
+   globally (`mcp.rs:23` covers every MCP call, so a hung sidecar would pin an agent for minutes on
+   a PID-1 process). **Verified NOT a config flip** — `Job` has no schedule field and the scheduler
+   has no native job cron. Six open design questions in
+   `docs/plans/attn.3-real-context-window.md` §4, including the **timezone gap** (no `chrono::Local`,
+   no `tzdata`, no `TZ`, so "08:00" silently means UTC) and the fate of the other two h7.3 trigger
+   servers. Needs its own `/autoplan`.
+2. **Then** `docker compose up -d cos` (**`up -d`, not `start`**) and leave it. Booting before
+   attn.4 costs ~$50/day of inference to poll a clock and still emits nothing.
+3. The D4 measure: **does the operator stop checking email manually?** 14 days.
+
+**In parallel, needing zero engineering, and now flagged by four consecutive CEO voices:** name mv
+design partners. Gate 2026-10-01, **0 of 10 named, 0 of 3 demos**. Both CEO voices in attn.3's
+/autoplan ranked it above this entire track again; Codex's verdict was "attn.3 is probably a real bug
+fix. It is not a company milestone. The strategic failure would be using it to defer the only dated
+external validation gate." The pipeline is already inside the briefs on disk — Mayfield, MIT and Kong
+(domain-verified), plus Microsoft/GitHub, NTT and Amex.
 
 **In parallel, needing zero engineering:** name mv design partners. Gate 2026-10-01 (61 days at time
 of writing), 0 of 10 named, 0 of 3 demos. Candidate contacts are already inside the briefs on disk.

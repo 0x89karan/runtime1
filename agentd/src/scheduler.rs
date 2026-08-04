@@ -111,10 +111,16 @@ fn repair_and_record(
     if repaired.is_empty() {
         return;
     }
+    // Field names match the checkpoint-side repair (`build_scheduler_checkpoint`) on purpose.
+    // These were `repaired_call_ids` with no count while the checkpoint side emitted
+    // `repaired_ids` + `repaired_count`, so a log query for one silently missed the other —
+    // and post-attn.3 THIS path is the rarer and more interesting one, because it now means
+    // "this checkpoint was written by an older binary". Found at /qa.
     recorder.record(agent_id, Some(cp_agent.turn), EventKind::AgentRestored, json!({
-        "stage": "restore_repair",
-        "reason": "interrupted tool calls had no result at checkpoint time",
-        "repaired_call_ids": repaired,
+        "stage":          "restore_repair",
+        "reason":         "interrupted tool calls had no result at checkpoint time",
+        "repaired_ids":   repaired,
+        "repaired_count": repaired.len(),
     }));
 }
 
@@ -3729,17 +3735,69 @@ async fn poll_universal_agents(
 /// Terminal agents are excluded — they've already delivered their results.
 /// The deferred queue is intentionally omitted: those agents remain in `state.agents`
 /// in NeedInfer state, so step() re-derives their InferenceRequest on restore.
+/// Returns the checkpoint plus a map of `agent_id -> sealed tool_use ids` for any agent whose
+/// PERSISTED transcript had to be repaired. The caller folds that into its own single
+/// `AgentCheckpointed` event: one checkpoint must produce exactly ONE event per agent, or
+/// anything counting checkpoints double-counts precisely when a repair fires.
 fn build_scheduler_checkpoint(
     state: &SchedulerState,
     cred_gw: Option<&Arc<crate::credential::CredentialGateway>>,
-) -> SchedulerCheckpoint {
+) -> (SchedulerCheckpoint, HashMap<String, Vec<String>>) {
+    let mut repairs: HashMap<String, Vec<String>> = HashMap::new();
     // Include waiting orchestrated agents (terminal=true) in addition to active agents.
     // Their terminal flag is preserved so the seed loop skips them on restore.
+    // attn.3 A3 — never PERSIST a transcript whose tail is an unanswered `tool_use`.
+    //
+    // Measured on the live `agentos_cos-data` volume (2026-08-01): a `wait_for_trigger`
+    // tool call was dispatched at 18:13:31 and SIGTERM arrived at 18:13:47, 16 s into a
+    // 20 s call — 63 `tool_call` events against 62 `tool_result`. The half-finished turn
+    // was checkpointed, and the restore 10 s later drew
+    // `400 ... messages.125: tool_use ids were found without tool_result blocks
+    // immediately after`, one second after `agent_restored`, twice.
+    //
+    // The repair is applied to the checkpoint COPY, never to the live transcript: the live
+    // agent may still receive the real result and carry on, and its history stays untouched.
+    //
+    // ⚠ Be precise about what this does and does NOT guarantee (corrected at /review):
+    // For a SIGTERM checkpoint, "the in-flight result never arrives" is true. For a PERIODIC
+    // checkpoint it is NOT — `checkpoint_interval_turns` defaults to 1 and `checkpoint_all`
+    // snapshots ALL agents on ANY agent's tool boundary, so agent B's turn can seal agent A's
+    // still-running call. A then completes, its side effect lands, and if the process dies
+    // before the next checkpoint the restored A is told the call was interrupted. So restore
+    // is **at-least-once** for tool side effects, not exactly-once. That is NOT a regression —
+    // pre-attn.3 the dangling id was persisted and the restore-side repair synthesised the
+    // identical block — but it must not be mistaken for exactly-once. Making it exactly-once
+    // needs dispatched ids tracked in a checkpointed `in_flight_tool_calls` map (state.pending
+    // holds opaque futures, so nothing can distinguish "never ran" from "ran, result lost").
+    // It also makes the synthetic block's existing wording ("Interrupted by a restart
+    // before this tool produced a result") literally true, since a checkpoint is only ever
+    // read back after a restart.
+    //
+    // A call the scheduler has already promised to answer must NOT be repaired: those ids
+    // come from `awaiting.values()` and `pending_approvals.values()` — `.values()`, because
+    // `awaiting` is keyed by CHILD id and `pending_approvals` by APPROVAL id, so the keys
+    // are not call ids (the ux.13 P0 confusion). Restore re-creates both tables from this
+    // same checkpoint, so anything listed there gets its real result on the way back up.
+    let live_call_ids: std::collections::HashSet<String> = state
+        .awaiting
+        .values()
+        .map(|ap| ap.call_id.clone())
+        .chain(state.pending_approvals.values().map(|pa| pa.call_id.clone()))
+        .collect();
+
     let agents: Vec<crate::checkpoint::AgentCheckpoint> = state
         .agents
         .iter()
         .filter(|(id, a)| !a.is_terminal() || state.waiting.contains(id.as_str()))
-        .map(|(_, a)| a.to_checkpoint())
+        .map(|(_, a)| {
+            let mut cp = a.to_checkpoint();
+            let repaired =
+                AgentTask::repair_dangling_tool_uses(&mut cp.messages, &live_call_ids);
+            if !repaired.is_empty() {
+                repairs.insert(cp.agent_id.clone(), repaired);
+            }
+            cp
+        })
         .collect();
 
     let awaiting: Vec<AwaitingEntry> = state
@@ -3771,7 +3829,7 @@ fn build_scheduler_checkpoint(
         .map(|gw| gw.provider_health_checkpoints())
         .unwrap_or_default();
 
-    SchedulerCheckpoint {
+    let cp = SchedulerCheckpoint {
         format_version:      crate::checkpoint::FORMAT_VERSION,
         agents,
         awaiting,
@@ -3787,7 +3845,8 @@ fn build_scheduler_checkpoint(
         credential_health,
         budget_window_start:  state.budget_window_start,
         global_window_anchor: state.global_window_anchor,
-    }
+    };
+    (cp, repairs)
 }
 
 /// Write the full scheduler state to the checkpoint store and emit flight events.
@@ -3797,7 +3856,7 @@ async fn checkpoint_all(
     state: &SchedulerState,
     recorder: &FlightRecorder,
 ) {
-    let cp = build_scheduler_checkpoint(state, state.cred_gw.as_ref());
+    let (cp, repairs) = build_scheduler_checkpoint(state, state.cred_gw.as_ref());
     if let Err(e) = store.save(&cp).await {
         tracing::warn!("checkpoint save failed (best-effort): {e:#}");
         return;
@@ -3807,7 +3866,24 @@ async fn checkpoint_all(
             &agent_cp.agent_id,
             Some(agent_cp.turn),
             EventKind::AgentCheckpointed,
-            json!({ "turn": agent_cp.turn, "total_tokens": agent_cp.total_input + agent_cp.total_output }),
+            // attn.3 A3: when the PERSISTED transcript had to be sealed, say so HERE rather
+            // than in a second event — one checkpoint, one event per agent, so anything
+            // counting checkpoints does not double-count exactly when a repair fires.
+            match repairs.get(&agent_cp.agent_id) {
+                Some(ids) => json!({
+                    "turn":           agent_cp.turn,
+                    "total_tokens":   agent_cp.total_input + agent_cp.total_output,
+                    "stage":          "checkpoint_repair",
+                    "repaired_ids":   ids,
+                    "repaired_count": ids.len(),
+                    "note":           "in-flight tool call sealed so the PERSISTED transcript \
+                                       is well-formed; the live agent is unchanged",
+                }),
+                None => json!({
+                    "turn":         agent_cp.turn,
+                    "total_tokens": agent_cp.total_input + agent_cp.total_output,
+                }),
+            },
         );
     }
 }
@@ -6845,6 +6921,343 @@ mod tests {
         );
     }
 
+    // ── attn.3 A3: never persist a transcript ending in an unanswered tool_use ──────
+    //
+    // Reproduces the MEASURED production failure (live agentos_cos-data volume,
+    // 2026-08-01): a tool call was dispatched at 18:13:31, SIGTERM landed at 18:13:47
+    // 16 s into a 20 s call (63 tool_call vs 62 tool_result), the half-finished turn was
+    // checkpointed, and the restore drew `400 ... messages.125: tool_use ids were found
+    // without tool_result blocks immediately after` one second after agent_restored.
+
+    /// Drive an agent through the REAL api into the exact production shape: a stored
+    /// response carrying a tool_use whose result never arrived.
+    fn state_with_inflight_tool_call(id: &str, call_id: &str) -> (SchedulerState, Arc<FlightRecorder>, NamedTempFile) {
+        let (rec, tmp) = recorder();
+        let mut state = minimal_state(id);
+        let task = state.agents.get_mut(id).unwrap();
+        // step() once so the transcript has the task turn, then hand back a tool_use
+        // response — the same sequence the scheduler runs before dispatching a tool.
+        let _ = task.step(&rec);
+        task.provide_inference(
+            InferenceResponse {
+                blocks: vec![Block::ToolUse {
+                    id:    call_id.to_string(),
+                    name:  "wait_for_trigger".to_string(),
+                    input: serde_json::json!({ "timeout_s": 20 }),
+                }],
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      11_569,
+                output_tokens:     57,
+                transport_retries: 0,
+            },
+            &rec,
+        );
+        // provide_inference only STORES the response; step_with_response is what pushes
+        // its blocks into `messages` and emits the tool-call effect. Without this second
+        // step the transcript is just the task turn and every assertion below is vacuous.
+        let _ = state.agents.get_mut(id).unwrap().step(&rec);
+        (state, rec, tmp)
+    }
+
+    /// The provider's pairing rule as a NON-PANICKING predicate: every `tool_use` id must have
+    /// a `tool_result` in the IMMEDIATELY following message. Position-sensitive on purpose — a
+    /// later, non-adjacent result does not satisfy the real API and must not satisfy this either.
+    ///
+    /// A predicate, not an assertion, because one caller needs to prove a transcript IS
+    /// malformed. Doing that with `catch_unwind` would depend on unwinding, and this crate sets
+    /// `panic = "abort"` in `[profile.release]` — a dev/test profile that ever inherits it would
+    /// turn that precondition from a failing test into an aborted test binary.
+    fn first_unpaired_tool_use(msgs: &[Msg]) -> Option<(usize, String)> {
+        for (i, m) in msgs.iter().enumerate() {
+            let uses: Vec<&str> = m
+                .blocks
+                .iter()
+                .filter_map(|b| match b {
+                    Block::ToolUse { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if uses.is_empty() {
+                continue;
+            }
+            let answered: Vec<&str> = msgs
+                .get(i + 1)
+                .map(|n| {
+                    n.blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            Block::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(u) = uses.iter().find(|u| !answered.contains(*u)) {
+                return Some((i, (*u).to_string()));
+            }
+        }
+        None
+    }
+
+    fn assert_well_formed(msgs: &[Msg], label: &str) {
+        if let Some((i, id)) = first_unpaired_tool_use(msgs) {
+            panic!(
+                "{label}: tool_use {id} at messages.{i} has no tool_result in the immediately \
+                 following message — this is the exact 400 the CoS hit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_adjacent_tool_result_does_not_satisfy_the_pairing_rule() {
+        // Guards the POSITION-SENSITIVITY of first_unpaired_tool_use, which a mutation proved
+        // was previously unguarded: making the predicate scan all later messages instead of
+        // only `i + 1` left every test green. The provider rule is "tool_result in the
+        // IMMEDIATELY following message", so a result that exists but sits two turns later is
+        // still a 400 — and a checker that accepts it would declare the CoS transcript healthy
+        // on exactly the shape that took the pipeline down.
+        let msgs = vec![
+            Msg { role: Role::User, blocks: vec![Block::Text { text: "task".into() }] },
+            Msg {
+                role:   Role::Assistant,
+                blocks: vec![Block::ToolUse {
+                    id:    "toolu_late".into(),
+                    name:  "wait_for_trigger".into(),
+                    input: serde_json::json!({}),
+                }],
+            },
+            // Not a tool_result — so toolu_late is unanswered AT THE REQUIRED POSITION.
+            Msg { role: Role::User, blocks: vec![Block::Text { text: "unrelated".into() }] },
+            Msg { role: Role::Assistant, blocks: vec![Block::Text { text: "thinking".into() }] },
+            // The result DOES exist, just too late. The real API rejects this.
+            Msg {
+                role:   Role::User,
+                blocks: vec![Block::ToolResult {
+                    tool_use_id: "toolu_late".into(),
+                    content:     "{}".into(),
+                    is_error:    false,
+                }],
+            },
+        ];
+
+        let found = first_unpaired_tool_use(&msgs);
+        assert_eq!(
+            found.as_ref().map(|(i, id)| (*i, id.as_str())),
+            Some((1, "toolu_late")),
+            "a tool_result two turns later must NOT count as paired; got {found:?}"
+        );
+
+        // Positive control: move the result to the adjacent slot and it IS paired. Without this
+        // half, a predicate hard-wired to `return Some(..)` would also pass the assertion above.
+        let mut adjacent = msgs.clone();
+        adjacent.remove(3);
+        adjacent.swap(2, 3);
+        assert_eq!(
+            first_unpaired_tool_use(&adjacent),
+            None,
+            "an immediately-following tool_result must count as paired"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_seals_an_inflight_tool_call_so_restore_cannot_400() {
+        let (state, _rec, tmp) = state_with_inflight_tool_call("ck-inflight", "toolu_inflight");
+
+        // Precondition: the LIVE transcript really is malformed. If this ever stops being
+        // true the test below is vacuous, so prove the hazard exists before proving the fix.
+        let live = state.agents["ck-inflight"].messages();
+        assert!(
+            live.iter().any(|m| m
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::ToolUse { id, .. } if id == "toolu_inflight"))),
+            "fixture must produce an assistant tool_use turn"
+        );
+        assert!(
+            first_unpaired_tool_use(live).is_some(),
+            "fixture precondition: the live transcript MUST be malformed, else this test \
+             proves nothing"
+        );
+
+        let cp = build_scheduler_checkpoint(&state, None).0;
+        let acp = cp.agents.iter().find(|a| a.agent_id == "ck-inflight").expect("agent in cp");
+        assert_well_formed(&acp.messages, "checkpoint");
+
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_on_disk_is_well_formed_after_a_mid_tool_call_shutdown() {
+        // The production failure was not about an in-memory struct: the transcript that
+        // came BACK OFF DISK was malformed, and the restore 10 s later drew the 400. So
+        // prove it through the real CheckpointStore, save -> load, not just the builder.
+        let (state, rec, tmp) = state_with_inflight_tool_call("ck-disk", "toolu_disk");
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path());
+
+        checkpoint_all(&store, &state, &rec).await;
+
+        let loaded = store
+            .load()
+            .expect("checkpoint must load")
+            .expect("checkpoint must exist on disk");
+        let acp = loaded
+            .agents
+            .iter()
+            .find(|a| a.agent_id == "ck-disk")
+            .expect("agent must be in the persisted checkpoint");
+        assert_well_formed(&acp.messages, "on-disk checkpoint");
+
+        // And the repair is auditable: a bare `agent_checkpointed` would hide that the
+        // persisted transcript differs from what the agent actually holds.
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        let ck_events: Vec<serde_json::Value> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|e| e["kind"] == "agent_checkpointed" && e["agent"] == "ck-disk")
+            .collect();
+
+        // ONE checkpoint must produce exactly ONE event per agent. The first cut of this fix
+        // emitted a second `agent_checkpointed` from inside the checkpoint builder, so anything
+        // counting checkpoints double-counted precisely when a repair fired. Caught at /review.
+        assert_eq!(
+            ck_events.len(),
+            1,
+            "exactly one agent_checkpointed per agent per checkpoint; got {}:\n{log}",
+            ck_events.len()
+        );
+        // ...and the repair must be ON that event, not silent.
+        let data = &ck_events[0]["data"];
+        assert_eq!(data["stage"].as_str(), Some("checkpoint_repair"));
+        assert_eq!(data["repaired_count"].as_u64(), Some(1));
+        assert_eq!(
+            data["repaired_ids"][0].as_str(),
+            Some("toolu_disk"),
+            "the sealed id must be named so the log is auditable"
+        );
+        // The pre-existing fields must survive the added ones.
+        assert!(data["total_tokens"].is_u64(), "total_tokens must not be dropped");
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_repair_does_not_touch_the_live_transcript() {
+        // The repair must apply to the checkpoint COPY only. The live agent may still
+        // receive the real tool result, so mutating its history would fabricate a
+        // cancellation that did not happen and then collide with the real result.
+        let (state, _rec, tmp) = state_with_inflight_tool_call("ck-copy", "toolu_copy");
+
+        let before = state.agents["ck-copy"].messages().len();
+        let cp = build_scheduler_checkpoint(&state, None).0;
+        let after = state.agents["ck-copy"].messages().len();
+
+        assert_eq!(before, after, "live transcript must be untouched by checkpoint repair");
+        let acp = cp.agents.iter().find(|a| a.agent_id == "ck-copy").unwrap();
+        assert_eq!(
+            acp.messages.len(),
+            before + 1,
+            "the checkpoint copy gains exactly one synthetic tool_result turn"
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_does_not_seal_a_call_the_scheduler_promised_to_answer() {
+        // NEGATIVE CONTROL. A tool_use awaiting a live child is NOT orphaned: restore
+        // rebuilds `awaiting` from this same checkpoint and the real result arrives.
+        // Sealing it would fabricate a result for work still in progress.
+        //
+        // `awaiting` is keyed by CHILD id and the call id lives in the VALUE — using the
+        // keys here is the ux.13 P0 confusion, and the mutation control below pins it.
+        let (mut state, _rec, tmp) = state_with_inflight_tool_call("ck-live", "toolu_promised");
+        state.awaiting.insert(
+            "child-1".to_string(),
+            AwaitingParent {
+                parent_id:       "ck-live".to_string(),
+                call_id:         "toolu_promised".to_string(),
+                deliver_content: false,
+            },
+        );
+
+        let cp = build_scheduler_checkpoint(&state, None).0;
+        let acp = cp.agents.iter().find(|a| a.agent_id == "ck-live").unwrap();
+
+        // Non-vacuity: the tool_use must actually BE in the checkpointed transcript, or
+        // "was not sealed" is trivially true and this control proves nothing.
+        assert!(
+            acp.messages.iter().any(|m| m
+                .blocks
+                .iter()
+                .any(|b| matches!(b, Block::ToolUse { id, .. } if id == "toolu_promised"))),
+            "non-vacuity: the promised tool_use must be present in the checkpoint"
+        );
+
+        let synthesized = acp.messages.iter().any(|m| {
+            m.blocks.iter().any(
+                |b| matches!(b, Block::ToolResult { tool_use_id, .. } if tool_use_id == "toolu_promised"),
+            )
+        });
+        assert!(
+            !synthesized,
+            "a promised call must NOT be sealed — restore delivers the real result"
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_leaves_a_well_formed_transcript_byte_identical() {
+        // Idempotence + no-op safety. Compares the FULL Vec<Msg>, not len(): the repair's
+        // merge path can reorder blocks without changing length (a false green the eng
+        // review named).
+        let (rec, tmp) = recorder();
+        let mut state = minimal_state("ck-clean");
+        let task = state.agents.get_mut("ck-clean").unwrap();
+        let _ = task.step(&rec);
+        task.provide_inference(
+            InferenceResponse {
+                blocks:            vec![Block::ToolUse {
+                    id:    "toolu_ok".to_string(),
+                    name:  "wait_for_trigger".to_string(),
+                    input: serde_json::json!({}),
+                }],
+                stop_reason:       StopReason::ToolUse,
+                input_tokens:      10,
+                output_tokens:     5,
+                transport_retries: 0,
+            },
+            &rec,
+        );
+        // The step that the helper above warns about, and that this test originally omitted:
+        // provide_inference only STORES the response. Without it `messages` holds no tool_use
+        // at all, the byte-identity check exercises only the is_empty() short-circuit, and
+        // sealing unconditionally still passes. Caught at /review by a surviving mutation.
+        let _ = state.agents.get_mut("ck-clean").unwrap().step(&rec);
+        let task = state.agents.get_mut("ck-clean").unwrap();
+        // Answer it, exactly as the scheduler does — now the transcript is well-formed.
+        task.provide_tool_results(
+            vec![Block::ToolResult {
+                tool_use_id: "toolu_ok".to_string(),
+                content:     "{\"status\":\"waiting\"}".to_string(),
+                is_error:    false,
+            }],
+            &rec,
+        );
+
+        assert_well_formed(state.agents["ck-clean"].messages(), "precondition");
+        // Serialized comparison rather than len(): this catches block REORDERING and any
+        // content edit, which a length check would sail past.
+        let expected = serde_json::to_string(state.agents["ck-clean"].messages()).unwrap();
+
+        let cp = build_scheduler_checkpoint(&state, None).0;
+        let acp = cp.agents.iter().find(|a| a.agent_id == "ck-clean").unwrap();
+        assert_eq!(
+            serde_json::to_string(&acp.messages).unwrap(),
+            expected,
+            "a well-formed transcript must pass through completely unchanged"
+        );
+        drop(tmp);
+    }
+
     #[tokio::test]
     async fn checkpoint_excludes_universal_agents() {
         // Universal agents must never appear in the scheduler checkpoint —
@@ -6861,7 +7274,7 @@ mod tests {
         let mut state = minimal_state("native");
         state.universal_agents.insert(cfg.id.clone(), ua);
 
-        let cp = build_scheduler_checkpoint(&state, None);
+        let cp = build_scheduler_checkpoint(&state, None).0;
         assert!(
             !cp.agents.iter().any(|a| a.agent_id == "univ_ck"),
             "universal agent must NOT appear in checkpoint"
@@ -7168,7 +7581,14 @@ mod tests {
         assert_eq!(ev["kind"], "agent_restored",
             "must not be `error` — that would paint a successful self-heal red in the cockpit");
         assert_eq!(ev["agent"], "solo", "the JSONL field is `agent`, not `agent_id`");
-        assert_eq!(ev["data"]["repaired_call_ids"], serde_json::json!(["toolu_orphan"]));
+        // Field names harmonised with the checkpoint-side repair at /qa: a log query for
+        // `repaired_ids` previously missed this path entirely.
+        assert_eq!(ev["data"]["repaired_ids"], serde_json::json!(["toolu_orphan"]));
+        assert_eq!(ev["data"]["repaired_count"], serde_json::json!(1));
+        assert!(
+            ev["data"]["repaired_call_ids"].is_null(),
+            "the old field name must be gone, not emitted alongside the new one"
+        );
 
         let msgs = sched.agents["solo"].messages();
         let last = msgs.last().expect("history must not be empty");
@@ -7335,7 +7755,7 @@ mod tests {
         state.orchestrated.insert("orch".to_string());
         // Terminal flag would normally be set by AgentTask completing — test that
         // filter includes waiting agents regardless of terminal status.
-        let cp = build_scheduler_checkpoint(&state, None);
+        let cp = build_scheduler_checkpoint(&state, None).0;
         assert!(
             cp.waiting_agents.contains(&"orch".to_string()),
             "waiting_agents must be included in checkpoint"

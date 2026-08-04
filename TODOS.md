@@ -204,19 +204,73 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   BuildKit ≥0.16 that speaks the gha cache v2 API, OR switch to `type=registry` cache
   (`cache-to: type=registry,ref=ghcr.io/0x89karan/runtime1:buildcache,mode=max`). Perf only —
   releases publish fine after the hotfix.
-- **audit118-R1 (P0) [AUDIT-v0.118, measured] — context paging is keyed to `token_budget` (a SPEND
-  ceiling), not the model's context window. The CoS cannot produce briefs.** There is no
-  `context_window` concept in the codebase. `context.rs:43` divides retained tokens by
-  `token_budget`; `agent/mod.rs:813` passes `self.cfg.token_budget`. With HARD_THRESHOLD 0.90 and the
-  shipped budgets, Hard fires at 4.5e9 / 1.35M / 450k retained against a 200k window — 22,500× too
-  high for the orchestrator, so paging never fires. **Measured on the live volume: 65 inference
-  requests in 29 min, 417,638 tokens, msg_count 121→126 monotonic, zero `memory_paged`, `output/`
-  empty.** Spend is quadratic in turns. Independent of and unaddressed by attn.1a's restart fix.
-  Fix: a real `context_window` config field, defaulted per model, threaded to `assess()`.
-- **audit118-R2 (P1) [AUDIT-v0.118] — the dangling-`tool_use` repair runs only on the restore path.**
-  attn.2 R2 fixed restore, but the live 400 loop was in-memory (no `checkpoint.json` in the volume).
-  `repair_dangling_tool_uses` is reachable only from `repair_and_record` at `scheduler.rs:419`/`:434`.
-  Fix: run the pairing check before every `InferenceRequest`. Small; belongs with audit118-R1.
+- **audit118-R1 (P2, was P0) [AUDIT-v0.118 — DEMOTED + BLOCKED at attn.3's /autoplan gate] —
+  context paging divides retained tokens by `token_budget`, a SPEND ceiling.** Real bug:
+  `context.rs:43` / `agent/mod.rs:813`; there is no `context_window` concept in the codebase.
+  **But the audit's severity and its causal claim were both wrong, disproven by measurement:**
+  (a) at the observed failure retained context was **11,569 tokens** against a would-be corrected
+  trigger of 172,627 — **15× away**, so re-keying would have changed nothing; (b) with the measured
+  slope of ~159 tokens/poll-pair the 10M global window dies at turn ~355 while paging would first
+  fire at turn ~1,086, so on the trigger **budget exhaustion beats paging by ~3×, always** — the fix
+  is arithmetically inert on the very agent the audit headlined. Its "independent, **sufficient**
+  explanation for three briefs in fifteen days" is **withdrawn**.
+  **BLOCKED, not merely deferred: fixing this alone is an active REGRESSION.** Paging is lossy and
+  unrecoverable — `cap_short_term` (`agent/mod.rs:522-528`) does `drain(0..overflow)` silently,
+  `memory.distill_on_complete` defaults `false` (`config.rs:196`) and is unset in `cos.agents.toml`,
+  nothing recalls `short_term` in-run, and `page_count` sheds ~a quarter of the transcript
+  oldest-first. On `cos-inbox` that discards the emails it read first: "no brief" becomes "quietly
+  incomplete brief", with `memory_paged` in the log looking like the fix working.
+  **Preconditions before touching it:** (1) paging must be non-lossy (distillation on plus an in-run
+  recall path); (2) the limit is a **per-agent** property — a single top-level `[model]` table
+  (`config.rs:34`) cannot say "trigger 2.5k, jobs 190k"; (3) evaluate **prompt caching** first —
+  `cache_control`/`prompt_caching` have **zero** hits in `agentd/src/`, it attacks the same dominant
+  cost term (an identical prefix resent every turn) and is non-lossy where paging is not;
+  (4) `estimate_context_tokens` does not count the tool schemas `agent/mod.rs:898` actually sends,
+  so the numerator is a documented undercount; (5) the paging FLOOR is reachable — `page_count`
+  returns 0 for any transcript of ≤4 messages, and `cos-inbox` pulls ~20 emails into ONE
+  `tool_result`. `attn.3` shipped `paging_limit` + `paging_limit_source` on `inference_request` so
+  the wrongness is now legible in the log.
+- **audit118-R2 — CLOSED. Its premise was wrong; the real defect is closed by attn.2 + attn.3.**
+  The audit said "the live 400 loop was in-memory (no `checkpoint.json` in the volume)" and
+  prescribed a pairing check before every `InferenceRequest`. **The volume disproves it:** 65
+  `agent_checkpointed` + 2 `agent_restored` events, and the 400 lands **one second after each
+  restore**, twice (18:13:57→:58, 18:17:32→:33). It is the RESTORE path, already fixed by attn.2
+  (`db9cccb3`). The **producer** is SIGTERM landing mid-tool-call — dispatched 18:13:31, SIGTERM
+  18:13:47, 16 s into a 20 s `wait_for_trigger`; 63 `tool_call` vs 62 `tool_result` — and `attn.3`
+  closes that at `build_scheduler_checkpoint` so a malformed transcript is never persisted.
+  **The in-loop repair was built and then WITHDRAWN**: no producer could be demonstrated (the
+  candidate mechanism was refuted — the id *does* appear in a `tool_call` and every `stop_reason`
+  is `tool_use`, never `end_turn`; `live_call_ids` is `∅` at all 16 `step()` sites), and it would
+  have **removed the circuit breaker** — the 400 currently kills the trigger at ~29 min, whereas a
+  repaired trigger polls on until the 10M window dies at ~2.6 h. Do not re-add it without a
+  demonstrated producer.
+- **attn.3-qa-01 (P2) [attn.3 /qa, proven live] — `repair_and_record` emits a SECOND
+  `agent_restored`, so anything counting restores double-counts exactly when a repair fires.**
+  `main.rs:1258` already records one `AgentRestored` per restored agent; `scheduler.rs:114` records
+  another when a restore repair happens. Observed live in two /qa arms — `agent_restored` appears
+  twice for the same agent. **This is the identical defect class /review fixed one function over**
+  in `build_scheduler_checkpoint` (72dad0e4), and the same reasoning applies. Pre-existing from
+  attn.2, not introduced by attn.3, but its sibling was fixed in this increment and this one was not.
+  Fix: collect the repaired ids into `SchedulerRestored` and fold them into main.rs's single
+  `AgentRestored`, mirroring how `checkpoint_all` now folds the checkpoint-side repair. Deliberately
+  NOT bundled into attn.3 — it needs plumbing through the restore return type, which is more surgery
+  than a log-hygiene fix warrants at the end of an increment. The field-name half **is** fixed
+  (`repaired_ids` + `repaired_count`, matching the checkpoint side).
+- **attn.4 (P1) [attn.3 /autoplan, operator-chosen] — the CoS burns ~3,456 inference calls a day
+  to watch a clock. Scheduler-native cron.** MEASURED: 63 of 63 tool calls in a 29-min window were
+  `wait_for_trigger(timeout_s=20)`, each answering "next fire 14 h from now"; 414,016 input tokens
+  **to wait**, growing ~159 tokens/poll-pair because the whole transcript is resent. That is the
+  dominant cost driver and the reason the 10M/24h window empties in ~2.6 h — **not** paging (R1).
+  `cos.agents.toml:271` documents the furnace as a `max_turns` sizing problem and raises the limits
+  to accommodate it. `MAX_TIMEOUT_S = 25` (`cron_mcp.py:31`) is a consequence of the global
+  `MCP_TIMEOUT = 30s` (`mcp.rs:23`), so raising the timeout globally would let any hung sidecar pin
+  an agent for minutes on a PID-1 process — rejected at the gate. Chosen fix: give `[[jobs]]` a
+  schedule and fire them from the scheduler, removing the LLM from the schedule boundary entirely
+  (which *strengthens* cap.2b). **Verified NOT a config flip:** `Job` has no schedule field and
+  `scheduler.rs` has no native job cron. Open design questions in
+  `docs/plans/attn.3-real-context-window.md` §4, incl. the **timezone gap** (no `chrono::Local`, no
+  `tzdata`, no `TZ` — "08:00" silently means UTC) and the fate of the other two h7.3 trigger servers.
+  **The brief is not expected to return until this ships.**
 - **audit118-R3 (P1) [AUDIT-v0.118] — three PRODUCT-THESIS security claims the code does not
   implement.** `:63` network-namespace egress confinement (`universal.rs:68` passes
   `--network=host`); `:65` eBPF syscall auditing (no eBPF exists); `:69`/`:108` per-tool approval

@@ -769,6 +769,55 @@ docker compose down -v   # WARNING: deletes cos-data volume + all KB
 The orchestrator parks on `wait_for_trigger` between brief cycles. Ctrl-C checkpoints
 state; restart picks up from where it left off.
 
+#### Triage: no brief, and the log repeats a `tool_use` / `tool_result` 400
+
+Symptom in `flight.jsonl` (agent dies seconds after every restart):
+
+```
+"error":"Anthropic API 400 Bad Request: messages.N: `tool_use` ids were found without
+ `tool_result` blocks immediately after: toolu_..."
+```
+
+**Cause.** `Ctrl-C` / `docker compose stop` / a container restart can land *during* an
+in-flight tool call — `wait_for_trigger` blocks up to 25 s, so the window is wide. The
+half-finished turn (an assistant `tool_use` with no result) used to be checkpointed as-is, and
+every restore then resent it and drew the same 400 forever. Measured on 2026-08-01: the call was
+dispatched at 18:13:31, SIGTERM arrived at 18:13:47, and the restore at 18:13:57 failed at
+18:13:58 — twice, 3.5 minutes apart. Confirm with `63 tool_call` vs `62 tool_result`:
+
+```bash
+docker run --rm -v agentos_cos-data:/data:ro alpine:3 sh -c \
+  'apk add -q jq; jq -r .kind /data/flight.jsonl | sort | uniq -c | grep tool_'
+```
+
+**Fixed in two places, both shipped.** `attn.2` (v0.119.0) repairs a dangling `tool_use` on
+restore, so an existing bad checkpoint self-heals. `attn.3` stops *creating* one in the common case: the
+checkpoint writer seals in-flight calls before persisting. Two honest limits: it does **not**
+apply the dead-child filter the restore path uses, so an await naming an already-terminal child
+can still persist a dangling id (restore then self-heals it); and **a clean checkpoint does not
+prove the live agent is healthy** — a running agent can still be in an in-memory 400 loop, which
+is a separate open item. Neither diagnostic below can see that case. A repair is visible as an `agent_checkpointed` event with
+`"stage":"checkpoint_repair"`. **If you see this 400 on a build at or after v0.120.0, the
+checkpoint predates the fix** — it will heal itself on the next restore, or
+`docker compose down -v` resets state (destroys the KB; rarely worth it).
+
+#### Triage: the brief is late and spend looks enormous for an idle day
+
+`inference_request` now carries `retained_tokens_est` and `paging_limit` +
+`paging_limit_source`. A trigger that is merely *waiting* should hold a small, roughly flat
+`retained_tokens_est`. If it climbs monotonically for hours, the transcript is accumulating one
+poll pair per ~20 s and the whole transcript is resent each turn, so spend grows quadratically:
+
+```bash
+docker run --rm -v agentos_cos-data:/data:ro alpine:3 sh -c \
+  'apk add -q jq; jq -r "select(.kind==\"inference_request\") | .data.retained_tokens_est" \
+   /data/flight.jsonl | tail -20'
+```
+
+That is the known `attn.4` work (scheduler-native cron). Note `paging_limit_source` reads
+`token_budget`, a **spend ceiling**, not a context window — `audit118-R1` is still open, and the
+field is named that way so the log states the limitation instead of hiding it.
+
 ### 11.6 Where the brief lands
 
 **Dev mode (cargo run):**

@@ -889,6 +889,36 @@ impl AgentTask {
                 "model":      &self.model_cfg.model,
                 "msg_count":  self.messages.len(),
                 "tool_count": self.specs.len(),
+                // attn.3 A2 — the numbers that decide paging, on the record.
+                //
+                // Diagnosing the CoS brief drought took mounting a Docker volume and
+                // inferring intent from tool-call previews, and three separate premises
+                // were falsified by numbers that could simply have been logged. So log
+                // them.
+                //
+                // `_est` is not decoration: `estimate_context_tokens` walks `messages`
+                // only, at ~4 chars/token, and does NOT count the tool schemas that go
+                // out with this very request (`tools:` below). For an agent holding the
+                // Gmail + semantic-KB schemas that is a five-figure undercount. The
+                // provider's own `input_tokens` (anthropic.rs, `message_start`) is the
+                // ground truth; this is a cheap lower bound, labelled as one.
+                // MUST be recomputed here, not reused from the pre-paging `retained` above:
+                // the paging block between them can call `page_turns`, which DRAINS
+                // `self.messages`. Reusing the earlier value would pair a pre-paging estimate
+                // with the post-paging `msg_count` on the same line — an OVER-estimate of what
+                // actually went on the wire, wrong exactly on the turn paging fires, and the
+                // RUNBOOK triage ("a flat retained_tokens_est means idle") reads it.
+                "retained_tokens_est": estimate_context_tokens(&self.messages),
+                // Deliberately NOT called `context_limit`. `audit118-R1` is still OPEN:
+                // this denominator is `token_budget`, a SPEND ceiling, not the model's
+                // context window (there is no context-window concept in the codebase
+                // yet). A field named `context_limit` holding 5_000_000_000 would teach
+                // the next reader that the window is 5e9 — the exact conflation R1 is
+                // about. Naming the source makes the bug legible in the log instead of
+                // hiding it, and `context_tokens()` in this file already means CUMULATIVE
+                // SPEND, so "context_*" here would mean the opposite of retained context.
+                "paging_limit":        self.cfg.token_budget,
+                "paging_limit_source": "token_budget",
             }),
         );
 
@@ -1495,6 +1525,59 @@ mod tests {
         let unicode = "áéíóú";
         assert_eq!(truncate(unicode, 3), "áéí…");
         assert_eq!(truncate(unicode, 5), "áéíóú");
+    }
+
+    #[tokio::test]
+    async fn inference_request_event_carries_the_paging_numbers_honestly_named() {
+        // attn.3 A2 — AC6. Diagnosing the CoS brief drought needed a Docker volume mount
+        // and three premises fell to numbers that could have just been in the log.
+        //
+        // Asserted by PARSING THE EMITTED JSON. Reading the constant back into the
+        // assertion is the false green that shipped in attn.2's own fix round: the test
+        // re-read the key inside the test body, so a rename still passed.
+        let tmp = NamedTempFile::new().unwrap();
+        let rec = crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap();
+        let cfg = AgentConfig { token_budget: 5_000_000_000, ..agent_cfg(20, 5_000_000_000) };
+        let mut task = AgentTask::new("paging-log", "watch the clock", &cfg, &model_cfg(), vec![]);
+        let _ = task.step(&rec);
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap();
+        let event: serde_json::Value = content
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .find(|e: &serde_json::Value| e["kind"] == "inference_request")
+            .expect("inference_request event missing");
+        let data = &event["data"];
+
+        // Assert the VALUE, not the type. `is_u64()` was the original assertion and it is
+        // unfalsifiable: hardcoding the field to 0 left 933/933 green (mutation-proven at
+        // /review). The number must equal a fresh estimate over the transcript that was sent.
+        let expected = crate::memory::context::estimate_context_tokens(task.messages());
+        assert!(expected > 0, "fixture must produce a non-trivial transcript, else 0 == 0 passes");
+        assert_eq!(
+            data["retained_tokens_est"].as_u64(),
+            Some(expected),
+            "retained_tokens_est must equal a FRESH estimate of the sent transcript, not a \
+             stale pre-paging value"
+        );
+        assert_eq!(
+            data["paging_limit"].as_u64(),
+            Some(5_000_000_000),
+            "paging_limit must report the value the paging decision actually divides by"
+        );
+        assert_eq!(
+            data["paging_limit_source"].as_str(),
+            Some("token_budget"),
+            "the SOURCE must be named: audit118-R1 is still open, so this denominator is a \
+             SPEND ceiling, not a context window. Naming it keeps the bug legible."
+        );
+        // The honest-naming guard. `context_limit` holding 5e9 would teach the next
+        // reader that the model's context window is 5e9 — the exact conflation R1 is about.
+        assert!(
+            data["context_limit"].is_null(),
+            "must NOT emit `context_limit`: this value is a spend ceiling, and \
+             context_tokens() in this file already means cumulative spend"
+        );
     }
 
     #[tokio::test]

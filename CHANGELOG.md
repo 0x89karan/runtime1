@@ -3,6 +3,59 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.120.0] - 2026-08-03
+
+### Fixed
+- **attn.3 — a SIGTERM landing mid-tool-call no longer persists a transcript the provider will
+  reject.** Measured on the live `agentos_cos-data` volume: a `wait_for_trigger` call was dispatched
+  at 18:13:31, SIGTERM arrived at 18:13:47 (16 s into a 20 s call, leaving 63 `tool_call` events
+  against 62 `tool_result`), the half-finished turn was checkpointed, and the restore at 18:13:57
+  drew `400 ... messages.125: tool_use ids were found without tool_result blocks immediately after`
+  one second later — twice, 3.5 minutes apart.
+  `build_scheduler_checkpoint` now seals an unanswered `tool_use` before the checkpoint is written.
+  - **The repair applies to the checkpoint COPY, never the live transcript.** The live agent may
+    still receive the real result and carry on. This also makes attn.2's synthetic wording
+    ("Interrupted by a restart before this tool produced a result") literally true, since a
+    checkpoint is only ever read back after a restart.
+  - **Honest about the limit:** for a SIGTERM checkpoint "the in-flight result never arrives" holds.
+    For a *periodic* checkpoint it does not — `checkpoint_interval_turns` defaults to 1 and all
+    agents are snapshotted on any agent's tool boundary, so restore is **at-least-once** for tool
+    side effects, not exactly-once. Not a regression (the pre-fix path persisted the dangling id and
+    the restore-side repair synthesised the same block), but not exactly-once either.
+  - Live ids come from `awaiting.values()` **and** `pending_approvals.values()` — `.values()`,
+    because `awaiting` is keyed by CHILD id. It does not apply the dead-child filter the restore
+    path uses, so an await naming an already-terminal child can still persist a dangling id, which
+    restore then self-heals.
+
+### Added
+- **`inference_request` now carries the numbers that decide context paging:** `retained_tokens_est`,
+  `paging_limit`, and `paging_limit_source`. Diagnosing the brief drought required mounting a Docker
+  volume and inferring intent from tool-call previews, and three separate premises were falsified by
+  numbers that could simply have been logged.
+  - `paging_limit_source` reads `"token_budget"` on purpose. `audit118-R1` is still open, so that
+    denominator is a **spend ceiling**, not a context window — a field named `context_limit` holding
+    `5_000_000_000` would teach the next reader that the window is 5e9, which is the exact
+    conflation R1 is about. `_est` is likewise load-bearing: the estimate walks `messages` only and
+    excludes the tool schemas sent with the same request.
+
+### Changed
+- **`audit118-R1` demoted P0 → P2 and BLOCKED.** The audit called it an "independent, sufficient
+  explanation" for the brief drought; measurement withdraws that. Retained context at the observed
+  failure was 11,569 tokens against a would-be corrected trigger of 172,627 (15× away), and with the
+  measured slope the global budget dies at turn ~355 while paging would first fire at ~1,086 — so
+  the fix is arithmetically inert on the agent it headlined. It is also **blocked**, not merely
+  deferred: paging is lossy (`cap_short_term` drains silently, `distill_on_complete` defaults false
+  and is unset for the CoS, nothing recalls `short_term` in-run), so enabling it on `cos-inbox`
+  would silently drop the oldest emails and produce a quietly incomplete brief.
+- **`audit118-R2` closed, premise corrected.** The audit said the 400 loop was in-memory ("no
+  `checkpoint.json` in the volume"); the volume holds 65 `agent_checkpointed` and 2
+  `agent_restored`, with the 400 one second after each restore. It is the restore path, already
+  fixed by attn.2. The in-loop repair was built and then **withdrawn**: no producer could be
+  demonstrated, and it would have removed the circuit breaker that currently kills the runaway
+  trigger at ~29 minutes.
+- `docs/RUNBOOK.md` gains triage for both symptoms (the repeating pairing 400, and a monotonically
+  climbing `retained_tokens_est` meaning the trigger is burning inference to watch a clock).
+
 ## [v0.119.0] - 2026-08-01
 
 ### Fixed

@@ -61,7 +61,7 @@ Phase 0 kinds (canonical — do not rename):
 |---|---|
 | `agent_spawned` | agent created (id, model, tools, limits, task_preview) |
 | `perceive` | a task/event enters the agent's context |
-| `inference_request` | before calling the gateway (msg count, tool count) |
+| `inference_request` | before calling the gateway (msg count, tool count, `retained_tokens_est`, `paging_limit` + `paging_limit_source`) |
 | `inference_response` | after (stop_reason, token usage, running total, preview) |
 | `tool_call` | before invoking a tool (id, name, input_preview) |
 | `tool_result` | after (ok + preview, or error) |
