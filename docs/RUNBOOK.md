@@ -822,8 +822,9 @@ field is named that way so the log states the limitation instead of hiding it.
 
 **Dev mode (cargo run):**
 ```bash
-ls ./output/brief-*.md          # written by the orchestrator
-cat ./output/brief-$(date +%Y-%m-%d).md
+ls ./output/brief-*.md          # written by the curator
+# R4 (attn.2): filename carries a per-fire timestamp, not a fixed date — glob for today's.
+cat ./output/brief-$(date +%Y-%m-%d)T*.md
 ```
 
 **QEMU/distro mode:**

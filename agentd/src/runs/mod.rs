@@ -109,6 +109,15 @@ pub struct BriefRecord {
     /// Optional model-authored narrative color (facts above cannot be faked by it).
     #[serde(default)]
     pub narrative:      Option<String>,
+    /// R3.4 (attn.2): count of matching Gmail messages the inbox job could not fetch because
+    /// they exceeded its `maxResults` cap, derived from Gmail's own `resultSizeEstimate` field.
+    /// MODEL-REPORTED, same trust tier as `narrative` — agentd never independently counts Gmail
+    /// messages, so this cannot be verified the way `run_count`/`spend_total` can. It answers
+    /// "how many matching messages were not reviewed", NOT "how many were archived/handled" —
+    /// `in:inbox` scoping and Gmail's fetch cap are two different exclusions; conflating them
+    /// would confidently mislabel the number.
+    #[serde(default)]
+    pub suppressed_count: Option<u64>,
 }
 
 /// A lifecycle transition sent from the scheduler to the writer task.
@@ -144,9 +153,10 @@ pub enum WriterMsg {
     Event(RunEvent),
     /// Compose + persist a brief on the writer thread; reply with the persisted record.
     PublishBrief {
-        narrative: Option<String>,
-        now:       u64,
-        reply:     tokio::sync::oneshot::Sender<anyhow::Result<BriefRecord>>,
+        narrative:        Option<String>,
+        suppressed_count: Option<u64>,
+        now:              u64,
+        reply:            tokio::sync::oneshot::Sender<anyhow::Result<BriefRecord>>,
     },
 }
 
@@ -244,13 +254,18 @@ impl BriefPublisher {
     /// Compose + persist a brief on the writer thread and return the persisted record.
     /// Errors (no store, channel closed, writer dropped, or a persist failure) propagate
     /// so the tool returns `Err` and NO `BriefWritten` event fires (advance-on-success).
-    pub async fn publish(&self, narrative: Option<String>, now: u64) -> anyhow::Result<BriefRecord> {
+    pub async fn publish(
+        &self,
+        narrative: Option<String>,
+        suppressed_count: Option<u64>,
+        now: u64,
+    ) -> anyhow::Result<BriefRecord> {
         let tx = self
             .tx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("run history not configured; cannot publish brief"))?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
-        tx.send(WriterMsg::PublishBrief { narrative, now, reply })
+        tx.send(WriterMsg::PublishBrief { narrative, suppressed_count, now, reply })
             .map_err(|_| anyhow::anyhow!("run-history writer channel closed"))?;
         reply_rx
             .await
@@ -278,12 +293,15 @@ pub async fn run_writer(
                     Err(e)     => tracing::warn!(error = %e, "run-history writer join failed"),
                 }
             }
-            WriterMsg::PublishBrief { narrative, now, reply } => {
+            WriterMsg::PublishBrief { narrative, suppressed_count, now, reply } => {
                 // Composition runs HERE, after all earlier events applied (FIFO). The full
                 // RUNS scan happening on this off-loop writer is fine — later events just
                 // queue behind it, which never stalls the scheduler (best-effort logging).
                 let store = std::sync::Arc::clone(&store);
-                let res = tokio::task::spawn_blocking(move || store.publish_brief(narrative, now)).await;
+                let res = tokio::task::spawn_blocking(move || {
+                    store.publish_brief(narrative, suppressed_count, now)
+                })
+                .await;
                 let flattened = match res {
                     Ok(inner) => inner,
                     Err(e)    => Err(anyhow::anyhow!("brief writer join failed: {e}")),
@@ -335,7 +353,7 @@ mod tracker_tests {
     #[tokio::test]
     async fn disabled_brief_publisher_errors() {
         let bp = BriefPublisher::disabled();
-        assert!(bp.publish(None, 100_000).await.is_err(), "no store → error, not a false brief");
+        assert!(bp.publish(None, None, 100_000).await.is_err(), "no store → error, not a false brief");
     }
 
     #[tokio::test]
@@ -355,7 +373,7 @@ mod tracker_tests {
         tracker.close("scout", "failed", Some("err".into()), Some("boom".into()), Some(9));
         // `tracker.close` stamps end_ts with real wall-clock time, so the brief window
         // must be anchored to real time too (a few seconds ahead covers the close).
-        let brief = publisher.publish(None, unix_now_secs() + 5).await.unwrap();
+        let brief = publisher.publish(None, None, unix_now_secs() + 5).await.unwrap();
         assert_eq!(brief.run_count, 1, "the close ahead in the FIFO queue was applied first");
         assert_eq!(brief.failed_count, 1);
         assert_eq!(brief.items[0].run_id, "scout:0");

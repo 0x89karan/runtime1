@@ -334,7 +334,7 @@ var ZONES = {
        badges:[['b-enforced','KB-only']], kind:'step',
        p:'Separation of duty between the two jobs: the one that reads untrusted email cannot write your files, and the one that writes your files cannot read your mail.',
        refs:['agentd/cos.agents.toml cos-curator']},
-      {id:'c5', n:'brief-YYYY-MM-DD.md', d:'The markdown you actually read. Thread permalinks per row.',
+      {id:'c5', n:'brief-YYYY-MM-DDTHHMMSSZ.md', d:'The markdown you actually read. Thread permalinks per row. Timestamped since R4 (attn.2) so a second same-day run adds a new file instead of truncating the first.',
        badges:[['b-declared','escaping is a prompt rule']], kind:'step',
        p:'Honest limit: sender-written fields are entity-escaped by an instruction the model is told to follow, not by code (brief-03). A dash instead of a link means the thread id failed its hex check — fail-closed, by design. If the brief opens with a shortened-to-fit warning, it is deliberately incomplete.',
        refs:['docs/RUNBOOK.md §11.6']},

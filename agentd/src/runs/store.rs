@@ -428,7 +428,12 @@ impl RunsStore {
     /// `window_from` is the previous brief's `window_to` (or `now − 24h` for the first
     /// brief). Facts are authored here from `runs.redb`; `narrative` is model color only.
     /// Returns the persisted record (the caller emits `BriefWritten` from it).
-    pub fn publish_brief(&self, narrative: Option<String>, now: u64) -> anyhow::Result<BriefRecord> {
+    pub fn publish_brief(
+        &self,
+        narrative: Option<String>,
+        suppressed_count: Option<u64>,
+        now: u64,
+    ) -> anyhow::Result<BriefRecord> {
         // Bound the model-authored narrative before it is stored + re-emitted (H3).
         let narrative = narrative.map(|n| {
             if n.chars().count() > MAX_NARRATIVE_CHARS {
@@ -541,6 +546,7 @@ impl RunsStore {
                 overflow_count,
                 attention_overflow,
                 narrative,
+                suppressed_count,
             };
 
             let json = serde_json::to_string(&record).context("serialize brief")?;
@@ -763,7 +769,7 @@ mod tests {
     fn quiet_night_persists_a_row_and_advances_window() {
         // G6: 0 runs still writes a brief — presence is the liveness signal.
         let (s, _d) = store();
-        let b0 = s.publish_brief(None, 100_000).unwrap();
+        let b0 = s.publish_brief(None, None, 100_000).unwrap();
         assert_eq!(b0.run_count, 0);
         assert!(b0.items.is_empty());
         assert_eq!(b0.overflow_count, 0);
@@ -771,7 +777,7 @@ mod tests {
         assert_eq!(b0.window_from, 100_000 - 86_400, "first-ever window floors at now−24h");
         assert_eq!(b0.window_to, 100_000);
         // Second brief: window_from = prior window_to; seq advances.
-        let b1 = s.publish_brief(None, 200_000).unwrap();
+        let b1 = s.publish_brief(None, None, 200_000).unwrap();
         assert_eq!(b1.brief_id, "brief:1");
         assert_eq!(b1.window_from, 100_000, "advance: from = prior window_to");
         assert_eq!(b1.window_to, 200_000);
@@ -800,7 +806,7 @@ mod tests {
         // must NOT be filtered out just because start_ts < window_from.
         s.open_segment("E", None, "child_spawn", Some(0), "native", 2_000).unwrap();
 
-        let b = s.publish_brief(None, 100_000).unwrap();
+        let b = s.publish_brief(None, None, 100_000).unwrap();
         assert_eq!(b.run_count, 4, "A(done)+C(running)+D(failed)+E(hung running); B(seed) excluded");
         assert_eq!(b.failed_count, 1, "D");
         assert_eq!(b.spend_total, 100, "A 30 + D 70; running runs have no spend");
@@ -833,7 +839,7 @@ mod tests {
             s.open_segment(&id, None, "child_spawn", Some(0), "native", 30_000 + i as u64).unwrap();
             s.close_segment(&id, "done", None, None, Some(1), 30_500 + i as u64).unwrap();
         }
-        let b = s.publish_brief(None, 100_000).unwrap();
+        let b = s.publish_brief(None, None, 100_000).unwrap();
         assert_eq!(b.failed_count, (MAX_BRIEF_ITEMS + 20) as u64);
         assert_eq!(b.items.len(), MAX_BRIEF_ITEMS, "attention capped");
         assert_eq!(b.attention_overflow, 20, "truncated failures surfaced, not hidden");
@@ -845,17 +851,40 @@ mod tests {
         let (s, _d) = store();
         s.open_segment("X", None, "child_spawn", Some(0), "native", 20_000).unwrap();
         s.close_segment("X", "done", None, None, Some(5), 20_010).unwrap();
-        let b = s.publish_brief(Some("all quiet, one sync".into()), 100_000).unwrap();
+        let b = s.publish_brief(Some("all quiet, one sync".into()), None, 100_000).unwrap();
         assert_eq!(b.narrative.as_deref(), Some("all quiet, one sync"));
         assert_eq!(b.run_count, 1, "fact authored from the store, not the narrative");
     }
 
     #[test]
+    fn brief_suppressed_count_round_trips_and_distinguishes_none_from_zero() {
+        // R3.4 (attn.2): suppressed_count is MODEL-REPORTED (unlike run_count/spend_total,
+        // agentd cannot verify it), so the store's only job is to pass it through faithfully —
+        // including the distinction between "not reported" (None) and "reported as zero".
+        let (s, _d) = store();
+        let with_count = s.publish_brief(None, Some(7), 100_000).unwrap();
+        assert_eq!(with_count.suppressed_count, Some(7));
+
+        let zero_reported = s.publish_brief(None, Some(0), 200_000).unwrap();
+        assert_eq!(
+            zero_reported.suppressed_count,
+            Some(0),
+            "explicitly-reported zero must not collapse into 'not reported'"
+        );
+
+        let not_reported = s.publish_brief(None, None, 300_000).unwrap();
+        assert_eq!(
+            not_reported.suppressed_count, None,
+            "absent input must stay None, not silently become Some(0)"
+        );
+    }
+
+    #[test]
     fn list_briefs_newest_first() {
         let (s, _d) = store();
-        s.publish_brief(None, 100_000).unwrap();
-        s.publish_brief(None, 200_000).unwrap();
-        s.publish_brief(None, 300_000).unwrap();
+        s.publish_brief(None, None, 100_000).unwrap();
+        s.publish_brief(None, None, 200_000).unwrap();
+        s.publish_brief(None, None, 300_000).unwrap();
         let recent = s.list_briefs(2).unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].brief_id, "brief:2", "newest first");

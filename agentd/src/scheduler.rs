@@ -2592,8 +2592,18 @@ fn dispatch_run_job(
 
     // 5. Collision guard: reject if a child with this id is still LIVE (in state.agents) or
     // retained in outcomes. A job that already COMPLETED and delivered to its parent is in
-    // neither map, so a same-day re-trigger re-runs (harmless — brief is log-append/LWW; cron
-    // fires once daily). Same-day idempotency is intentionally not enforced (matches dispatch_spawn).
+    // neither map, so a same-day re-trigger re-runs.
+    //
+    // ⚠ CORRECTED (R4, attn.2): this used to say "harmless — brief is log-append/LWW". That
+    // was false twice over: the curator's `write_file` OVERWRITES (truncates) the same path,
+    // and the `ops:briefs` KB entry is genuinely last-writer-wins, meaning a second same-day
+    // run DESTROYED the first run's brief — "LWW" was being used to describe data loss as if
+    // it were a safety property. R4 gives both the file and the KB key a per-fire `{ts}`
+    // suffix (`Job::render`, `config.rs`), so a second same-day run now adds a new file and a
+    // new KB entry instead of overwriting either — "harmless" is accurate only because of that
+    // fix, not because it always was. Same-day idempotency is intentionally still not enforced
+    // (matches `dispatch_spawn`) — this guard only prevents a collision with a run that is
+    // still IN PROGRESS.
     if state.agents.contains_key(&child_id) || state.outcomes.contains_key(&child_id) {
         recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
             json!({ "stage": "run_job", "error": "child ID collision", "child_id": &child_id }));
@@ -2603,9 +2613,12 @@ fn dispatch_run_job(
     }
 
     // 6. Build the child from the CONFIG-TRUSTED declaration — fixed caps (no subset check),
-    // fixed task template with only the server-stamped {date} substituted.
+    // fixed task template with only the server-stamped {date}/{ts} substituted. `{ts}` (R4) is
+    // a per-fire-unique component (HHMMSS) so a same-day re-trigger's write_file/kb_put never
+    // collides with an earlier fire's — see the collision-guard comment above.
     let child_caps = Some(job.capabilities.clone());
-    let task = job.render(&date);
+    let ts = chrono::Utc::now().format("%H%M%S").to_string();
+    let task = job.render(&date, &ts);
     let child_agent_cfg = crate::config::AgentConfig {
         id:              child_id.clone(),
         task:            task.clone(),

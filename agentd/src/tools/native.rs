@@ -880,16 +880,20 @@ impl Tool for PublishBrief {
          failures, spend, and the failing/blocked run IDs) deterministically from durable run \
          history over the window since the last brief — you do NOT pass any of those. Optionally \
          pass `narrative`: a one- or two-sentence plain-English summary to accompany the facts. \
-         Call this once per cron cycle after writing the ops:briefs entry. The brief is then \
-         readable via `agentctl brief` / GET /api/v1/brief regardless of when the operator looks. \
-         Requires the BriefPublish capability."
+         Optionally pass `suppressed_count`: how many matching Gmail messages the inbox job could \
+         not fetch because they exceeded its result cap (from Gmail's own `resultSizeEstimate`) — \
+         NOT how many were archived or handled, a different exclusion. Call this once per cron \
+         cycle after writing the ops:briefs entry. The brief is then readable via `agentctl brief` \
+         / GET /api/v1/brief regardless of when the operator looks. Requires the BriefPublish \
+         capability."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "narrative": { "type": "string", "description": "Optional plain-English summary; facts are authored by agentd, not from this field" }
+                "narrative": { "type": "string", "description": "Optional plain-English summary; facts are authored by agentd, not from this field" },
+                "suppressed_count": { "type": "integer", "description": "Optional count of matching Gmail messages not fetched due to the result cap (Gmail's resultSizeEstimate minus messages actually reviewed) — not archived/handled mail" }
             },
             "additionalProperties": false
         })
@@ -901,6 +905,7 @@ impl Tool for PublishBrief {
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let narrative = input["narrative"].as_str().map(str::to_string);
+        let suppressed_count = input["suppressed_count"].as_u64();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -908,7 +913,7 @@ impl Tool for PublishBrief {
         // Route through the writer lane: composes AFTER all prior lifecycle events are
         // applied (FIFO), then persists in one txn. A failure returns Err → the central
         // invoke hook fires no BriefWritten and the window does not advance (E7).
-        let brief = self.publisher.publish(narrative, now).await?;
+        let brief = self.publisher.publish(narrative, suppressed_count, now).await?;
         // Return the structured spine so the ToolRegistry hook can emit BriefWritten.
         Ok(serde_json::to_string(&brief)?)
     }

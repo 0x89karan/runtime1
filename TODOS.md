@@ -1283,7 +1283,8 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   Two structural blockers, either of which alone is fatal: (a) **nothing ever removes an entry
   for a resolved item** — there is no `kb_delete`, and the Qdrant TTL sweep runs once at sidecar
   process start; (b) **neither job can observe resolution** — the curator has no Gmail access, and
-  the inbox job only queries `q=newer_than:1d`, which cannot tell "replied to" from "quiet".
+  the inbox job's query (⚠ UPDATED by R3.1/attn.2: `q=in:inbox`, was `q=newer_than:1d`) cannot tell
+  "replied to" from "quiet" either — inbox presence answers "not archived", not "not yet handled".
   Note the naive fix is a trap: dropping the `ops:briefs` union makes carried-forward items
   vanish the moment a thread goes quiet, which is worse than re-listing.
   Likely shape: let the inbox job read the open set and check, per open thread, whether the newest
@@ -1366,7 +1367,8 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   mechanical fix. Same file's `open_items` shape and thread-id handling *were* mirrored.
 
 - **brief-02 (P3) — Permalinks never reach Telegram.** The Thread column added by brief.1 exists
-  only in `~/.agentos-output/brief-{date}.md`. The Telegram bridge pushes `GET /api/v1/brief`
+  only in `~/.agentos-output/brief-{date}T{ts}Z.md` (timestamped filename since R4/attn.2). The
+  Telegram bridge pushes `GET /api/v1/brief`
   (`docker/telegram_mcp.py`), which is the runtime-authored `BriefRecord` (facts from `runs.redb`
   plus a bounded model `narrative`) — a different artifact that has no thread field. If Telegram
   is the surface the operator actually reads each morning, brief.1's criterion 2 is not met there.
