@@ -63,21 +63,49 @@ remaining work — one increment per branch, `main` shippable between, each thro
 9. ~~**cred.7** (v0.84.0)~~ ✅ shipped — credential resilience (on top of broker mode).
 10. **Audit remediation** (from `docs/AUDIT-v0.86.md` §6/§9): ~~**audit.1** (v0.87.0)~~ ✅ shipped — P0 hotfix + guard batch (`docs/plans/audit.1-p0-hotfix-guards.md`) → ~~**ci.1** (v0.88.0)~~ ✅ shipped — CI tests the artifact (`docs/plans/ci.1-ci-tests-the-artifact.md`): workspace-wide CI, sidecar marker contract, docker-smoke + negative fixture, fail-closed release guards, nightly mock E2E, monthly qemu cron; broker E2E deferred as named `ci.2` (TODOS) → then cap.1/cap.2/run.1/par.1-2 interleave per the audit build order.
 11. **Track UX cockpit** (agentctl-client): ux.0 → ux.9 → ux.2a → ux.1 (all ✅ shipped) → **reshaped 2026-07-18 (office-hours "trust after absence", `docs/plans/0x89karan-ux-control-panel-design-*.md`): ux.8′ (budgets) → ux.11 (history/digest) → ux.12 (Telegram digest+approve/deny) → cap.1 → ux.13 (Cancel + live budget/caps)**, then the tail (ux.3, ux.2b, ux.10) and evidence-gated expansions (ux.6, ux.5, ux.7). Turns the cockpit from watch-and-chat into a control panel. A second identity — the governed-agent-microVM **mv track** — shares agentd core. Its design record lives **outside this repo**, at `~/.gstack/projects/0x89karan-runtime1/0x89karan-mv-governed-agent-runtime-design-20260720-114634.md` (APPROVED 2026-07-20); the old `docs/plans/0x89karan-mv-*` pointer here was dangling and cost a /autoplan session a wrong premise. **External gate date: the earlier of mv.3 shipped or 2026-10-01** (named 2026-07-29 during ux.6a — it had never been recorded, and the design doc's own warning is that "an unnamed gate date is how 'deferred' becomes 'never'"). The gate needs 10 named humans and 3 booked demos; no `mv.*` increment is scheduled yet, and none should be until the gate work starts. **Correction on the record:** that doc estimates its demo package at "~2 days, everything exists" on the strength of "normal tool use → signed receipt" and "forbidden capability → denied + receipt". Neither action class is receipted, and before ux.6a no deny was reachable at all, so the estimate is wrong.
-12. **Track ATTN** (attention routing over the CoS): ~~**attn.2 R1+R2** (v0.119.0)~~ ✅ shipped —
-    keyless boot + restore survival (`attn.1a-05` closed). R3/R4/R5 of `attn.2` remain UNBUILT;
-    the brief still cannot be produced until `docs/AUDIT-v0.118.md` R1 (context window vs spend
-    budget) is fixed, so do **not** start the 14-day measure yet. ~~**attn.1a-core** (v0.118.0)~~ ✅ shipped —
-    made the CoS actually run (`restart: unless-stopped` + log caps + launchd, none of which existed on
-    the Mac path) and made a stopped pipeline visible (`server_now` on `GET /api/v1/brief`, age + a
-    26 h STALE banner in `agentctl brief`). **Recreate containers with `docker compose up -d` or it is
-    inert.** Reframed at office-hours 2026-08-01 from "morning brief" to **attention router**: three
-    tiers (interrupt / morning / never), Telegram as the interrupt channel, and D4 = "does the operator
-    stop checking email manually" over 14 days. **`attn.1b`** (the interrupt tier itself) is DEFERRED
-    behind 8 preconditions — both CEO voices returned RESHAPE/DEFER 6/6 and the operator overrode at
-    the premise gate, but two preconditions are contradictions (a no-`from` payload cannot support a
-    VIP-sender night gate; `^[0-9a-f]{1,20}$` accepts any attacker-owned thread id). `attn.1a` §3/§4
-    ride with 1b. Plans: `docs/plans/attn.1a-sub-daily-job-safety.md`,
-    `docs/plans/attn.1-interrupt-tier.md`. **Nothing further here until the 14-day tally.**
+12. **Track ATTN** (attention routing over the CoS): ~~**attn.3** (v0.120.0)~~ ✅ shipped — a SIGTERM
+    landing mid-tool-call no longer persists a transcript the provider rejects
+    (`build_scheduler_checkpoint` seals an unanswered `tool_use`, on the checkpoint COPY only), plus
+    `retained_tokens_est` / `paging_limit` / `paging_limit_source` on `inference_request` so the next
+    diagnosis needs no Docker-volume archaeology. ~~**attn.2 R1+R2** (v0.119.0)~~ ✅ shipped — keyless
+    boot + restore survival (`attn.1a-05` closed). ~~**attn.1a-core** (v0.118.0)~~ ✅ shipped — made the
+    CoS actually run (`restart: unless-stopped` + log caps + launchd, none of which existed on the Mac
+    path) and made a stopped pipeline visible. **Recreate containers with `docker compose up -d` or it
+    is inert.**
+    - **⚠ CORRECTED 2026-08-04 — this entry previously said "the brief cannot be produced until
+      `AUDIT-v0.118.md` R1 (context window vs spend budget) is fixed." That is FALSE and it cost one
+      session a wrong premise.** Measured on the live `agentos_cos-data` volume during attn.3's
+      /autoplan: retained context at the observed failure was **11,569 tokens against a would-be
+      corrected paging trigger of 172,627** — 15× away — and with the measured ~159 tokens/poll-pair
+      the global budget dies at turn ~355 while paging first fires at ~1,086, so R1 is
+      **arithmetically inert on the orchestrator**. `audit118-R1` is now **P2 and BLOCKED**, not P0:
+      paging is lossy (`cap_short_term` drains silently, `distill_on_complete` defaults false and is
+      unset for the CoS, nothing recalls `short_term` in-run), so enabling it on `cos-inbox` would
+      silently drop the oldest emails and turn "no brief" into "quietly incomplete brief". **Fixing R1
+      alone is an active regression.** Do not build it until paging is non-lossy.
+    - **THE REAL BLOCKER IS `attn.4` — scheduler-native cron. Not yet specified as an increment;
+      needs its own `/autoplan`.** Measured: the trigger spends **~3,456 inference calls/day** to poll
+      `wait_for_trigger(timeout_s=20)` and be told "next fire 14 h from now" — 63 of 63 tool calls in a
+      29-minute window, **414,016 input tokens to WAIT** — which empties the 10M/24h global window in
+      ~2.6 h, after which everything defers until rollover and the once-daily cron misses the day.
+      Rejected at attn.3's gate: raising `MCP_TIMEOUT` globally (`mcp.rs:23` covers every MCP call, so a
+      hung sidecar would pin an agent for minutes on a PID-1 process). **Verified NOT a config flip** —
+      `config.rs` `Job` has no schedule field and `scheduler.rs` has no native job cron, so the
+      `cron_trigger` MCP plus the polling agent is currently the *only* scheduling mechanism. Open
+      questions incl. the **timezone gap** (no `chrono::Local`, no `tzdata`, no `TZ`, so `TRIGGER_CRON`
+      silently means UTC): `docs/plans/attn.3-real-context-window.md` §4.
+    - **`attn.2` R3/R4/R5 remain UNBUILT.** R3 is the on-demand fire path (`.fire-now` sentinel) — the
+      file already exists in `~/.agentos-output/` as a leftover from spec work and is **inert**; nothing
+      in `docker/`, `agentd/` or the entrypoint reads it.
+    - Reframed at office-hours 2026-08-01 from "morning brief" to **attention router**: three tiers
+      (interrupt / morning / never), Telegram as the interrupt channel, and D4 = "does the operator stop
+      checking email manually" over 14 days. **Do not start the 14-day measure until `attn.4` ships** —
+      it would record a drought caused by a known bug.
+    - **`attn.1b`** (the interrupt tier itself) is DEFERRED behind 8 preconditions — both CEO voices
+      returned RESHAPE/DEFER 6/6 and the operator overrode at the premise gate, but two preconditions
+      are contradictions (a no-`from` payload cannot support a VIP-sender night gate;
+      `^[0-9a-f]{1,20}$` accepts any attacker-owned thread id). `attn.1a` §3/§4 ride with 1b.
+      Plans: `docs/plans/attn.1a-sub-daily-job-safety.md`, `docs/plans/attn.1-interrupt-tier.md`.
 13. **Phase 9** — kernel observability (`ebpf.*` / `sink.1`); heavy, privileged, appliance-oriented; last.
 
 Detailed queue + single-lane→split rules: `docs/prompts/12-build-queue-single-lane.md`.

@@ -25,6 +25,22 @@ are all better than typical. The problems are concentrated in three places:
 The single most important finding is **R1** below. It is the difference between "the CoS is
 unreliable" and "the CoS cannot work as configured."
 
+> **⚠ SUPERSEDED 2026-08-04 (attn.3). The sentence above is WRONG, and R1's own severity claim with
+> it.** Left in place because an audit is a record, not a living doc — but do not act on it. Measured
+> during attn.3's /autoplan, on the same volume this audit read: retained context at the observed
+> failure was **11,569 tokens against R1's own proposed trigger of 172,627** (15× away), and at the
+> measured ~159 tokens/poll-pair the global budget dies at turn ~355 while paging first fires at
+> ~1,086 — so **R1 is arithmetically inert on `cos-orchestrator`, the agent it headlines.** R1's
+> claim to be "an independent, **sufficient** explanation for three briefs in fifteen days" is
+> **withdrawn**; `audit118-R1` is now **P2 and BLOCKED** (paging is lossy, so fixing it alone is an
+> active regression). **R2's premise was also wrong** — it asserts the 400 loop was in-memory ("no
+> `checkpoint.json` in the volume"), but the volume holds 65 `agent_checkpointed` and 2
+> `agent_restored` with the 400 landing one second after each restore; it is the restore path, already
+> fixed by attn.2. **The actual dominant defect this audit missed:** the trigger spends ~3,456
+> inference calls/day polling `wait_for_trigger` to be told "next fire 14 h from now" — 414,016 input
+> tokens to *wait* — which is what empties the 10M/24h window. That is `attn.4`. See
+> `docs/plans/attn.3-real-context-window.md` §0 and `TODOS.md`.
+
 ---
 
 ## R1 — CRITICAL. Context paging is keyed to the token BUDGET, not the context WINDOW
