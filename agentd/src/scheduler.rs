@@ -2614,10 +2614,22 @@ fn dispatch_run_job(
 
     // 6. Build the child from the CONFIG-TRUSTED declaration — fixed caps (no subset check),
     // fixed task template with only the server-stamped {date}/{ts} substituted. `{ts}` (R4) is
-    // a per-fire-unique component (HHMMSS) so a same-day re-trigger's write_file/kb_put never
-    // collides with an earlier fire's — see the collision-guard comment above.
+    // a per-fire-unique component so a same-day re-trigger's write_file/kb_put never collides
+    // with an earlier fire's — see the collision-guard comment above.
+    //
+    // ⚠ CORRECTED (QA on the real binary, attn.2): HHMMSS-only (1s resolution) was proven to
+    // collide, not just theoretically weak. Driving the actual scheduler against a scripted
+    // provider — a fast mock, but the same code path a real retry or a manual re-fire hits —
+    // produced TWO `run_job("qa-job")` dispatches whose `ts` came back byte-identical
+    // ("095353Z" both times) because both `chrono::Utc::now()` calls landed in the same wall
+    // second; the second `write_file` then silently overwrote the first's output — the exact
+    // failure R4 exists to close, just with a narrower window than "a full day" (attn.2-R5's
+    // manual-fire API will make sub-second re-fires routine, not hypothetical). Nanosecond
+    // resolution (`%9f`) does not make collision impossible, but shrinks the window from "one
+    // wall-clock second" to "the same nanosecond", which two `chrono::Utc::now()` calls
+    // separated by real dispatch work cannot hit.
     let child_caps = Some(job.capabilities.clone());
-    let ts = chrono::Utc::now().format("%H%M%S").to_string();
+    let ts = chrono::Utc::now().format("%H%M%S%9f").to_string();
     let task = job.render(&date, &ts);
     let child_agent_cfg = crate::config::AgentConfig {
         id:              child_id.clone(),
@@ -5027,6 +5039,76 @@ mod tests {
         assert!(!content.contains("\"agent_spawn_denied\""), "a valid run_job must not be denied");
         // The child materialized under the server-stamped id and ran (agent_spawned recorded).
         assert!(content.contains("cos-curator-"), "job child should be id-stamped cos-curator-<date>");
+    }
+
+    #[tokio::test]
+    async fn run_job_ts_differs_across_rapid_same_day_refires() {
+        // Regression: R4's non-destructive-write guarantee rests entirely on {ts} differing
+        // between same-day re-fires. Driving the real binary against a scripted provider (QA,
+        // attn.2, 2026-08-04) found HHMMSS-only (1s resolution) is NOT good enough: two
+        // `run_job` calls fired back-to-back by the same trigger rendered the identical `ts`
+        // ("095353Z" both times) because both `chrono::Utc::now()` calls landed in the same
+        // wall second, and the second `write_file` silently overwrote the first's output — the
+        // exact failure R4 exists to close. Fixed by moving to nanosecond resolution (%9f).
+        // This test fires run_job TWICE in one trigger session — no real network latency at
+        // all, the tightest collision window achievable — and pins that the two rendered
+        // tasks (and therefore the two `{ts}` substitutions) differ.
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let run1 = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj1".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "qa-ts-job" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let run2 = InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: "rj2".to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "qa-ts-job" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        let gw = MockGateway::new(vec![
+            run1,
+            end_turn("child1 ok", 5, 3),
+            run2,
+            end_turn("child2 ok", 5, 3),
+            end_turn("trigger ok", 10, 5),
+        ]);
+
+        let trigger = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("trigger", "fire run_job twice")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger], unlimited(), gw, registry);
+        let mut job = cos_like_job("qa-ts-job", vec![]);
+        job.task = "at {ts} on {date}".to_string();
+        let sched = sched.with_jobs(vec![job]);
+        let outcomes = sched.run().await;
+        assert!(outcomes["trigger"].is_ok(), "trigger must complete: {:?}", outcomes["trigger"]);
+
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        let previews: Vec<String> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["data"]["job_id"] == "qa-ts-job")
+            .filter_map(|v| v["data"]["task_preview"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(previews.len(), 2, "expected exactly two job dispatches, got {previews:?}");
+        assert_ne!(
+            previews[0], previews[1],
+            "two same-day run_job fires rendered the IDENTICAL task (same {{ts}}) — this is \
+             the exact silent-overwrite collision R4 exists to prevent"
+        );
+        assert!(!previews[0].contains("{ts}") && !previews[1].contains("{ts}"), "no literal {{ts}} may survive substitution");
     }
 
     #[tokio::test]
