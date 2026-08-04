@@ -672,3 +672,95 @@ broker requests; moots the `attn.1a-01` interaction the original R3.4 raised.
 3. `start_reason = "manual_fire"` — confirm `run_tracker.open()`'s signature accepts an arbitrary
    string here today, or whether it needs a typed enum change.
 4. R3.2's null-`thread_id` dedup matching rule (Phase 1 Section 4 gap, still unresolved).
+
+---
+
+## Phase 3 Eng Review — R3/R4/R5-redesigned (2026-08-04, /autoplan)
+
+### Cross-model coverage gap (not a disagreement of opinion — one voice missed a P0 the other found)
+
+**Codex found, independent Claude subagent did NOT flag:** `dispatch_run_job`'s `reject()` helper
+(`scheduler.rs:2534-2545`) does `state.agents[&parent_id].priority()`, `.cap_set_cloned()`, and
+`state.agents.get_mut(&parent_id).unwrap()` — three separate `HashMap` index/unwrap sites, all of
+which **panic on a missing key**. Every rejection branch (capability denied, unknown job_id, depth
+exceeded, child-id collision) calls `reject()`. With `parent_id = "manual-fire"` — a synthetic id
+the CEO gate's design deliberately never inserts into `state.agents` — **any rejection panics the
+whole process**. On `panic = "abort"`, PID 1: a same-day collision (the single most likely
+real-world trigger — firing the endpoint twice) crashes agentd entirely.
+
+**Independently re-verified against the code** (not taken on trust): confirmed at
+`scheduler.rs:2534` — `let priority = state.agents[&parent_id].priority();` — `Index`, not `.get()`.
+
+This means `dispatch_run_job` **cannot be called as-is** with a synthetic parent. It needs an
+internal fix mirroring the pattern `handle_agent_terminal` already uses for delivery
+(`parent_live` check, skip the touch if false) — applied to `reject()`, not just to completion
+delivery.
+
+### Independent Claude eng subagent — three additional silent-failure gaps, none flagged by the
+### CEO gate or by Codex
+
+1. **`child_model_cfg` fallback** (`scheduler.rs:2626-2630`) derives from
+   `state.agents.get(&parent_id)...unwrap_or_default()`. For a synthetic parent this silently
+   returns `ModelConfig::default()` (`max_tokens: 4096`) instead of the configured `8192` — every
+   existing `run_job` caller is a real, live agent, so this fallback arm has **never executed in
+   production**; the manual-fire route would be the first caller that ever hits it. Silent, no
+   error, would look like an unrelated truncation flake.
+2. **`is_mutating_route`** (`management.rs:139-152`) is a hand-enumerated match, not a blanket
+   rule. A new route not added to it is **unauthenticated even when `AGENTOS_APPROVAL_SECRET` is
+   configured** — strictly weaker than the `inject`/`reset-attention` precedents it's meant to
+   match, by omission, not design. `cap.4`/AUDIT-v0.97 P2-3 fixed this exact hole once already for
+   the whole mutating surface.
+3. **Stats exclusion doesn't exist as a reusable pattern.** `runs/store.rs:489-495`: the
+   `start_reason != "config_seed"` filter is **only inside the `still_running` arm**.
+   `terminal_in_window` (the branch a manually-fired job's *completion* actually matches) has **no
+   `start_reason` filter at all**. The CEO gate's "reuse the config_seed pattern" doesn't cover
+   this branch — it's new code at a different branch, not reuse.
+
+**Also resolved definitively** (open question #2 from the CEO gate): there is **no automatic
+inbox→curator handoff** anywhere in Rust. `handle_agent_terminal` skips delivery unconditionally
+when the parent isn't live; the real trigger's own prompt (STEP 2/3) is the *only* mechanism that
+currently sequences the two jobs. **A route firing `cos-inbox` only will never produce a brief.**
+Recommended design: `job_id` as an explicit request parameter (fire one job per call), not
+auto-chaining — auto-chaining via an SSE subscriber is possible but does not survive an `agentd`
+restart (new gap: no checkpoint, no restart hook, silently drops the second job).
+
+**Also found:** R3.4/D2 still needs real (small) Rust work — `resultSizeEstimate` reaching the
+model is sound, but getting it into an *auditable flight event* (not just brief markdown) needs a
+`PublishBrief` schema extension (`BriefRecord`, `#[serde(default)]`, same shape as
+`attention_overflow`'s existing addition) — this was understated as "zero Rust work" in the CEO
+synthesis. R4.3's doc citations are miscited (wrong line numbers in 2 of 3 sites,
+`docs/DEPLOYMENT.md:499`'s `tail -f` missed entirely, `architecture-diagram.html:337`'s node label
+not checked). R3.2's null-`thread_id` dedup now has a concrete rule: never fuzzy-match null-
+`thread_id` items against anything — treat null as "unknown identity," exact `thread_id` match
+only.
+
+### ENG DUAL VOICES — CONSENSUS TABLE
+
+```
+  Dimension                            Codex      Claude subagent   Consensus
+  ──────────────────────────────────── ────────── ───────────────── ─────────
+  1. Architecture sound as specified?  NO (panic) NO (3 silent gaps) CONFIRMED not sound as written
+  2. Test coverage sufficient?         n/a        11 gaps, 10 tests  Claude subagent only — no disagreement
+  3. Security threats covered?         NO (auth   NO (same finding, CONFIRMED — same finding, independent
+                                        allowlist) independent)      discovery
+  4. Silent-failure risk?              1 P0        3 P0/P1           CONFIRMED — 4 total, additive not overlapping
+  5. Sequencing (job chaining)?        NO auto-    NO auto-chain,    CONFIRMED — same conclusion, same evidence
+                                        chain       same evidence
+  6. Deployment risk manageable?       —           reversible, 4/5   Claude subagent only
+```
+
+**Single-voice critical findings, flagged per the skill's own rule** (a single voice finding a
+CRITICAL still counts, regardless of the other voice's silence): the `reject()` panic (Codex only)
+and the `child_model_cfg` fallback / stats-exclusion-branch gap (Claude subagent only) are BOTH
+real, BOTH independently re-verified against the code in this session, and NEITHER is contradicted
+by the other voice — this is additive coverage, not disagreement.
+
+### Completion Summary
+
+R5 as redesigned is not a "thin API route." It needs: a `dispatch_run_job` safety fix (parent-
+live-aware `reject()`), an explicit default-model parameter (not the `unwrap_or_default()`
+fallback), a new `ControlCommand` variant (management.rs has no direct scheduler-state access —
+confirmed, it only owns `control_tx`), an `is_mutating_route` allowlist entry, a `start_reason`
+parameter threaded through `dispatch_run_job`, and a new stats-exclusion filter on
+`terminal_in_window`. This is a real engineering scope, not a config/prompt edit — the plan's own
+effort table (~40min CC) is now stale for R5 specifically.
