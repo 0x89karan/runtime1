@@ -764,3 +764,34 @@ confirmed, it only owns `control_tx`), an `is_mutating_route` allowlist entry, a
 parameter threaded through `dispatch_run_job`, and a new stats-exclusion filter on
 `terminal_in_window`. This is a real engineering scope, not a config/prompt edit — the plan's own
 effort table (~40min CC) is now stale for R5 specifically.
+
+---
+
+## Decision Audit Trail
+
+| # | Phase | Decision | Class | Principle | Rationale |
+|---|-------|----------|-------|-----------|-----------|
+| 1 | CEO | Run R3/R4/R5 through /autoplan as one combined review | Mechanical | P6 bias to action | Plan doc already treats them as one cohesive spec with a stated cross-dependency (R4 precedes R5) |
+| 2 | CEO | **Approach C: R3+R4 now, redesign R5** | **USER CHALLENGE** | — | Both voices independently converged: the sentinel is a silent no-op exactly when a manual fire would be needed (budget-deferred trigger) |
+| 3 | CEO | **D1: R5 as a management-API verb, not a sentinel** | **USER CHALLENGE** | — | Both voices independently named the same alternative; removes 4 sentinel-specific edge-case surfaces |
+| 4 | CEO | D2: suppressed_count via resultSizeEstimate | Mechanical | P5 explicit | Free (already-fetched response field), zero new broker requests, moots the attn.1a-01 interaction |
+| 5 | Eng | R5's synthetic-parent design needs a dispatch_run_job safety fix before ANY caller can use it | Mechanical | — | Codex-verified: reject() panics on a missing HashMap key; every rejection path hits this with a synthetic parent |
+| 6 | Eng | R3.4/D2 needs a small PublishBrief schema addition, not zero Rust work | Mechanical | P1 completeness | resultSizeEstimate reaching the model doesn't produce a Rust-auditable flight event on its own |
+| 7 | Final | **Ship R3+R4 this cycle; file R5 as its own increment (attn.2-R5)** | **OPERATOR GATE** | — | R5 grew from "thin route" to real engineering (4 silent-failure bugs, one a PID-1 crash risk) — same split pattern as attn.3/attn.4 earlier today |
+
+## GSTACK REVIEW REPORT
+
+- **Verdict:** APPROVED as scoped. R3+R4 ready to build. R5 REDESIGNED (API verb) is
+  fully spec'd but deferred to its own increment — not ready to build without further
+  scoping of the 4 findings below.
+- **Voices:** CEO codex + 1 subagent (0 unavailable); Eng codex + 1 subagent (0 unavailable).
+  Zero disagreement between voices on any dimension across both phases — all findings additive.
+- **User Challenges, both resolved:** (1) R5-as-sentinel → R5-as-API-verb (D1); (2) ship
+  R3+R4 now despite attn.4 being unbuilt, since neither shares any surface with it.
+- **Ships now:** R3 (D2 variant) + R4, as specified in this document's R3/R4 sections plus
+  the corrections logged above (KB key `{ts}`, corrected doc citations, small PublishBrief
+  schema addition for suppressed_count).
+- **Does NOT ship this increment:** R5. Filed as `attn.2-R5` in TODOS.md with its four
+  concrete requirements (dispatch_run_job parent-live-aware reject(), explicit default-model
+  param, new ControlCommand variant, is_mutating_route entry, start_reason threading +
+  terminal_in_window stats filter).

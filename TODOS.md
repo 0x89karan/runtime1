@@ -256,6 +256,37 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   NOT bundled into attn.3 — it needs plumbing through the restore return type, which is more surgery
   than a log-hygiene fix warrants at the end of an increment. The field-name half **is** fixed
   (`repaired_ids` + `repaired_count`, matching the checkpoint side).
+- **attn.2-R5 (P2) [attn.2 /autoplan 2026-08-04, split from R3/R4] — manual fire as a
+  management-API verb. Fully spec'd (docs/plans/attn.2-workable-brief.md, "R5 REDESIGNED"
+  section), NOT a thin route — needs real engineering, four findings independently verified:**
+  (1) `dispatch_run_job`'s `reject()` (`scheduler.rs:2534-2545`) indexes
+  `state.agents[&parent_id]` — `HashMap` `Index`, panics on a missing key — on EVERY
+  rejection path (capability denied, unknown job, depth exceeded, collision). A synthetic
+  never-live parent id (the only safe design for the completion-delivery side, per
+  `handle_agent_terminal`'s existing `parent_live` check) makes any rejection **crash the
+  process** — `panic = "abort"`, PID 1. The single most likely real-world trigger (firing the
+  endpoint twice, hitting the collision guard) kills agentd entirely. Needs `reject()` made
+  parent-live-aware, mirroring the pattern `handle_agent_terminal` already uses for delivery.
+  (2) `child_model_cfg` (`scheduler.rs:2626-2630`) falls back to `ModelConfig::default()`
+  (`max_tokens: 4096`) for a nonexistent parent — every existing `run_job` caller is a real
+  live agent, so this arm has never executed in production; a manual-fire route would silently
+  halve the configured `8192` output budget. Needs an explicit default-model parameter (mirror
+  the `Spawn` control-command's existing `default_model` param at `scheduler.rs:3158`).
+  (3) `is_mutating_route` (`management.rs:139-152`) is a hand-enumerated allowlist — a new
+  route not added to it ships **unauthenticated even with `AGENTOS_APPROVAL_SECRET`
+  configured**, the exact hole `cap.4`/AUDIT-v0.97 P2-3 fixed once already for the whole
+  mutating surface.
+  (4) The stats-exclusion pattern proposed at the CEO gate (`start_reason != "config_seed"`)
+  is **only inside `runs/store.rs`'s `still_running` arm** — `terminal_in_window`, the branch
+  a *completed* manually-fired job actually matches, has no filter at all. Needs a NEW
+  condition on `terminal_in_window` plus a distinct `start_reason = "manual_fire"` threaded
+  through `dispatch_run_job` (today hardcoded to `"run_job"` at `scheduler.rs:2638`;
+  `run_tracker.open()`'s signature already accepts an arbitrary `&str`, no type change needed).
+  Also resolved: there is NO automatic `cos-inbox`→`cos-curator` handoff anywhere in Rust —
+  100% the trigger's own prompt behavior. The route needs `job_id` as an explicit request
+  parameter (fire one job per call); auto-chaining is possible but does not survive an `agentd`
+  restart (no checkpoint, no restart hook — a new, undocumented failure mode if built).
+  10 new tests specified with mutation controls in the plan doc's Phase 3 Eng section.
 - **attn.4 (P1) [attn.3 /autoplan, operator-chosen] — the CoS burns ~3,456 inference calls a day
   to watch a clock. Scheduler-native cron.** MEASURED: 63 of 63 tool calls in a 29-min window were
   `wait_for_trigger(timeout_s=20)`, each answering "next fire 14 h from now"; 414,016 input tokens
