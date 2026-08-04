@@ -1268,6 +1268,21 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   simpler single-agent demo templates where the broker's operational overhead isn't worth it).
   `templates/github-agent.template.toml` is already correctly on the broker pattern — no fix
   needed there. Depends on: none.
+- **cos-dev-04 (P3) — the same two templates are now ALSO stale on the R3/R4 prompt-logic
+  fixes.** Found reviewing attn.2 R3+R4 (2026-08-04): `templates/cos-inbox.template.toml` still
+  queries `q=newer_than:1d` (R3.1 replaced this with `q=in:inbox` in both shipped configs — an
+  un-archived old thread otherwise vanishes after one day) and reports no `suppressed_count`
+  (R3.4). `templates/cos-curator.template.toml` has no CLASSIFICATION RULE (R3.2 — an item can
+  still land in both `important` and `response_needed`), no sender-text neutralisation rule at
+  all (R3.3's `[`/`]`/`|` escaping — a bare `templates/cos-curator.template.toml` markdown brief
+  is exposed to the exact injected-link risk THREAT_MODEL.md §9.5 documents for the hardened
+  configs), and still writes the fixed `brief-{date}.md` (R4 — a same-day re-run truncates it).
+  `agentd/src/config.rs`'s `COS_PROMPT_SOURCES` test array already includes both templates and
+  deliberately filters the `{ts}`/link/escaping assertions to `dev`/`overlay` only ("the
+  templates do not author the markdown brief" — true for cos-inbox, but cos-curator DOES), so
+  CI is green while an operator using `agentctl spawn cos-curator` gets none of these fixes.
+  Same fix shape as cos-dev-03: mirror the fixes into both templates, or add an explicit banner
+  in each stating they are a stripped-down demo, not the hardened path. Depends on: none.
 
 ## brief.1 — Open items (from /review, 2026-07-29)
 

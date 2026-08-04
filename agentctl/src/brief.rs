@@ -236,6 +236,18 @@ fn render_brief(
     if overflow > 0 {
         out.push_str(&format!("  ✓ {overflow} others ok\n"));
     }
+    // R3.4 (attn.2): model-reported, and Some(0) is a real "reported, nothing suppressed"
+    // answer distinct from None ("didn't report"). Shown whenever present, even at 0 — the
+    // whole reason this field exists is so silent suppression cannot look like a track with
+    // no problem to solve (attn.2 plan, R3.4). Absent (pre-R3.4 agentd, or the inbox job
+    // didn't report one) renders nothing, matching every other optional count on this brief.
+    if let Some(suppressed) = brief["suppressed_count"].as_u64() {
+        if suppressed > 0 {
+            out.push_str(&format!("  ⚠ {suppressed} suppressed (exceeded Gmail fetch cap)\n"));
+        } else {
+            out.push_str("  ✓ 0 suppressed (all matching mail reviewed)\n");
+        }
+    }
     push_narrative(&mut out, brief);
     out
 }
@@ -308,6 +320,39 @@ mod tests {
         assert!(s.contains("⏳ curator  running  (curator:2)"));
         assert!(s.contains("✓ 10 others ok"));
         assert!(s.contains("one failure overnight"));
+    }
+
+    #[test]
+    fn suppressed_count_absent_renders_nothing() {
+        // Pre-R3.4 agentd, or an inbox job that didn't report one — must not fabricate a count.
+        let b = json!({
+            "run_count": 1, "failed_count": 0, "window_from": 0, "window_to": 86_400,
+            "items": []
+        });
+        let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
+        assert!(!s.contains("suppressed"));
+    }
+
+    #[test]
+    fn suppressed_count_zero_is_shown_not_omitted() {
+        // R3.4: Some(0) is "reported, nothing suppressed" — a real answer, not silence.
+        // Omitting it here would let suppression look unmeasured rather than measured-as-zero.
+        let b = json!({
+            "run_count": 1, "failed_count": 0, "window_from": 0, "window_to": 86_400,
+            "items": [], "suppressed_count": 0
+        });
+        let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
+        assert!(s.contains("✓ 0 suppressed (all matching mail reviewed)"));
+    }
+
+    #[test]
+    fn suppressed_count_nonzero_warns() {
+        let b = json!({
+            "run_count": 1, "failed_count": 0, "window_from": 0, "window_to": 86_400,
+            "items": [], "suppressed_count": 7
+        });
+        let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
+        assert!(s.contains("⚠ 7 suppressed (exceeded Gmail fetch cap)"));
     }
 
     #[test]
