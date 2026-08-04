@@ -24,11 +24,55 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.120.0 (shipped 2026-08-03)
+**Current version:** v0.121.0 (shipped 2026-08-04)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** attn.3 (v0.120.0) — **a SIGTERM mid-tool-call no longer persists a
+**Latest shipped:** attn.2 R3+R4 (v0.121.0) — **the brief is readable (exclusive
+important/response_needed classification, narrowed sender-text escaping, a real
+`suppressed_count`) and non-destructive to write (a per-fire `{ts}` in both the brief
+filename and the KB key).** R5 (manual fire) is explicitly NOT in this increment — split
+out at the /autoplan gate as its own future increment, filed as `attn.2-R5` in
+TODOS.md. Plan: `docs/plans/attn.2-workable-brief.md`.
+- **R3.1** dropped the `q=newer_than:1d` recency bound for `q=in:inbox` — an un-archived
+  old thread was silently vanishing after one day, which is worse than a duplicate
+  listing. **R3.2** gives every item EXACTLY ONE home (`important` XOR
+  `response_needed`) — fixes a MEASURED shipped bug where an urgent item needing a reply
+  rendered twice. **R3.3** narrowed the neutralisation rule from 5 entities to 3
+  (`[`/`]`/`|`): measured against a real brief, 25 of 37 escaped entities were characters
+  the old rule never named (`<`/`>`, em-dash, `$`/`'`) and zero were `[`/`]` — the model
+  had generalised to over-escaping its own prose. **R3.4** adds `suppressed_count`
+  (messages excluded by the 50-message Gmail fetch cap) from Gmail's own
+  `resultSizeEstimate`, zero extra API calls (decision D2).
+- **R4** gives `Job::render` a `{ts}` token alongside `{date}`, carried into both the
+  brief filename and the `ops:briefs` KB key — a same-day re-fire used to silently
+  overwrite the morning's brief on both the file and the KB side; a false comment at the
+  collision guard called this "harmless — log-append/LWW," which was wrong twice over.
+- **QA drove the real binary and found a real collision, not a theoretical one:** `{ts}`
+  at `%H%M%S` (1-second resolution) rendered byte-identical across two `run_job` fires in
+  the same trigger session, and the second `write_file` silently overwrote the first —
+  the exact bug R4 exists to close, just with a narrower window. Fixed with nanosecond
+  resolution. QA also found `agentctl brief`'s new `suppressed_count` line only fired in
+  the non-"Quiet night" render branch, so a real brief with `run_count=0` and a nonzero
+  `suppressed_count` printed nothing about it — reproduced against a live agentd (three
+  published briefs, all quiet, zero suppression lines shown).
+- **The mandatory /ship adversarial pass (Codex + Claude subagent, cross-model
+  agreement) found two more, both fixed:** the `suppressed_count=0` CLI line read "all
+  matching mail reviewed," which overclaims — the field only tracks the 50-message FETCH
+  cap, not the SEPARATE "analyze up to 20 messages" cap the same prompt applies after
+  fetching; reworded to "fetch cap not exceeded." And three R3 prompt fixes (the
+  `q=in%3Ainbox` query, the CLASSIFICATION RULE, the `suppressed_count` computation) had
+  zero `COS_PROMPT_SOURCES` pin, unlike every other measured fix this session — added and
+  mutation-verified both directions.
+- **Two residuals filed, not fixed, because they're out of this increment's stated
+  scope:** `attn.2-ts-01` (P2) — nanosecond `{ts}` shrinks but doesn't eliminate the
+  collision window; a repeated/backward-stepped system clock can still tie. `attn.2-esc-01`
+  (P3) — `<`/`>` were never in the sender-text escape list, in either the pre- or
+  post-R3.3 version (verified against the pre-attn.2 commit) — a pre-existing gap, not a
+  regression from this PR; same class as the already-documented `brief-03`/`brief-04`
+  limitation ("escaping is a prompt rule, not code enforcement").
+
+**Prev:** attn.3 (v0.120.0) — **a SIGTERM mid-tool-call no longer persists a
 transcript the provider rejects, and the numbers that decide paging are now in the log. The brief
 is still NOT expected to appear — that is `attn.4`.** Plan:
 `docs/plans/attn.3-real-context-window.md`.

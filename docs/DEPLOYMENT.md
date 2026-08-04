@@ -192,7 +192,10 @@ docker run --rm -it \
 agentctl watch --url http://localhost:7999
 
 # 8. Read the brief (after the first cycle, ~2-3 min)
-cat ~/.agentos-output/brief-$(date +%Y-%m-%d).md
+# R4 (attn.2): the filename carries a per-fire timestamp now, not a fixed date —
+# find today's with the glob, or use `agentctl brief` (below) for the pull surface.
+ls ~/.agentos-output/brief-$(date +%Y-%m-%d)T*.md
+cat ~/.agentos-output/brief-$(date +%Y-%m-%d)T*.md
 ```
 
 **⚠ This `docker run --rm` is a test drive, not a standing service (attn.1a).** It runs in the
@@ -495,8 +498,9 @@ agentctl brief --n 5                            # the last 5 briefs
 curl -s localhost:7999/api/v1/brief             # structured JSON: {brief, approvals_pending, server_now}
 
 # Full brief markdown (written by the CoS in addition to the pull surface)
+# R4 (attn.2): filename carries a per-fire timestamp, not a fixed date.
 ls /home/agentos/.agentos-output/brief-*.md
-tail -f /home/agentos/.agentos-output/brief-$(date +%Y-%m-%d).md
+tail -f /home/agentos/.agentos-output/brief-$(date +%Y-%m-%d)T*.md
 
 # Approval workflow
 agentctl approve <id>           # approve pending requests

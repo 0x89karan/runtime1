@@ -256,6 +256,37 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   NOT bundled into attn.3 — it needs plumbing through the restore return type, which is more surgery
   than a log-hygiene fix warrants at the end of an increment. The field-name half **is** fixed
   (`repaired_ids` + `repaired_count`, matching the checkpoint side).
+- **attn.2-R5 (P2) [attn.2 /autoplan 2026-08-04, split from R3/R4] — manual fire as a
+  management-API verb. Fully spec'd (docs/plans/attn.2-workable-brief.md, "R5 REDESIGNED"
+  section), NOT a thin route — needs real engineering, four findings independently verified:**
+  (1) `dispatch_run_job`'s `reject()` (`scheduler.rs:2534-2545`) indexes
+  `state.agents[&parent_id]` — `HashMap` `Index`, panics on a missing key — on EVERY
+  rejection path (capability denied, unknown job, depth exceeded, collision). A synthetic
+  never-live parent id (the only safe design for the completion-delivery side, per
+  `handle_agent_terminal`'s existing `parent_live` check) makes any rejection **crash the
+  process** — `panic = "abort"`, PID 1. The single most likely real-world trigger (firing the
+  endpoint twice, hitting the collision guard) kills agentd entirely. Needs `reject()` made
+  parent-live-aware, mirroring the pattern `handle_agent_terminal` already uses for delivery.
+  (2) `child_model_cfg` (`scheduler.rs:2626-2630`) falls back to `ModelConfig::default()`
+  (`max_tokens: 4096`) for a nonexistent parent — every existing `run_job` caller is a real
+  live agent, so this arm has never executed in production; a manual-fire route would silently
+  halve the configured `8192` output budget. Needs an explicit default-model parameter (mirror
+  the `Spawn` control-command's existing `default_model` param at `scheduler.rs:3158`).
+  (3) `is_mutating_route` (`management.rs:139-152`) is a hand-enumerated allowlist — a new
+  route not added to it ships **unauthenticated even with `AGENTOS_APPROVAL_SECRET`
+  configured**, the exact hole `cap.4`/AUDIT-v0.97 P2-3 fixed once already for the whole
+  mutating surface.
+  (4) The stats-exclusion pattern proposed at the CEO gate (`start_reason != "config_seed"`)
+  is **only inside `runs/store.rs`'s `still_running` arm** — `terminal_in_window`, the branch
+  a *completed* manually-fired job actually matches, has no filter at all. Needs a NEW
+  condition on `terminal_in_window` plus a distinct `start_reason = "manual_fire"` threaded
+  through `dispatch_run_job` (today hardcoded to `"run_job"` at `scheduler.rs:2638`;
+  `run_tracker.open()`'s signature already accepts an arbitrary `&str`, no type change needed).
+  Also resolved: there is NO automatic `cos-inbox`→`cos-curator` handoff anywhere in Rust —
+  100% the trigger's own prompt behavior. The route needs `job_id` as an explicit request
+  parameter (fire one job per call); auto-chaining is possible but does not survive an `agentd`
+  restart (no checkpoint, no restart hook — a new, undocumented failure mode if built).
+  10 new tests specified with mutation controls in the plan doc's Phase 3 Eng section.
 - **attn.4 (P1) [attn.3 /autoplan, operator-chosen] — the CoS burns ~3,456 inference calls a day
   to watch a clock. Scheduler-native cron.** MEASURED: 63 of 63 tool calls in a 29-min window were
   `wait_for_trigger(timeout_s=20)`, each answering "next fire 14 h from now"; 414,016 input tokens
@@ -1237,6 +1268,50 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   simpler single-agent demo templates where the broker's operational overhead isn't worth it).
   `templates/github-agent.template.toml` is already correctly on the broker pattern — no fix
   needed there. Depends on: none.
+- **cos-dev-04 (P3) — the same two templates are now ALSO stale on the R3/R4 prompt-logic
+  fixes.** Found reviewing attn.2 R3+R4 (2026-08-04): `templates/cos-inbox.template.toml` still
+  queries `q=newer_than:1d` (R3.1 replaced this with `q=in:inbox` in both shipped configs — an
+  un-archived old thread otherwise vanishes after one day) and reports no `suppressed_count`
+  (R3.4). `templates/cos-curator.template.toml` has no CLASSIFICATION RULE (R3.2 — an item can
+  still land in both `important` and `response_needed`), no sender-text neutralisation rule at
+  all (R3.3's `[`/`]`/`|` escaping — a bare `templates/cos-curator.template.toml` markdown brief
+  is exposed to the exact injected-link risk THREAT_MODEL.md §9.5 documents for the hardened
+  configs), and still writes the fixed `brief-{date}.md` (R4 — a same-day re-run truncates it).
+  `agentd/src/config.rs`'s `COS_PROMPT_SOURCES` test array already includes both templates and
+  deliberately filters the `{ts}`/link/escaping assertions to `dev`/`overlay` only ("the
+  templates do not author the markdown brief" — true for cos-inbox, but cos-curator DOES), so
+  CI is green while an operator using `agentctl spawn cos-curator` gets none of these fixes.
+  Same fix shape as cos-dev-03: mirror the fixes into both templates, or add an explicit banner
+  in each stating they are a stripped-down demo, not the hardened path. Depends on: none.
+- **attn.2-ts-01 (P2) — `{ts}` collision resistance rests on the wall clock, not a monotonic
+  identifier.** Found at /ship's adversarial pass (Codex + Claude subagent, cross-model
+  agreement, 2026-08-04): `dispatch_run_job`'s nanosecond-resolution `%H%M%S%9f` (the QA fix
+  in this same increment, replacing 1-second `%H%M%S` after a live-driven collision) shrinks
+  the same-day-refire collision window from "one wall-clock second" to "the same nanosecond",
+  but does not eliminate it — a repeated or backward-stepped system clock (NTP correction, VM
+  clock skew) can still produce two identical `ts` values, silently reproducing the exact
+  overwrite R4 exists to prevent, now at much lower but nonzero probability. A scheduler-owned
+  monotonic sequence number, per-run UUID, or an explicit uniqueness check + retry on
+  `dispatch_run_job`'s existing collision guard would close this fully. Not fixed here: R3+R4's
+  stated scope was "non-destructive for a same-day re-fire under normal operation", not
+  "collision-proof under adversarial clock manipulation" — the nanosecond fix already closes
+  the measured, reproduced failure mode; this is defense-in-depth for a much rarer trigger.
+  Revisit before/with attn.2-R5 (manual fire), which is expected to make rapid re-fires routine
+  rather than exceptional. Depends on: none.
+- **attn.2-esc-01 (P3) — the sender-text neutralisation rule has never covered `<`/`>`, in
+  either the pre- or post-R3.3 entity list.** Found at /ship's adversarial pass (Claude
+  subagent): verified against `git show <pre-attn.2-commit>:agentd/cos.agents.toml` — the
+  ORIGINAL 5-entity rule (`[` `]` `(` `)` `|`) never named `<`/`>` either, so R3.3's narrowing
+  to 3 entities did not regress or "reopen" anything; this is a pre-existing gap, not
+  introduced by this PR. Sender-controlled email text (`from`/`subject`/`ask`/`summary`/
+  open-item `text`/`focus_recommendation`) can still carry raw `<`/`>`, which is latent (not
+  live) against today's consumers — a terminal `cat` and the ratatui TUI do not interpret
+  HTML — but would become a live HTML/script-injection vector for any future consumer that
+  renders the brief as HTML (a web viewer, a markdown-to-HTML bridge). This is the same
+  documented limitation as `brief-03`/`brief-04` ("escaping is a prompt rule, not code
+  enforcement" — the real fix is runtime-authored markdown from the typed `BriefRecord`, not
+  another prompt-text patch) — file alongside that work rather than as a standalone escape-
+  list addition. Depends on: brief-04 (runtime-authored brief markdown).
 
 ## brief.1 — Open items (from /review, 2026-07-29)
 
@@ -1252,7 +1327,8 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   Two structural blockers, either of which alone is fatal: (a) **nothing ever removes an entry
   for a resolved item** — there is no `kb_delete`, and the Qdrant TTL sweep runs once at sidecar
   process start; (b) **neither job can observe resolution** — the curator has no Gmail access, and
-  the inbox job only queries `q=newer_than:1d`, which cannot tell "replied to" from "quiet".
+  the inbox job's query (⚠ UPDATED by R3.1/attn.2: `q=in:inbox`, was `q=newer_than:1d`) cannot tell
+  "replied to" from "quiet" either — inbox presence answers "not archived", not "not yet handled".
   Note the naive fix is a trap: dropping the `ops:briefs` union makes carried-forward items
   vanish the moment a thread goes quiet, which is worse than re-listing.
   Likely shape: let the inbox job read the open set and check, per open thread, whether the newest
@@ -1335,7 +1411,8 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   mechanical fix. Same file's `open_items` shape and thread-id handling *were* mirrored.
 
 - **brief-02 (P3) — Permalinks never reach Telegram.** The Thread column added by brief.1 exists
-  only in `~/.agentos-output/brief-{date}.md`. The Telegram bridge pushes `GET /api/v1/brief`
+  only in `~/.agentos-output/brief-{date}T{ts}Z.md` (timestamped filename since R4/attn.2). The
+  Telegram bridge pushes `GET /api/v1/brief`
   (`docker/telegram_mcp.py`), which is the runtime-authored `BriefRecord` (facts from `runs.redb`
   plus a bounded model `narrative`) — a different artifact that has no thread field. If Telegram
   is the surface the operator actually reads each morning, brief.1's criterion 2 is not met there.

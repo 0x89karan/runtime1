@@ -195,6 +195,14 @@ fn render_brief(
         }
         out.push_str(&age_suffix(age));
         out.push('\n');
+        // R3.4-ar-02 (QA on the real binary, attn.2): this branch used to `return` here,
+        // before ever reaching the suppressed_count block below — so a genuinely quiet
+        // run_count (the inbox job's own run excluded from the count, or simply nothing
+        // else ran) silently hid a real, nonzero suppressed_count. Driving publish_brief
+        // against a live agentd reproduced it directly: three real briefs, all with
+        // run_count=0, and `agentctl brief` printed nothing about suppression for any of
+        // them, including the one carrying suppressed_count=7.
+        push_suppressed_count_line(&mut out, brief);
         push_narrative(&mut out, brief);
         return out;
     }
@@ -236,8 +244,36 @@ fn render_brief(
     if overflow > 0 {
         out.push_str(&format!("  ✓ {overflow} others ok\n"));
     }
+    push_suppressed_count_line(&mut out, brief);
     push_narrative(&mut out, brief);
     out
+}
+
+/// R3.4 (attn.2): model-reported, and Some(0) is a real "reported, nothing suppressed"
+/// answer distinct from None ("didn't report"). Shown whenever present, even at 0 — the
+/// whole reason this field exists is so silent suppression cannot look like a track with
+/// no problem to solve (attn.2 plan, R3.4). Absent (pre-R3.4 agentd, or the inbox job
+/// didn't report one) renders nothing, matching every other optional count on this brief.
+///
+/// Called from BOTH `render_brief` branches (quiet-night early-return and the normal
+/// path) — R3.4-ar-02 found that only the normal path called this, so a quiet run_count
+/// silently hid a real suppressed_count.
+///
+/// ⚠ CORRECTED (ship-review, adversarial pass): the zero-case wording used to read "all
+/// matching mail reviewed". That overclaims — `suppressed_count` measures ONLY messages
+/// excluded by the 50-message Gmail FETCH cap (`cos.agents.toml` STEP 2); it says nothing
+/// about the SEPARATE 20-message ANALYSIS cap ("Analyze up to 20 messages") the same
+/// prompt applies after fetching. `suppressed_count=0` with 45 fetched-but-only-20-analyzed
+/// messages is an honest report of the field's own definition, not evidence "all matching
+/// mail was reviewed" — so the line no longer claims that.
+fn push_suppressed_count_line(out: &mut String, brief: &Value) {
+    if let Some(suppressed) = brief["suppressed_count"].as_u64() {
+        if suppressed > 0 {
+            out.push_str(&format!("  ⚠ {suppressed} suppressed (exceeded Gmail fetch cap)\n"));
+        } else {
+            out.push_str("  ✓ 0 suppressed (fetch cap not exceeded)\n");
+        }
+    }
 }
 
 /// " · written 3h ago", or empty when the age is unknown (pre-attn.1a daemon).
@@ -291,6 +327,21 @@ mod tests {
     }
 
     #[test]
+    fn quiet_night_still_surfaces_a_real_suppressed_count() {
+        // R3.4-ar-02: found by driving a real agentd — publish_brief with run_count=0 (the
+        // inbox job's own run wasn't counted) and suppressed_count=7 rendered NOTHING about
+        // suppression, because the quiet-night branch returned before the suppressed_count
+        // block. Fixed by calling push_suppressed_count_line from both branches.
+        let b = json!({
+            "run_count": 0, "failed_count": 0, "window_from": 0, "window_to": 86_400,
+            "items": [], "suppressed_count": 7
+        });
+        let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
+        assert!(s.contains("Quiet night — 0 runs"));
+        assert!(s.contains("⚠ 7 suppressed (exceeded Gmail fetch cap)"));
+    }
+
+    #[test]
     fn leads_with_attention_and_names_ids() {
         let b = json!({
             "run_count": 12, "failed_count": 1, "overflow_count": 10, "attention_overflow": 0,
@@ -308,6 +359,39 @@ mod tests {
         assert!(s.contains("⏳ curator  running  (curator:2)"));
         assert!(s.contains("✓ 10 others ok"));
         assert!(s.contains("one failure overnight"));
+    }
+
+    #[test]
+    fn suppressed_count_absent_renders_nothing() {
+        // Pre-R3.4 agentd, or an inbox job that didn't report one — must not fabricate a count.
+        let b = json!({
+            "run_count": 1, "failed_count": 0, "window_from": 0, "window_to": 86_400,
+            "items": []
+        });
+        let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
+        assert!(!s.contains("suppressed"));
+    }
+
+    #[test]
+    fn suppressed_count_zero_is_shown_not_omitted() {
+        // R3.4: Some(0) is "reported, nothing suppressed" — a real answer, not silence.
+        // Omitting it here would let suppression look unmeasured rather than measured-as-zero.
+        let b = json!({
+            "run_count": 1, "failed_count": 0, "window_from": 0, "window_to": 86_400,
+            "items": [], "suppressed_count": 0
+        });
+        let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
+        assert!(s.contains("✓ 0 suppressed (fetch cap not exceeded)"));
+    }
+
+    #[test]
+    fn suppressed_count_nonzero_warns() {
+        let b = json!({
+            "run_count": 1, "failed_count": 0, "window_from": 0, "window_to": 86_400,
+            "items": [], "suppressed_count": 7
+        });
+        let s = render_brief(&b, 0, None, true, STALE_AFTER_SECS);
+        assert!(s.contains("⚠ 7 suppressed (exceeded Gmail fetch cap)"));
     }
 
     #[test]

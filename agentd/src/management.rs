@@ -1550,7 +1550,7 @@ mod tests {
             agent_id: "scout".into(), status: "failed".into(), stop_reason: Some("error".into()),
             last_error: Some("boom".into()), end_context_tokens: Some(14), ts: 20_050,
         }).unwrap();
-        store.publish_brief(Some("one failure overnight".into()), 100_000).unwrap();
+        store.publish_brief(Some("one failure overnight".into()), None, 100_000).unwrap();
 
         // Snapshot carries two pending approvals → live overlay must report 2.
         let mut snap = SchedulerSnapshot::default();
@@ -1599,7 +1599,7 @@ mod tests {
         // failure mode this increment exists to eliminate.
         let dir = tempfile::tempdir().unwrap();
         let (store, _q) = crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap();
-        store.publish_brief(None, 100_000).unwrap();
+        store.publish_brief(None, None, 100_000).unwrap();
         let before = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

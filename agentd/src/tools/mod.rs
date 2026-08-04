@@ -365,6 +365,9 @@ impl ToolRegistry {
                         "run_count":    v["run_count"].as_u64().unwrap_or(0),
                         "failed_count": v["failed_count"].as_u64().unwrap_or(0),
                         "spend_total":  v["spend_total"].as_u64().unwrap_or(0),
+                        // R3.4 (attn.2): null when the inbox job didn't report one — distinct
+                        // from Some(0), which means "reported and nothing was suppressed".
+                        "suppressed_count": v["suppressed_count"],
                     }),
                 );
             }

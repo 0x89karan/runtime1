@@ -880,16 +880,20 @@ impl Tool for PublishBrief {
          failures, spend, and the failing/blocked run IDs) deterministically from durable run \
          history over the window since the last brief — you do NOT pass any of those. Optionally \
          pass `narrative`: a one- or two-sentence plain-English summary to accompany the facts. \
-         Call this once per cron cycle after writing the ops:briefs entry. The brief is then \
-         readable via `agentctl brief` / GET /api/v1/brief regardless of when the operator looks. \
-         Requires the BriefPublish capability."
+         Optionally pass `suppressed_count`: how many matching Gmail messages the inbox job could \
+         not fetch because they exceeded its result cap (from Gmail's own `resultSizeEstimate`) — \
+         NOT how many were archived or handled, a different exclusion. Call this once per cron \
+         cycle after writing the ops:briefs entry. The brief is then readable via `agentctl brief` \
+         / GET /api/v1/brief regardless of when the operator looks. Requires the BriefPublish \
+         capability."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "narrative": { "type": "string", "description": "Optional plain-English summary; facts are authored by agentd, not from this field" }
+                "narrative": { "type": "string", "description": "Optional plain-English summary; facts are authored by agentd, not from this field" },
+                "suppressed_count": { "type": "integer", "description": "Optional count of matching Gmail messages not fetched due to the result cap (Gmail's resultSizeEstimate minus messages actually reviewed) — not archived/handled mail" }
             },
             "additionalProperties": false
         })
@@ -901,6 +905,7 @@ impl Tool for PublishBrief {
 
     async fn invoke(&self, input: Value, _ctx: &ToolContext) -> Result<String> {
         let narrative = input["narrative"].as_str().map(str::to_string);
+        let suppressed_count = input["suppressed_count"].as_u64();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -908,7 +913,7 @@ impl Tool for PublishBrief {
         // Route through the writer lane: composes AFTER all prior lifecycle events are
         // applied (FIFO), then persists in one txn. A failure returns Err → the central
         // invoke hook fires no BriefWritten and the window does not advance (E7).
-        let brief = self.publisher.publish(narrative, now).await?;
+        let brief = self.publisher.publish(narrative, suppressed_count, now).await?;
         // Return the structured spine so the ToolRegistry hook can emit BriefWritten.
         Ok(serde_json::to_string(&brief)?)
     }
@@ -2369,5 +2374,58 @@ mod tests {
             err.to_string().contains("capability denied"),
             "kb_search without KbRead cap must be denied; got: {err}"
         );
+    }
+
+    // ── PublishBrief::invoke — suppressed_count parsing ─────────────────────────
+    //
+    // Found by the ship-workflow adversarial + coverage passes: this parsing had ZERO
+    // test coverage — not even the valid-integer happy path went through the tool's
+    // invoke(), only through BriefPublisher::publish/RunsStore::publish_brief directly.
+
+    async fn publish_brief_tool() -> (PublishBrief, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = std::sync::Arc::new(crate::runs::RunsStore::open(&dir.path().join("runs.redb")).unwrap().0);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(crate::runs::run_writer(rx, std::sync::Arc::clone(&store)));
+        let publisher = crate::runs::RunTracker::new(tx).brief_publisher();
+        (PublishBrief { publisher }, dir)
+    }
+
+    #[tokio::test]
+    async fn publish_brief_passes_a_valid_integer_through() {
+        let (tool, _dir) = publish_brief_tool().await;
+        let raw = tool
+            .invoke(json!({"suppressed_count": 7}), &ctx())
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["suppressed_count"], 7);
+    }
+
+    #[tokio::test]
+    async fn publish_brief_malformed_suppressed_count_coerces_to_absent_not_an_error() {
+        // Documents (rather than merely implies) the current behaviour: `as_u64()` returns
+        // None for a negative number, a float, or a string, and PublishBrief treats that
+        // exactly like the field being absent — it does NOT error and does NOT collapse to
+        // Some(0). A model that miscomputes `max(0, resultSizeEstimate - fetched)` into a
+        // negative number gets "not reported", not "0 reported" — silently losing the
+        // signal rather than reporting a wrong one. Same trust tier as `narrative`
+        // (runs/mod.rs's own doc comment): this is the accepted, documented tradeoff, not a
+        // gap this test is asking to be closed — it exists so a future change to `.as_u64()`
+        // parsing can't silently start erroring, panicking, or coercing to Some(0) instead.
+        let (tool, _dir) = publish_brief_tool().await;
+        for bad in [json!(-3), json!(2.5), json!("7")] {
+            let raw = tool
+                .invoke(json!({"suppressed_count": bad}), &ctx())
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                v["suppressed_count"].is_null(),
+                "malformed suppressed_count {bad:?} must coerce to absent (null), not error \
+                 or silently become 0 — got {:?}",
+                v["suppressed_count"]
+            );
+        }
     }
 }
