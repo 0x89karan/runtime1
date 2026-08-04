@@ -3,6 +3,55 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.121.0] - 2026-08-04
+
+### Fixed
+- **attn.2 R4 — a same-day `run_job` re-fire no longer overwrites the morning's brief.**
+  `Job::render` gains a `{ts}` substitution token alongside `{date}`, carried into both
+  the brief's filename (`brief-{date}T{ts}Z.md`) and its `ops:briefs` KB key
+  (`{date}T{ts}`). The collision-guard comment previously called a second same-day run
+  "harmless — brief is log-append/LWW"; that was wrong on both counts — `write_file`
+  truncates the existing path, and the KB record is genuinely last-writer-wins.
+  - **QA found the fix itself collided.** Driving the real binary against a scripted
+    provider, two `run_job` fires in the same trigger session rendered a byte-identical
+    `{ts}` (`%H%M%S`, 1-second resolution), and the second `write_file` silently
+    overwrote the first — reproducing the exact failure this fix exists to close, just
+    with a narrower window. Moved to nanosecond resolution (`%9f`).
+  - **QA also found `agentctl brief` silently dropped the new `suppressed_count` line
+    whenever `run_count` was 0** — the "Quiet night" render branch returned before ever
+    reaching it. Reproduced against a live agentd (three published briefs, all
+    `run_count=0`, zero suppression lines shown, including one carrying
+    `suppressed_count=7`). Fixed by extracting a shared render helper called from both
+    branches.
+  - **The mandatory ship-time adversarial pass (Codex + independent Claude review) found
+    two more:** the `suppressed_count=0` CLI line read "all matching mail reviewed" —
+    an overclaim, since the field tracks only the 50-message Gmail FETCH cap and says
+    nothing about the prompt's SEPARATE "analyze up to 20 messages" cap applied after
+    fetching; reworded to "fetch cap not exceeded." And three R3 prompt-logic fixes (the
+    `q=in%3Ainbox` query, the important/response_needed classification rule, the
+    `suppressed_count` computation) shipped with zero regression-pin coverage, unlike
+    every other measured prompt fix this cycle — added and mutation-verified.
+
+### Added
+- **attn.2 R3 — the brief is readable.** `cos.agents.toml` (both the dev and QEMU-overlay
+  copies): the inbox query drops its `q=newer_than:1d` recency bound for `q=in:inbox` (an
+  un-archived old thread was silently vanishing after one day); every item now lands in
+  EXACTLY ONE of `important`/`response_needed` (fixes a measured shipped bug where an
+  urgent item needing a reply rendered twice); the sender-text neutralisation rule
+  narrows from 5 entities to 3 (`[`/`]`/`|`) — measured against a real brief, 25 of 37
+  escaped entities were characters the old rule never named, and the model had
+  generalised to over-escaping its own prose; and a `suppressed_count` field (messages
+  excluded by the fetch cap, from Gmail's own `resultSizeEstimate`, zero extra API
+  calls) is threaded end to end through `PublishBrief` → `BriefRecord` → the management
+  API → `agentctl brief`.
+
+### Deferred
+- **R5 (manual fire)** is explicitly NOT in this release — split into its own future
+  increment at the /autoplan gate (filed as `attn.2-R5` in TODOS.md) after review found
+  the original filesystem-sentinel design would silently no-op exactly when needed, and
+  the redesigned management-API-verb approach still had a PID-1 crash risk in
+  `dispatch_run_job`'s reject path.
+
 ## [v0.120.0] - 2026-08-03
 
 ### Fixed
