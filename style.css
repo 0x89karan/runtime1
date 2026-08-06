@@ -556,6 +556,45 @@ kbd{font-family:var(--mono);font-size:11px;line-height:1;padding:3px 6px;border-
 .rec-out .deny{border-color:var(--md-sys-color-error);color:var(--md-sys-color-error)}
 .rec-cap{font-family:var(--mono);font-size:12px;color:var(--text-dim);margin:10px 0 0}
 
+/* ─── verification miniature (3-up: actions → proof → verify) ─── */
+.vd-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin:26px 0 8px}
+.vd-grid .rec{margin:0}
+.rec-hd .gn{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;
+  border-radius:var(--md-sys-shape-corner-full);border:1px solid var(--accent);color:var(--accent);
+  font-family:var(--mono);font-size:9.5px;flex:none}
+.vd-log{height:230px}
+.vd-note{font-size:12.5px}
+.vd-note b{color:var(--md-sys-color-on-surface)}
+/* Rows in the proof/verify columns have no .kind/.det split — color the row itself. */
+.rl.plain{color:var(--text-muted)}
+.rl.plain.flow{color:var(--flow)}
+.rl.plain.enf {color:var(--enforced)}
+.rl.plain.abs {color:var(--absent)}
+.rl.plain.mut {color:var(--declared)}
+.rl.removed{opacity:.3;text-decoration:line-through;transition:opacity var(--md-sys-motion-duration-medium2) var(--md-sys-motion-easing-standard)}
+.vd-rm{display:none;margin-left:auto;flex:none;width:16px;height:16px;border-radius:50%;
+  border:1px solid var(--md-sys-color-outline);background:transparent;color:var(--text-dim);
+  font-size:12px;line-height:1;cursor:pointer;align-items:center;justify-content:center;padding:0}
+.vd-rm:hover{border-color:var(--md-sys-color-error);color:var(--md-sys-color-error);
+  background:var(--absent-bg)}
+.vd-log.removable .vd-rm{display:inline-flex}
+@media (max-width:900px){ .vd-grid{grid-template-columns:1fr} .vd-log{height:190px} }
+
+/* Same component, deliberately marked "not built": dashed border, declared-color
+   accents instead of enforced-green, so it can never be mistaken for the shipped
+   demo above it even at a glance. */
+.vd-grid--zk .rec{border-style:dashed;border-color:var(--md-sys-color-outline)}
+.vd-grid--zk .rec-hd{background:var(--declared-bg)}
+.vd-grid--zk .rec-hd .dot{background:var(--declared);box-shadow:0 0 0 3px var(--declared-bg)}
+.vd-grid--zk .rec-hd .gn{border-color:var(--declared);color:var(--declared)}
+.zk-verdict{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:11px;
+  padding:1px 8px;border-radius:var(--md-sys-shape-corner-full);border:1px solid;cursor:pointer;
+  margin-left:auto;flex:none;background:none;transition:opacity .15s}
+.zk-verdict:hover{opacity:.8}
+.zk-verdict.allow{color:var(--enforced);border-color:var(--enforced);background:var(--enforced-bg)}
+.zk-verdict.deny{color:var(--absent);border-color:var(--absent);background:var(--absent-bg)}
+.zk-lock{color:var(--text-dim);letter-spacing:.08em}
+
 /* ─── evidence filter + matrix ─── */
 /* M3 filter chips: outlined when unselected, container-filled with a leading
    checkmark when selected, state layer throughout. Shape stays `corner-full` to

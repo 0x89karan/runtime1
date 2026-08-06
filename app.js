@@ -10,6 +10,17 @@
   var root = document.documentElement;
   var reduced = window.matchMedia('(prefers-reduced-motion: reduce)');
 
+  /* FNV-1a-ish 32-bit string hash → 8 hex chars. Illustrative only, shared by the
+     verification-page miniatures (real chain, and the zk.2 illustration). */
+  function h(str) {
+    var hash = 2166136261;
+    for (var i = 0; i < str.length; i++) {
+      hash ^= str.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+  }
+
   /* ─── theme ───────────────────────────────────────────────────────────────
      The light palette already existed in style.css but nothing could reach it
      except an OS-level preference change. Persist an explicit choice; absent
@@ -477,6 +488,399 @@
       }, { threshold: 0.12 });   // low, so a short laptop viewport still trips it
       ro.observe(host);
     } else { play(); }
+  })();
+
+  /* ─── verification miniature (zk-verification.html) ─────────────────────
+     Three linked panes: actions → proof generation → verification. The hash
+     is a toy FNV-ish string hash, not the shipped SHA-256/Ed25519 — the page
+     says so — but the shape of the check is real: sign a chain head once,
+     then show that removing a receipt from underneath it is exactly what a
+     recomputed-root comparison catches. */
+  (function verifyDemo() {
+    var host = document.querySelector('[data-verify-demo]');
+    if (!host) return;
+
+    var actionsLog = host.querySelector('[data-vd-actions]');
+    var proofLog   = host.querySelector('[data-vd-proof]');
+    var verifyLog  = host.querySelector('[data-vd-verify]');
+    var hintEl     = host.querySelector('[data-vd-hint]');
+    var artifactEl = host.querySelector('[data-vd-artifact]');
+    var verdictEl  = host.querySelector('[data-vd-verdict]');
+    var replayBtn  = host.querySelector('[data-vd-replay]');
+
+    var ACTIONS = [
+      { t: 'agent_scheduled',   c: 'flow', d: 'agent=cos-inbox  in_flight=1' },
+      { t: 'inference_request', c: 'flow', d: 'model=claude-sonnet  retained_tokens_est=1,840' },
+      { t: 'tool_call',         c: 'mut',  d: 'gmail.search  q="in:inbox"  cap=Mcp{google_oauth}' },
+      { t: 'tool_call',         c: 'mut',  d: 'write_file  path=/data/output/brief.md  cap=FsWrite{/data/output}' },
+      { t: 'brief_written',     c: 'enf',  d: 'brief_id=2026-08-06  run_count=3' },
+      { t: 'agent_completed',   c: 'enf',  d: 'agent=cos-inbox  turns=4' }
+    ];
+    var GENESIS = 'runtime1-genesis';
+    var TICK = 480;
+
+    var alive = [];          // {idx, t, c, d, row}
+    var signedRoot = null, signedSig = null, signedCount = 0;
+    var timer = null;
+
+    function chainRoot(items) {
+      var prev = h(GENESIS);
+      for (var i = 0; i < items.length; i++) {
+        prev = h(prev + '|' + items[i].idx + items[i].t + items[i].d);
+      }
+      return prev;
+    }
+
+    function sign(rootHash) { return 'ed25519:' + h('a:' + rootHash) + h('b:' + rootHash).slice(0, 4); }
+
+    function stamp(idx) {
+      var base = new Date(2026, 7, 6, 9, 0, 0, 0);
+      base.setMilliseconds(base.getMilliseconds() + idx * 640);
+      var p = function (x, n) { return String(x).padStart(n || 2, '0'); };
+      return p(base.getHours()) + ':' + p(base.getMinutes()) + ':' + p(base.getSeconds()) +
+             '.' + p(base.getMilliseconds(), 3);
+    }
+
+    function line(el, cls, text) {
+      var row = document.createElement('div');
+      row.className = 'rl plain ' + (cls || 'flow');
+      row.innerHTML = text;
+      el.appendChild(row);
+      el.scrollTop = el.scrollHeight;
+      return row;
+    }
+
+    function actionRow(a) {
+      var row = document.createElement('div');
+      row.className = 'rl ' + a.c;
+      row.dataset.idx = a.idx;
+      row.innerHTML =
+        '<span class="ts">' + stamp(a.idx) + '</span>' +
+        '<span class="kind">' + a.t + '</span>' +
+        '<span class="det">' + a.d + '</span>' +
+        '<button type="button" class="vd-rm" data-vd-rm aria-label="Remove this action">&times;</button>';
+      actionsLog.appendChild(row);
+      actionsLog.scrollTop = actionsLog.scrollHeight;
+      row.querySelector('[data-vd-rm]').addEventListener('click', function () { removeAction(a, row); });
+      return row;
+    }
+
+    function removeAction(a, row) {
+      alive = alive.filter(function (x) { return x !== a; });
+      row.classList.add('removed');
+      setTimeout(function () { row.remove(); }, 260);
+      if (signedRoot) reverify();
+    }
+
+    function reverify() {
+      verifyLog.innerHTML = '';
+      var root2 = chainRoot(alive);
+      line(verifyLog, 'flow', 'fetch published chain head + public key');
+      line(verifyLog, 'mut',  'recompute chain from the log (' + alive.length + ' receipt' + (alive.length === 1 ? '' : 's') + ')');
+      line(verifyLog, 'mut',  'compare  recomputed=' + root2 + '  signed=' + signedRoot);
+      if (root2 === signedRoot && alive.length === signedCount) {
+        line(verifyLog, 'enf', 'signature valid over ' + signedRoot);
+        verdictEl.className = 'rec-out vd-note good';
+        verdictEl.innerHTML = '&#10003; verified — ' + alive.length + ' receipts, chain unbroken, signature valid over <b>' + signedRoot + '</b>.';
+      } else {
+        line(verifyLog, 'abs', 'root mismatch — signature check FAILED');
+        verdictEl.className = 'rec-out vd-note bad';
+        verdictEl.innerHTML = '&#10007; verification failed — the signed root committed to <b>' + signedCount +
+          '</b> receipts; the log now has <b>' + alive.length + '</b>. Recomputed root <b>' + root2 +
+          '</b> &ne; signed root <b>' + signedRoot + '</b>. An action was removed after the proof was' +
+          ' generated — exactly what a hash chain is built to catch.';
+      }
+    }
+
+    function generateProof() {
+      hintEl.textContent = 'run complete — generating proof…';
+      proofLog.innerHTML = '';
+      var step = 0;
+      function next() {
+        if (step < alive.length) {
+          var a = alive[step];
+          line(proofLog, 'mut', 'hash receipt #' + a.idx + '  ' + a.t + '  &rarr; ' + h(a.idx + a.t + a.d).slice(0, 8));
+          step++;
+          timer = setTimeout(next, TICK);
+          return;
+        }
+        if (step === alive.length) {
+          signedRoot = chainRoot(alive);
+          line(proofLog, 'flow', 'chain head = ' + signedRoot);
+          step++;
+          timer = setTimeout(next, TICK);
+          return;
+        }
+        signedSig = sign(signedRoot);
+        signedCount = alive.length;
+        line(proofLog, 'enf', 'sign(chain head, sk) = ' + signedSig);
+        artifactEl.className = 'rec-out vd-note good';
+        artifactEl.innerHTML = 'chain head <b>' + signedRoot + '</b> &middot; signature <b>' + signedSig +
+          '</b> &middot; ' + signedCount + ' receipts signed';
+        hintEl.textContent = 'verifying…';
+        timer = setTimeout(runVerify, TICK);
+      }
+      next();
+    }
+
+    function runVerify() {
+      verifyLog.innerHTML = '';
+      var steps = [
+        ['flow', 'fetch published chain head + public key'],
+        ['mut',  'recompute chain from the log (' + alive.length + ' receipts)'],
+        ['mut',  'compare  recomputed=' + signedRoot + '  signed=' + signedRoot],
+        ['enf',  'signature valid over ' + signedRoot]
+      ];
+      var step = 0;
+      function next() {
+        if (step >= steps.length) {
+          verdictEl.className = 'rec-out vd-note good';
+          verdictEl.innerHTML = '&#10003; verified — ' + alive.length + ' receipts, chain unbroken, signature valid over <b>' + signedRoot + '</b>.';
+          actionsLog.classList.add('removable');
+          hintEl.textContent = 'try removing an action on the left';
+          return;
+        }
+        line(verifyLog, steps[step][0], steps[step][1]);
+        step++;
+        timer = setTimeout(next, TICK);
+      }
+      next();
+    }
+
+    function reset() {
+      clearTimeout(timer);
+      actionsLog.innerHTML = ''; actionsLog.classList.remove('removable');
+      proofLog.innerHTML = ''; verifyLog.innerHTML = '';
+      artifactEl.className = 'rec-out vd-note'; artifactEl.textContent = 'waiting for the run to finish…';
+      verdictEl.className = 'rec-out vd-note'; verdictEl.textContent = 'waiting for a proof…';
+      hintEl.textContent = 'recording…';
+      alive = ACTIONS.map(function (a, idx) { return { idx: idx, t: a.t, c: a.c, d: a.d }; });
+      signedRoot = null; signedSig = null; signedCount = 0;
+    }
+
+    function record() {
+      reset();
+      var i = 0;
+      function next() {
+        if (i >= alive.length) { generateProof(); return; }
+        actionRow(alive[i]);
+        i++;
+        timer = setTimeout(next, TICK);
+      }
+      next();
+    }
+
+    if (replayBtn) replayBtn.addEventListener('click', record);
+
+    if (reduced.matches) {
+      reset();
+      alive.forEach(actionRow);
+      signedRoot = chainRoot(alive);
+      signedSig = sign(signedRoot);
+      signedCount = alive.length;
+      line(proofLog, 'enf', 'sign(chain head, sk) = ' + signedSig);
+      artifactEl.className = 'rec-out vd-note good';
+      artifactEl.innerHTML = 'chain head <b>' + signedRoot + '</b> &middot; signature <b>' + signedSig +
+        '</b> &middot; ' + signedCount + ' receipts signed';
+      line(verifyLog, 'enf', 'signature valid over ' + signedRoot);
+      verdictEl.className = 'rec-out vd-note good';
+      verdictEl.innerHTML = '&#10003; verified — ' + alive.length + ' receipts, chain unbroken, signature valid over <b>' + signedRoot + '</b>.';
+      actionsLog.classList.add('removable');
+      hintEl.textContent = 'try removing an action on the left';
+    } else if ('IntersectionObserver' in window) {
+      var seen = false;
+      var ro = new IntersectionObserver(function (en) {
+        if (en[0].isIntersecting && !seen) { seen = true; record(); ro.disconnect(); }
+      }, { threshold: 0.12 });
+      ro.observe(host);
+    } else { record(); }
+  })();
+
+  /* ─── zk.2, illustrated (zk-verification.html) ───────────────────────────
+     zk.2 is unbuilt — the page says so, repeatedly, on purpose. This is not a
+     simulation of running code; it's a diagram that happens to be interactive.
+     The property it shows is different from the hash-chain demo above: policy
+     CONSISTENCY, checked by a verifier who never receives the policy, only a
+     commitment to it. Flipping a verdict after the proof exists is the zk
+     analogue of removing a receipt — same class of failure, different cause. */
+  (function zkDemo() {
+    var host = document.querySelector('[data-zk-demo]');
+    if (!host) return;
+
+    var decLog     = host.querySelector('[data-zk-decisions]');
+    var proveLog   = host.querySelector('[data-zk-prove]');
+    var verifyLog  = host.querySelector('[data-zk-verify]');
+    var hintEl     = host.querySelector('[data-zk-hint]');
+    var artifactEl = host.querySelector('[data-zk-artifact]');
+    var verdictEl  = host.querySelector('[data-zk-verdict]');
+    var replayBtn  = host.querySelector('[data-zk-replay]');
+
+    var TEMPLATE = [
+      { rule: 'cap_check',      d: 'tool=gmail.search  cap=Mcp{google_oauth}' },
+      { rule: 'budget_check',   d: 'spend=1,840  cap=12,000' },
+      { rule: 'cap_check',      d: 'tool=write_file  cap=FsWrite{/data/output}' },
+      { rule: 'approval_check', d: 'risk=medium  gate=off' },
+      { rule: 'budget_check',   d: 'spend=9,650  cap=12,000' }
+    ];
+    var TICK = 480;
+    var decisions = [], provenVerdicts = null, commitment = null, proof = null;
+    var timer = null;
+
+    function policyCommitment() { return h('policy-v3|' + TEMPLATE.length + '|secret-rules-never-shown'); }
+
+    function line(el, cls, text) {
+      var row = document.createElement('div');
+      row.className = 'rl plain ' + (cls || 'flow');
+      row.innerHTML = text;
+      el.appendChild(row);
+      el.scrollTop = el.scrollHeight;
+      return row;
+    }
+
+    function decisionRow(d) {
+      var row = document.createElement('div');
+      row.className = 'rl mut';
+      row.dataset.idx = d.idx;
+      row.innerHTML =
+        '<span class="kind">' + d.rule + '</span>' +
+        '<span class="det">' + d.d + '</span>' +
+        '<button type="button" class="zk-verdict ' + (d.verdict === 'ALLOW' ? 'allow' : 'deny') +
+        '" data-zk-toggle>' + d.verdict + '</button>';
+      decLog.appendChild(row);
+      decLog.scrollTop = decLog.scrollHeight;
+      row.querySelector('[data-zk-toggle]').addEventListener('click', function (ev) {
+        d.verdict = d.verdict === 'ALLOW' ? 'DENY' : 'ALLOW';
+        ev.currentTarget.textContent = d.verdict;
+        ev.currentTarget.className = 'zk-verdict ' + (d.verdict === 'ALLOW' ? 'allow' : 'deny');
+        if (provenVerdicts) reverify();
+      });
+      return row;
+    }
+
+    function reverify() {
+      verifyLog.innerHTML = '';
+      var current = decisions.map(function (d) { return d.verdict; });
+      line(verifyLog, 'flow', 'receive proof &pi; + policy commitment (not the policy)');
+      line(verifyLog, 'mut',  'check &pi; against commitment ' + commitment + ' + claimed decisions');
+      var mismatchAt = -1;
+      for (var i = 0; i < current.length; i++) {
+        if (current[i] !== provenVerdicts[i]) { mismatchAt = i; break; }
+      }
+      if (mismatchAt === -1) {
+        line(verifyLog, 'enf', 'policy-consistent');
+        verdictEl.className = 'rec-out vd-note good';
+        verdictEl.innerHTML = '&#10003; policy-consistent — ' + current.length +
+          ' decisions verified against commitment <b>' + commitment + '</b>, policy never revealed.';
+      } else {
+        line(verifyLog, 'abs', 'decision #' + mismatchAt + ' mismatch — proof commits to ' +
+          provenVerdicts[mismatchAt] + ', journal now claims ' + current[mismatchAt]);
+        line(verifyLog, 'abs', 'policy consistency check FAILED');
+        verdictEl.className = 'rec-out vd-note bad';
+        verdictEl.innerHTML = '&#10007; inconsistent — the proof commits to decision #' + mismatchAt +
+          ' resolving <b>' + provenVerdicts[mismatchAt] + '</b>; the journal now claims <b>' +
+          current[mismatchAt] + '</b>. The proof can\'t tell you which side is lying — only that ' +
+          'they no longer agree.';
+      }
+    }
+
+    function generateProof() {
+      hintEl.textContent = 'run complete — generating proof…';
+      proveLog.innerHTML = '';
+      commitment = policyCommitment();
+      var step = 0;
+      function next() {
+        if (step === 0) {
+          line(proveLog, 'flow', 'commit(policy) = ' + commitment + '  <span class="zk-lock">(policy never leaves the box)</span>');
+          step++; timer = setTimeout(next, TICK); return;
+        }
+        if (step <= decisions.length) {
+          var d = decisions[step - 1];
+          line(proveLog, 'mut', 'decision #' + d.idx + '  ' + d.rule + '  &rarr; ' + d.verdict);
+          step++; timer = setTimeout(next, TICK); return;
+        }
+        provenVerdicts = decisions.map(function (d) { return d.verdict; });
+        proof = 'zk:' + h('pi|' + commitment + '|' + provenVerdicts.join(',')) +
+                h('pi2|' + commitment).slice(0, 4);
+        line(proveLog, 'enf', '&pi; = ' + proof);
+        artifactEl.className = 'rec-out vd-note good';
+        artifactEl.innerHTML = 'commitment <b>' + commitment + '</b> &middot; proof <b>' + proof +
+          '</b> &middot; ' + provenVerdicts.length + ' decisions proven';
+        hintEl.textContent = 'verifying…';
+        timer = setTimeout(runVerify, TICK);
+      }
+      next();
+    }
+
+    function runVerify() {
+      verifyLog.innerHTML = '';
+      var steps = [
+        ['flow', 'receive proof &pi; + policy commitment (not the policy)'],
+        ['mut',  'check &pi; against commitment ' + commitment + ' + claimed decisions'],
+        ['enf',  'policy-consistent']
+      ];
+      var step = 0;
+      function next() {
+        if (step >= steps.length) {
+          verdictEl.className = 'rec-out vd-note good';
+          verdictEl.innerHTML = '&#10003; policy-consistent — ' + decisions.length +
+            ' decisions verified against commitment <b>' + commitment + '</b>, policy never revealed.';
+          hintEl.textContent = 'try flipping a verdict on the left';
+          return;
+        }
+        line(verifyLog, steps[step][0], steps[step][1]);
+        step++;
+        timer = setTimeout(next, TICK);
+      }
+      next();
+    }
+
+    function reset() {
+      clearTimeout(timer);
+      decLog.innerHTML = ''; proveLog.innerHTML = ''; verifyLog.innerHTML = '';
+      artifactEl.className = 'rec-out vd-note'; artifactEl.textContent = 'waiting for the run to finish…';
+      verdictEl.className = 'rec-out vd-note'; verdictEl.textContent = 'waiting for a proof…';
+      hintEl.textContent = 'recording…';
+      decisions = TEMPLATE.map(function (t, idx) { return { idx: idx, rule: t.rule, d: t.d, verdict: 'ALLOW' }; });
+      provenVerdicts = null; commitment = null; proof = null;
+    }
+
+    function record() {
+      reset();
+      var i = 0;
+      function next() {
+        if (i >= decisions.length) { generateProof(); return; }
+        decisionRow(decisions[i]);
+        i++;
+        timer = setTimeout(next, TICK);
+      }
+      next();
+    }
+
+    if (replayBtn) replayBtn.addEventListener('click', record);
+
+    if (reduced.matches) {
+      reset();
+      decisions.forEach(decisionRow);
+      commitment = policyCommitment();
+      provenVerdicts = decisions.map(function (d) { return d.verdict; });
+      proof = 'zk:' + h('pi|' + commitment + '|' + provenVerdicts.join(',')) + h('pi2|' + commitment).slice(0, 4);
+      line(proveLog, 'flow', 'commit(policy) = ' + commitment + '  <span class="zk-lock">(policy never leaves the box)</span>');
+      line(proveLog, 'enf', '&pi; = ' + proof);
+      artifactEl.className = 'rec-out vd-note good';
+      artifactEl.innerHTML = 'commitment <b>' + commitment + '</b> &middot; proof <b>' + proof +
+        '</b> &middot; ' + provenVerdicts.length + ' decisions proven';
+      line(verifyLog, 'enf', 'policy-consistent');
+      verdictEl.className = 'rec-out vd-note good';
+      verdictEl.innerHTML = '&#10003; policy-consistent — ' + decisions.length +
+        ' decisions verified against commitment <b>' + commitment + '</b>, policy never revealed.';
+      hintEl.textContent = 'try flipping a verdict on the left';
+    } else if ('IntersectionObserver' in window) {
+      var seen = false;
+      var ro = new IntersectionObserver(function (en) {
+        if (en[0].isIntersecting && !seen) { seen = true; record(); ro.disconnect(); }
+      }, { threshold: 0.12 });
+      ro.observe(host);
+    } else { record(); }
   })();
 
 })();
