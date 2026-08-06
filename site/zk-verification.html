@@ -95,7 +95,7 @@ td{background:var(--surface)}
   <nav class="nav">
     <span class="brand"><a href="index.html" style="color:inherit">runtime<b>1</b></a></span>
     <div class="links">
-      <a href="agent-os.html">Agent OS</a>
+      <a href="agent-os.html">agentOS</a>
       <a href="zk-verification.html" style="color:var(--text)">Verification</a>
       <a href="architecture.html">Architecture</a>
       <a href="https://github.com/0x89karan/runtime1">GitHub</a>
@@ -105,20 +105,21 @@ td{background:var(--surface)}
   <p class="eyebrow">thesis 2 · the evidence</p>
   <h1>Enforce in real time. Prove it after the fact. Say exactly what the proof means.</h1>
   <p class="lead">
-    Verifiable agent governance splits into two pipelines with very different physics:
-    enforcement, which must be native and instantaneous, and evidence, which must be
-    cryptographic and checkable by someone who doesn't trust you. Confusing the two is how
-    this space overclaims — so we don't.
+    runtime1's verification pipeline splits agent governance into two halves with very
+    different physics: enforcement, which <b>agentOS</b> does natively and instantaneously,
+    and evidence, which must be cryptographic and checkable by someone who doesn't trust you.
+    Confusing the two is how this space overclaims — so we don't.
   </p>
 
   <h2>The two-pipeline architecture</h2>
   <p>
     Proving a policy decision in a zkVM takes seconds; an agent runtime makes thousands of
     tool and model calls a day. Putting cryptography in the authorization path would be a
-    denial-of-service against our own runtime. So the pipelines are separated:
+    denial-of-service against agentOS itself. So the pipelines are separated — agentOS
+    enforces, and the verification pipeline proves:
   </p>
   <pre>
-  ENFORCEMENT (hot path, native, microseconds)          EVIDENCE (post-hoc, cryptographic)
+  agentOS ENFORCEMENT (hot path, microseconds)          EVIDENCE PIPELINE (post-hoc, crypto)
   ┌───────────────────────────────────────┐            ┌─────────────────────────────────────┐
   │ agent requests action                 │            │ every decision → append-only log    │
   │   → capability check                  │  journals  │   Ed25519 hash chain, rotated       │
@@ -129,8 +130,8 @@ td{background:var(--surface)}
   └───────────────────────────────────────┘            └─────────────────────────────────────┘
   </pre>
   <p class="mut">
-    The prover never sits in front of an action, never lives inside the ~2&nbsp;MB PID-1
-    runtime, and never becomes a reason an agent can't act. Enforcement is code that already
+    The prover never sits in front of an action, never lives inside <code>agentd</code> (the
+    ~2&nbsp;MB PID-1 runtime), and never becomes a reason an agent can't act. Enforcement is code that already
     runs; evidence is a record that already exists, progressively hardened until a stranger
     can check it.
   </p>
@@ -223,7 +224,7 @@ td{background:var(--surface)}
       <tr>
         <td><code>zk.2</code></td>
         <td><b>Zero-knowledge batch replay proofs.</b> A separate prover binary (zkVM;
-        never inside the runtime) proves per session or per day: <em>"every decision record in
+        never inside agentd) proves per session or per day: <em>"every decision record in
         this committed journal range re-evaluates to the same verdict under a policy whose
         commitment is X"</em> — the policy stays private; only commitments go public. Proofs
         attach to the audit packet and verify in milliseconds.</td>
@@ -262,8 +263,9 @@ td{background:var(--surface)}
 
   <div class="callout purple">
     <p class="k">design rules the ladder cannot break</p>
-    <p>1 — The prover is a separate binary. zkVM dependency trees never enter the PID-1
-    runtime or its boot path; the ~2&nbsp;MB footprint and its CI guard are untouched.</p>
+    <p>1 — The prover is a separate binary. zkVM dependency trees never enter
+    <code>agentd</code> or its PID-1 boot path; the ~2&nbsp;MB footprint and its CI guard are
+    untouched.</p>
     <p>2 — One compiled policy artifact serves enforcement and proving. Dual compilation of
     "the same" policy is how the proven policy silently drifts from the enforced one.</p>
     <p>3 — A missing proof is loud. Prover down means a visible, signed gap record in the
@@ -288,8 +290,8 @@ td{background:var(--surface)}
   </p>
 
   <div class="next-row">
-    <a class="btn" href="agent-os.html">← The Agent OS thesis</a>
-    <a class="btn" href="architecture.html">Open the runtime schematic</a>
+    <a class="btn" href="agent-os.html">← The agentOS thesis</a>
+    <a class="btn" href="architecture.html">Open the agentOS schematic</a>
     <a class="btn" href="https://github.com/0x89karan/runtime1">GitHub</a>
   </div>
 
