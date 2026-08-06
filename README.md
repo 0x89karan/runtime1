@@ -1,4 +1,4 @@
-# AgentOS
+# runtime1
 
 A Linux-based operating system where **agents are the primitive, not applications**
 — designed to be **super light**. The runtime is [`agentd`](agentd/). In the full
@@ -51,7 +51,7 @@ See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full increment list.
 ## Repo structure
 
 ```
-agentos/                   ← run `claude` here
+runtime1/                   ← run `claude` here
 ├── README.md              this file
 ├── CLAUDE.md              project memory for Claude Code
 ├── CHANGELOG.md           notable changes per release
@@ -105,20 +105,20 @@ Two image tiers published to `ghcr.io/0x89karan/runtime1` (multi-arch: `linux/am
 
 ```bash
 # Full tier (batteries-included) — same as :latest
-docker pull ghcr.io/0x89karan/runtime1:full
+docker pull ghcr.io/0x89karan/agentos:full
 
 # Core tier (Rust runtime only)
-docker pull ghcr.io/0x89karan/runtime1:core
+docker pull ghcr.io/0x89karan/agentos:core
 
 # Zero-arg default: cockpit mode (agentctl watch, no agents running yet — see below)
 export ANTHROPIC_API_KEY=sk-ant-...
-docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full
+docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/agentos:full
 
 # Chain-of-scouts research agent
-docker run --rm -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full cos
+docker run --rm -e ANTHROPIC_API_KEY ghcr.io/0x89karan/agentos:full cos
 
 # Interactive multi-turn orchestrator REPL (starts agentd + agentctl orchestrate)
-docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/runtime1:full orchestrate
+docker run --rm -it -e ANTHROPIC_API_KEY ghcr.io/0x89karan/agentos:full orchestrate
 ```
 
 ### `docker/entrypoint.sh` modes
@@ -151,7 +151,7 @@ out of the box in the default unprivileged/HTTP-fallback cockpit shown above, bu
 message shows a clear inline error instead of hanging.
 
 If the package is private, set it to Public once: GitHub repo → Packages →
-agentos → Package Settings → Change visibility → Public.
+runtime1 → Package Settings → Change visibility → Public.
 
 ## Docker quickstart (cos + Google)
 
@@ -189,7 +189,7 @@ docker compose logs -f cos        # watch the agent run
 **Keeping it running (v0.118.0).** `cos` carries `restart: unless-stopped`, so it survives a crash
 and a Docker restart — but Docker fixes the restart policy at container **creation**, so an existing
 container needs `docker compose up -d` (`docker compose start` will not pick it up). Reboot survival
-needs one more step (Docker Desktop at login, or `docker/com.agentos.cos.plist`). `agentctl brief`
+needs one more step (Docker Desktop at login, or `docker/com.runtime1.cos.plist`). `agentctl brief`
 now states each brief's age and warns when the pipeline has missed a cycle. Procedure and the
 "briefs stopped arriving" checklist: [`docs/RUNBOOK.md`](docs/RUNBOOK.md) §11.12.
 
