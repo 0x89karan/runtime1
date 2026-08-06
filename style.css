@@ -196,18 +196,33 @@ li{margin-bottom:8px}
 .muted-li li{color:var(--text-muted)}
 
 /* wrap: wide for the landing grid, narrow (.doc) for reading pages */
+/* One content measure everywhere, so the global header's left edge lines up with
+   the page content on every page. Long-form pages keep a readable line length by
+   capping the PROSE rather than the container — tables, the embedded schematic and
+   card grids still get the full width, which is what they want anyway. */
 .wrap{max-width:1080px;margin:0 auto;padding:0 22px}
-.wrap.doc{max-width:880px;padding-bottom:72px;line-height:1.65}
+.wrap.doc{padding-bottom:72px;line-height:1.65}
+.wrap.doc > p, .wrap.doc > ul, .wrap.doc > ol,
+.wrap.doc > h1, .wrap.doc > h2, .wrap.doc > h3,
+.wrap.doc > .callout, .wrap.doc > .honesty{max-width:860px}
 
 /* ─── nav ─── */
-.nav{display:flex;align-items:center;gap:22px;padding:18px 0;border-bottom:1px solid var(--border);
-  flex-wrap:wrap;position:sticky;top:0;z-index:40}
-/* Full-bleed backdrop from inside the padded .wrap; body has overflow-x:clip so the
-   negative inset can't create a horizontal scrollbar (clip, unlike hidden, keeps sticky). */
-.nav::before{content:'';position:absolute;inset:0 -50vw;z-index:-1;background:var(--ground);
-  opacity:0;transition:opacity .2s ease}
-.nav.stuck::before{opacity:.94;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
-.nav.stuck{border-bottom-color:var(--border-bright)}
+/* The header is a GLOBAL element, not part of any page's content column. It lives
+   outside .wrap so it renders identically whether the page below it is the 880px
+   reading measure, the 1080px landing grid, or the schematic. */
+.topbar{position:sticky;top:0;z-index:40;
+  border-bottom:1px solid var(--md-sys-color-outline-variant);
+  background:var(--md-sys-color-surface);
+  transition:border-color var(--md-sys-motion-duration-short4) var(--md-sys-motion-easing-standard)}
+.topbar.stuck{border-bottom-color:var(--md-sys-color-outline);
+  background:color-mix(in srgb, var(--md-sys-color-surface) 92%, transparent);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+@supports not (background:color-mix(in srgb, red 50%, transparent)){
+  .topbar.stuck{background:var(--md-sys-color-surface)}
+}
+/* one inner measure, every page */
+.nav{display:flex;align-items:center;gap:22px;flex-wrap:wrap;
+  max-width:1080px;margin:0 auto;padding:16px 22px}
 .brand{font-family:var(--mono);font-weight:700;font-size:17px;color:var(--text);letter-spacing:.02em}
 .brand b{color:var(--accent)}
 .nav .links{display:flex;gap:18px;margin-left:auto;flex-wrap:wrap}
