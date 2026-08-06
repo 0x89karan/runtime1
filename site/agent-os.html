@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runtime1 — the Agent OS thesis</title>
+<meta name="description" content="Why the agent should be the operating system's primitive: a minimal Linux distro whose entire userspace is the agent runtime, scheduling tokens and dollars instead of CPU time.">
+<style>
+:root{
+  --ground:#070D1A; --surface:#0E1626; --surface-2:#13203A; --surface-3:#192948;
+  --border:#1C2E4A; --border-bright:#243D64;
+  --text:#CDD6E8; --text-muted:#7089A8; --text-dim:#3B5478;
+  --accent:#E8A030; --accent-dim:rgba(232,160,48,.13);
+  --enforced:#38D48A; --enforced-bg:rgba(56,212,138,.10);
+  --declared:#E8A030; --declared-bg:rgba(232,160,48,.10);
+  --absent:#D45070;   --absent-bg:rgba(212,80,112,.10);
+  --flow:#35C4BB;     --flow-bg:rgba(53,196,187,.10);
+  --mono:'JetBrains Mono','SF Mono','Cascadia Code',Consolas,'Liberation Mono',monospace;
+  --sans:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
+  --r:3px;
+}
+:root[data-theme="light"]{
+  --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
+  --border:#D2DAE6; --border-bright:#B4C1D4;
+  --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
+  --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
+  --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
+  --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
+  --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
+  --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){
+    --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
+    --border:#D2DAE6; --border-bright:#B4C1D4;
+    --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
+    --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
+    --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
+    --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
+    --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
+    --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--ground);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
+.wrap{max-width:880px;margin:0 auto;padding:0 22px 72px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:1px 5px}
+pre{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.5;color:var(--text-muted)}
+.nav{display:flex;align-items:center;gap:22px;padding:18px 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.brand{font-family:var(--mono);font-weight:700;font-size:17px;color:var(--text)}
+.brand b{color:var(--accent)}
+.nav .links{display:flex;gap:18px;margin-left:auto;flex-wrap:wrap}
+.nav .links a{color:var(--text-muted);font-size:14px}
+.nav .links a:hover{color:var(--text);text-decoration:none}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:52px 0 12px}
+h1{font-size:clamp(26px,4.5vw,38px);line-height:1.18;margin:0 0 16px}
+.lead{font-size:18px;color:var(--text-muted);margin:0 0 8px}
+h2{font-size:22px;margin:48px 0 12px;padding-top:18px;border-top:1px solid var(--border)}
+h3{font-size:17px;margin:26px 0 8px}
+p{margin:0 0 14px}
+p.mut{color:var(--text-muted)}
+table{width:100%;border-collapse:collapse;font-size:14px;margin:14px 0}
+th,td{text-align:left;padding:9px 12px;border:1px solid var(--border);vertical-align:top}
+th{background:var(--surface-2);font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted)}
+td{background:var(--surface)}
+td code{white-space:nowrap}
+.callout{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--r);padding:16px 18px;margin:18px 0}
+.callout .k{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 6px}
+.callout p{margin:0;font-size:14.5px;color:var(--text-muted)}
+.callout.green{border-left-color:var(--enforced)}
+.callout.green .k{color:var(--enforced)}
+.callout.red{border-left-color:var(--absent)}
+.callout.red .k{color:var(--absent)}
+ul{margin:0 0 14px;padding-left:22px}
+li{margin-bottom:8px}
+li,p{color:var(--text)}
+li b,p b{color:var(--text)}
+.muted-li li{color:var(--text-muted)}
+.arch-embed{margin:20px 0}
+.arch-embed iframe{width:100%;height:920px;border:1px solid var(--border);border-radius:var(--r);background:var(--ground)}
+.arch-embed .cap{font-size:13px;color:var(--text-dim);margin-top:8px;font-family:var(--mono)}
+.next{display:flex;gap:12px;flex-wrap:wrap;margin-top:40px}
+.btn{display:inline-block;font-family:var(--mono);font-size:14px;padding:10px 18px;border-radius:var(--r);border:1px solid var(--border-bright);color:var(--text)}
+.btn:hover{text-decoration:none;border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="nav">
+    <span class="brand"><a href="index.html" style="color:inherit">runtime<b>1</b></a></span>
+    <div class="links">
+      <a href="agent-os.html" style="color:var(--text)">Agent OS</a>
+      <a href="zk-verification.html">Verification</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="https://github.com/0x89karan/runtime1">GitHub</a>
+    </div>
+  </nav>
+
+  <p class="eyebrow">thesis 1 · the substrate</p>
+  <h1>The agent is the primitive. Everything else follows.</h1>
+  <p class="lead">
+    A minimal, Linux-based operating system whose unit of execution, scheduling, and isolation
+    is the <em>agent</em>, not the application — and why that has to live at the OS layer, not
+    in a framework.
+  </p>
+
+  <h2>The problem nobody's runtime solves</h2>
+  <p>
+    Agents that touch real, sensitive systems — email, CRM, code, deals, a cap table — can't be
+    run unsupervised today. You either babysit them with per-action approval prompts, sandbox
+    the whole process coarsely in a container and hope, or hand your crown-jewel operations to
+    a multi-tenant SaaS you don't control.
+  </p>
+  <p class="mut">
+    None of those let a <em>team</em> of agents coordinate across your systems, 24/7, while
+    guaranteeing each one is bounded, every action is audited, spend is metered, and your data
+    doesn't leak — without you watching. That guarantee is an operating-system-shaped problem:
+    it's about what the boundary enforces, not what the agent promises.
+  </p>
+
+  <h2>What "agents as the primitive" means</h2>
+  <p>
+    In a conventional OS the kernel's managed unit is the process and the human-facing unit is
+    the application. runtime1 replaces that center of gravity. The managed unit is an
+    <b>agent</b>: a long-lived, stateful, non-deterministic entity defined by a role, a working
+    context (its RAM), a connection to a model (its CPU), a set of capabilities exposed as
+    tools, persistent memory, and a lifecycle — spawn, run, suspend, resume, delegate,
+    terminate. There are no applications; the things you would "open" are things an agent
+    <em>invokes</em>.
+  </p>
+  <table>
+    <thead><tr><th>Classical OS</th><th>runtime1 analogue</th></tr></thead>
+    <tbody>
+      <tr><td>Process / thread</td><td>Agent — the schedulable, isolatable unit</td></tr>
+      <tr><td>Application</td><td>A <em>role</em> an agent plays; capabilities are tools, not apps</td></tr>
+      <tr><td><code>exec()</code> a binary</td><td>Spawn an agent from a spec: role + tools + budget + memory</td></tr>
+      <tr><td>Shell / login</td><td>Natural-language intent, or a root orchestrator agent</td></tr>
+      <tr><td>init / systemd (PID 1)</td><td><code>agentd</code> — the agent supervisor <em>is</em> the userspace</td></tr>
+      <tr><td>Syscall table</td><td>The tool ABI — MCP; tools are syscalls to the world</td></tr>
+      <tr><td>IPC (pipes, D-Bus)</td><td>Structured inter-agent messages</td></tr>
+      <tr><td>CPU time (the scarce resource)</td><td><b>Inference slots, token/$ budgets, tool rate limits</b></td></tr>
+      <tr><td><code>/proc</code></td><td><code>/agents/&lt;id&gt;/{context,memory,tools,budget}</code> via FUSE</td></tr>
+    </tbody>
+  </table>
+  <p class="mut">
+    This table is the spine of the design. If a feature can't be mapped onto the right-hand
+    column, it belongs to the host Linux layer and is left alone — the kernel is not the
+    innovation, the userspace reconception is.
+  </p>
+
+  <h2>Two decisions gate everything</h2>
+  <ul>
+    <li><b>Cognition is remote.</b> The device is a thin agent host; the model is an API call
+      behind an inference gateway. No local weights, no inference engine — this is the
+      difference between an OS that is genuinely ~2&nbsp;MB and one where "light" means a lean
+      shell around a necessarily heavy model. A local backend can be added later as another
+      gateway implementation, never as a core assumption.</li>
+    <li><b>Single-tenant.</b> One person's agents on one box, mutually trusting, in-process.
+      Capability scoping between agents exists for least-privilege — not because agents
+      distrust each other, but because a prompt-injected agent should hold the smallest
+      possible blast radius.</li>
+  </ul>
+
+  <h2>Why cognition being metered changes the scheduler</h2>
+  <p>
+    Unlike CPU time, every "thought" costs real money. So budgets — tokens, dollars,
+    wall-clock — are first-class, schedulable, <em>enforced</em> resources. The scheduler
+    admission gate checks the budget before every model call; a rolling reset window means a
+    runaway agent is <em>deferred</em>, not bricked; the fuse has been proven live against a
+    real runaway loop. Agents are event-driven and mostly idle — they block on inference and
+    tool I/O for seconds at a time — so the system suspends and resumes them around events
+    rather than keeping them hot.
+  </p>
+
+  <h2>What the runtime is made of</h2>
+  <ul class="muted-li">
+    <li><b>Lifecycle manager &amp; scheduler</b> — spawns, suspends, resumes, and terminates
+      agents; schedules inference slots and budgets, not CPU time.</li>
+    <li><b>Context manager</b> — owns each agent's working context; pages between context and
+      long-term memory.</li>
+    <li><b>Memory substrate</b> — embedded structured store + semantic index, with provenance,
+      exposed at <code>/agents/&lt;id&gt;/memory</code>.</li>
+    <li><b>Tool manager</b> — MCP is the tool ABI; tool servers run as sandboxed subprocesses
+      with tiered isolation.</li>
+    <li><b>Capability system</b> — every agent runs with an explicit grant set: which tools,
+      which memory segments, which hosts, what spend. Spawned children can only receive an
+      attenuated subset of the parent's grants — over-granting is rejected at spawn, not
+      clamped silently.</li>
+    <li><b>Credential broker</b> — agents never hold raw credentials; OAuth and API secrets
+      live behind a broker that injects them at the egress boundary. A memory dump of an agent
+      yields inert placeholders.</li>
+    <li><b>Inference gateway</b> — the one place cognition enters; metered, retried, streamed,
+      and receipted.</li>
+    <li><b>Flight recorder</b> — an append-only structured log of every prompt, tool call,
+      verdict, and decision. Built on day one, because non-determinism makes it non-optional.</li>
+  </ul>
+
+  <h2>The security model, stated the way we'd want to hear it</h2>
+  <div class="callout red">
+    <p class="k">what we refuse to say</p>
+    <p>"Watertight." Landlock + seccomp + namespaces is a <em>capability layer</em> —
+    least-privilege on a process that still shares the host kernel. It is not an isolation
+    boundary strong enough for untrusted or foreign-framework code; for that, the floor is a
+    microVM or a user-space kernel (gVisor), and the runtime's isolation tiers say which one a
+    workload actually got. Anyone who can call a model can, in principle, launder data through
+    it — the model channel itself is a covert channel. We say so.</p>
+  </div>
+  <div class="callout green">
+    <p class="k">the claim we do make</p>
+    <p>Allowlist-only egress. Every allowed call metered and audited. Approval gates on risky
+    actions. Deterministic anti-credential-theft via boundary secret rewriting. A budget fuse
+    that has actually stopped a runaway. Dramatically reduced blast radius, and a tamper-evident
+    audit trail of what each agent did — defense-in-depth plus accountability, not a hermetic
+    seal. Sophisticated operators trust this framing and distrust "impenetrable."</p>
+  </div>
+
+  <h2>Explore the runtime, component by component</h2>
+  <p class="mut">
+    The schematic below is the real map of the running system — every box is clickable, and
+    every badge is honest about whether a property is <em>enforced by code</em>, merely
+    <em>declared</em> in config or prompt, or <em>not built</em>. It renders per-platform
+    (Mac/Docker, Linux/QEMU, bare) because the guarantees differ per platform, and pretending
+    otherwise is how trust dies.
+  </p>
+  <div class="arch-embed">
+    <iframe src="architecture.html" title="runtime1 interactive architecture schematic" loading="lazy"></iframe>
+    <p class="cap">Interactive — click any component. Or <a href="architecture.html">open it full-page →</a></p>
+  </div>
+
+  <h2>What exists today vs. what is a bet</h2>
+  <p>
+    <b>Built and tested:</b> the multi-agent scheduler with token/$ metering and the rolling
+    budget fuse; the capability sandbox (Landlock, seccomp, namespaces, gVisor tiering);
+    4-tier memory with provenance; the <code>/agents</code> FUSE control plane; MCP over stdio
+    and HTTP/SSE; streaming inference; checkpoint/restore that survives SIGTERM mid-tool-call;
+    the credential broker; the signed receipt chain; the <code>agentctl</code> operator TUI;
+    and a standing chief-of-staff workload dogfooded daily against a real inbox.
+  </p>
+  <p class="mut">
+    <b>The bet:</b> that a high-trust slice of work will never go to multi-tenant SaaS and
+    wants an owned substrate — true whether SaaS broadly thrives or shrinks. We are not
+    betting "SaaS is dead"; we need SaaS to exist as the distrusted default.
+  </p>
+
+  <div class="next">
+    <a class="btn" href="zk-verification.html">Next: the verification thesis →</a>
+    <a class="btn" href="architecture.html">Open the schematic</a>
+    <a class="btn" href="https://github.com/0x89karan/runtime1">GitHub</a>
+  </div>
+
+</div>
+</body>
+</html>

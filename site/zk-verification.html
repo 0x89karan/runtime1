@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runtime1 — the verification thesis</title>
+<meta name="description" content="Verifiable agent governance: native real-time enforcement, cryptographic evidence, custody anchoring, and zero-knowledge replay proofs — with an honest account of what each proves.">
+<style>
+:root{
+  --ground:#070D1A; --surface:#0E1626; --surface-2:#13203A; --surface-3:#192948;
+  --border:#1C2E4A; --border-bright:#243D64;
+  --text:#CDD6E8; --text-muted:#7089A8; --text-dim:#3B5478;
+  --accent:#E8A030; --accent-dim:rgba(232,160,48,.13);
+  --enforced:#38D48A; --enforced-bg:rgba(56,212,138,.10);
+  --declared:#E8A030; --declared-bg:rgba(232,160,48,.10);
+  --absent:#D45070;   --absent-bg:rgba(212,80,112,.10);
+  --flow:#35C4BB;     --flow-bg:rgba(53,196,187,.10);
+  --external:#9880F0; --external-bg:rgba(152,128,240,.10);
+  --mono:'JetBrains Mono','SF Mono','Cascadia Code',Consolas,'Liberation Mono',monospace;
+  --sans:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
+  --r:3px;
+}
+:root[data-theme="light"]{
+  --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
+  --border:#D2DAE6; --border-bright:#B4C1D4;
+  --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
+  --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
+  --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
+  --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
+  --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
+  --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
+  --external:#5B45B8; --external-bg:rgba(91,69,184,.09);
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){
+    --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
+    --border:#D2DAE6; --border-bright:#B4C1D4;
+    --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
+    --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
+    --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
+    --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
+    --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
+    --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
+    --external:#5B45B8; --external-bg:rgba(91,69,184,.09);
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{background:var(--ground);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
+.wrap{max-width:880px;margin:0 auto;padding:0 22px 72px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:1px 5px}
+pre{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.55;color:var(--text-muted);margin:14px 0}
+.nav{display:flex;align-items:center;gap:22px;padding:18px 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.brand{font-family:var(--mono);font-weight:700;font-size:17px;color:var(--text)}
+.brand b{color:var(--accent)}
+.nav .links{display:flex;gap:18px;margin-left:auto;flex-wrap:wrap}
+.nav .links a{color:var(--text-muted);font-size:14px}
+.nav .links a:hover{color:var(--text);text-decoration:none}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:52px 0 12px}
+h1{font-size:clamp(26px,4.5vw,38px);line-height:1.18;margin:0 0 16px}
+.lead{font-size:18px;color:var(--text-muted);margin:0 0 8px}
+h2{font-size:22px;margin:48px 0 12px;padding-top:18px;border-top:1px solid var(--border)}
+h3{font-size:17px;margin:26px 0 8px}
+p{margin:0 0 14px}
+p.mut{color:var(--text-muted)}
+ul{margin:0 0 14px;padding-left:22px}
+li{margin-bottom:8px}
+table{width:100%;border-collapse:collapse;font-size:14px;margin:14px 0}
+th,td{text-align:left;padding:9px 12px;border:1px solid var(--border);vertical-align:top}
+th{background:var(--surface-2);font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted)}
+td{background:var(--surface)}
+.badge{display:inline-block;font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid;white-space:nowrap}
+.badge.enf{color:var(--enforced);border-color:var(--enforced);background:var(--enforced-bg)}
+.badge.next{color:var(--flow);border-color:var(--flow);background:var(--flow-bg)}
+.badge.road{color:var(--external);border-color:var(--external);background:var(--external-bg)}
+.badge.gated{color:var(--declared);border-color:var(--declared);background:var(--declared-bg)}
+.callout{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--r);padding:16px 18px;margin:18px 0}
+.callout .k{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 6px}
+.callout p{margin:0 0 8px;font-size:14.5px;color:var(--text-muted)}
+.callout p:last-child{margin:0}
+.callout.green{border-left-color:var(--enforced)} .callout.green .k{color:var(--enforced)}
+.callout.red{border-left-color:var(--absent)}     .callout.red .k{color:var(--absent)}
+.callout.purple{border-left-color:var(--external)} .callout.purple .k{color:var(--external)}
+.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px;margin:14px 0}
+.next-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:40px}
+.btn{display:inline-block;font-family:var(--mono);font-size:14px;padding:10px 18px;border-radius:var(--r);border:1px solid var(--border-bright);color:var(--text)}
+.btn:hover{text-decoration:none;border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="nav">
+    <span class="brand"><a href="index.html" style="color:inherit">runtime<b>1</b></a></span>
+    <div class="links">
+      <a href="agent-os.html">Agent OS</a>
+      <a href="zk-verification.html" style="color:var(--text)">Verification</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="https://github.com/0x89karan/runtime1">GitHub</a>
+    </div>
+  </nav>
+
+  <p class="eyebrow">thesis 2 · the evidence</p>
+  <h1>Enforce in real time. Prove it after the fact. Say exactly what the proof means.</h1>
+  <p class="lead">
+    Verifiable agent governance splits into two pipelines with very different physics:
+    enforcement, which must be native and instantaneous, and evidence, which must be
+    cryptographic and checkable by someone who doesn't trust you. Confusing the two is how
+    this space overclaims — so we don't.
+  </p>
+
+  <h2>The two-pipeline architecture</h2>
+  <p>
+    Proving a policy decision in a zkVM takes seconds; an agent runtime makes thousands of
+    tool and model calls a day. Putting cryptography in the authorization path would be a
+    denial-of-service against our own runtime. So the pipelines are separated:
+  </p>
+  <pre>
+  ENFORCEMENT (hot path, native, microseconds)          EVIDENCE (post-hoc, cryptographic)
+  ┌───────────────────────────────────────┐            ┌─────────────────────────────────────┐
+  │ agent requests action                 │            │ every decision → append-only log    │
+  │   → capability check                  │  journals  │   Ed25519 hash chain, rotated       │
+  │   → budget admission (rolling window) │ ─────────▶ │   segments, offline verifier        │
+  │   → approval gate (if risky)          │            │ + custody anchoring (roadmap)       │
+  │   → credential broker executes        │            │ + zk batch replay proofs (roadmap)  │
+  │ allow / deny — in real time           │            │ verified in milliseconds, by others │
+  └───────────────────────────────────────┘            └─────────────────────────────────────┘
+  </pre>
+  <p class="mut">
+    The prover never sits in front of an action, never lives inside the ~2&nbsp;MB PID-1
+    runtime, and never becomes a reason an agent can't act. Enforcement is code that already
+    runs; evidence is a record that already exists, progressively hardened until a stranger
+    can check it.
+  </p>
+
+  <h2>What exists today <span class="badge enf">shipped</span></h2>
+  <ul>
+    <li><b>The signed receipt chain.</b> Model calls — allowed <em>and denied</em> — are
+      receipted into <code>evidence.jsonl</code>: hash-chained, Ed25519-signed, rotated in
+      independently verifiable segments, resumable after crashes.</li>
+    <li><b>An offline verifier.</b> <code>agentctl verify</code> checks a segment against a
+      public key with no runtime, no network, no trust in the box that produced it.</li>
+    <li><b>The complete action record.</b> Every tool call, capability verdict, approval,
+      cancel, and budget decision lands in the flight recorder — the raw material the
+      evidence pipeline progressively signs.</li>
+    <li><b>A public account of the limits.</b> Our threat model states, in writing, what this
+      chain does <em>not</em> prove: the signing key lives on the audited host, and deletion
+      seams between rotated segments are not detectable from the chain alone. Most vendors
+      hide that paragraph. It is the most load-bearing paragraph we publish.</li>
+  </ul>
+
+  <h2>The honest core: what evidence can and cannot say</h2>
+  <div class="two">
+    <div class="callout green">
+      <p class="k">what cryptography can prove</p>
+      <p><b>Integrity:</b> the published log was not modified or reordered after writing.</p>
+      <p><b>Rewind detection</b> (with anchoring): records that were journaled and anchored
+      cannot be silently deleted or rewritten later.</p>
+      <p><b>Policy consistency</b> (with zk replay): every decision in the published log
+      re-evaluates to the same verdict under the committed policy — without revealing the
+      policy.</p>
+    </div>
+    <div class="callout red">
+      <p class="k">what no signature or proof can say</p>
+      <p><b>Completeness.</b> An action that was never journaled produces no gap. Cryptography
+      over a log inherits the log; "every action was recorded" is a property of the
+      <em>boundary</em>, not of any proof over its output.</p>
+      <p>Closing that seam structurally takes hardware attestation with credentials sealed
+      inside the attested boundary — on our roadmap for fleet deployments, and scoped honestly
+      to brokered actions when it lands.</p>
+    </div>
+  </div>
+  <p class="mut">
+    Our claim discipline is binding across docs, demos, and this site: we say
+    <em>"policy-consistency of the published, custody-anchored log"</em> — never "proof of
+    enforcement," never "mathematical certainty that all policies were enforced." A proof
+    artifact that looks like certainty while quietly carrying an omission seam is worse than
+    no cryptography at all, because it teaches your auditor to stop asking the right question.
+  </p>
+
+  <h2>The verification ladder</h2>
+  <p class="mut">Each rung is a separate, independently shippable increment. Order matters:
+  the proof lands on top of auditor-grade evidence, never ahead of it.</p>
+  <table>
+    <thead><tr><th>Rung</th><th>What it adds</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>gov.1</code></td>
+        <td><b>Coverage + custody.</b> Sign a projection of the full action record (tool calls,
+        verdicts, approvals, budget mutations — not just model calls). Pin the verify key with
+        the customer via an enrollment step, publish out-of-band anchors so rewind and key
+        replacement are detectable, and bundle it all into an <code>audit-packet</code> with
+        two variants: full (for the policy-owning security team) and commitment-only (for
+        external verifiers).</td>
+        <td><span class="badge next">next</span></td>
+      </tr>
+      <tr>
+        <td><code>gov.2</code></td>
+        <td><b>The auditor-side trust root.</b> Key enrollment registry, anchor registry,
+        expected-batch registry (so a <em>missing</em> batch is itself a detectable event),
+        and prover-image pinning. This is what makes fleet verification mean something.</td>
+        <td><span class="badge road">roadmap</span></td>
+      </tr>
+      <tr>
+        <td><code>zk.0</code></td>
+        <td><b>One policy artifact.</b> Extract policy evaluation (capability matching, budget
+        admission, tier legality) into a single pure crate consumed by <em>both</em> the live
+        enforcement path and any future prover — so the policy that is proven is the policy
+        that is enforced, by construction, not by promise.</td>
+        <td><span class="badge road">roadmap</span></td>
+      </tr>
+      <tr>
+        <td><code>zk.1</code></td>
+        <td><b>Decision journal + native replay.</b> Every admission decision becomes a
+        canonical record (explicit inputs → verdict). <code>agentctl verify-decisions</code>
+        re-executes the policy over the journal natively and confirms every verdict
+        reproduces — the exact statement the zk proof will later make, checked for free
+        first, at native speed.</td>
+        <td><span class="badge road">roadmap</span></td>
+      </tr>
+      <tr>
+        <td><code>zk.2</code></td>
+        <td><b>Zero-knowledge batch replay proofs.</b> A separate prover binary (zkVM;
+        never inside the runtime) proves per session or per day: <em>"every decision record in
+        this committed journal range re-evaluates to the same verdict under a policy whose
+        commitment is X"</em> — the policy stays private; only commitments go public. Proofs
+        attach to the audit packet and verify in milliseconds.</td>
+        <td><span class="badge gated">partner-gated</span></td>
+      </tr>
+      <tr>
+        <td><code>zk.3</code></td>
+        <td><b>Fleet verification.</b> A verifier sweep runs every few hours across a fleet of
+        agents, checking packets, proofs, and anchors, and alerting on gaps against the
+        expected-batch registry. Built for the deployment where hundreds or thousands of
+        governed agents run across many hosts and one team has to answer for all of them.</td>
+        <td><span class="badge road">roadmap</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Why zero-knowledge, specifically</h2>
+  <p>
+    One property in this space is unique to zk and impossible any other way: <b>a verifier who
+    must check policy compliance without ever seeing the policy.</b> A security team's rules —
+    which senders can trigger actions, what spend is normal, which systems an agent may touch —
+    are themselves sensitive. The zk replay proof lets an outside party (a compliance service,
+    a counterparty, a regulator's delegate) confirm that a fleet's published decision logs are
+    consistent with the committed policy while learning nothing about the rules or payloads
+    beyond the commitments themselves.
+  </p>
+  <p class="mut">
+    We are equally clear about the boundary of that story. When the verifier <em>is</em> the
+    policy owner, the native replay verifier gives the same assurance for free — so
+    <code>zk.2</code> is gated on a named party who must verify but must not see the policy.
+    And a proof over a log inherits the log's completeness limits, which is why the ladder
+    puts coverage, custody, and the trust root first. The proving economics work because
+    proofs are batched: one proof per agent per session or day, not per action — at 2026 GPU
+    proving costs, cents per batch, milliseconds to verify.
+  </p>
+
+  <div class="callout purple">
+    <p class="k">design rules the ladder cannot break</p>
+    <p>1 — The prover is a separate binary. zkVM dependency trees never enter the PID-1
+    runtime or its boot path; the ~2&nbsp;MB footprint and its CI guard are untouched.</p>
+    <p>2 — One compiled policy artifact serves enforcement and proving. Dual compilation of
+    "the same" policy is how the proven policy silently drifts from the enforced one.</p>
+    <p>3 — A missing proof is loud. Prover down means a visible, signed gap record in the
+    packet — enforcement is native and unaffected, and an outage is never silently absorbed.</p>
+    <p>4 — Every claim names its seam. Integrity, rewind detection, and policy consistency
+    are provable; completeness is a boundary property; we label which is which everywhere.</p>
+  </div>
+
+  <h2>The verifier's experience, end state</h2>
+  <p>
+    A security team (or their external verifier) receives an <b>audit packet</b> per agent per
+    period: chain segments, anchors, the decision journal or its commitments, and — where the
+    zk rungs have landed — replay proofs. Verification is offline and fast: check the chain,
+    check the anchors against the registry, check the proof. Milliseconds per packet, no trust
+    in the host that produced it, and a written statement of exactly which properties were
+    just verified.
+  </p>
+  <p class="mut">
+    That last artifact — the written statement of what was verified — is the product. Auditors
+    don't buy novel cryptography; they buy defensible statements. Ours are defensible because
+    they are narrow.
+  </p>
+
+  <div class="next-row">
+    <a class="btn" href="agent-os.html">← The Agent OS thesis</a>
+    <a class="btn" href="architecture.html">Open the runtime schematic</a>
+    <a class="btn" href="https://github.com/0x89karan/runtime1">GitHub</a>
+  </div>
+
+</div>
+</body>
+</html>

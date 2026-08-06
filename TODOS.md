@@ -1,5 +1,31 @@
 # TODOS
 
+## zk track — Open (reshaped at /autoplan premise gate, 2026-08-06)
+
+Plan + increment ladder: `docs/plans/zk.1-hybrid-crypto-verification.md`. The inline-zkVM
+"hybrid cryptographic verification" brief was rejected 6/6 cross-model and reshaped by the
+operator into **attn.4 → gov.1 (ux.6b B2 coverage + key custody + audit packet, BOTH packet
+variants per D6) → gov.2 (auditor-side trust root: key enrollment + anchor registry +
+expected-batch registry + image pinning; SCHEDULED by operator override D5) → zk.0 (pure
+policy-eval crate) → zk.1 (decision journal + native replay verifier) → zk.2 (batch replay
+prover, PARTNER-GATED — gate sharpened at the 2026-08-06 red-team pass to "a party who must
+verify compliance but must NOT see the policy, named in writing"; separate binary, never in
+agentd/PID-1) → zk.3 (fleet verifier sweep)**. A cross-model red-team pass (Claude RT-1..12 +
+Codex C1..12, 2026-08-06) confirmed 6 CRITICAL themes; per-increment mandatory question lists
+live in the plan's red-team addendum — each /autoplan MUST consume its list. zk.0/zk.1 stay
+unconditional by operator override D4 (both voices recommended gating them with zk.2).
+
+- **zk-01 (P3) — RFC 3161 timestamping of evidence segment heads.** Deferred from gov.1's
+  scope: needs an external-service choice (TSA selection, availability semantics) before it is
+  buildable. The `(pubkey, max_seq)` out-of-band anchor in gov.1 covers rewind detection
+  without it.
+- **zk-02 (P3) — TEE attestation (Nitro/SEV-SNP/TDX) considered, not scheduled.** The only
+  technology in the review that addresses "did the host run this code" (the omission seam zk
+  cannot close). Pairs naturally with mv.3's microVM tier — engage it there, not before. Do
+  not let a future session re-derive the comparison: {custody fix, external anchor, WORM
+  export, TEE, zk} was run against the two real auditor questions (completeness, custody) and
+  zk lost on both; zk's surviving value is policy-privacy of the replay proof (zk.2).
+
 ## Full-system audit (v0.86.2) — Open (2026-07-17)
 
 Findings from the whole-system audit (`docs/AUDIT-v0.86.md`, prompt 14). Full evidence,

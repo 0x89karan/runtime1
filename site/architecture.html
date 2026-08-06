@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runtime1 — Runtime Architecture (v0.118.0)</title>
+<style>
+/* ─── tokens: extends the house palette shared with docs/cos-guide.html ─── */
+:root{
+  --ground:#070D1A; --surface:#0E1626; --surface-2:#13203A; --surface-3:#192948;
+  --border:#1C2E4A; --border-bright:#243D64;
+  --text:#CDD6E8; --text-muted:#7089A8; --text-dim:#3B5478;
+  --accent:#E8A030; --accent-dim:rgba(232,160,48,.13);
+
+  /* semantic — deliberately NOT the accent hue */
+  --enforced:#38D48A;  --enforced-bg:rgba(56,212,138,.10);
+  --declared:#E8A030;  --declared-bg:rgba(232,160,48,.10);
+  --absent:#D45070;    --absent-bg:rgba(212,80,112,.10);
+  --flow:#35C4BB;      --flow-bg:rgba(53,196,187,.10);
+  --external:#9880F0;  --external-bg:rgba(152,128,240,.10);
+
+  --mono:'JetBrains Mono','SF Mono','Cascadia Code',Consolas,'Liberation Mono',monospace;
+  --sans:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
+  --r:3px;
+}
+:root[data-theme="light"]{
+  --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
+  --border:#D2DAE6; --border-bright:#B4C1D4;
+  --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
+  --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
+  --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
+  --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
+  --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
+  --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
+  --external:#5B45B8; --external-bg:rgba(91,69,184,.09);
+}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme="dark"]){
+    --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
+    --border:#D2DAE6; --border-bright:#B4C1D4;
+    --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
+    --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
+    --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
+    --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
+    --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
+    --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
+    --external:#5B45B8; --external-bg:rgba(91,69,184,.09);
+  }
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--ground); color:var(--text); font-family:var(--sans);
+  font-size:14px; line-height:1.55; -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1280px;margin:0 auto;padding:28px 22px 72px}
+
+/* ─── masthead ─── */
+.masthead{display:flex;flex-wrap:wrap;gap:20px;align-items:flex-end;justify-content:space-between;
+  border-bottom:1px solid var(--border);padding-bottom:18px}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--text-dim);margin:0 0 6px}
+h1{font-size:24px;line-height:1.15;margin:0;font-weight:600;letter-spacing:-.01em;text-wrap:balance}
+h1 .v{font-family:var(--mono);color:var(--accent);font-weight:500;font-size:20px}
+.sub{color:var(--text-muted);margin:8px 0 0;max-width:62ch;font-size:13px}
+
+/* ─── the thesis: platform switch ─── */
+.platform{background:var(--surface);border:1px solid var(--border-bright);border-radius:var(--r);
+  padding:14px 16px;min-width:330px}
+.platform-q{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--text-dim);margin:0 0 9px}
+.seg{display:flex;gap:0;border:1px solid var(--border-bright);border-radius:var(--r);overflow:hidden}
+.seg button{flex:1;appearance:none;background:transparent;border:0;color:var(--text-muted);
+  font-family:var(--mono);font-size:11px;padding:8px 10px;cursor:pointer;line-height:1.3;
+  transition:background .15s,color .15s}
+.seg button+button{border-left:1px solid var(--border-bright)}
+.seg button:hover{background:var(--surface-2);color:var(--text)}
+.seg button[aria-pressed="true"]{background:var(--accent-dim);color:var(--accent);font-weight:600}
+.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.platform-read{font-family:var(--mono);font-size:11px;margin:10px 0 0;color:var(--text-muted)}
+.platform-read b{color:var(--text)}
+
+/* ─── view rail ─── */
+.rail{display:flex;gap:6px;flex-wrap:wrap;margin:22px 0 4px}
+.rail button{appearance:none;background:var(--surface);border:1px solid var(--border);
+  color:var(--text-muted);font-family:var(--mono);font-size:11px;letter-spacing:.04em;
+  padding:7px 13px;border-radius:var(--r);cursor:pointer;transition:all .15s}
+.rail button:hover{border-color:var(--border-bright);color:var(--text)}
+.rail button[aria-pressed="true"]{background:var(--accent-dim);border-color:var(--accent);color:var(--accent)}
+.rail button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.view-note{color:var(--text-muted);font-size:12.5px;margin:12px 0 20px;max-width:78ch;min-height:2.6em}
+
+/* ─── schematic ─── */
+.zones{display:flex;flex-direction:column;gap:16px}
+.zone{border:1px solid var(--border);border-radius:var(--r);background:var(--surface);overflow:hidden}
+.zone-hd{display:flex;align-items:center;gap:10px;padding:9px 13px;background:var(--surface-2);
+  border-bottom:1px solid var(--border)}
+.zone-name{font-family:var(--mono);font-size:10.5px;letter-spacing:.15em;text-transform:uppercase;color:var(--text)}
+.zone-tag{font-family:var(--mono);font-size:9.5px;color:var(--text-dim);margin-left:auto;text-align:right}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:9px;padding:12px}
+
+.node{position:relative;text-align:left;appearance:none;background:var(--surface-2);
+  border:1px solid var(--border);border-left:2px solid var(--border-bright);
+  border-radius:var(--r);padding:10px 11px;cursor:pointer;color:inherit;font:inherit;
+  transition:border-color .15s,background .15s,transform .15s}
+.node:hover{background:var(--surface-3);border-color:var(--border-bright);transform:translateY(-1px)}
+.node:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.node[aria-pressed="true"]{border-left-color:var(--accent);background:var(--surface-3)}
+.node-name{font-family:var(--mono);font-size:12px;font-weight:600;display:block;margin-bottom:3px}
+.node-desc{font-size:11.5px;color:var(--text-muted);display:block;line-height:1.45}
+.node-badges{display:flex;flex-wrap:wrap;gap:4px;margin-top:7px}
+
+.badge{font-family:var(--mono);font-size:9px;letter-spacing:.06em;text-transform:uppercase;
+  padding:2px 5px;border-radius:2px;border:1px solid transparent;white-space:nowrap}
+.b-enforced{color:var(--enforced);background:var(--enforced-bg);border-color:var(--enforced)}
+.b-declared{color:var(--declared);background:var(--declared-bg);border-color:var(--declared)}
+.b-absent  {color:var(--absent);background:var(--absent-bg);border-color:var(--absent)}
+.b-flow    {color:var(--flow);background:var(--flow-bg);border-color:var(--flow)}
+.b-external{color:var(--external);background:var(--external-bg);border-color:var(--external)}
+.b-plain   {color:var(--text-dim);background:transparent;border-color:var(--border-bright)}
+
+.node[data-state="absent"]{opacity:.62}
+.node[data-state="absent"] .node-name{text-decoration:line-through;text-decoration-color:var(--absent)}
+
+/* flow: ordered steps carry real sequence, so numbering is warranted here */
+.flow-step{counter-increment:fstep}
+.flow-step .node-name::before{content:counter(fstep) " · ";color:var(--accent);font-weight:500}
+.grid.is-flow{counter-reset:fstep}
+
+/* ─── detail panel ─── */
+.detail{margin-top:16px;border:1px solid var(--border-bright);border-radius:var(--r);
+  background:var(--surface);padding:0;overflow:hidden}
+.detail-hd{display:flex;gap:10px;align-items:baseline;padding:11px 14px;background:var(--surface-2);
+  border-bottom:1px solid var(--border)}
+.detail-hd h2{margin:0;font-family:var(--mono);font-size:13px;font-weight:600}
+.detail-kind{font-family:var(--mono);font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim)}
+.detail-body{padding:13px 14px;display:grid;gap:11px}
+.detail-body p{margin:0;font-size:12.5px;color:var(--text);max-width:76ch}
+.detail-body .muted{color:var(--text-muted)}
+.refs{display:flex;flex-wrap:wrap;gap:5px}
+.ref{font-family:var(--mono);font-size:10.5px;color:var(--text-muted);background:var(--surface-2);
+  border:1px solid var(--border);border-radius:2px;padding:2.5px 6px}
+.detail-empty{color:var(--text-dim);font-size:12.5px;font-style:italic}
+
+/* ─── enforcement matrix ─── */
+.matrix-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:var(--r);background:var(--surface)}
+table{border-collapse:collapse;width:100%;min-width:560px;font-size:12px}
+caption{text-align:left;padding:10px 13px;background:var(--surface-2);border-bottom:1px solid var(--border);
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--text)}
+th,td{text-align:left;padding:8px 13px;border-bottom:1px solid var(--border);vertical-align:top}
+th{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--text-dim);font-weight:500}
+td:first-child{font-family:var(--mono);font-size:11.5px;color:var(--text)}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover{background:var(--surface-2)}
+.cell-note{display:block;color:var(--text-muted);font-size:11px;margin-top:2px}
+
+/* ─── callout ─── */
+.callout{border:1px solid var(--absent);border-left-width:2px;background:var(--absent-bg);
+  border-radius:var(--r);padding:12px 14px;margin:22px 0 0}
+.callout-label{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--absent);margin:0 0 5px}
+.callout p{margin:0;font-size:12.5px;max-width:82ch}
+.callout code{font-family:var(--mono);font-size:11.5px;background:var(--surface);padding:1px 4px;border-radius:2px}
+
+footer{margin-top:34px;padding-top:16px;border-top:1px solid var(--border);
+  font-family:var(--mono);font-size:10.5px;color:var(--text-dim);display:flex;gap:16px;flex-wrap:wrap}
+.legend{display:flex;gap:9px;flex-wrap:wrap;margin:0 0 18px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+@media (max-width:640px){ .wrap{padding:18px 14px 56px} h1{font-size:20px} .platform{min-width:0;width:100%} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="masthead">
+    <div>
+      <p class="eyebrow"><a href="index.html" style="color:inherit;text-decoration:none">← runtime1</a> · agentd · runtime schematic</p>
+      <h1>runtime1 Runtime <span class="v">v0.118.0</span></h1>
+      <p class="sub">Agents are the primitive, not applications. Cognition is remote; the device is a thin
+      agent host. Single-tenant by design — agents are mutually trusting and run in-process.</p>
+    </div>
+    <div class="platform">
+      <p class="platform-q">Where are you running it?</p>
+      <div class="seg" role="group" aria-label="Deployment platform">
+        <button type="button" data-plat="mac" aria-pressed="true">Mac · Docker<br>aarch64</button>
+        <button type="button" data-plat="linux" aria-pressed="false">Linux · QEMU<br>x86_64</button>
+      </div>
+      <p class="platform-read" id="platRead"></p>
+    </div>
+  </div>
+
+  <nav class="rail" role="group" aria-label="Architecture view">
+    <button type="button" data-view="runtime" aria-pressed="true">Runtime core</button>
+    <button type="button" data-view="cos" aria-pressed="false">Morning-brief pipeline</button>
+    <button type="button" data-view="trust" aria-pressed="false">Trust &amp; enforcement</button>
+    <button type="button" data-view="store" aria-pressed="false">Persistence</button>
+  </nav>
+  <p class="view-note" id="viewNote"></p>
+
+  <div class="legend" id="legend"></div>
+  <div class="zones" id="zones"></div>
+
+  <section class="detail" aria-live="polite">
+    <div class="detail-hd">
+      <h2 id="dTitle">Select a component</h2>
+      <span class="detail-kind" id="dKind"></span>
+    </div>
+    <div class="detail-body" id="dBody">
+      <p class="detail-empty">Click any box above for what it does, what actually enforces it, and where it lives in the tree.</p>
+    </div>
+  </section>
+
+  <div class="callout">
+    <p class="callout-label">Read this before trusting a badge</p>
+    <p><code>Sandbox: applied</code> in <code>agentctl watch</code> means the rules were compiled and handed
+    to the kernel — <strong>not</strong> that the kernel enforced them. <code>Isolation: none</code> is the
+    line that matters. On Apple silicon, Landlock reports ABI v0 and <code>Net{ports}</code> <strong>fails
+    open</strong>: per-port enforcement is skipped and the sidecar keeps unrestricted network access
+    (<code>agentd/src/main.rs:1478</code>). See THREAT_MODEL BP-4 / BP-4a.</p>
+  </div>
+
+  <footer>
+    <span>source of truth: the code, not this page</span>
+    <span>docs/DESIGN.md · docs/THREAT_MODEL.md · docs/CONVENTIONS.md</span>
+  </footer>
+</div>
+
+<script>
+/* Enforcement depends on the platform, so state is a function of (control, platform).
+   enforced = kernel or runtime actually stops it · declared = grant is real to agentd but
+   nothing below it enforces · absent = mechanism unavailable on this platform. */
+var PLAT = 'mac';
+var VIEW = 'runtime';
+
+var NOTES = {
+  runtime:'Everything inside one process. The scheduler steps agents cooperatively; capability checks are ordinary Rust and hold on every platform. What varies is the kernel layer beneath the MCP sidecars.',
+  cos:'The Chief-of-Staff pipeline, in the order it runs each morning. Since cap.2b the trigger is de-privileged: it holds only {cron_trigger, RunJob} and receives a completion signal, never a job’s output.',
+  trust:'Which controls are real where. Flip the platform switch above and watch the badges change — that difference is the honest security posture of your deployment.',
+  store:'Four stores, three of them redb. Nothing here is a cache: losing any one of them loses history the operator relies on.'
+};
+
+var LEGEND = [
+  ['b-enforced','enforced'], ['b-declared','declared only'], ['b-absent','unavailable here'],
+  ['b-flow','data flow'], ['b-external','leaves the box']
+];
+
+/* state: 'enforced' | 'declared' | 'absent' | null, per platform */
+function E(mac, linux){ return {mac:mac, linux:linux}; }
+
+var ZONES = {
+  runtime:[
+    {name:'agentd — one process, PID 1 in the full system', tag:'Rust · in-process · single-tenant', nodes:[
+      {id:'sched', n:'Scheduler', d:'Steps every agent cooperatively toward its next effect. Owns budgets and checkpoints.',
+       badges:[['b-enforced','budget gate'],['b-plain','cooperative']],
+       kind:'native', p:'One loop, many agents. Each turn produces an AgentEffect the scheduler applies; nothing runs in parallel inside a turn, which is why the flight log reads as a clean sequence. The budget gate is pre-turn: an agent over its window defers rather than terminating (ux.8′), so a burst costs you latency, not the agent.',
+       refs:['agentd/src/scheduler.rs','agentd/src/agent/mod.rs']},
+      {id:'jobs', n:'run_job — sealed jobs', d:'Config owns the child’s capabilities and task. The caller cannot widen either.',
+       badges:[['b-enforced','config-owned caps'],['b-enforced','no output return']],
+       kind:'native', p:'cap.2b’s answer to an injected orchestrator. A sealed job’s capabilities and instructions come from [[jobs]] in config, never from the caller, and the parent receives only a completion signal — never the job’s output. That is what stops a compromised trigger from reading your mail through a child it spawned.',
+       refs:['agentd/cos.agents.toml [[jobs]]','agentd/src/scheduler.rs']},
+      {id:'inf', n:'InferenceGateway', d:'The only way to reach a model. Remote by construction — no local weights.',
+       badges:[['b-external','api.anthropic.com'],['b-enforced','metered']],
+       kind:'native', p:'A locked decision, not an accident: there is no local inference engine and no model weights on the device. Adding a local backend later is allowed only as another impl of this trait, never as a core assumption. Every call is token-metered and counted against the window.',
+       refs:['agentd/src/inference/mod.rs','agentd/src/inference/anthropic.rs']},
+      {id:'tools', n:'Tool registry', d:'Everything an agent does to the world is a Tool, gated by a capability.',
+       badges:[['b-enforced','capability gate']],
+       kind:'native', p:'MCP is the tool ABI; native tools exist for zero-dependency convenience. The registry refuses a call whose capability the agent was not granted — this check is in-process Rust and is unaffected by whether the kernel below is enforcing anything.',
+       refs:['agentd/src/tools/mod.rs','agentd/src/tools/native.rs']},
+      {id:'caps', n:'Capability engine', d:'Declare-then-check. Spawned children can narrow, never widen.',
+       badges:[['b-enforced','always'],['b-plain','agentd check --strict']],
+       kind:'native', p:'The one control that holds identically on every platform, because it never leaves the process. Grants are matched by prefix for FS, by host and port for Net, by segment for KB. `agentd check --strict` lints the declarations at boot and fails closed on a mis-wired grant.',
+       refs:['agentd/src/capability.rs','agentd/src/config.rs']},
+      {id:'flight', n:'Flight recorder', d:'Append-only JSONL. Every meaningful step an agent takes.',
+       badges:[['b-plain','flight.jsonl'],['b-flow','SSE :7999']],
+       kind:'native', p:'Best-effort by design: logging must never crash an agent. New behaviour gets new event kinds rather than overloaded ones, and the same stream fans out over SSE so the cockpit sees events live.',
+       refs:['agentd/src/flight_recorder.rs','agentd/src/events.rs']},
+      {id:'ev', n:'Evidence chain', d:'Ed25519 receipts over model calls — not over every tool result.',
+       badges:[['b-declared','self-attested'],['b-plain','records denials']],
+       kind:'native', p:'Deliberately de-claimed at ux.6a. Three real limits: coverage is model calls only; the signer IS the audited party, so this is self-attestation rather than third-party evidence; and deletion or rotation seams are undetectable from the chain alone. It does now record refusals, edge-triggered per (agent, reason) so a retry loop cannot force unbounded fsyncs.',
+       refs:['agentd/src/evidence.rs','THREAT_MODEL §8.7.1']},
+      {id:'cred', n:'Credential gateway', d:'Holds the OAuth token so sidecars never see it.',
+       badges:[['b-enforced','host allowlist'],['b-enforced','IP pinned']],
+       kind:'native', p:'The sidecar receives an ephemeral broker token valid for one spawn, never the refresh token. Upstream hosts are allowlisted and IP-pinned at startup, and query parameters are dropped unless explicitly passed through — which is why Gmail needs an explicit metadataHeaders allowance.',
+       refs:['agentd/src/credential/mod.rs','docker/oauth_mcp.py']},
+      {id:'mgmt', n:'Management API :7999', d:'Read the system, and mutate it if you hold the secret.',
+       badges:[['b-declared','secret-gated'],['b-flow','SSE + REST']],
+       kind:'native', p:'Every mutating POST requires a constant-time X-Approval-Token when AGENTOS_APPROVAL_SECRET is set; reads are ungated. With the secret unset the whole mutating surface is open, which is fine on loopback and not fine on a LAN.',
+       refs:['agentd/src/management.rs']},
+      {id:'fuse', n:'/agents FUSE', d:'The system as files. Read-only except one control inode.',
+       badges:[['b-enforced','EROFS elsewhere'],['b-plain','Linux only']],
+       kind:'native', p:'Reading an agent’s state is a cat away. Writes return EROFS on every inode except the control file, so the filesystem cannot be used to widen anything.',
+       refs:['surfaces/src/agents_fs.rs']}
+    ]},
+    {name:'MCP sidecars — separate processes', tag:'the kernel boundary lives here', nodes:[
+      {id:'oauth', n:'oauth_mcp.py', d:'Generic OAuth2 + PKCE REST client. Three tools, env-configured scopes.',
+       badges:[['b-external','Google'],['b-enforced','no raw token']], kind:'sidecar',
+       p:'Not a Gmail connector — a generic OAuth2 client with oauth_start_auth, oauth_check_auth and oauth_call_api. Adding a provider is scopes plus endpoints plus a capability grant, not a new sidecar.',
+       refs:['docker/oauth_mcp.py']},
+      {id:'cron', n:'cron_mcp.py', d:'wait_for_trigger — 5-field cron in UTC, or a plain interval.',
+       badges:[['b-plain','poll + retry']], kind:'sidecar',
+       p:'Parks the trigger agent between cycles and re-polls within the MCP timeout. Keep the fire time away from 00:00 UTC: the inbox-to-curator handoff is date-keyed and server-stamped, so a pipeline straddling midnight fails the brief cleanly.',
+       refs:['docker/cron_mcp.py']},
+      {id:'tg', n:'telegram_mcp.py', d:'Two-way reach: delivers the brief, relays approve/deny.',
+       badges:[['b-external','api.telegram.org'],['b-declared','chat allowlist']], kind:'sidecar',
+       p:'A no-tools server running a background thread. It polls GET /api/v1/brief and relays allowlisted replies to the approvals API. Note it sends with no parse_mode, which makes it structurally immune to markdown injection — and also why it currently renders a raw dict rather than a formatted brief (brief-02).',
+       refs:['docker/telegram_mcp.py']},
+      {id:'skb', n:'semantic_kb_mcp.py', d:'Qdrant-backed KB. Shadows the native kb_* tools when enabled.',
+       badges:[['b-declared','tool_override'],['b-external','OpenAI embeddings']], kind:'sidecar',
+       p:'With tool_override = true every kb_put/kb_get/kb_search from the CoS lands in Qdrant instead of memory.redb. Consequence worth knowing: FUSE, the [m] view and /api/v1/memory all read L1 redb, so KB state written this way is invisible on every operator surface.',
+       refs:['docker/semantic_kb_mcp.py']},
+      {id:'misc', n:'http · search · shell · fs_watch · webhook', d:'The rest of the harness. Each declares its own capabilities.',
+       badges:[['b-plain','harness tier']], kind:'sidecar',
+       p:'Bundled sidecars carry a self-test contract: every docker/*_mcp.py implements --test, exits 0 and prints a PASSED marker, with no API key required. CI globs the directory, so a new sidecar without --test fails the build.',
+       refs:['docker/','docs/MCP_SERVERS.md']}
+    ]}
+  ],
+
+  cos:[
+    {name:'One morning, in order', tag:'cron trigger → two sealed jobs → your brief', flow:true, nodes:[
+      {id:'c1', n:'Trigger wakes', d:'Holds only {cron_trigger, RunJob}. No Gmail, no KB, no file write, no spawn.',
+       badges:[['b-enforced','de-privileged']], kind:'step',
+       p:'The node that reads the schedule is the least privileged thing in the system. It cannot read your mail even if something convinces it to try.',
+       refs:['agentd/cos.agents.toml']},
+      {id:'c2', n:'Inbox job reads Gmail', d:'Metadata only — headers plus a ~200-char snippet, never full bodies.',
+       badges:[['b-enforced','gmail.readonly'],['b-flow','≤ 50 messages']], kind:'step',
+       p:'format=metadata is a budget control as much as a privacy one: one message can be 50–100 KB of base64, which would blow the context window. Triage happens on subject plus snippet. Each message id is cached in mail:raw so a re-run is cheap.',
+       refs:['agentd/cos.agents.toml cos-inbox']},
+      {id:'c3', n:'OperatingBrief → KB', d:'Typed JSON with a thread id per item. Hard 8 KiB ceiling.',
+       badges:[['b-enforced','8 KiB cap'],['b-declared','byte budget']], kind:'step',
+       p:'The handoff between the two sealed jobs. The cap is counted in bytes on the JSON-escaped, provenance-wrapped entry — roughly 600 bytes of overhead beyond the raw JSON. Over the cap the write fails, so v0.117.0 added a shed-and-retry ladder with a guaranteed-fit floor rather than losing the morning.',
+       refs:['agentd/src/tools/native.rs MAX_MEM_CONTENT_BYTES']},
+      {id:'c4', n:'Curator assembles', d:'No Gmail access at all. Works only from what the inbox job wrote.',
+       badges:[['b-enforced','KB-only']], kind:'step',
+       p:'Separation of duty between the two jobs: the one that reads untrusted email cannot write your files, and the one that writes your files cannot read your mail.',
+       refs:['agentd/cos.agents.toml cos-curator']},
+      {id:'c5', n:'brief-YYYY-MM-DDTHHMMSSZ.md', d:'The markdown you actually read. Thread permalinks per row. Timestamped since R4 (attn.2) so a second same-day run adds a new file instead of truncating the first.',
+       badges:[['b-declared','escaping is a prompt rule']], kind:'step',
+       p:'Honest limit: sender-written fields are entity-escaped by an instruction the model is told to follow, not by code (brief-03). A dash instead of a link means the thread id failed its hex check — fail-closed, by design. If the brief opens with a shortened-to-fit warning, it is deliberately incomplete.',
+       refs:['docs/RUNBOOK.md §11.6']},
+      {id:'c6', n:'publish_brief → BriefRecord', d:'A different artifact: run history, authored by agentd.',
+       badges:[['b-enforced','facts from runs.redb']], kind:'step',
+       p:'Worth not confusing with the markdown. BriefRecord holds run counts, failures, spend and a bounded model narrative — no email fields at all. It is what agentctl brief and Telegram render; the markdown is what you cat.',
+       refs:['agentd/src/runs/store.rs']}
+    ]}
+  ],
+
+  trust:[
+    {name:'Controls, and whether they hold on your platform', tag:'flip the switch above', nodes:[
+      {id:'t1', n:'agentd capability checks', d:'In-process Rust. Never leaves the binary.',
+       state:E('enforced','enforced'), kind:'control',
+       p:'The load-bearing control on every platform. If a tool call is not covered by a grant, the registry refuses it — no kernel involvement, nothing to degrade.',
+       refs:['agentd/src/capability.rs']},
+      {id:'t2', n:'Landlock FS (FsRead / FsWrite)', d:'Kernel-level path confinement for sidecars.',
+       state:E('absent','enforced'), kind:'control',
+       p:'Requires CONFIG_SECURITY_LANDLOCK. On Docker Desktop for Apple silicon the ABI reports v0, so this compiles to a best-effort no-op and the grants are declarative only.',
+       refs:['sandbox/src/lib.rs','THREAT_MODEL BP-4']},
+      {id:'t3', n:'Landlock Net (per-port)', d:'Confines a sidecar to the ports it declared.',
+       state:E('absent','enforced'), kind:'control',
+       p:'Needs Landlock ABI V4 (Linux ≥ 6.7). Without it agentd FAILS OPEN: it skips isolation so the server keeps working, and says so in a startup warning. Defensible — a sidecar that declared 443 needs 443 — but it is fail-open and no document should call it conservative.',
+       refs:['agentd/src/main.rs:1478','THREAT_MODEL BP-4a']},
+      {id:'t4', n:'seccomp-bpf', d:'Syscall filtering on sidecar subprocesses.',
+       state:E('absent','enforced'), kind:'control',
+       p:'Compiled by the sandbox crate and applied via pre_exec. Unavailable on the Mac Docker path.',
+       refs:['sandbox/src/lib.rs']},
+      {id:'t5', n:'DenySpawn', d:'Stops a sidecar forking a child it was not granted.',
+       state:E('absent','enforced'), kind:'control',
+       p:'The gate is #[cfg(target_arch = "x86_64")], so on aarch64 it is unavailable regardless of kernel. This is what spawn_enforcement_unavailable_arch in the System view is telling you.',
+       refs:['sandbox/src/lib.rs']},
+      {id:'t6', n:'gVisor / runsc', d:'Optional universal-tier isolation for untrusted workloads.',
+       state:E('absent','declared'), kind:'control',
+       p:'Detected at startup and reported as an isolation tier. Not present in either default deployment; classify_tier() reports none when runsc is absent.',
+       refs:['agentd/src/isolation.rs']},
+      {id:'t7', n:'Container / VM boundary', d:'Docker networking, or the QEMU guest.',
+       state:E('enforced','enforced'), kind:'control',
+       p:'What actually bounds a compromised sidecar on a Mac. Coarse — it does not distinguish port 443 from anything else the container can reach — but real.',
+       refs:['docker-compose.yml','distro/Makefile']},
+      {id:'t8', n:'Credential broker allowlist', d:'Upstream hosts pinned; the token never leaves agentd.',
+       state:E('enforced','enforced'), kind:'control',
+       p:'Platform-independent, because it is enforced in the gateway rather than the kernel. A compromised sidecar can still ask the broker to call an allowlisted host, but cannot exfiltrate the credential itself.',
+       refs:['agentd/src/credential/mod.rs']}
+    ]}
+  ],
+
+  store:[
+    {name:'Durable state', tag:'redb × 3 + one append-only log', nodes:[
+      {id:'s1', n:'memory.redb', d:'The KB. Tier-1 short term and tier-2 long term share the file.',
+       badges:[['b-plain','segments + classes']], kind:'store',
+       p:'Segments carry a mutability class: log means the store assigns a monotonic key and ignores yours; scratch means your key wins, last-writer-wins with a version bump; canon refuses agent writes outright. Getting the class wrong is how keys silently accumulate or silently collide.',
+       refs:['agentd/src/memory/store.rs']},
+      {id:'s2', n:'caps.redb', d:'Per-agent spend counters for the credential tier.',
+       badges:[['b-plain','cred.4']], kind:'store',
+       p:'Separate file so a spend cap survives a memory reset. Checked before a brokered call, not after.',
+       refs:['agentd/src/credential/caps.rs']},
+      {id:'s3', n:'runs.redb', d:'Durable run history, plus the BRIEFS table.',
+       badges:[['b-enforced','agentd-authored'],['b-flow','/api/v1/runs']], kind:'store',
+       p:'Written off-loop by a single run-writer lane from authoritative scheduler transitions, so the record cannot drift from what the scheduler actually did. Post-v1 fields must be #[serde(default)] so an older file still deserializes — which is what makes extending BriefRecord cheap.',
+       refs:['agentd/src/runs/store.rs','agentd/src/runs/mod.rs']},
+      {id:'s4', n:'evidence.jsonl', d:'The signed receipt chain. Genesis-anchored, rotatable.',
+       badges:[['b-declared','self-attested']], kind:'store',
+       p:'Boot reads a bounded 64 KiB tail rather than the whole file, repairs a torn tail, and signature-checks the tail receipt with a warning instead of refusing — failing closed here would brick anyone who archived or hand-edited the log. Rotation renames rather than truncating, so each segment stays independently verifiable.',
+       refs:['agentd/src/evidence.rs']},
+      {id:'s5', n:'output/brief-*.md', d:'The morning brief. Write-only from the system’s side.',
+       badges:[['b-plain','human reads it']], kind:'store',
+       p:'No code in the repo reads this file back — verified. It is a leaf artifact the operator cats, which is why changing how it is produced breaks nothing downstream.',
+       refs:['docs/RUNBOOK.md §11.6']},
+      {id:'s6', n:'Qdrant', d:'Vector store behind the semantic KB sidecar.',
+       badges:[['b-external','agent-net'],['b-plain','not host-exposed']], kind:'store',
+       p:'Reachable only on the internal Docker network. Its only reclamation is a TTL sweep that runs once at sidecar start, so orphaned points persist until a restart at least that old.',
+       refs:['docker-compose.yml','docker/semantic_kb_mcp.py']}
+    ]}
+  ]
+};
+
+var STATE_LABEL = {enforced:'enforced', declared:'declared only', absent:'unavailable here'};
+
+function badgeFor(state){
+  var cls = state==='enforced' ? 'b-enforced' : state==='declared' ? 'b-declared' : 'b-absent';
+  return '<span class="badge '+cls+'">'+STATE_LABEL[state]+'</span>';
+}
+
+function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function render(){
+  var zones = ZONES[VIEW] || [];
+  var html = '';
+  zones.forEach(function(z){
+    html += '<section class="zone"><div class="zone-hd">'+
+            '<span class="zone-name">'+esc(z.name)+'</span>'+
+            '<span class="zone-tag">'+esc(z.tag||'')+'</span></div>'+
+            '<div class="grid'+(z.flow?' is-flow':'')+'">';
+    z.nodes.forEach(function(nd){
+      var st = nd.state ? nd.state[PLAT] : null;
+      var badges = '';
+      if(st){ badges += badgeFor(st); }
+      (nd.badges||[]).forEach(function(b){ badges += '<span class="badge '+b[0]+'">'+esc(b[1])+'</span>'; });
+      html += '<button type="button" class="node'+(z.flow?' flow-step':'')+'" data-id="'+nd.id+'"'+
+              (st?' data-state="'+st+'"':'')+' aria-pressed="false">'+
+              '<span class="node-name">'+esc(nd.n)+'</span>'+
+              '<span class="node-desc">'+esc(nd.d)+'</span>'+
+              '<span class="node-badges">'+badges+'</span></button>';
+    });
+    html += '</div></section>';
+  });
+  document.getElementById('zones').innerHTML = html;
+  document.getElementById('viewNote').textContent = NOTES[VIEW];
+
+  var lg = '';
+  LEGEND.forEach(function(l){ lg += '<span class="badge '+l[0]+'">'+l[1]+'</span>'; });
+  document.getElementById('legend').innerHTML = lg;
+
+  document.querySelectorAll('.node').forEach(function(b){
+    b.addEventListener('click', function(){ selectNode(b.getAttribute('data-id'), b); });
+  });
+}
+
+function findNode(id){
+  var out = null;
+  Object.keys(ZONES).forEach(function(v){
+    ZONES[v].forEach(function(z){ z.nodes.forEach(function(n){ if(n.id===id) out=n; }); });
+  });
+  return out;
+}
+
+function selectNode(id, btn){
+  document.querySelectorAll('.node').forEach(function(b){ b.setAttribute('aria-pressed', b===btn?'true':'false'); });
+  var n = findNode(id); if(!n) return;
+  document.getElementById('dTitle').textContent = n.n;
+  var st = n.state ? n.state[PLAT] : null;
+  document.getElementById('dKind').textContent = (n.kind||'') + (st ? ' · ' + STATE_LABEL[st] + ' on ' + (PLAT==='mac'?'Mac':'Linux') : '');
+  var refs = (n.refs||[]).map(function(r){ return '<span class="ref">'+esc(r)+'</span>'; }).join('');
+  document.getElementById('dBody').innerHTML =
+    '<p>'+esc(n.p)+'</p>'+(refs?'<div class="refs">'+refs+'</div>':'');
+}
+
+function platformRead(){
+  var counts = {enforced:0, declared:0, absent:0};
+  ZONES.trust[0].nodes.forEach(function(n){ counts[n.state[PLAT]]++; });
+  var el = document.getElementById('platRead');
+  el.innerHTML = PLAT==='mac'
+    ? '<b>'+counts.enforced+' enforced</b> · '+counts.declared+' declared · <b>'+counts.absent+' unavailable</b><br>'+
+      'No Landlock, no seccomp, no DenySpawn. Capability checks and the container boundary hold.'
+    : '<b>'+counts.enforced+' enforced</b> · '+counts.declared+' declared · '+counts.absent+' unavailable<br>'+
+      'Kernel enforcement available: Landlock FS + per-port Net, seccomp, DenySpawn.';
+}
+
+document.querySelectorAll('.seg button').forEach(function(b){
+  b.addEventListener('click', function(){
+    PLAT = b.getAttribute('data-plat');
+    document.querySelectorAll('.seg button').forEach(function(o){
+      o.setAttribute('aria-pressed', o===b ? 'true':'false');
+    });
+    platformRead(); render();
+  });
+});
+document.querySelectorAll('.rail button').forEach(function(b){
+  b.addEventListener('click', function(){
+    VIEW = b.getAttribute('data-view');
+    document.querySelectorAll('.rail button').forEach(function(o){
+      o.setAttribute('aria-pressed', o===b ? 'true':'false');
+    });
+    render();
+  });
+});
+
+platformRead();
+render();
+</script>
+</body>
+</html>
