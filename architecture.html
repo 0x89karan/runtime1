@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>runtime1 — runtime architecture (v0.118.0)</title>
+<title>runtime1 — runtime architecture (v0.121.0)</title>
 <link rel="stylesheet" href="style.css">
 <style>
 /* ─── tokens: extends the house palette shared with docs/cos-guide.html ─── */
@@ -148,7 +148,7 @@ footer{margin-top:34px;padding-top:16px;border-top:1px solid var(--border);
 <div class="wrap">
 
 
-  <p class="eyebrow">runtime schematic · agentd v0.118.0</p>
+  <p class="eyebrow">runtime schematic · agentd v0.121.0</p>
   <h1>What runs in the process, and what actually enforces it.</h1>
   <p class="sub">Agents are the primitive, not applications. Cognition is remote; the device is a thin
   agent host. Single-tenant by design — agents are mutually trusting and run in-process.</p>
@@ -227,7 +227,7 @@ var ZONES = {
     {name:'agentd — one process, PID 1 in the full system', tag:'Rust · in-process · single-tenant', nodes:[
       {id:'sched', n:'Scheduler', d:'Steps every agent cooperatively toward its next effect. Owns budgets and checkpoints.',
        badges:[['b-enforced','budget gate'],['b-plain','cooperative']],
-       kind:'native', p:'One loop, many agents. Each turn produces an AgentEffect the scheduler applies; nothing runs in parallel inside a turn, which is why the flight log reads as a clean sequence. The budget gate is pre-turn: an agent over its window defers rather than terminating (ux.8′), so a burst costs you latency, not the agent.',
+       kind:'native', p:'One loop, many agents. Each turn produces an AgentEffect the scheduler applies; nothing runs in parallel inside a turn, which is why the flight log reads as a clean sequence. The budget gate is pre-turn: an agent over its window defers rather than terminating (ux.8′), so a burst costs you latency, not the agent. Since v0.120.0 a SIGTERM landing mid-tool-call is sealed on the checkpoint copy — never the live transcript — so a restore no longer replays a transcript the provider rejects. Restore is at-least-once for tool side effects, not exactly-once; that limit is stated, not glossed.',
        refs:['agentd/src/scheduler.rs','agentd/src/agent/mod.rs']},
       {id:'jobs', n:'run_job — sealed jobs', d:'Config owns the child’s capabilities and task. The caller cannot widen either.',
        badges:[['b-enforced','config-owned caps'],['b-enforced','no output return']],
@@ -235,7 +235,7 @@ var ZONES = {
        refs:['agentd/cos.agents.toml [[jobs]]','agentd/src/scheduler.rs']},
       {id:'inf', n:'InferenceGateway', d:'The only way to reach a model. Remote by construction — no local weights.',
        badges:[['b-external','api.anthropic.com'],['b-enforced','metered']],
-       kind:'native', p:'A locked decision, not an accident: there is no local inference engine and no model weights on the device. Adding a local backend later is allowed only as another impl of this trait, never as a core assumption. Every call is token-metered and counted against the window.',
+       kind:'native', p:'A locked decision, not an accident: there is no local inference engine and no model weights on the device. Adding a local backend later is allowed only as another impl of this trait, never as a core assumption. Every call is token-metered and counted against the window, and since v0.120.0 every inference_request logs retained_tokens_est, paging_limit and paging_limit_source — the numbers that decide context paging. Honest limit: that limit source reads "token_budget" because context paging is still keyed to a spend ceiling, not the model’s context window (audit118-R1, open and blocked — enabling paging today would silently drop the oldest context).',
        refs:['agentd/src/inference/mod.rs','agentd/src/inference/anthropic.rs']},
       {id:'tools', n:'Tool registry', d:'Everything an agent does to the world is a Tool, gated by a capability.',
        badges:[['b-enforced','capability gate']],
@@ -272,17 +272,17 @@ var ZONES = {
        p:'Not a Gmail connector — a generic OAuth2 client with oauth_start_auth, oauth_check_auth and oauth_call_api. Adding a provider is scopes plus endpoints plus a capability grant, not a new sidecar.',
        refs:['docker/oauth_mcp.py']},
       {id:'cron', n:'cron_mcp.py', d:'wait_for_trigger — 5-field cron in UTC, or a plain interval.',
-       badges:[['b-plain','poll + retry']], kind:'sidecar',
-       p:'Parks the trigger agent between cycles and re-polls within the MCP timeout. Keep the fire time away from 00:00 UTC: the inbox-to-curator handoff is date-keyed and server-stamped, so a pipeline straddling midnight fails the brief cleanly.',
-       refs:['docker/cron_mcp.py']},
+       badges:[['b-plain','poll + retry'],['b-absent','being retired']], kind:'sidecar',
+       p:'Parks the trigger agent between cycles and re-polls within the MCP timeout. Keep the fire time away from 00:00 UTC: the inbox-to-curator handoff is date-keyed and server-stamped, so a pipeline straddling midnight fails the brief cleanly. Measured cost of this shape: an LLM sitting on the schedule boundary burns ~3,456 inference calls a day just to watch a clock — 414k tokens in one 29-minute window, all of it wait_for_trigger. Scheduler-native cron (attn.4) is the next increment; this sidecar’s job moves into agentd so no model call sits on a timer.',
+       refs:['docker/cron_mcp.py','docs/ROADMAP.md attn.4']},
       {id:'tg', n:'telegram_mcp.py', d:'Two-way reach: delivers the brief, relays approve/deny.',
        badges:[['b-external','api.telegram.org'],['b-declared','chat allowlist']], kind:'sidecar',
        p:'A no-tools server running a background thread. It polls GET /api/v1/brief and relays allowlisted replies to the approvals API. Note it sends with no parse_mode, which makes it structurally immune to markdown injection — and also why it currently renders a raw dict rather than a formatted brief (brief-02).',
        refs:['docker/telegram_mcp.py']},
       {id:'skb', n:'semantic_kb_mcp.py', d:'Qdrant-backed KB. Shadows the native kb_* tools when enabled.',
-       badges:[['b-declared','tool_override'],['b-external','OpenAI embeddings']], kind:'sidecar',
-       p:'With tool_override = true every kb_put/kb_get/kb_search from the CoS lands in Qdrant instead of memory.redb. Consequence worth knowing: FUSE, the [m] view and /api/v1/memory all read L1 redb, so KB state written this way is invisible on every operator surface.',
-       refs:['docker/semantic_kb_mcp.py']},
+       badges:[['b-declared','tool_override'],['b-external','OpenAI embeddings'],['b-enforced','degrades honestly']], kind:'sidecar',
+       p:'With tool_override = true every kb_put/kb_get/kb_search from the CoS lands in Qdrant instead of memory.redb. Consequence worth knowing: FUSE, the [m] view and /api/v1/memory all read L1 redb, so KB state written this way is invisible on every operator surface. Since v0.119.0 a missing embeddings key no longer fails the boot: kb_put/kb_get are point lookups that never needed vectors, kb_search returns an explicit empty rather than arbitrary nearest-neighbours (with zero vectors every point is equidistant — the un-guarded build returned resolved items at score 0.0), and degraded writes land in a kbdegraded_* namespace so real embeddings are untouched.',
+       refs:['docker/semantic_kb_mcp.py','docker/entrypoint.sh']},
       {id:'misc', n:'http · search · shell · fs_watch · webhook', d:'The rest of the harness. Each declares its own capabilities.',
        badges:[['b-plain','harness tier']], kind:'sidecar',
        p:'Bundled sidecars carry a self-test contract: every docker/*_mcp.py implements --test, exits 0 and prints a PASSED marker, with no API key required. CI globs the directory, so a new sidecar without --test fails the build.',
@@ -298,7 +298,7 @@ var ZONES = {
        refs:['agentd/cos.agents.toml']},
       {id:'c2', n:'Inbox job reads Gmail', d:'Metadata only — headers plus a ~200-char snippet, never full bodies.',
        badges:[['b-enforced','gmail.readonly'],['b-flow','≤ 50 messages']], kind:'step',
-       p:'format=metadata is a budget control as much as a privacy one: one message can be 50–100 KB of base64, which would blow the context window. Triage happens on subject plus snippet. Each message id is cached in mail:raw so a re-run is cheap.',
+       p:'format=metadata is a budget control as much as a privacy one: one message can be 50–100 KB of base64, which would blow the context window. Triage happens on subject plus snippet. Each message id is cached in mail:raw so a re-run is cheap. Since v0.121.0 every item lands in exactly one of important / response_needed (an urgent item needing a reply used to render twice), and messages the 50-message fetch cap excluded are counted as suppressed_count from Gmail’s own resultSizeEstimate — zero extra API calls, so a capped morning says so instead of looking complete.',
        refs:['agentd/cos.agents.toml cos-inbox']},
       {id:'c3', n:'OperatingBrief → KB', d:'Typed JSON with a thread id per item. Hard 8 KiB ceiling.',
        badges:[['b-enforced','8 KiB cap'],['b-declared','byte budget']], kind:'step',
@@ -357,7 +357,7 @@ var ZONES = {
   ],
 
   store:[
-    {name:'Durable state', tag:'redb × 3 + one append-only log', nodes:[
+    {name:'Durable state', tag:'redb × 3 + append-only logs + checkpoints', nodes:[
       {id:'s1', n:'memory.redb', d:'The KB. Tier-1 short term and tier-2 long term share the file.',
        badges:[['b-plain','segments + classes']], kind:'store',
        p:'Segments carry a mutability class: log means the store assigns a monotonic key and ignores yours; scratch means your key wins, last-writer-wins with a version bump; canon refuses agent writes outright. Getting the class wrong is how keys silently accumulate or silently collide.',
@@ -378,6 +378,10 @@ var ZONES = {
        badges:[['b-plain','human reads it']], kind:'store',
        p:'No code in the repo reads this file back — verified. It is a leaf artifact the operator cats, which is why changing how it is produced breaks nothing downstream.',
        refs:['docs/RUNBOOK.md §11.6']},
+      {id:'s7', n:'checkpoint.json', d:'Agent snapshots at turn boundaries. Sealed against mid-tool-call SIGTERMs.',
+       badges:[['b-plain','at-least-once restore']], kind:'store',
+       p:'All agents are snapshotted on any agent’s tool boundary (checkpoint_interval_turns defaults to 1). Since v0.120.0 an unanswered tool_use is sealed on the checkpoint copy before the write, so a restart after a mid-call SIGTERM restores cleanly instead of drawing a provider 400. Honest limits: the writer does not apply the dead-child filter the restore path does (restore self-heals that), and a clean checkpoint does not prove a live agent is healthy.',
+       refs:['agentd/src/scheduler.rs build_scheduler_checkpoint']},
       {id:'s6', n:'Qdrant', d:'Vector store behind the semantic KB sidecar.',
        badges:[['b-external','agent-net'],['b-plain','not host-exposed']], kind:'store',
        p:'Reachable only on the internal Docker network. Its only reclamation is a TTL sweep that runs once at sidecar start, so orphaned points persist until a restart at least that old.',

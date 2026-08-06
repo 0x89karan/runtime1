@@ -90,7 +90,7 @@
     { k: 't', label: 'toggle light / dark', run: toggleTheme },
     { k: 'g', label: 'open the GitHub repo', run: function () { go('https://github.com/0x89karan/runtime1'); } },
     { k: 'h', label: 'home', run: function () { go('index.html'); } },
-    { k: '1', label: 'the runtime1 thesis', run: function () { go('thesis.html'); } },
+    { k: '1', label: 'the agentOS thesis', run: function () { go('thesis.html'); } },
     { k: '2', label: 'verification thesis', run: function () { go('zk-verification.html'); } },
     { k: '3', label: 'runtime schematic', run: function () { go('architecture.html'); } },
     { k: '4', label: 'roadmap', run: function () { go('roadmap.html'); } },
