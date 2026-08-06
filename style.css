@@ -245,6 +245,18 @@ h3{font-size:17px;margin:26px 0 8px}
 .hero .sub{font-size:19px;color:var(--text-muted);max-width:760px;margin:0 0 28px}
 .cta{display:flex;gap:12px;flex-wrap:wrap}
 
+/* ─── pill badge: a stamped label, not just muted caption text ─── */
+.pill{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);font-size:12px;
+  letter-spacing:.08em;text-transform:uppercase;white-space:nowrap;
+  color:var(--md-sys-color-on-primary-container);background:var(--md-sys-color-primary-container);
+  border:1px solid var(--md-sys-color-primary);border-radius:var(--md-sys-shape-corner-full);
+  padding:6px 14px 6px 11px}
+.pill::before{content:'';width:6px;height:6px;border-radius:50%;background:var(--md-sys-color-primary);
+  flex:0 0 auto}
+.hero-tag{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:0 0 16px}
+.hero-tag .rest{font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--text-dim)}
+
 /* ─── buttons ─── */
 /* M3 buttons. `.primary` is a filled button, plain `.btn`/`.ghost` an outlined
    button. Both carry a real M3 state layer: a currentColor overlay at the
@@ -304,6 +316,18 @@ h3{font-size:17px;margin:26px 0 8px}
 .honesty .k{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;
   color:var(--enforced);margin:0 0 8px}
 .honesty p{margin:0;color:var(--text-muted);font-size:15px;max-width:860px}
+
+/* ─── in-page table of contents ─── */
+.toc{background:var(--md-sys-color-surface-container-low);border:1px solid var(--md-sys-color-outline-variant);
+  border-radius:var(--md-sys-shape-corner-medium);padding:18px 22px;margin:22px 0}
+.toc .k{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--text-dim);margin:0 0 10px}
+.toc ol{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:6px 20px;counter-reset:toc}
+.toc li{counter-increment:toc;font-size:14px}
+.toc li::before{content:counter(toc) ".";font-family:var(--mono);color:var(--text-dim);margin-right:8px}
+.toc a{color:var(--text-muted)}
+.toc a:hover{color:var(--accent);text-decoration:none}
 
 /* ─── badges ─── */
 .badge{display:inline-block;font-family:var(--mono);font-size:11px;padding:2px 8px;
