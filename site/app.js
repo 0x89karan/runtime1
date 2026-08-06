@@ -94,6 +94,7 @@
     { k: '2', label: 'verification thesis', run: function () { go('zk-verification.html'); } },
     { k: '3', label: 'runtime schematic', run: function () { go('architecture.html'); } },
     { k: '4', label: 'roadmap', run: function () { go('roadmap.html'); } },
+    { k: '5', label: 'the whitepaper', run: function () { go('whitepaper.html'); } },
     { k: 'p', label: 'pause / resume the recorder', run: function () { if (rec) rec.toggle(); }, only: 'rec' },
     { k: 'r', label: 'replay the recorder', run: function () { if (rec) rec.replay(); }, only: 'rec' }
   ];

@@ -1,0 +1,133 @@
+/* ============================================================================
+   The whitepaper, rendered as an actual document embedded in the page.
+   Deliberately its own visual language: a fixed "paper" palette and serif
+   type that do NOT follow the site's dark/light toggle — the metaphor is an
+   embedded document sitting on top of the site, not a themed page of it.
+   ============================================================================ */
+
+.paper{
+  --p-serif:'Iowan Old Style','Palatino Linotype','URW Palladio L',Palatino,Georgia,'Times New Roman',serif;
+  --p-bg:#f8f4e9;
+  --p-bg-tint:#efe7d2;
+  --p-ink:#201c15;
+  --p-ink-soft:#57503e;
+  --p-rule:#26221a;
+  --p-accent:#7c2430;
+  --p-enf:#1f6b3f;
+  --p-dec:#8a5a12;
+  --p-abs:#8a2222;
+
+  position:relative;
+  max-width:920px;
+  margin:36px auto 8px;
+  background:var(--p-bg);
+  color:var(--p-ink);
+  font-family:var(--p-serif);
+  border:1px solid rgba(0,0,0,.16);
+  border-radius:2px;
+  box-shadow:
+    0 1px 0 rgba(255,255,255,.4) inset,
+    0 26px 50px -20px rgba(0,0,0,.5),
+    0 4px 14px rgba(0,0,0,.2);
+}
+
+.paper-inner{padding:60px 68px 64px;position:relative;z-index:1}
+
+.paper-kicker{font-family:var(--mono);font-size:11px;letter-spacing:.24em;text-transform:uppercase;
+  text-align:center;color:var(--p-accent);margin:0 0 22px}
+.paper-title{font-family:var(--p-serif);font-weight:700;font-size:37px;line-height:1.18;
+  text-align:center;margin:0 0 16px;color:var(--p-ink);letter-spacing:-.01em}
+.paper-sub{font-style:italic;text-align:center;font-size:16.5px;line-height:1.55;
+  color:var(--p-ink-soft);max-width:620px;margin:0 auto 18px}
+.paper-byline{text-align:center;font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--p-ink-soft);margin:0 0 28px}
+.paper-band{height:3px;background:var(--p-ink);margin:0 0 4px}
+.paper-rule{border:0;margin:0}
+.paper-rule.thin{border-top:1px solid var(--p-rule);opacity:.45;margin:0 0 30px}
+
+.paper-abstract{max-width:640px;margin:0 auto 30px}
+.paper-abstract p{font-size:15.5px;line-height:1.72;color:var(--p-ink-soft);
+  text-align:justify;hyphens:auto;font-style:italic;margin:0}
+
+.paper-label{font-family:var(--mono);font-size:11px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--p-accent);text-align:center;margin:0 0 12px}
+
+.paper-toc{max-width:600px;margin:0 auto 8px}
+.paper-toc ol{list-style:none;margin:0;padding:0;display:grid;
+  grid-template-columns:repeat(2,1fr);gap:8px 30px;counter-reset:ptoc}
+.paper-toc li{counter-increment:ptoc;font-size:14.5px;line-height:1.4}
+.paper-toc li::before{content:counter(ptoc) ".";margin-right:6px;color:var(--p-ink-soft);
+  font-family:var(--mono);font-size:12px}
+.paper-toc a{color:var(--p-ink)}
+.paper-toc a:hover{color:var(--p-accent)}
+
+.paper-body{column-count:2;column-gap:46px;margin-top:6px}
+.paper-body h2,.paper-body h3,.paper-body table,.paper-body .callout,.paper-body .honesty{
+  column-span:all}
+.paper-body h2,.paper-body h3{scroll-margin-top:90px}
+.paper-body h2{font-family:var(--p-serif);font-size:21px;font-weight:700;margin:38px 0 12px;
+  padding-top:24px;border-top:1px solid rgba(0,0,0,.14);color:var(--p-ink)}
+.paper-body h2:first-of-type{border-top:0;padding-top:0;margin-top:4px}
+.paper-body h3{font-family:var(--p-serif);font-size:16px;font-weight:700;font-style:italic;
+  margin:22px 0 8px;color:var(--p-ink)}
+.paper-body p{font-size:14.5px;line-height:1.68;text-align:justify;hyphens:auto;
+  margin:0 0 14px;color:var(--p-ink)}
+.paper-body p.mut{color:var(--p-ink-soft)}
+.paper-body ul,.paper-body ol{margin:0 0 16px;padding-left:19px;font-size:14px;
+  line-height:1.6;color:var(--p-ink)}
+.paper-body li{margin-bottom:8px}
+.paper-body b{color:var(--p-ink)}
+.paper-body code{font-family:var(--mono);font-size:.82em;background:rgba(0,0,0,.06);
+  border:1px solid rgba(0,0,0,.13);border-radius:2px;padding:1px 4px;color:var(--p-ink)}
+.paper-body a{color:var(--p-accent);text-decoration:underline;
+  text-decoration-color:rgba(124,36,48,.4);text-decoration-thickness:1px}
+.paper-body a:hover{text-decoration-color:currentColor}
+
+.paper-body table{width:100%;border-collapse:collapse;margin:8px 0 24px;
+  font-size:13.5px;font-family:var(--p-serif)}
+.paper-body th,.paper-body td{padding:8px 12px;text-align:left;vertical-align:top;
+  border:0;border-bottom:1px solid rgba(0,0,0,.16);background:transparent;color:var(--p-ink)}
+.paper-body thead th{border-top:2px solid var(--p-ink);border-bottom:1.5px solid var(--p-ink);
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--p-ink-soft)}
+.paper-body tbody tr:last-child td{border-bottom:2px solid var(--p-ink)}
+.paper-body td code{background:none;border:0;padding:0}
+
+.paper-body .callout{background:var(--p-bg-tint);border:1px solid rgba(0,0,0,.16);
+  border-radius:2px;padding:14px 20px;margin:8px 0 22px}
+.paper-body .callout .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--p-ink-soft);margin:0 0 6px}
+.paper-body .callout p{font-size:13.5px;text-align:left;color:var(--p-ink);margin:0 0 6px}
+.paper-body .callout p:last-child{margin:0}
+.paper-body .callout.red{border-color:var(--p-abs)}   .paper-body .callout.red .k{color:var(--p-abs)}
+.paper-body .callout.green{border-color:var(--p-enf)} .paper-body .callout.green .k{color:var(--p-enf)}
+
+.paper-body .honesty{background:var(--p-bg-tint);border:1px solid var(--p-enf);
+  border-radius:2px;padding:16px 22px;margin:16px 0 24px}
+.paper-body .honesty .k{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--p-enf);margin:0 0 8px}
+.paper-body .honesty p{font-size:13.5px;text-align:left;color:var(--p-ink);max-width:none;margin:0}
+
+.paper-body .badge{font-family:var(--mono);font-size:10px;padding:1px 6px;border-radius:2px;
+  border:1px solid;background:none;letter-spacing:.03em}
+.paper-body .badge.enf{color:var(--p-enf);border-color:var(--p-enf)}
+.paper-body .badge.dec{color:var(--p-dec);border-color:var(--p-dec)}
+.paper-body .badge.abs{color:var(--p-abs);border-color:var(--p-abs)}
+.paper-body .badge.road{color:var(--p-dec);border-color:var(--p-dec)}
+
+.paper-colophon{max-width:620px;margin:8px auto 0;font-style:italic;text-align:center;
+  color:var(--p-ink-soft);font-size:14px;line-height:1.6}
+
+@media (max-width:760px){
+  .paper-inner{padding:38px 24px 44px}
+  .paper-title{font-size:27px}
+  .paper-body{column-count:1}
+  .paper-toc ol{grid-template-columns:1fr}
+}
+
+@media print{
+  .topbar,.progress,.wrap>.eyebrow,.wrap>.lead,.wrap>.callout,.next,.keyhint{display:none!important}
+  body{background:#fff}
+  .paper{box-shadow:none;border:0;max-width:none;margin:0}
+  .paper-body{column-count:1}
+}

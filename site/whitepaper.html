@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runtime1 — the whitepaper</title>
+<meta name="description" content="The full argument in one document: the thesis, the two constitutional decisions, the architecture as built, the security model in enforced/declared/not-built terms, the evidence pipeline and its stated limits, and prior art.">
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="paper.css">
+<script>try{var t=localStorage.getItem('runtime1-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
+</head>
+<body>
+<div class="progress"><span></span></div>
+<header class="topbar">
+  <nav class="nav">
+    <span class="brand"><a href="index.html" style="color:inherit">runtime<b>1</b></a></span>
+    <div class="links">
+      <a href="thesis.html">Thesis</a>
+      <a href="zk-verification.html">Verification</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="roadmap.html">Roadmap</a>
+      <a href="whitepaper.html" class="here">Whitepaper</a>
+      <a href="https://github.com/0x89karan/runtime1">GitHub</a>
+    </div>
+    <div class="tools">
+      <button type="button" class="keyhint" data-help aria-label="Keyboard shortcuts"><kbd>?</kbd></button>
+      <button type="button" class="tt" data-theme-toggle aria-pressed="false" title="Switch to light (t)">
+        <svg class="moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+        <svg class="sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M6.3 17.7l-1.4 1.4M19.1 4.9l-1.4 1.4"/></svg>
+        <span class="tt-label">dark</span>
+      </button>
+    </div>
+  </nav>
+</header>
+
+<div class="wrap">
+
+  <p class="eyebrow">the whitepaper</p>
+  <p class="lead">
+    The full argument in one document, reproduced below as it reads on paper — the thesis, the
+    architecture as built, the security model, and the evidence pipeline together with a
+    precise account of what it cannot prove.
+  </p>
+
+  <div class="callout">
+    <p class="k">this page vs. the source</p>
+    <p>
+      What follows is the whitepaper rendered onto the site, unabridged. The source of truth is
+      <a href="https://github.com/0x89karan/runtime1/blob/main/docs/WHITEPAPER.md"><code>docs/WHITEPAPER.md</code></a>
+      — where they disagree, the markdown in the repo wins. There's also a one-page
+      <a href="https://github.com/0x89karan/runtime1/blob/main/docs/PRODUCT-LANGUAGE.md">naming &amp; claim-vocabulary reference</a>
+      if you just want the words we use and refuse.
+    </p>
+  </div>
+
+  <article class="paper">
+  <div class="paper-inner">
+
+    <p class="paper-kicker">runtime1 whitepaper</p>
+    <h1 class="paper-title">An Operating System Where Agents Are the Primitive</h1>
+    <p class="paper-sub">A whitepaper on agentOS and agentd — the substrate, the security model,
+    and the evidence pipeline.</p>
+    <p class="paper-byline">runtime1 project · agentd v0.121.0 · August 2026 · draft, versioned with the code</p>
+    <div class="paper-band"></div>
+    <hr class="paper-rule thin">
+
+    <div class="paper-abstract">
+      <p class="paper-label">Abstract</p>
+      <p>
+        AI agents are useful precisely when you stop watching them — and that is when they are
+        dangerous. Today, an agent that touches real, sensitive systems (email, code, deals, a
+        cap table) is either babysat with per-action approval prompts, coarsely sandboxed in a
+        container, or handed to a multi-tenant cloud service the operator does not control.
+        None of these lets a <em>team</em> of agents run unsupervised while guaranteeing that
+        each one is bounded, every action is audited, spend is metered, and data does not leak.
+        runtime1 is an open-source experiment testing one idea: those guarantees are
+        operating-system-shaped. They belong in the boundary that runs the agent, not in the
+        framework that authored it and not in the prompt that instructs it.
+      </p>
+    </div>
+    <hr class="paper-rule thin">
+
+    <nav class="paper-toc" aria-label="Contents">
+      <p class="paper-label">Contents</p>
+      <ol>
+        <li><a href="#names">Names, once</a></li>
+        <li><a href="#problem">The problem</a></li>
+        <li><a href="#thesis">The thesis: agents as the primitive</a></li>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#security">The security model</a></li>
+        <li><a href="#evidence">Evidence: enforce in real time, prove after the fact</a></li>
+        <li><a href="#workload">The reference workload</a></li>
+        <li><a href="#prior-art">Prior art, and the gap</a></li>
+        <li><a href="#status">What exists today, and what is still a hypothesis</a></li>
+        <li><a href="#further">How to read the rest of the project</a></li>
+      </ol>
+    </nav>
+
+  <div class="paper-body">
+
+  <h2 id="names">1. Names, once</h2>
+  <p>Three names, one stack:</p>
+  <table>
+    <thead><tr><th>Name</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><b>runtime1</b></td><td>The open-source project as a whole: the OS, the runtime, the operator tooling, the tool servers, the verification pipeline, and the docs.</td></tr>
+      <tr><td><b>agentOS</b></td><td>The operating system inside it: a minimal Linux base whose entire userspace is the agent runtime. No desktop, no apps, no login shell — agents and the tools they invoke.</td></tr>
+      <tr><td><b>agentd</b></td><td>agentOS's runtime binary: a ~2&nbsp;MB size-optimized Rust daemon that boots as PID&nbsp;1 and <em>is</em> the userspace. Today it also runs as an ordinary binary on a normal distro.</td></tr>
+    </tbody>
+  </table>
+  <p class="mut">
+    Supporting cast: <code>agentctl</code> is the operator CLI and terminal cockpit; MCP
+    servers are the tool processes; the flight recorder, evidence chain, and memory substrate
+    are subsystems of agentd described below.
+  </p>
+
+  <h2 id="problem">2. The problem</h2>
+  <p>
+    Agents that act on systems that matter cannot currently be trusted unsupervised. The three
+    available postures all fail the same test:
+  </p>
+  <ul>
+    <li><b>Babysitting.</b> Per-action approval prompts scale with the number of actions, and a
+      standing 24/7 team of agents produces more actions than any human will review.
+      Supervision that requires presence is not supervision for the case that matters.</li>
+    <li><b>Coarse sandboxing.</b> A container around the whole process bounds the blast radius
+      of a crash, not of a decision. It cannot distinguish "read the inbox" from "forward the
+      inbox," cannot meter spend, and records nothing an auditor could use.</li>
+    <li><b>Hosted delegation.</b> A multi-tenant SaaS chief-of-staff sees your investor threads,
+      customer deals, and credentials by construction. For a class of high-trust work, that is
+      disqualifying regardless of the vendor's controls — the objection is structural, not
+      reputational.</li>
+  </ul>
+  <p class="mut">
+    The missing artifact is a substrate you own: one that runs agents while you are not looking
+    and can afterward show you — and, on the roadmap, show a third party — exactly what
+    happened, with the boundaries enforced by code rather than promised by a prompt.
+  </p>
+
+  <h2 id="thesis">3. The thesis: agents as the primitive</h2>
+  <p>
+    In a conventional OS the kernel's managed unit is the process and the human-facing unit is
+    the application. agentOS replaces that center of gravity. The managed unit is an
+    <b>agent</b>: a long-lived, stateful, non-deterministic entity defined by a role, a working
+    context (its RAM), a connection to a model (its CPU), a set of capabilities exposed as
+    tools, persistent memory, and a lifecycle — spawn, run, suspend, resume, delegate,
+    terminate. There are no applications; the things a user would "open" are things an agent
+    <em>invokes</em>.
+  </p>
+  <table>
+    <thead><tr><th>Classical OS</th><th>agentOS analogue</th></tr></thead>
+    <tbody>
+      <tr><td>Process / thread</td><td>Agent — the schedulable, isolatable unit</td></tr>
+      <tr><td>Application</td><td>A <em>role</em> an agent plays; capabilities are tools, not apps</td></tr>
+      <tr><td><code>exec()</code> a binary</td><td>Spawn an agent from a spec: role + tools + budget + memory</td></tr>
+      <tr><td>Shell / login</td><td>Natural-language intent, or a root orchestrator agent</td></tr>
+      <tr><td>init / systemd (PID 1)</td><td><code>agentd</code> — the agent supervisor <em>is</em> the userspace</td></tr>
+      <tr><td>Syscall table</td><td>The tool ABI — MCP; tools are syscalls to the world</td></tr>
+      <tr><td>IPC (pipes, D-Bus)</td><td>Structured inter-agent messages</td></tr>
+      <tr><td>CPU time (the scarce resource)</td><td><b>Inference slots, token/$ budgets, tool rate limits</b></td></tr>
+      <tr><td><code>/proc</code></td><td><code>/agents/&lt;id&gt;/{context,memory,tools,budget}</code> via FUSE</td></tr>
+    </tbody>
+  </table>
+  <p class="mut">
+    This table is the spine of the design. A feature that cannot be mapped onto the right-hand
+    column belongs to the host Linux layer and is left alone — the kernel is not the
+    innovation; the userspace reconception is.
+  </p>
+
+  <h3>3.1 Two constitutional decisions</h3>
+  <p>Two choices were made deliberately, early, and are treated as locked:</p>
+  <ul>
+    <li><b>Cognition is remote.</b> The device is a thin agent host; the model is an API call
+      behind an inference gateway. There are no local weights and no local inference engine.
+      This is the difference between an OS that is genuinely ~2&nbsp;MB and one where "light"
+      means a lean shell around a necessarily heavy model. A local backend may arrive later
+      only as another gateway implementation, never as a core assumption.</li>
+    <li><b>Single-tenant.</b> One person's agents on one box, mutually trusting, in-process.
+      Capability scoping between agents exists for least privilege — a prompt-injected agent
+      should hold the smallest possible blast radius — not because agents distrust each other.
+      Multi-tenant hardening is explicitly out of scope.</li>
+  </ul>
+
+  <h3>3.2 Why light matters</h3>
+  <p class="mut">
+    "Super light" is not an aesthetic. Remote cognition plus a ~2&nbsp;MB static binary means
+    agentd runs on hardware people actually own — an Apple Silicon Mac, a Raspberry Pi, an ARM
+    home server — not only on x86 cloud VMs. That is what makes this an <em>OS you own</em>
+    rather than <em>a cloud you rent</em>, and it is a precondition of the thesis: the
+    high-trust work that motivates the project is exactly the work its operators will not put
+    in someone else's cloud.
+  </p>
+
+  <h2 id="architecture">4. Architecture</h2>
+  <p>
+    agentd is one process. Everything below runs inside it except the tool servers, which are
+    separate sandboxed processes.
+  </p>
+
+  <h3>4.1 The scheduler</h3>
+  <p>
+    One cooperative loop steps every agent toward its next effect; nothing runs in parallel
+    inside a turn, so the flight log reads as a clean sequence. The scheduler owns the two
+    resources that actually matter for agents:
+  </p>
+  <ul class="muted-li">
+    <li><b>Budgets.</b> Token and dollar spend is metered per agent and globally, with a
+      rolling reset window. The admission gate is pre-turn: an agent over its window is
+      <em>deferred</em>, not bricked, so a burst costs latency rather than the agent. The fuse
+      has stopped a real runaway loop.</li>
+    <li><b>Checkpoints.</b> All agents are snapshotted at turn boundaries and restored after a
+      crash or restart. A SIGTERM landing mid-tool-call is sealed on the checkpoint copy —
+      never the live transcript — so a restore does not replay a transcript the model provider
+      rejects. Restore is <b>at-least-once</b> for tool side effects, not exactly-once; that
+      limit is stated in the runbook, not glossed.</li>
+  </ul>
+  <p class="mut">
+    <b>Sealed jobs.</b> A parent can trigger a job whose capabilities and instructions come from
+    config, never from the caller, and receives only a completion signal — never the job's
+    output. This is the answer to an injected orchestrator: a compromised trigger cannot read
+    your mail through a child it spawned.
+  </p>
+
+  <h3>4.2 The capability system</h3>
+  <p>
+    Every agent runs with an explicit grant set: which tools, which filesystem prefixes, which
+    hosts and ports, which memory segments, what spend. The checks are in-process Rust at the
+    tool-invocation boundary — enforcement is external to the agent's reasoning, because a
+    non-deterministic actor cannot be trusted to police itself. Spawned children may only
+    receive an attenuated subset of the parent's grants; an over-grant is rejected at spawn, not
+    silently clamped. A boot-time linter (<code>agentd check --strict</code>) fails closed on
+    mis-wired grants.
+  </p>
+
+  <h3>4.3 Tools: MCP as the ABI</h3>
+  <p>
+    Anything an agent does to the world is a Tool, and MCP is the tool ABI — over stdio and
+    streamable HTTP. Native tools exist only for zero-dependency convenience. Tool servers run
+    as separate subprocesses under tiered sandboxing (§5), and event triggers (cron,
+    filesystem, webhook) let the world wake an agent up.
+  </p>
+
+  <h3>4.4 The credential broker</h3>
+  <p>
+    Agents and tool servers never hold raw credentials. OAuth tokens and API secrets live
+    behind a broker inside agentd; sidecars receive an ephemeral broker token valid for one
+    spawn. Upstream hosts are allowlisted and IP-pinned at startup. A memory dump of an agent
+    yields inert placeholders — credential exfiltration is killed structurally. (This does not
+    stop data being laundered <em>through</em> an allowlisted channel; that is a different
+    threat, and we say so.)
+  </p>
+
+  <h3>4.5 The memory substrate</h3>
+  <p>
+    Four tiers with provenance: the in-context working set; per-agent short- and long-term
+    stores on an embedded key-value engine (redb); a shared knowledge base with namespaces and
+    mutability classes (<code>log</code>, <code>scratch</code>, <code>canon</code> — the store
+    enforces who may write what and how keys are assigned); and a semantic index behind an
+    optional sidecar. Memory is exposed to agents as tools and to the operator through the
+    filesystem surface. The semantic tier degrades honestly: without an embeddings key, search
+    returns an explicit empty rather than arbitrary nearest-neighbours, and degraded writes land
+    in a separate namespace.
+  </p>
+
+  <h3>4.6 The inference gateway</h3>
+  <p>
+    The only way to reach a model, and the one place cognition enters the system. Remote by
+    construction; metered, retried, streamed, and receipted. Every request logs the numbers
+    that decide context paging (<code>retained_tokens_est</code>, <code>paging_limit</code>,
+    <code>paging_limit_source</code>) — added after a production diagnosis had to be done by
+    mounting a Docker volume and inferring intent from tool-call previews.
+  </p>
+
+  <h3>4.7 The flight recorder</h3>
+  <p>
+    An append-only structured JSONL log of every meaningful step: prompts, tool calls,
+    capability verdicts, approvals, budget decisions. Logging is best-effort by design and must
+    never crash an agent. Built on day one, because non-determinism makes it non-optional: it
+    is the debugging substrate, the audit substrate, and the raw material the evidence pipeline
+    signs. The same stream fans out over SSE to the operator surfaces.
+  </p>
+
+  <h3>4.8 The evidence chain</h3>
+  <p>
+    Model calls — allowed <em>and denied</em> — are receipted into a hash-chained,
+    Ed25519-signed log, rotated into independently verifiable segments, with an offline
+    verifier (<code>agentctl verify</code>). Its three honest limits are documented in the
+    threat model and repeated in §6, because they are the most load-bearing paragraphs in the
+    project.
+  </p>
+
+  <h3>4.9 Operator surfaces</h3>
+  <ul class="muted-li">
+    <li><b><code>agentctl watch</code></b> — a terminal cockpit: every agent, spend,
+      capabilities, live output, logs, topology, memory, and an approval queue, with row-scoped
+      control verbs (cancel, set budget, park) on the same screen as the evidence.</li>
+    <li><b><code>/agents</code> FUSE filesystem</b> (Linux) — the system as files; read-only
+      except one control inode.</li>
+    <li><b>A management HTTP API</b> with SSE fan-out; every mutating route gated by a
+      constant-time approval token when configured.</li>
+    <li><b>The morning brief</b> — the reference workload's daily artifact, delivered as
+      markdown on disk and over Telegram, with staleness surfaced on the read path (a brief
+      that stopped being produced announces itself, because a field written only on success can
+      never report failure).</li>
+  </ul>
+
+  <h3>4.10 The distro</h3>
+  <p class="mut">
+    agentOS as an image: a Buildroot external tree — stripped kernel, musl, BusyBox, immutable
+    rootfs — that boots QEMU (x86_64 and aarch64) straight into agentd as PID&nbsp;1, with the
+    FUSE control plane mounted and no login shell. The same binary ships in a multi-arch Docker
+    image for the Mac path, which is the one dogfooded daily.
+  </p>
+
+  <h2 id="security">5. The security model, stated the way we'd want to hear it</h2>
+  <p>
+    Every claim in this project carries one of three labels, and the same vocabulary runs
+    through the site, the docs, and the interactive architecture schematic:
+  </p>
+  <ul>
+    <li><b>enforced</b> — code stops you; tests cover it.</li>
+    <li><b>declared</b> — a config or prompt says so; nothing beneath it enforces it.</li>
+    <li><b>not built</b> — it does not exist yet, however good the spec is.</li>
+  </ul>
+  <p>
+    The load-bearing distinction is <b>capability layer vs. isolation boundary</b>. Landlock +
+    seccomp + namespaces is a <em>capability layer</em>: least-privilege on a process that still
+    shares the host kernel. It is not an isolation boundary strong enough for untrusted or
+    foreign-framework code; for that, the floor is a microVM or a user-space kernel (gVisor),
+    and the runtime's isolation tiers report which one a workload actually got.
+  </p>
+  <p class="mut">Enforcement is also a function of platform, and the architecture schematic renders it that way:</p>
+  <table>
+    <thead><tr><th>Control</th><th>Mac · Docker (aarch64)</th><th>Linux · QEMU (x86_64)</th></tr></thead>
+    <tbody>
+      <tr><td>agentd capability checks</td><td><b>enforced</b></td><td><b>enforced</b></td></tr>
+      <tr><td>Landlock FS confinement</td><td>unavailable</td><td><b>enforced</b></td></tr>
+      <tr><td>Landlock per-port net</td><td>unavailable (fails open, with a startup warning)</td><td><b>enforced</b></td></tr>
+      <tr><td>seccomp-bpf</td><td>unavailable</td><td><b>enforced</b></td></tr>
+      <tr><td>DenySpawn</td><td>unavailable (x86_64-gated)</td><td><b>enforced</b></td></tr>
+      <tr><td>gVisor tier</td><td>not present</td><td>declared (detected if installed)</td></tr>
+      <tr><td>Container / VM boundary</td><td><b>enforced</b> (coarse)</td><td><b>enforced</b> (coarse)</td></tr>
+      <tr><td>Credential broker allowlist</td><td><b>enforced</b></td><td><b>enforced</b></td></tr>
+    </tbody>
+  </table>
+  <div class="callout red">
+    <p class="k">what we refuse to say</p>
+    <p>"Watertight." Anyone who can call a model can, in principle, launder data through it —
+    the model channel is itself a covert channel.</p>
+  </div>
+  <div class="callout green">
+    <p class="k">what we do say</p>
+    <p>Allowlist-only egress, every allowed call metered and audited, approval gates on risky
+    actions, structural anti-credential-theft, a budget fuse that has actually stopped a
+    runaway, and a tamper-evident audit trail. Defense-in-depth plus accountability, not a
+    hermetic seal.</p>
+  </div>
+
+  <h2 id="evidence">6. Evidence: enforce in real time, prove after the fact</h2>
+  <p>
+    Agent governance splits into two halves with different physics. <b>Enforcement</b> must be
+    native and instantaneous — proving a policy decision in a zkVM takes seconds, an agent
+    runtime makes thousands of calls a day, so cryptography in the authorization path is a
+    denial-of-service against the runtime itself. <b>Evidence</b> must be cryptographic and
+    checkable by someone who does not trust you. agentd enforces; a separate pipeline proves;
+    the prover never sits in front of an action and never enters agentd's dependency tree.
+  </p>
+  <p>
+    What cryptography can prove about the log: <b>integrity</b> (not modified or reordered
+    after writing), <b>rewind detection</b> once custody anchoring lands, and <b>policy
+    consistency</b> once zk replay lands — every published decision re-evaluates to the same
+    verdict under a committed policy, without revealing the policy.
+  </p>
+  <div class="honesty">
+    <p class="k">what no signature or proof can say</p>
+    <p>
+      <b>Completeness.</b> An action that was never journaled produces no gap; "every action
+      was recorded" is a property of the boundary, not of any proof over its output. Today's
+      chain has two further stated limits: coverage is model calls only, and the signing key
+      lives on the audited host — the chain proves integrity relative to a local key, which is
+      self-attestation, not third-party evidence. The verification ladder (coverage and custody
+      anchoring → auditor-side trust root → one shared policy-evaluation artifact → decision
+      journal with native replay → zk batch replay proofs → fleet-scale verification) is
+      specced and sequenced so the proof lands on top of auditor-grade evidence, never ahead of
+      it. The zk rung stays unbuilt until a concrete counterparty exists whose verifier must not
+      see the policy — when the verifier owns the policy, native replay gives the same
+      assurance for free. Closing the completeness seam structurally requires hardware
+      attestation with credentials sealed inside the attested boundary; it is sketched,
+      honestly scoped to brokered actions, and not scheduled.
+    </p>
+  </div>
+
+  <h2 id="workload">7. The reference workload</h2>
+  <p>
+    The workload that drives the work is a standing <b>chief of staff</b>: three of the
+    seventeen shipped agent templates wired together — a de-privileged cron trigger holding
+    only <code>{cron_trigger, RunJob}</code>, a sealed inbox job that reads Gmail metadata
+    (headers plus a ~200-character snippet, never bodies), and a sealed curator with no Gmail
+    access at all that assembles a morning brief from what the inbox job wrote. Separation of
+    duty is structural: the job that reads untrusted email cannot write your files, and the job
+    that writes your files cannot read your mail.
+  </p>
+  <p class="mut">
+    It is not the product. It exists to put the substrate under real conditions, and it earns
+    its keep by failing informatively. The uptime drought traced to a missing Docker restart
+    policy, not brief logic. The "handled items re-list" premise was falsified by tracing the
+    read path. The context-paging fix that an audit headlined was measured to be arithmetically
+    inert on the agent it named — and enabling it would have been an active regression, silently
+    dropping the oldest emails. The current increment (scheduler-native cron) exists because
+    measurement showed an LLM sitting on a schedule boundary burns ~3,456 inference calls a day
+    to watch a clock. Each of these corrections is recorded in the repo rather than edited out
+    of it.
+  </p>
+
+  <h2 id="prior-art">8. Prior art, and the gap</h2>
+  <ul>
+    <li><b>Karpathy's LLM-as-OS framing</b> is the mental model: model as CPU, context as RAM,
+      tools as syscalls. A metaphor, not a system — but the abstractions here line up with it.</li>
+    <li><b>MemGPT/Letta</b> turned the memory half into a mechanism: two-tier memory with
+      model-driven paging, and an event-driven loop where agents idle until something happens.
+      Both are borrowed.</li>
+    <li><b>AIOS</b> (Rutgers, COLM 2025) is the closest system and the important
+      differentiation: an "AIOS kernel" that is a userspace runtime <em>on top of</em> a normal
+      Linux, where agents are still ordinary processes managed by a library.</li>
+    <li><b>MCP / A2A / ACP</b> are treated as the POSIX of this world: build on the emerging
+      standards, don't fork them.</li>
+  </ul>
+  <p class="mut">
+    The gap runtime1 fills is pushing "agent as primitive" <em>down the stack</em>: a distro
+    where the agent runtime is the userspace (PID&nbsp;1, the boot target), where there are no
+    general-purpose apps, where agent state is exposed through kernel-adjacent surfaces — and
+    where the governance (capabilities, budgets, evidence) is native to that layer rather than
+    layered on as a framework. AIOS is a blueprint for a runtime's internal modules; runtime1's
+    contribution is making those modules the operating system, in a super-light footprint, with
+    an evidence story that states its own limits.
+  </p>
+
+  <h2 id="status">9. What exists today, and what is still a hypothesis</h2>
+  <p>
+    <span class="badge enf">built &amp; tested</span> (v0.121.0): the multi-agent scheduler with
+    token/$ metering and the rolling budget fuse; checkpoint/restore that survives SIGTERM
+    mid-tool-call; the capability system with spawn-time attenuation and a strict linter; the
+    tiered sandbox (Landlock, seccomp, namespaces, gVisor detection); four-tier memory with
+    provenance and mutability classes; MCP over stdio and HTTP/SSE; streaming inference; the
+    credential broker; the signed receipt chain with offline verification; the
+    <code>/agents</code> FUSE surface; the management API; the <code>agentctl</code> cockpit;
+    seventeen agent templates; the Buildroot/QEMU distro path; and the chief-of-staff reference
+    workload, dogfooded daily against a real inbox.
+  </p>
+  <p>
+    <span class="badge road">specced, not built</span>: full action coverage and custody
+    anchoring, the auditor-side trust root, the shared policy artifact, the decision journal and
+    native replay, zk batch replay proofs, fleet-scale verification, hardware isolation per
+    agent, and skills as governed objects.
+  </p>
+  <div class="honesty">
+    <p class="k">the hypothesis under test</p>
+    <p>
+      That a high-trust slice of work will never go to multi-tenant SaaS and wants an owned
+      substrate — and that putting the guarantees in an operating system makes unsupervised
+      agents genuinely trustworthy rather than differently untrustworthy. That is an open
+      question. The dogfood metric that decides the current chapter is unsentimental: does the
+      operator stop checking email manually for fourteen consecutive days?
+    </p>
+  </div>
+  <p class="mut">
+    "Light" is also measured, not asserted: image size, idle RAM, boot-to-first-agent,
+    agents-per-GB, and budget-enforcement accuracy are the tracked numbers; the runtime binary
+    is ~2&nbsp;MB and the size is CI-guarded.
+  </p>
+
+  <h2 id="further">10. How to read the rest of the project</h2>
+  <ul class="muted-li">
+    <li><a href="https://github.com/0x89karan/runtime1/blob/main/docs/DESIGN.md"><code>docs/DESIGN.md</code></a> — the full design and research synthesis (the <em>why</em>).</li>
+    <li><a href="https://github.com/0x89karan/runtime1/blob/main/docs/ROADMAP.md"><code>docs/ROADMAP.md</code></a> — the staged build plan and work queue (or the friendlier <a href="roadmap.html">roadmap page</a>).</li>
+    <li><a href="https://github.com/0x89karan/runtime1/blob/main/docs/THREAT_MODEL.md"><code>docs/THREAT_MODEL.md</code></a> — the security posture, including §8.7's account of what the evidence chain cannot prove.</li>
+    <li><a href="https://github.com/0x89karan/runtime1/blob/main/docs/PRODUCT-LANGUAGE.md"><code>docs/PRODUCT-LANGUAGE.md</code></a> — the one-page naming and claim-vocabulary reference.</li>
+    <li>The website's <a href="architecture.html">interactive schematic</a> — the running system, box by box, with every badge honest about enforced vs. declared vs. absent, per platform.</li>
+  </ul>
+
+  </div><!-- .paper-body -->
+
+  <hr class="paper-rule thin">
+  <p class="paper-colophon">
+    The source of truth is the code, not this paper. Where they disagree, the code wins and
+    this paper gets corrected — that has already happened to bolder claims than any made here.
+  </p>
+
+  </div><!-- .paper-inner -->
+  </article>
+
+  <div class="next">
+    <a class="btn" href="thesis.html">Read the thesis →</a>
+    <a class="btn" href="architecture.html">Open the schematic</a>
+    <a class="btn ghost" href="https://github.com/0x89karan/runtime1/blob/main/docs/WHITEPAPER.md">Raw markdown on GitHub</a>
+  </div>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>
