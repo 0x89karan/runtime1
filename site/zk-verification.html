@@ -87,6 +87,48 @@
       load-bearing paragraph in the repo, and it is written down rather than glossed over.</li>
   </ul>
 
+  <h2>See it happen <span class="badge enf">shipped mechanics</span></h2>
+  <p class="mut">
+    A faithful miniature of the two rows above: the same event kinds, a hash-chained-then-signed
+    construction, and the check an outside verifier actually runs. Once the chain is signed, try
+    removing an action on the left — that's the one property a hash chain exists to guarantee.
+  </p>
+
+  <div class="vd-grid" data-verify-demo>
+    <div class="rec vd-col">
+      <div class="rec-hd">
+        <span class="gn">1</span>
+        <span class="dot" aria-hidden="true"></span>
+        <span class="file">flight.jsonl · agent=cos-inbox</span>
+        <div class="rec-ctl"><button type="button" data-vd-replay>↻ replay</button></div>
+      </div>
+      <div class="rec-log vd-log" data-vd-actions role="log" aria-live="off" aria-label="Agent actions"></div>
+      <p class="rec-out vd-note" data-vd-hint>recording…</p>
+    </div>
+
+    <div class="rec vd-col">
+      <div class="rec-hd">
+        <span class="gn">2</span>
+        <span class="file">proof generation</span>
+      </div>
+      <div class="rec-log vd-log" data-vd-proof role="log" aria-live="off" aria-label="Proof generation steps"></div>
+      <p class="rec-out vd-note" data-vd-artifact>waiting for the run to finish…</p>
+    </div>
+
+    <div class="rec vd-col">
+      <div class="rec-hd">
+        <span class="gn">3</span>
+        <span class="file">verification — external auditor</span>
+      </div>
+      <div class="rec-log vd-log" data-vd-verify role="log" aria-live="off" aria-label="Verification steps"></div>
+      <p class="rec-out vd-note" data-vd-verdict>waiting for a proof…</p>
+    </div>
+  </div>
+  <p class="rec-cap">Illustrative hashing, not the real primitive — the shipped chain is SHA-256
+  linked and Ed25519-signed; this shows the shape of the check, not the cipher. Everything else
+  is faithful: an action removed after signing changes the recomputed root, the signed root
+  doesn't move, and the mismatch is exactly what <code>agentctl verify</code> would catch.</p>
+
   <h2>The honest core: what evidence can and cannot say</h2>
   <div class="two">
     <div class="callout green">
@@ -209,6 +251,51 @@
     <p>4 — Every claim names its seam. Integrity, rewind detection, and policy consistency
     are provable; completeness is a boundary property; we label which is which everywhere.</p>
   </div>
+
+  <h2>See <code>zk.2</code>, illustrated <span class="badge gated">needs a real use case · not built</span></h2>
+  <p class="mut">
+    Not running code — <code>zk.2</code> is unbuilt on purpose (see above). This shows what it
+    would prove that the hash chain above cannot: <em>policy consistency</em> instead of
+    integrity, checked by a verifier who never sees the policy, only a commitment to it.
+    Flip a verdict on the left after the proof is generated, the same way you removed a receipt
+    above, and watch the same class of failure show up for a different reason.
+  </p>
+
+  <div class="vd-grid vd-grid--zk" data-zk-demo>
+    <div class="rec vd-col">
+      <div class="rec-hd">
+        <span class="gn">1</span>
+        <span class="dot" aria-hidden="true"></span>
+        <span class="file">decision journal · agent=cos-inbox</span>
+        <div class="rec-ctl"><button type="button" data-zk-replay>↻ replay</button></div>
+      </div>
+      <div class="rec-log vd-log" data-zk-decisions role="log" aria-live="off" aria-label="Policy decisions"></div>
+      <p class="rec-out vd-note" data-zk-hint>recording…</p>
+    </div>
+
+    <div class="rec vd-col">
+      <div class="rec-hd">
+        <span class="gn">2</span>
+        <span class="file">prove — zkVM, offline</span>
+      </div>
+      <div class="rec-log vd-log" data-zk-prove role="log" aria-live="off" aria-label="Proof generation steps"></div>
+      <p class="rec-out vd-note" data-zk-artifact>waiting for the run to finish…</p>
+    </div>
+
+    <div class="rec vd-col">
+      <div class="rec-hd">
+        <span class="gn">3</span>
+        <span class="file">verify — no policy access</span>
+      </div>
+      <div class="rec-log vd-log" data-zk-verify role="log" aria-live="off" aria-label="Verification steps"></div>
+      <p class="rec-out vd-note" data-zk-verdict>waiting for a proof…</p>
+    </div>
+  </div>
+  <p class="rec-cap">The policy itself never appears above — only a commitment to it. That's the
+  one thing this rung can do that the shipped chain cannot: prove a decision matched a policy
+  without revealing the policy. Everything about <em>when</em> it ships is real: gated on a
+  named counterparty whose verifier must not see the policy, because until then native replay
+  gives the same assurance for free.</p>
 
   <h2>The verifier's experience, end state</h2>
   <p>
