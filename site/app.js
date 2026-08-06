@@ -53,7 +53,7 @@
 
   /* ─── scroll progress + sticky nav ─────────────────────────────────────── */
   var bar = document.querySelector('.progress span');
-  var nav = document.querySelector('.nav');
+  var nav = document.querySelector('.topbar') || document.querySelector('.nav');
   var ticking = false;
 
   function onScroll() {
