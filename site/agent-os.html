@@ -118,8 +118,8 @@ li b,p b{color:var(--text)}
   <p>
     Agents that touch real, sensitive systems — email, CRM, code, deals, a cap table — can't be
     run unsupervised today. You either babysit them with per-action approval prompts, sandbox
-    the whole process coarsely in a container and hope, or hand your crown-jewel operations to
-    a multi-tenant SaaS you don't control.
+    the whole process coarsely in a container and hope, or hand your most sensitive operations
+    to a hosted service you don't control.
   </p>
   <p class="mut">
     None of those let a <em>team</em> of agents coordinate across your systems, 24/7, while
@@ -237,7 +237,7 @@ li b,p b{color:var(--text)}
     <p class="cap">Interactive — click any component. Or <a href="architecture.html">open it full-page →</a></p>
   </div>
 
-  <h2>What exists today vs. what is a bet</h2>
+  <h2>What exists today, and what is still a hypothesis</h2>
   <p>
     <b>Built and tested:</b> the multi-agent scheduler with token/$ metering and the rolling
     budget fuse; the capability sandbox (Landlock, seccomp, namespaces, gVisor tiering);
@@ -247,9 +247,12 @@ li b,p b{color:var(--text)}
     and a standing chief-of-staff workload dogfooded daily against a real inbox.
   </p>
   <p class="mut">
-    <b>The bet:</b> that a high-trust slice of work will never go to multi-tenant SaaS and
-    wants an owned substrate — true whether SaaS broadly thrives or shrinks. We are not
-    betting "SaaS is dead"; we need SaaS to exist as the distrusted default.
+    <b>The hypothesis under test:</b> that some work is sensitive enough that it will never
+    be handed to somebody else's multi-tenant cloud, and that the right home for it is a
+    substrate you run yourself. This is not a claim that hosted services are going away — the
+    interesting case only exists because most software is hosted. The experiment is whether
+    putting the guarantees in an OS makes unsupervised agents genuinely trustworthy, or just
+    differently untrustworthy. That is an open question, and the code is how it gets answered.
   </p>
 
   <div class="next">
