@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>runtime1 — the operating system where agents are the primitive</title>
-<meta name="description" content="runtime1 is an open-source, Linux-based operating system whose primitive is the agent, not the application. Every agent bounded by capability, every action brokered and recorded, with a verifiable evidence trail.">
+<title>runtime1 — building the operating system where agents are the primitive</title>
+<meta name="description" content="runtime1 is the open-source project building agentOS — a Linux-based operating system whose primitive is the agent, not the application. Every agent bounded by capability, every action brokered and recorded, with a verifiable evidence trail.">
 <link rel="stylesheet" href="style.css">
 <script>try{var t=localStorage.getItem('runtime1-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
 </head>
@@ -40,10 +40,11 @@
     <p class="eyebrow">an open-source experiment · Linux-based · ~2 MB runtime</p>
     <h1>The operating system where agents are the primitive, not applications.</h1>
     <p class="sub">
-      runtime1 runs a team of AI agents on hardware you own. It is an operating system where
-      every agent is bounded by the capabilities it was granted, every tool and model call is
-      brokered and recorded, and everything an agent does lands in an evidence trail you can
-      verify — so agents can run unsupervised on systems that matter.
+      runtime1 is the open-source project building agentOS: an operating system that runs a
+      team of AI agents on hardware you own. Every agent is bounded by the capabilities it was
+      granted, every tool and model call is brokered and recorded, and everything an agent does
+      lands in an evidence trail you can verify — so agents can run unsupervised on systems
+      that matter.
     </p>
     <div class="cta">
       <a class="btn primary" href="https://github.com/0x89karan/runtime1">View on GitHub</a>
@@ -181,7 +182,7 @@
       <div class="card" data-reveal>
         <p class="k">01 · agents, not apps</p>
         <h3>A new primitive</h3>
-        <p>A normal operating system schedules processes and CPU time. runtime1 schedules <em>agents</em> and
+        <p>A normal operating system schedules processes and CPU time. agentOS schedules <em>agents</em> and
         the resources that actually matter for them: inference slots, token budgets, dollars,
         and tool access. The runtime (<code>agentd</code>) boots as PID&nbsp;1 — there is no
         desktop, no apps, just agents and their tools.</p>
@@ -211,11 +212,11 @@
     <div class="doors">
       <a class="door" href="thesis.html" data-reveal>
         <p class="k">thesis 1 · the substrate</p>
-        <h3>runtime1 — the agent operating system</h3>
+        <h3>agentOS — the agent operating system</h3>
         <p>Why "agent frameworks on a normal operating system" is the wrong shape, what it means to push the
         agent down to the primitive, and how <code>agentd</code> replaces init, the shell, and
         the application model in ~2&nbsp;MB. Includes the interactive runtime schematic.</p>
-        <span class="go">Read the runtime1 thesis →</span>
+        <span class="go">Read the agentOS thesis →</span>
       </a>
       <a class="door" href="zk-verification.html" data-reveal>
         <p class="k">thesis 2 · the evidence</p>
@@ -338,22 +339,30 @@
 
   <section class="section">
     <h2>How the pieces are named</h2>
-    <p class="lead">Two names, one stack — worth getting straight before anything else.</p>
-    <div class="plain two">
+    <p class="lead">Three names, one stack — worth getting straight before anything else.</p>
+    <div class="plain">
+      <div class="card" data-reveal>
+        <p class="k">the project</p>
+        <h3>runtime1</h3>
+        <p>The open-source experiment as a whole: the operating system, the runtime, the
+        operator tooling (<code>agentctl</code>), the tool servers, the verification
+        pipeline, and the docs. When we talk about "the repo" or "the experiment," this is
+        the name.</p>
+      </div>
       <div class="card" data-reveal>
         <p class="k">the operating system</p>
-        <h3>runtime1</h3>
+        <h3>agentOS</h3>
         <p>A minimal Linux base whose entire userspace is the agent runtime: no desktop, no
-        apps, no login shell, just agents and the tools they invoke. The name also covers the
-        rest of the open-source project — the operator tooling (<code>agentctl</code>), the
-        tool servers, the verification pipeline, and the docs.</p>
+        apps, no login shell, just agents and the tools they invoke. This is the artifact the
+        project exists to build — the OS where agents are the primitive.</p>
       </div>
       <div class="card" data-reveal>
         <p class="k">the runtime process</p>
         <h3>agentd</h3>
-        <p>runtime1's runtime binary — a ~2&nbsp;MB Rust daemon that boots as PID&nbsp;1 and
+        <p>agentOS's runtime binary — a ~2&nbsp;MB Rust daemon that boots as PID&nbsp;1 and
         <em>is</em> the userspace. It holds the scheduler, the capability system, the memory
-        substrate, the gateways, and the flight recorder.</p>
+        substrate, the gateways, and the flight recorder. Today it also runs as an ordinary
+        binary on a normal distro.</p>
       </div>
     </div>
   </section>
@@ -389,15 +398,15 @@
     model, and tell us where the argument breaks.</p>
     <div class="cta">
       <a class="btn primary" href="https://github.com/0x89karan/runtime1">View on GitHub</a>
-      <a class="btn ghost" href="thesis.html">Read the runtime1 thesis</a>
+      <a class="btn ghost" href="thesis.html">Read the agentOS thesis</a>
       <a class="btn ghost" href="architecture.html">Open the schematic</a>
     </div>
   </section>
 
   <footer>
     <div class="row">
-      <span>runtime1 — an open-source agent operating system</span>
-      <a href="thesis.html">runtime1 thesis</a>
+      <span>runtime1 — the open-source project building agentOS</span>
+      <a href="thesis.html">agentOS thesis</a>
       <a href="zk-verification.html">Verification thesis</a>
       <a href="architecture.html">Runtime schematic</a>
       <a href="https://github.com/0x89karan/runtime1">GitHub</a>

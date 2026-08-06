@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>runtime1 — the thesis</title>
+<title>runtime1 — the agentOS thesis</title>
 <meta name="description" content="Why the agent should be the operating system's primitive: a minimal Linux distro whose entire userspace is the agent runtime, scheduling tokens and dollars instead of CPU time.">
 <link rel="stylesheet" href="style.css">
 <script>try{var t=localStorage.getItem('runtime1-theme');if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
@@ -39,15 +39,15 @@
   <p class="eyebrow">thesis 1 · the substrate</p>
   <h1>The agent is the primitive. Everything else follows.</h1>
   <p class="lead">
-    <b>runtime1</b> is the operating system at the core of runtime1: a minimal, Linux-based
+    <b>agentOS</b> is the operating system at the core of runtime1: a minimal, Linux-based
     system whose unit of execution, scheduling, and isolation is the <em>agent</em>, not the
     application — and why that has to live at the operating-system layer, not in a framework.
   </p>
   <div class="callout">
     <p class="k">naming, once</p>
-    <p><b>runtime1</b> is the project. <b>runtime1</b> is the operating system inside it — the
-    part that runs the agents. <b>agentd</b> is runtime1's runtime binary: the ~2&nbsp;MB Rust
-    daemon that boots as PID&nbsp;1 and <em>is</em> the userspace. This page is about runtime1.</p>
+    <p><b>runtime1</b> is the project. <b>agentOS</b> is the operating system inside it — the
+    part that runs the agents. <b>agentd</b> is agentOS's runtime binary: the ~2&nbsp;MB Rust
+    daemon that boots as PID&nbsp;1 and <em>is</em> the userspace. This page is about agentOS.</p>
   </div>
 
   <h2>The problem nobody's runtime solves</h2>
@@ -67,7 +67,7 @@
   <h2>What "agents as the primitive" means</h2>
   <p>
     In a conventional operating system the kernel's managed unit is the process and the human-facing unit is
-    the application. runtime1 replaces that center of gravity. The managed unit is an
+    the application. agentOS replaces that center of gravity. The managed unit is an
     <b>agent</b>: a long-lived, stateful, non-deterministic entity defined by a role, a working
     context (its RAM), a connection to a model (its CPU), a set of capabilities exposed as
     tools, persistent memory, and a lifecycle — spawn, run, suspend, resume, delegate,
@@ -75,7 +75,7 @@
     <em>invokes</em>.
   </p>
   <table>
-    <thead><tr><th>Classical operating system</th><th>runtime1 analogue</th></tr></thead>
+    <thead><tr><th>Classical operating system</th><th>agentOS analogue</th></tr></thead>
     <tbody>
       <tr><td>Process / thread</td><td>Agent — the schedulable, isolatable unit</td></tr>
       <tr><td>Application</td><td>A <em>role</em> an agent plays; capabilities are tools, not apps</td></tr>

@@ -40,7 +40,7 @@
   <h1>Enforce in real time. Prove it after the fact. Say exactly what the proof means.</h1>
   <p class="lead">
     runtime1's verification pipeline splits agent governance into two halves with very
-    different physics: enforcement, which <b>runtime1</b> does natively and instantaneously,
+    different physics: enforcement, which <b>agentd</b> does natively and instantaneously,
     and evidence, which must be cryptographic and checkable by someone who doesn't trust you.
     Confusing the two is how this space overclaims — so we don't.
   </p>
@@ -49,11 +49,11 @@
   <p>
     Proving a policy decision in a zkVM takes seconds; an agent runtime makes thousands of
     tool and model calls a day. Putting cryptography in the authorization path would be a
-    denial-of-service against runtime1 itself. So the pipelines are separated — runtime1
+    denial-of-service against the runtime itself. So the pipelines are separated — agentd
     enforces, and the verification pipeline proves:
   </p>
   <pre>
-  runtime1 ENFORCEMENT (hot path, microseconds)          EVIDENCE PIPELINE (post-hoc, crypto)
+  agentd ENFORCEMENT (hot path, microseconds)            EVIDENCE PIPELINE (post-hoc, crypto)
   ┌───────────────────────────────────────┐            ┌─────────────────────────────────────┐
   │ agent requests action                 │            │ every decision → append-only log    │
   │   → capability check                  │  journals  │   Ed25519 hash chain, rotated       │
@@ -225,7 +225,7 @@
   </p>
 
   <div class="next-row">
-    <a class="btn" href="thesis.html">← The runtime1 thesis</a>
+    <a class="btn" href="thesis.html">← The agentOS thesis</a>
     <a class="btn" href="architecture.html">Open the runtime1 schematic</a>
     <a class="btn" href="https://github.com/0x89karan/runtime1">GitHub</a>
   </div>
