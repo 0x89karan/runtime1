@@ -5,97 +5,18 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>runtime1 — the agentOS thesis</title>
 <meta name="description" content="Why the agent should be the operating system's primitive: a minimal Linux distro whose entire userspace is the agent runtime, scheduling tokens and dollars instead of CPU time.">
-<style>
-:root{
-  --ground:#070D1A; --surface:#0E1626; --surface-2:#13203A; --surface-3:#192948;
-  --border:#1C2E4A; --border-bright:#243D64;
-  --text:#CDD6E8; --text-muted:#7089A8; --text-dim:#3B5478;
-  --accent:#E8A030; --accent-dim:rgba(232,160,48,.13);
-  --enforced:#38D48A; --enforced-bg:rgba(56,212,138,.10);
-  --declared:#E8A030; --declared-bg:rgba(232,160,48,.10);
-  --absent:#D45070;   --absent-bg:rgba(212,80,112,.10);
-  --flow:#35C4BB;     --flow-bg:rgba(53,196,187,.10);
-  --mono:'JetBrains Mono','SF Mono','Cascadia Code',Consolas,'Liberation Mono',monospace;
-  --sans:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
-  --r:3px;
-}
-:root[data-theme="light"]{
-  --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
-  --border:#D2DAE6; --border-bright:#B4C1D4;
-  --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
-  --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
-  --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
-  --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
-  --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
-  --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
-}
-@media (prefers-color-scheme:light){
-  :root:not([data-theme="dark"]){
-    --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
-    --border:#D2DAE6; --border-bright:#B4C1D4;
-    --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
-    --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
-    --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
-    --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
-    --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
-    --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
-  }
-}
-*{box-sizing:border-box}
-html,body{margin:0;padding:0}
-body{background:var(--ground);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.65;-webkit-font-smoothing:antialiased}
-.wrap{max-width:880px;margin:0 auto;padding:0 22px 72px}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:1px 5px}
-pre{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px;overflow-x:auto;font-family:var(--mono);font-size:13px;line-height:1.5;color:var(--text-muted)}
-.nav{display:flex;align-items:center;gap:22px;padding:18px 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
-.brand{font-family:var(--mono);font-weight:700;font-size:17px;color:var(--text)}
-.brand b{color:var(--accent)}
-.nav .links{display:flex;gap:18px;margin-left:auto;flex-wrap:wrap}
-.nav .links a{color:var(--text-muted);font-size:14px}
-.nav .links a:hover{color:var(--text);text-decoration:none}
-.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:52px 0 12px}
-h1{font-size:clamp(26px,4.5vw,38px);line-height:1.18;margin:0 0 16px}
-.lead{font-size:18px;color:var(--text-muted);margin:0 0 8px}
-h2{font-size:22px;margin:48px 0 12px;padding-top:18px;border-top:1px solid var(--border)}
-h3{font-size:17px;margin:26px 0 8px}
-p{margin:0 0 14px}
-p.mut{color:var(--text-muted)}
-table{width:100%;border-collapse:collapse;font-size:14px;margin:14px 0}
-th,td{text-align:left;padding:9px 12px;border:1px solid var(--border);vertical-align:top}
-th{background:var(--surface-2);font-family:var(--mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-muted)}
-td{background:var(--surface)}
-td code{white-space:nowrap}
-.callout{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:var(--r);padding:16px 18px;margin:18px 0}
-.callout .k{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 6px}
-.callout p{margin:0;font-size:14.5px;color:var(--text-muted)}
-.callout.green{border-left-color:var(--enforced)}
-.callout.green .k{color:var(--enforced)}
-.callout.red{border-left-color:var(--absent)}
-.callout.red .k{color:var(--absent)}
-ul{margin:0 0 14px;padding-left:22px}
-li{margin-bottom:8px}
-li,p{color:var(--text)}
-li b,p b{color:var(--text)}
-.muted-li li{color:var(--text-muted)}
-.arch-embed{margin:20px 0}
-.arch-embed iframe{width:100%;height:920px;border:1px solid var(--border);border-radius:var(--r);background:var(--ground)}
-.arch-embed .cap{font-size:13px;color:var(--text-dim);margin-top:8px;font-family:var(--mono)}
-.next{display:flex;gap:12px;flex-wrap:wrap;margin-top:40px}
-.btn{display:inline-block;font-family:var(--mono);font-size:14px;padding:10px 18px;border-radius:var(--r);border:1px solid var(--border-bright);color:var(--text)}
-.btn:hover{text-decoration:none;border-color:var(--accent);color:var(--accent)}
-</style>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div class="wrap">
+<div class="wrap doc">
 
   <nav class="nav">
     <span class="brand"><a href="index.html" style="color:inherit">runtime<b>1</b></a></span>
     <div class="links">
-      <a href="agent-os.html" style="color:var(--text)">agentOS</a>
+      <a href="agent-os.html" class="here">agentOS</a>
       <a href="zk-verification.html">Verification</a>
       <a href="architecture.html">Architecture</a>
+      <a href="roadmap.html">Roadmap</a>
       <a href="https://github.com/0x89karan/runtime1">GitHub</a>
     </div>
   </nav>

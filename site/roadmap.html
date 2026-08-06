@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>runtime1 — roadmap</title>
+<meta name="description" content="What runtime1 has built, what is being worked on, what is only specced, and what was deliberately rejected — organized by track, with no dates.">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap doc">
+
+  <nav class="nav">
+    <span class="brand"><a href="index.html" style="color:inherit">runtime<b>1</b></a></span>
+    <div class="links">
+      <a href="agent-os.html">agentOS</a>
+      <a href="zk-verification.html">Verification</a>
+      <a href="architecture.html">Architecture</a>
+      <a href="roadmap.html" class="here">Roadmap</a>
+      <a href="https://github.com/0x89karan/runtime1">GitHub</a>
+    </div>
+  </nav>
+
+  <p class="eyebrow">state of the experiment</p>
+  <h1>What's built, what's being worked on, what was rejected.</h1>
+  <p class="lead">
+    Organized by track, not by release. No dates and no delivery promises — this is one
+    developer's experiment, and the ordering below reflects intent, not a schedule.
+  </p>
+
+  <div class="callout">
+    <p class="k">how to read the labels</p>
+    <p>
+      <span class="badge enf">built &amp; dogfooded</span> running daily against real work ·
+      <span class="badge enf">built</span> works, lightly exercised ·
+      <span class="badge next">in progress</span> actively being built ·
+      <span class="badge road">specced</span> written down, not built ·
+      <span class="badge abs">not doing</span> considered and rejected, reasons below
+    </p>
+    <p>
+      Increment IDs like <code>gov.1</code> map to plan files in <code>docs/plans/</code> if you
+      want to follow the detail. <code>docs/ROADMAP.md</code> is the increment-level source of
+      truth; this page is the coarse view.
+    </p>
+  </div>
+
+  <h2>Tracks</h2>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>The runtime</h3>
+      <span class="badge enf">built &amp; dogfooded</span>
+    </div>
+    <p><code>agentd</code> as PID 1: the agent state machine, a cooperative multi-agent
+    scheduler, metered admission (tokens, dollars, wall-clock) with a rolling reset window,
+    checkpoint/restore that survives a SIGTERM mid-tool-call, and the flight recorder that
+    every other track reads from.</p>
+    <p class="q">Open question: can the scarce resource of an OS really be inference and
+    spend rather than CPU time, all the way down?</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Memory</h3>
+      <span class="badge enf">built &amp; dogfooded</span>
+    </div>
+    <p>Four tiers with provenance: in-context working set, per-agent short and long-term
+    stores on an embedded key-value engine, a shared knowledge base with namespaces and
+    mutability classes, and a semantic index for retrieval. Exposed to agents as tools and to
+    the operator through the filesystem surface.</p>
+    <p class="q">Open question: how much context management should the OS do <em>for</em> an
+    agent before it starts making the agent worse at its job?</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Capabilities &amp; isolation</h3>
+      <span class="badge enf">built</span>
+    </div>
+    <p>Every agent runs with an explicit grant set. Landlock, seccomp and namespaces enforce
+    it at the process boundary; gVisor provides a stronger tier for untrusted workloads;
+    spawned children can only receive an attenuated subset of the parent's grants, and an
+    over-grant is rejected rather than silently clamped. A linter catches the misconfigurations
+    that would otherwise fail open.</p>
+    <p class="q">Open question: is a capability layer ever enough for agent-generated code, or
+    does unsupervised autonomy always need a hardware boundary underneath?</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Tools &amp; connectors</h3>
+      <span class="badge enf">built &amp; dogfooded</span>
+    </div>
+    <p>MCP is the tool ABI, over stdio and streamable HTTP. A credential broker holds OAuth
+    tokens and API secrets so agents never do — they get inert placeholders, and the real
+    values are injected at the egress boundary. Event triggers (cron, filesystem, webhook) let
+    the world wake an agent up.</p>
+    <p class="q">Open question: does brokering every credential actually shrink the blast
+    radius in practice, or just relocate it?</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Operator surface</h3>
+      <span class="badge enf">built</span>
+    </div>
+    <p><code>agentctl</code>: a terminal cockpit for watching agents, topology, memory, logs
+    and spend, with row-level control verbs (cancel, set budget, park) and an approval queue.
+    A management HTTP API behind the same auth, plus reach outside the terminal so a standing
+    agent can ask a question and get an answer back.</p>
+    <p class="q">Open question: what is the smallest surface that lets someone leave agents
+    running and still trust what happened while they were away?</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Evidence &amp; verification</h3>
+      <span class="badge enf">built</span>
+      <span class="badge road">mostly specced</span>
+    </div>
+    <p><b>Built:</b> a hash-chained, Ed25519-signed receipt log of model calls (allowed and
+    denied), rotated into independently verifiable segments, with an offline verifier.</p>
+    <p><b>Specced, not built:</b> full action coverage and custody anchoring
+    (<code>gov.1</code>), an auditor-side trust root (<code>gov.2</code>), a single pure
+    policy-evaluation crate shared by enforcement and proving (<code>zk.0</code>), a decision
+    journal with a native replay verifier (<code>zk.1</code>), zero-knowledge batch replay
+    proofs (<code>zk.2</code>) and verification across many machines (<code>zk.3</code>).
+    The full ladder and its limits are on the <a href="zk-verification.html">verification
+    page</a>.</p>
+    <p class="q">Open question: can a stranger check what an agent did without trusting the
+    machine that did it — and how much of that is honestly achievable at all?</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>The workload</h3>
+      <span class="badge enf">running</span>
+      <span class="badge next">in progress</span>
+    </div>
+    <p>A standing chief-of-staff: agents that read a real inbox, dedupe against semantic
+    memory, and publish a morning brief. It exists to prove the substrate under real
+    conditions, and it is the source of most of the bugs worth fixing. Currently being made
+    reliable — the scheduler needs native cron so no model call sits on a clock boundary
+    (<code>attn.4</code>).</p>
+    <p class="q">Open question: does a bounded agent team actually save its operator time, or
+    just move the work somewhere else? Fourteen days of use decides it.</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Hardware isolation</h3>
+      <span class="badge road">specced</span>
+    </div>
+    <p>A per-agent microVM boundary rather than a shared kernel: hypervisor spike, a vsock
+    control plane, a Python-free guest, and microVM as a tier in the existing isolation ladder.
+    Beyond it sits an attested governor — policy evaluation, the evidence writer, and the
+    credential broker inside a measured confidential guest, with the signing key sealed to the
+    measurement. That is the only approach reviewed so far that closes, rather than narrows,
+    the "was every action recorded" gap — and only for brokered actions.</p>
+    <p class="q">Open question: is hardware attestation worth its complexity for a
+    single-operator system, or is it only meaningful at scale?</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Skills</h3>
+      <span class="badge road">specced</span>
+    </div>
+    <p>Procedural knowledge as a governed OS object: an agent that learns a repeatable
+    procedure should be able to keep it, share it, and have it reviewed — under the same
+    capability rules as everything else, with synthesized skills quarantined until approved.</p>
+    <p class="q">Open question: is a skill just a prompt with better packaging, or a genuine
+    OS primitive that deserves its own lifecycle?</p>
+  </div>
+
+  <h2>Considered and rejected</h2>
+  <p class="mut">
+    The reasoning behind a "no" is usually more useful than another line on a wish list, so
+    the notable ones are kept here rather than quietly dropped. Each was written down at the
+    time; none are hypothetical.
+  </p>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Zero-knowledge proofs in the authorization path</h3>
+      <span class="badge abs">not doing</span>
+    </div>
+    <p>The original design proved each policy decision in a zkVM before the action ran. At
+    seconds per proof against thousands of calls a day, that is a denial-of-service against
+    the runtime it protects. Worse, it would have claimed "mathematical certainty that policy
+    was enforced" while the host still chose which actions to submit for proving. Reshaped
+    into post-hoc batch replay proofs with an honest claim; the original is dead.</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>A per-action signed receipt for every tool call</h3>
+      <span class="badge abs">not doing</span>
+    </div>
+    <p>Widening the existing receipt chain to every action sounded obvious until the cost was
+    measured: a synchronous disk sync per receipt on the caller's thread, inside a writer that
+    fails closed, on a file the runtime reads at boot. Replaced by signing a batched projection
+    of the flight log — which also gets full coverage, without putting a fsync in front of every
+    tool call.</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>A per-agent request rate cap</h3>
+      <span class="badge abs">not doing</span>
+    </div>
+    <p>Built, then withdrawn before it shipped. The counter was monotonic over the process
+    lifetime rather than a real rate limit, so a long-running agent would have hit a hard
+    failure after days of normal operation — with the restart policy faithfully keeping the
+    process alive to reach it. The mechanism and three possible fixes are written down; the
+    feature is not shipping until one of them is real.</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Local model weights</h3>
+      <span class="badge abs">not doing</span>
+    </div>
+    <p>Cognition is remote by design. Shipping weights is the difference between an OS that is
+    genuinely a couple of megabytes and one where "light" means a lean shell around something
+    heavy. A local backend can arrive later as another gateway implementation — never as a core
+    assumption.</p>
+  </div>
+
+  <div class="track">
+    <div class="track-hd">
+      <h3>Multi-tenancy</h3>
+      <span class="badge abs">not doing</span>
+    </div>
+    <p>One person's agents on one machine, mutually trusting, in-process. Capability scoping
+    between agents exists for least privilege, not because agents distrust each other. Adding
+    tenancy boundaries would change nearly every subsystem and buy nothing for the case being
+    tested.</p>
+  </div>
+
+  <h2>How this page stays honest</h2>
+  <p class="mut">
+    Labels here follow the same rule as the rest of the site: a claim of "built" means code
+    enforces it and tests cover it, not that a config file mentions it. When something moves
+    from specced to built, the claim moves with it — and when something is discovered to be
+    less true than claimed, it moves back. That has already happened more than once, and those
+    corrections are in the repo's history rather than edited out of it.
+  </p>
+
+  <div class="next-row">
+    <a class="btn" href="agent-os.html">The agentOS thesis</a>
+    <a class="btn" href="zk-verification.html">The verification thesis</a>
+    <a class="btn" href="https://github.com/0x89karan/runtime1">GitHub</a>
+  </div>
+
+</div>
+</body>
+</html>

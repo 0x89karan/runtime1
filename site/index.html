@@ -5,115 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>runtime1 — the operating system where agents are the primitive</title>
 <meta name="description" content="runtime1 is an open-source, Linux-based operating system whose primitive is the agent, not the application. Every agent bounded, every action metered and recorded, with a verifiable evidence trail.">
-<style>
-/* ─── tokens: house palette shared with architecture.html / docs/cos-guide.html ─── */
-:root{
-  --ground:#070D1A; --surface:#0E1626; --surface-2:#13203A; --surface-3:#192948;
-  --border:#1C2E4A; --border-bright:#243D64;
-  --text:#CDD6E8; --text-muted:#7089A8; --text-dim:#3B5478;
-  --accent:#E8A030; --accent-dim:rgba(232,160,48,.13);
-  --enforced:#38D48A; --enforced-bg:rgba(56,212,138,.10);
-  --declared:#E8A030; --declared-bg:rgba(232,160,48,.10);
-  --absent:#D45070;   --absent-bg:rgba(212,80,112,.10);
-  --flow:#35C4BB;     --flow-bg:rgba(53,196,187,.10);
-  --external:#9880F0; --external-bg:rgba(152,128,240,.10);
-  --mono:'JetBrains Mono','SF Mono','Cascadia Code',Consolas,'Liberation Mono',monospace;
-  --sans:system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;
-  --r:3px;
-}
-:root[data-theme="light"]{
-  --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
-  --border:#D2DAE6; --border-bright:#B4C1D4;
-  --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
-  --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
-  --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
-  --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
-  --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
-  --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
-  --external:#5B45B8; --external-bg:rgba(91,69,184,.09);
-}
-@media (prefers-color-scheme:light){
-  :root:not([data-theme="dark"]){
-    --ground:#F2F4F8; --surface:#FFFFFF; --surface-2:#EDF1F7; --surface-3:#E2E8F2;
-    --border:#D2DAE6; --border-bright:#B4C1D4;
-    --text:#16233A; --text-muted:#4B6180; --text-dim:#8496AE;
-    --accent:#A96A05; --accent-dim:rgba(169,106,5,.10);
-    --enforced:#12855A; --enforced-bg:rgba(18,133,90,.09);
-    --declared:#A96A05; --declared-bg:rgba(169,106,5,.09);
-    --absent:#B02B4C;   --absent-bg:rgba(176,43,76,.09);
-    --flow:#0E8F88;     --flow-bg:rgba(14,143,136,.09);
-    --external:#5B45B8; --external-bg:rgba(91,69,184,.09);
-  }
-}
-*{box-sizing:border-box}
-html,body{margin:0;padding:0}
-body{background:var(--ground);color:var(--text);font-family:var(--sans);font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
-.wrap{max-width:1080px;margin:0 auto;padding:0 22px}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-code{font-family:var(--mono);font-size:.88em;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r);padding:1px 5px}
-
-/* nav */
-.nav{display:flex;align-items:center;gap:22px;padding:18px 0;border-bottom:1px solid var(--border);flex-wrap:wrap}
-.brand{font-family:var(--mono);font-weight:700;font-size:17px;color:var(--text);letter-spacing:.02em}
-.brand b{color:var(--accent)}
-.nav .links{display:flex;gap:18px;margin-left:auto;flex-wrap:wrap}
-.nav .links a{color:var(--text-muted);font-size:14px}
-.nav .links a:hover{color:var(--text);text-decoration:none}
-
-/* hero */
-.hero{padding:72px 0 48px;text-align:left}
-.hero .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--accent);margin:0 0 14px}
-.hero h1{font-size:clamp(30px,5vw,46px);line-height:1.15;margin:0 0 18px;max-width:840px}
-.hero .sub{font-size:19px;color:var(--text-muted);max-width:760px;margin:0 0 28px}
-.cta{display:flex;gap:12px;flex-wrap:wrap}
-.btn{display:inline-block;font-family:var(--mono);font-size:14px;padding:10px 18px;border-radius:var(--r);border:1px solid var(--border-bright)}
-.btn.primary{background:var(--accent);color:#0B1220;border-color:var(--accent);font-weight:700}
-.btn.primary:hover{text-decoration:none;filter:brightness(1.08)}
-.btn.ghost{color:var(--text)}
-.btn.ghost:hover{text-decoration:none;border-color:var(--accent);color:var(--accent)}
-
-/* plain-language explainer */
-.plain{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;padding:26px 0 8px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:22px}
-.card .k{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--text-dim);margin:0 0 10px}
-.card h3{margin:0 0 10px;font-size:18px}
-.card p{margin:0;color:var(--text-muted);font-size:15px}
-
-/* section scaffolding */
-.section{padding:44px 0 8px}
-.section h2{font-size:24px;margin:0 0 6px}
-.section .lead{color:var(--text-muted);max-width:760px;margin:0 0 22px}
-
-/* doors */
-.doors{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
-.door{display:block;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:26px;color:var(--text)}
-.door:hover{text-decoration:none;border-color:var(--accent)}
-.door .k{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);margin:0 0 10px}
-.door h3{margin:0 0 10px;font-size:20px}
-.door p{margin:0 0 14px;color:var(--text-muted);font-size:15px}
-.door .go{font-family:var(--mono);font-size:13px;color:var(--accent)}
-
-/* honesty strip */
-.honesty{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--enforced);border-radius:var(--r);padding:20px 22px;margin:44px 0 0}
-.honesty .k{font-family:var(--mono);font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--enforced);margin:0 0 8px}
-.honesty p{margin:0;color:var(--text-muted);font-size:15px;max-width:860px}
-.badge{display:inline-block;font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:999px;border:1px solid;margin-right:6px}
-.badge.enf{color:var(--enforced);border-color:var(--enforced);background:var(--enforced-bg)}
-.badge.dec{color:var(--declared);border-color:var(--declared);background:var(--declared-bg)}
-.badge.abs{color:var(--absent);border-color:var(--absent);background:var(--absent-bg)}
-
-/* status row */
-.status{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:10px}
-.stat{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:18px 20px}
-.stat .k{font-family:var(--mono);font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-dim);margin:0 0 6px}
-.stat p{margin:0;font-size:14px;color:var(--text-muted)}
-.stat .big{font-size:17px;color:var(--text);font-family:var(--mono)}
-
-footer{margin-top:64px;border-top:1px solid var(--border);padding:26px 0 48px;color:var(--text-dim);font-size:13px}
-footer .row{display:flex;gap:18px;flex-wrap:wrap}
-footer a{color:var(--text-muted)}
-</style>
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div class="wrap">
@@ -124,6 +16,7 @@ footer a{color:var(--text-muted)}
       <a href="agent-os.html">agentOS</a>
       <a href="zk-verification.html">Verification</a>
       <a href="architecture.html">Architecture</a>
+      <a href="roadmap.html">Roadmap</a>
       <a href="https://github.com/0x89karan/runtime1">GitHub</a>
     </div>
   </nav>
