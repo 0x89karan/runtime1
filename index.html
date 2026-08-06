@@ -129,17 +129,31 @@ footer a{color:var(--text-muted)}
   </nav>
 
   <section class="hero">
-    <p class="eyebrow">open source · Linux-based · ~2 MB runtime</p>
+    <p class="eyebrow">an open-source experiment · Linux-based · ~2 MB runtime</p>
     <h1>The operating system where agents are the primitive, not applications.</h1>
     <p class="sub">
       runtime1 runs a team of AI agents on hardware you own. At its core is
       <b>agentOS</b>: an operating system where every agent is bounded by a budget, every tool
       and model call is brokered and metered, and everything an agent does lands in an evidence
-      trail you can verify — so agents can finally run unsupervised on systems that matter.
+      trail you can verify — so agents can run unsupervised on systems that matter.
     </p>
     <div class="cta">
       <a class="btn primary" href="https://github.com/0x89karan/runtime1">View on GitHub</a>
       <a class="btn ghost" href="agent-os.html">Read the thesis</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="honesty" style="margin-top:0">
+      <p class="k">what this is</p>
+      <p>
+        An open-source experiment, built in the open, testing one idea: that if agents are
+        going to run unsupervised against real systems, the guarantees belong in an operating
+        system rather than in a framework or a prompt. It is a working tool — dogfooded daily
+        against a real inbox — and simultaneously an argument that might be wrong. There is
+        nothing to buy, nothing to sign up for, and no roadmap promises. Read the code,
+        disagree with the thesis, open an issue.
+      </p>
     </div>
   </section>
 
@@ -230,9 +244,9 @@ footer a{color:var(--text-muted)}
         Every claim on this site is labeled the way our own architecture diagram labels
         components: <span class="badge enf">enforced</span> means code stops you,
         <span class="badge dec">declared</span> means a config or prompt says so, and
-        <span class="badge abs">not built</span> means it doesn't exist yet. Security products
-        die of overclaiming. Our threat model documents what the evidence chain <em>cannot</em>
-        prove, in public, on purpose.
+        <span class="badge abs">not built</span> means it doesn't exist yet. Trust in a system
+        like this dies of overclaiming, so the threat model documents what the evidence chain
+        <em>cannot</em> prove, in public, on purpose.
       </p>
     </div>
   </section>
@@ -249,14 +263,15 @@ footer a{color:var(--text-muted)}
       <div class="stat">
         <p class="k">dogfood</p>
         <p class="big">daily, n=1</p>
-        <p>The flagship workload is a standing AI chief-of-staff running on a developer's own
-        hardware against a real inbox.</p>
+        <p>The workload driving the work is a standing AI chief-of-staff running on a
+        developer's own hardware against a real inbox.</p>
       </div>
       <div class="stat">
         <p class="k">license &amp; stage</p>
         <p class="big">open source</p>
-        <p>Early. APIs move. The flight recorder, scheduler, capability system, and signed
-        receipt chain are real and tested; the zk pipeline is a specified roadmap.</p>
+        <p>Early, and built in the open. APIs move. The flight recorder, scheduler,
+        capability system, and signed receipt chain are real and tested; the verification
+        ladder is a written spec, not a shipped feature.</p>
       </div>
     </div>
   </section>
