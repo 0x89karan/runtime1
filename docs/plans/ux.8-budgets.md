@@ -54,7 +54,7 @@ Add the pre-inference check at the top of `step_need_infer` (`agent/mod.rs:~439`
 Fixed rolling window: an agent that burns its window early goes dark until the next reset. v1 accepts this; token-bucket / soft-cap degradation (cheaper model before hard-deny) is noted as a future option, not built. Documented in DEPLOYMENT.md so it's a known behavior, not a surprise.
 
 ## Roadmap correction (both CEO voices)
-Soften ROADMAP:1229 "per-agent spend feeds the mv track's per-VM budgets" — rolling-anchor + one shared interval is anti-aligned with per-VM calendar-aligned billing (`docs/PRODUCT-THESIS.md`). The one thing that DOES help mv later is the monotonic counter (§A). Reword to say so.
+Soften ROADMAP:1229 "per-agent spend feeds the mv track's per-VM budgets" — rolling-anchor + one shared interval is anti-aligned with per-VM calendar-aligned billing. The one thing that DOES help mv later is the monotonic counter (§A). Reword to say so.
 
 ## Test plan (Eng F19 regression-critical set)
 - **The P0 test:** capped flagship spends to ceiling → parks (not terminates) → advance mock wall-clock past interval → loop tick rebases → agent re-admitted and resumes. This is the definition of "P0-2 closed."

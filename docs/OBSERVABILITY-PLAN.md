@@ -1,7 +1,7 @@
 # OBSERVABILITY-PLAN — OTEL + eBPF on top of the egress mediator
 
-**Status:** design. Companion to `docs/PRODUCT-THESIS.md` (observability is ~half the
-product) and `docs/plans/p7.5-egress-mediator.md` (you can't observe what you don't broker).
+**Status:** design. Companion to `docs/plans/p7.5-egress-mediator.md` (you can't observe what
+you don't broker) — observability is ~half the product.
 
 > The order matters: **brokering (p7.5) → observability.** The egress mediator is what makes
 > model/tool calls *pass through* AgentOS so they can be observed at all. OTEL formats that
@@ -68,7 +68,7 @@ Together that's a real audit trail even for a foreign framework that pins TLS.
 **Host eBPF is blind inside gVisor.** gVisor's Sentry handles the sandboxed app's syscalls in
 *user space* — they never reach the host kernel, so host-attached eBPF probes never fire. So
 "syscall-level ground truth" is delivered by a *different mechanism depending on the isolation
-floor* (see `docs/PRODUCT-THESIS.md`):
+floor*:
 
 | Isolation floor | Syscall-level observability mechanism |
 |---|---|

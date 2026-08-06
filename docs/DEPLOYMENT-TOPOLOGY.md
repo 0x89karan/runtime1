@@ -1,7 +1,7 @@
 # DEPLOYMENT-TOPOLOGY — multi-arch reach + multi-instance coordination
 
 **Status:** design + increment plan (planning session, 2026-07). Not yet built. Companion to
-`docs/DESIGN.md` (thesis), `docs/PRODUCT-THESIS.md` (positioning), `docs/ROADMAP.md` (queue).
+`docs/DESIGN.md` (thesis), `docs/ROADMAP.md` (queue).
 **Purpose:** outline the direction so `/autoplan` (or `/plan-eng-review` per item) can build it
 out in the increments defined in §4. Fold these into `ROADMAP.md` when picked up in the build
 session.

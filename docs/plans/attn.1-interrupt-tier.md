@@ -84,9 +84,9 @@ measurement (`attn.2`'s already-handled check) to the *next* increment. That is 
 increment that changes behaviour must carry the instrument that judges it.
 
 **P4 is worse than the design doc admitted.** Verified: `THREAT_MODEL.md` §8.7 already names
-`api.telegram.org` "a real confidentiality sink", and `PRODUCT-THESIS.md:36` defines the beachhead as
-someone who "won't put investor threads, customer deals, and cap-table context into someone else's
-cloud." A digest sends everything at low sensitivity density. **An interrupt tier selects the most
+`api.telegram.org` "a real confidentiality sink", and the target beachhead is someone who "won't
+put investor threads, customer deals, and cap-table context into someone else's cloud." A
+digest sends everything at low sensitivity density. **An interrupt tier selects the most
 sensitive items and sends only those** — it inverts the leak profile in the worst direction.
 
 ## 0B. Existing code leverage — what already exists
@@ -331,7 +331,7 @@ No `subject`. No `from`. The delivered message is *tier + reason + thread permal
 taps through to Gmail — where they were going anyway. Consequences, both good:
 
 1. **The privacy inversion largely closes.** `THREAT_MODEL.md` §8.7 already names `api.telegram.org` a
-   confidentiality sink, and `PRODUCT-THESIS.md:36` defines the beachhead as someone who will not put
+   confidentiality sink, and the target beachhead is someone who will not put
    investor/customer/cap-table context in someone else's cloud. Interrupts would have selected the
    *most* sensitive items for third-party delivery. Sending no subject and no sender removes most of it.
 2. **The escaping problem mostly evaporates.** `brief-03`/`brief-04` exist because sender-controlled

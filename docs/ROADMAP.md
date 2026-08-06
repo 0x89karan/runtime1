@@ -871,7 +871,7 @@ capability layer alone; the *universal tier* needs this floor underneath the egr
 **Couples to observability** (eBPF for native/Firecracker-guest; gVisor remote sink for gVisor —
 host eBPF is blind inside gVisor). A dual-backend (gVisor when nested-KVM is unavailable,
 Firecracker when hardware isolation is demanded) is the resilient posture. Design context:
-`docs/PRODUCT-THESIS.md` security model + `docs/OBSERVABILITY-PLAN.md`.
+`docs/OBSERVABILITY-PLAN.md`.
 
 **obs.1 — flight→OTLP sidecar + GenAI semconv** [HARNESS] ✅ *(v0.42.0)*
 Export the existing flight-event stream as OpenTelemetry: run=trace, agent=span, turn/inference/
@@ -1354,7 +1354,7 @@ step. ux.8′ ships first regardless — the P0-2 self-brick (prod currently run
 the P0-2 integrity hotfix alone; per-agent spend visibility + SetBudget + the BudgetRisk re-key moved to
 ux.11.) Its **monotonic counter + window-delta** design — not the rolling reset itself — is the one part
 that helps the mv track later; per-VM billing needs calendar-aligned, per-unit windows over that meter, so
-do NOT treat ux.8′'s single shared rolling window as the billing substrate (`docs/PRODUCT-THESIS.md`). **Parallel, independent
+do NOT treat ux.8′'s single shared rolling window as the billing substrate. **Parallel, independent
 of the cockpit — do first (makes the CoS usable today):** `cos-polish` (`docs/plans/cos-polish.md` — the
 8 bugs from live testing: brief-not-written, KB-unfindable, orchestrate errors, undersized budgets) and
 `memory-routing` (`docs/plans/memory-routing.md` — raw emails → harness Layer 2, also fixes the token
@@ -1448,8 +1448,8 @@ outranks the agents it watches), Linux-gated, kernel-version floor. Tractable on
   eBPF for native/Firecracker-guest, the sink for gVisor — pick per the chosen floor.
 
 (Sequencing across Phases 7-9: **p7.5 egress mediator → obs.1 OTLP → Phase 9 eBPF**. p7.5 is the
-prerequisite — you can't observe what you don't broker. See `docs/PRODUCT-THESIS.md` for why
-observability is ~half the product.)
+prerequisite — you can't observe what you don't broker, and observability is ~half the
+product.)
 
 ---
 
