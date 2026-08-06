@@ -121,7 +121,7 @@ footer a{color:var(--text-muted)}
   <nav class="nav">
     <span class="brand">runtime<b>1</b></span>
     <div class="links">
-      <a href="agent-os.html">Agent OS</a>
+      <a href="agent-os.html">agentOS</a>
       <a href="zk-verification.html">Verification</a>
       <a href="architecture.html">Architecture</a>
       <a href="https://github.com/0x89karan/runtime1">GitHub</a>
@@ -132,14 +132,42 @@ footer a{color:var(--text-muted)}
     <p class="eyebrow">open source · Linux-based · ~2 MB runtime</p>
     <h1>The operating system where agents are the primitive, not applications.</h1>
     <p class="sub">
-      runtime1 runs a team of AI agents on hardware you own. Every agent is bounded by a
-      budget, every tool and model call is brokered and metered, and everything an agent does
-      lands in an evidence trail you can verify — so agents can finally run unsupervised on
-      systems that matter.
+      runtime1 runs a team of AI agents on hardware you own. At its core is
+      <b>agentOS</b>: an operating system where every agent is bounded by a budget, every tool
+      and model call is brokered and metered, and everything an agent does lands in an evidence
+      trail you can verify — so agents can finally run unsupervised on systems that matter.
     </p>
     <div class="cta">
       <a class="btn primary" href="https://github.com/0x89karan/runtime1">View on GitHub</a>
       <a class="btn ghost" href="agent-os.html">Read the thesis</a>
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>How the pieces are named</h2>
+    <p class="lead">Three names, one stack — worth getting straight before anything else.</p>
+    <div class="plain">
+      <div class="card">
+        <p class="k">the project</p>
+        <h3>runtime1</h3>
+        <p>The whole open-source project: the operating system, the operator tooling
+        (<code>agentctl</code>), the tool servers, the verification pipeline, and the docs.
+        When you clone the repo or read this site, you are looking at runtime1.</p>
+      </div>
+      <div class="card">
+        <p class="k">the operating system</p>
+        <h3>agentOS</h3>
+        <p>The agent operating system inside runtime1 — the part that actually runs the agents.
+        A minimal Linux base whose entire userspace is the agent runtime: no desktop, no apps,
+        no login shell, just agents and the tools they invoke.</p>
+      </div>
+      <div class="card">
+        <p class="k">the runtime process</p>
+        <h3>agentd</h3>
+        <p>agentOS's runtime binary — a ~2&nbsp;MB Rust daemon that boots as PID&nbsp;1 and
+        <em>is</em> the userspace. It holds the scheduler, the capability system, the memory
+        substrate, the gateways, and the flight recorder.</p>
+      </div>
     </div>
   </section>
 
@@ -149,7 +177,7 @@ footer a{color:var(--text-muted)}
       <div class="card">
         <p class="k">01 · agents, not apps</p>
         <h3>A new primitive</h3>
-        <p>A normal OS schedules processes and CPU time. runtime1 schedules <em>agents</em> and
+        <p>A normal OS schedules processes and CPU time. agentOS schedules <em>agents</em> and
         the resources that actually matter for them: inference slots, token budgets, dollars,
         and tool access. The runtime (<code>agentd</code>) boots as PID&nbsp;1 — there is no
         desktop, no apps, just agents and their tools.</p>
@@ -179,11 +207,11 @@ footer a{color:var(--text-muted)}
     <div class="doors">
       <a class="door" href="agent-os.html">
         <p class="k">thesis 1 · the substrate</p>
-        <h3>The Agent Operating System</h3>
+        <h3>agentOS — the agent operating system</h3>
         <p>Why "agent frameworks on a normal OS" is the wrong shape, what it means to push the
-        agent down to the primitive, and how a ~2&nbsp;MB Rust runtime replaces init, the shell,
-        and the application model. Includes the interactive runtime schematic.</p>
-        <span class="go">Read the Agent OS thesis →</span>
+        agent down to the primitive, and how <code>agentd</code> replaces init, the shell, and
+        the application model in ~2&nbsp;MB. Includes the interactive runtime schematic.</p>
+        <span class="go">Read the agentOS thesis →</span>
       </a>
       <a class="door" href="zk-verification.html">
         <p class="k">thesis 2 · the evidence</p>
@@ -213,7 +241,7 @@ footer a{color:var(--text-muted)}
     <h2>Project status</h2>
     <div class="status">
       <div class="stat">
-        <p class="k">runtime</p>
+        <p class="k">agentOS runtime</p>
         <p class="big">agentd v0.121</p>
         <p>Rust workspace, ~2 MB size-optimized binary, boots as PID 1 under QEMU or runs on any
         Linux/macOS box.</p>
@@ -221,7 +249,7 @@ footer a{color:var(--text-muted)}
       <div class="stat">
         <p class="k">dogfood</p>
         <p class="big">daily, n=1</p>
-        <p>The flagship workload is a standing AI chief-of-staff running on the founder's own
+        <p>The flagship workload is a standing AI chief-of-staff running on a developer's own
         hardware against a real inbox.</p>
       </div>
       <div class="stat">
@@ -236,7 +264,7 @@ footer a{color:var(--text-muted)}
   <footer>
     <div class="row">
       <span>runtime1 — an open-source agent operating system</span>
-      <a href="agent-os.html">Agent OS thesis</a>
+      <a href="agent-os.html">agentOS thesis</a>
       <a href="zk-verification.html">Verification thesis</a>
       <a href="architecture.html">Runtime schematic</a>
       <a href="https://github.com/0x89karan/runtime1">GitHub</a>
