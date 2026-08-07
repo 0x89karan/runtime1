@@ -109,6 +109,8 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         EventKind::JobScheduleDegraded => false,
         EventKind::JobFired => false,
         EventKind::JobFireSkipped => false,
+        EventKind::JobManualFired => false,
+        EventKind::JobManualFireRejected => false,
         EventKind::Error => false,
     }
 }
