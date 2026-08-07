@@ -206,6 +206,17 @@ pub enum EventKind {
     /// Provider recovered from AttentionRequired (operator reset or successful refresh).
     /// data: { provider, source: "reset_attention"|"proactive_refresh"|"foreground_request" }
     CredentialRecovered,
+    /// A job's `schedule` string failed to parse at boot; that job alone degrades to
+    /// manual-fire-only (never fails the whole boot — agentd runs as PID 1). (attn.4)
+    /// data: { job_id, schedule, error }
+    JobScheduleDegraded,
+    /// The native scheduler dispatched a job on schedule with no LLM in the loop. (attn.4)
+    /// data: { job_id, occurrence_id, intended_fire_ts, child_id, caught_up: bool }
+    JobFired,
+    /// A native/shadow fire was computed but not dispatched (shadow mode, or a guard
+    /// rejected it — unknown job id, spawn depth, or occurrence collision). (attn.4)
+    /// data: { job_id, occurrence_id, intended_fire_ts, reason, shadow: bool }
+    JobFireSkipped,
     Error,
 }
 
@@ -309,6 +320,9 @@ impl EventKind {
             EventKind::IsolationProbed => "isolation_probed",
             EventKind::CredentialAttentionRequired => "credential_attention_required",
             EventKind::CredentialRecovered => "credential_recovered",
+            EventKind::JobScheduleDegraded => "job_schedule_degraded",
+            EventKind::JobFired => "job_fired",
+            EventKind::JobFireSkipped => "job_fire_skipped",
             EventKind::Error => "error",
         }
     }
@@ -399,6 +413,9 @@ impl EventKind {
         EventKind::IsolationProbed,
         EventKind::CredentialAttentionRequired,
         EventKind::CredentialRecovered,
+        EventKind::JobScheduleDegraded,
+        EventKind::JobFired,
+        EventKind::JobFireSkipped,
         EventKind::Error,
     ];
 }
@@ -610,6 +627,9 @@ mod tests {
                 | EventKind::IsolationProbed
                 | EventKind::CredentialAttentionRequired
                 | EventKind::CredentialRecovered
+                | EventKind::JobScheduleDegraded
+                | EventKind::JobFired
+                | EventKind::JobFireSkipped
                 | EventKind::Error => {
                     // Every variant must appear in ALL. If you just added a variant to
                     // the enum, the compiler pointed you here — add it to `EventKind::ALL`.

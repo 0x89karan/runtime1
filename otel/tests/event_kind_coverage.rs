@@ -104,6 +104,11 @@ fn assert_all_event_kinds_handled(kind: EventKind) -> bool {
         // cause a span-per-token explosion; the streaming operation as a whole is already
         // covered by InferenceStreamStarted/InferenceStreamCompleted's span mapping above.
         EventKind::InferenceStreamDelta => false,
+        // attn.4 native scheduler cron — informational job-lifecycle events, surfaced via
+        // agentctl/observability, not span-worthy (no request/response pair to bracket).
+        EventKind::JobScheduleDegraded => false,
+        EventKind::JobFired => false,
+        EventKind::JobFireSkipped => false,
         EventKind::Error => false,
     }
 }

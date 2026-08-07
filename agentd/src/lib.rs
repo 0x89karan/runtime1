@@ -17,6 +17,7 @@ pub mod management;
 pub mod memory;
 pub mod runs;
 pub mod scheduler;
+pub mod scheduler_cron;
 pub mod template;
 pub mod tools;
 pub mod universal;
