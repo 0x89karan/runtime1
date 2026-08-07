@@ -5,6 +5,11 @@ A Linux-based operating system where **agents are the primitive, not application
 system, that process *is* the userspace (PID 1 / the boot target); today it runs
 as an ordinary binary on a normal distro.
 
+**Site: <https://0x89karan.github.io/runtime1/>** — the thesis, the interactive
+architecture schematic, the verification pipeline (with a working hash-chain demo and
+an explicitly-marked-unbuilt `zk.2` illustration), and the whitepaper. Source is
+[`site/`](site/); see `docs/RUNBOOK.md` §6 "Site (GitHub Pages)" for how it deploys.
+
 Two design decisions are constitutional. See [`CLAUDE.md`](CLAUDE.md) and
 [`docs/DESIGN.md`](docs/DESIGN.md) for the full rationale.
 

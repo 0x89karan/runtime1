@@ -508,6 +508,45 @@ kernel config (Landlock/seccomp/FUSE/9p) and the `agentd` binary in the rootfs a
 matched pair; a mismatched kernel can silently drop a sandbox mechanism the binary
 assumes.
 
+### Site (GitHub Pages) — `site/` → `gh-pages` is manual, not automatic
+
+**Live at <https://0x89karan.github.io/runtime1/>.** The repo is public (was flipped
+from private on 2026-08-06 specifically to allow this). Pages is configured
+branch-based — source = `gh-pages` branch, path `/` — not the Actions-based
+`upload-pages-artifact`/`deploy-pages` flow; a custom `.github/workflows/pages.yml` was
+tried first and removed, because this account's Actions runners were stuck queued
+indefinitely at the time (later diagnosed as an unrelated, since-resolved GitHub-wide
+Actions/Pages incident — check <https://www.githubstatus.com/> if builds hang again
+before assuming it's a config problem).
+
+**`site/` on `main` is the only source of truth.** `gh-pages` is a derived, disposable
+copy — `site/`'s subdirectory history, split to its own branch root via
+`git subtree split`, force-pushed over `gh-pages` wholesale. **Editing `site/` on `main`
+does NOT redeploy anything by itself** — there is no hook, CI job, or webhook wired up.
+After any `site/` change reaches `main`, from the repo root:
+
+```bash
+git subtree split --prefix=site -b gh-pages-update   # rebuilds a fresh branch from current site/
+git push origin gh-pages-update:gh-pages             # fast-forwards the real gh-pages branch
+git branch -D gh-pages-update                        # local temp branch, safe to drop
+git fetch origin gh-pages:gh-pages                   # keep your local gh-pages ref in sync too
+```
+
+GitHub's own Pages builder should pick up the push within ~30–90s. If it doesn't (or you
+want to confirm rather than wait):
+
+```bash
+gh api -X POST repos/0x89karan/runtime1/pages/builds        # force a build
+gh api repos/0x89karan/runtime1/pages/builds/latest          # check status: queued|building|built|errored
+```
+
+**Known gap:** this is a manual step someone has to remember. If the site starts
+drifting from what's on `main`, this is almost certainly why — check
+`git log -1 gh-pages` against `git log -1 main -- site/` before debugging anything else.
+Automating this (a workflow that runs the four commands above on every push to `main`
+touching `site/`) is a reasonable follow-up once Actions has proven stable again, but
+was deliberately not built during the incident above.
+
 ---
 
 ## 7. Troubleshooting
