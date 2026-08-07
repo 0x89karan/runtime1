@@ -67,10 +67,12 @@ remaining work — one increment per branch, `main` shippable between, each thro
     keyless boot + restore survival (`attn.1a-05` closed). ~~**attn.2 R3+R4** (v0.121.0)~~ ✅
     shipped — the brief is readable (exclusive classification, narrowed escaping, a real
     `suppressed_count`) and non-destructive to write (per-fire `{ts}` in both the filename and
-    the KB key). **R5 (manual fire) split out at the /autoplan gate — filed as `attn.2-R5` in
-    TODOS.md, not scheduled.** The brief still cannot be produced until `attn.4` (scheduler-native
-    cron) ships — the trigger currently burns ~3,456 inference calls/day to watch a clock, which
-    is what empties the 10M/24h window before any brief-quality fix matters — so do **not** start
+    the KB key). ~~**R5 (manual fire)**~~ ✅ shipped (v0.123.0) — `agentctl watch`'s Jobs view
+    (`[J]`) and `agentctl run-job <id>`, redesigned on `dispatch_scheduled_job` rather than the
+    originally-spec'd `dispatch_run_job` + synthetic-parent-id shape, which sidesteps the two
+    bugs that shape was found to have. ~~`attn.4`~~ ✅ shipped (v0.122.0) — the trigger no longer
+    burns ~3,456 inference calls/day to watch a clock, which is what empties the 10M/24h window
+    before any brief-quality fix matters — so do **not** start
     the 14-day measure yet. ~~**attn.1a-core** (v0.118.0)~~ ✅ shipped —
     made the CoS actually run (`restart: unless-stopped` + log caps + launchd, none of which existed on
     the Mac path) and made a stopped pipeline visible (`server_now` on `GET /api/v1/brief`, age + a

@@ -960,6 +960,8 @@ Key views:
 - **Row actions** (`[x]`, v0.115.0): park / set budget / cancel the *selected* agent —
   see §11.8a. `?` opens the full key map, which is the authoritative list; this one is a
   summary and the footer only shows what fits.
+- **Jobs** (`[J]`, attn.2-R5): job schedule rows (next/last fire, shadow-or-live) with a
+  manual "fire now" verb — see §11.8b.
 
 #### 11.8a Stopping a runaway agent
 
@@ -996,7 +998,39 @@ Two caveats:
 If `AGENTOS_APPROVAL_SECRET` is set, these routes are gated like approve/deny — export it in
 the shell running `agentctl`, or every verb returns `HTTP 401` (see `DEPLOYMENT.md`).
 
-#### 11.8b On a Mac, `Sandbox: applied` is not reassuring — know what is actually holding the line
+#### 11.8b Manually firing a job (attn.2-R5)
+
+Press `[J]` to open the Jobs view — one row per `[[jobs]]` entry with a `schedule`
+(`cos-inbox`, `cos-curator`). Select a row and press `[f]` or `Enter` to open a confirm
+gate, then `[y]` to fire it right now:
+
+```bash
+# Or from the shell, without the TUI:
+agentctl run-job cos-inbox --url http://localhost:7999
+```
+
+Three things to know before using this:
+
+1. **It always dispatches for real, even in shadow mode.** `native_cron_shadow` (the
+   default) only governs the *automatic* schedule-driven path — a manual fire is an
+   explicit operator override, and is the only way to exercise a job's real capabilities
+   (live Gmail, KB writes) before flipping shadow mode off. There is no shadow-mode
+   equivalent of this verb.
+2. **Firing a job that already ran today can overwrite today's real data.** `cos-inbox`
+   writes to a KB key keyed by calendar date, last-writer-wins — a manual test-fire after
+   the real 08:00 UTC fire replaces the morning's real inbox read with the test run's. The
+   confirm overlay states this; there is no code-level guard against it (filed as a
+   residual in `TODOS.md`).
+3. **No rate limit.** Firing the same job repeatedly in quick succession dispatches every
+   time — each one a real, separate agent run against the job's real capabilities. Nothing
+   currently stops a script (or a slipped finger) from doing this many times in a row.
+
+Same authentication story as `[x]`'s row actions: gated by `AGENTOS_APPROVAL_SECRET` if set,
+fire-and-forget with no confirmation over the FUSE surface (`docker compose exec cos
+agentctl watch --agents-dir /agents` — this view has no FUSE producer yet, so it shows no
+rows there at all; use `--url http://localhost:7999`).
+
+#### 11.8c On a Mac, `Sandbox: applied` is not reassuring — know what is actually holding the line
 
 Press `[s]` in `agentctl watch` on Docker Desktop for Apple silicon and you will see something
 like:
