@@ -3,6 +3,63 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.122.0] - 2026-08-07
+
+### Added
+- **attn.4 — scheduler-native cron.** `[[jobs]]` gains a `schedule` field (5-field UTC cron,
+  parsed via `croner`); due jobs are now dispatched by the scheduler's own tick
+  (`tick_native_jobs`), not by an LLM sitting in a `wait_for_trigger` loop. Measured before this
+  change: 63/63 tool calls in a 29-minute window were `wait_for_trigger`, 414k tokens spent to
+  watch a clock — ~3,456 inference calls/day, emptying the 10M/24h window in ~2.6h with zero
+  briefs produced. Ships in **shadow mode by default** (`SchedulerConfig.native_cron_shadow =
+  true`): the new path computes and logs would-fire decisions but dispatches nothing, running
+  alongside the still-live LLM-polling path until an operator confirms equivalence.
+  - New occurrence ledger (`agentd/src/scheduler_cron.rs`) keyed on
+    `job_id + schedule-fingerprint + intended_fire_ts`, replacing the too-coarse
+    `{job_id}-{date}` scheme for native fires and giving each fire a stable, dedupable identity
+    across restarts.
+  - Missed-fire catch-up on boot, fingerprint-gated: a restored `next_fire_ts` is only trusted
+    if the job's schedule string hasn't changed since it was persisted.
+  - A malformed `schedule` degrades **only that job** to manual-fire-only with a loud warning
+    (`job_schedule_degraded` event) — it never fails the whole `agentd` boot, since a bad line
+    in one job's config must not brick a PID-1 process.
+  - New `agentctl jobs <config>` — validates every job's schedule and prints its next three
+    computed fire times without touching a running daemon, reusing the scheduler's own
+    parsing/next-fire logic so the answer can never drift from what the real scheduler does.
+  - `cos-inbox` (`0 8 * * *`) and `cos-curator` (`5 8 * * *`) now carry native schedules
+    alongside their still-live LLM-polling trigger, per the shadow-mode rollout plan.
+
+### Fixed
+- **A cross-restart double-fire bug, found by `/review`'s adversarial pass before it shipped.**
+  Three coordinated defects would have combined into it: missed-fire catch-up synthesizing a
+  fresh `now` instead of preserving the original occurrence's intended-fire timestamp; boot-init
+  discarding the occurrence ledger on every restart regardless of whether the schedule had
+  changed; and the ledger update not being guaranteed to reach disk before a possible crash. All
+  three fixed together and proven both by a new restart-across-a-fire unit test and by driving
+  the real binary (SIGKILL immediately after a fire, restart, confirmed no duplicate).
+- **A pre-existing 32-second SIGTERM-unresponsiveness bug, found by `/qa` driving the real
+  binary — invisible to every unit test.** The schedule-only idle branch of the main loop used a
+  bare `tokio::time::sleep` with nothing racing the signal handlers, so a SIGTERM landing
+  mid-sleep waited out the full interval before `agentd` reacted — long enough for Docker's
+  default ~10s SIGTERM grace period to SIGKILL it before it could checkpoint. This flaw predated
+  attn.4 but attn.4's own idle-loop keep-alive fix made the branch common enough to hit. Fixed by
+  wrapping the sleep in `tokio::select!` racing `sigterm.recv()`/`sigint.recv()`; measured
+  32s → 0.23s live, and mutation-verified with a new regression test.
+- **`croner`'s default leniency accepting extra cron fields, found by `codex review`.**
+  `"0 8 * * * *"` (a plausible operator typo — one extra field) would otherwise silently parse
+  as a seconds-bearing expression instead of erroring. `scheduler_cron::parse_cron` now checks
+  the field count explicitly before delegating to `croner::Cron::from_str`.
+
+### Known residuals (filed, not fixed — see TODOS.md)
+- `attn.4-clock-01` (P2) — no sanity bound on the system clock before trusting it at boot.
+- `attn.4-croner-01` (P3) — `croner`'s panic-safety on adversarial input is unpinned by a test.
+- `attn.4-ratelimit-01` (P2) — native cron removes the soft rate-limiting friction an LLM-driven
+  `run_job` call used to provide.
+- `attn.4-watch-01` (P2) — Task T4's live `agentctl watch` dashboard row was not built; only the
+  CLI dry-run (`agentctl jobs`) and the underlying snapshot type shipped.
+- Task T7 (delete the now-legacy LLM-polling prompt + `cron_trigger` MCP registration) is
+  deliberately deferred until a real shadow cycle confirms equivalence in the field.
+
 ## [v0.121.0] - 2026-08-04
 
 ### Fixed
