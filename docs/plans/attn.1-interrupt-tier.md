@@ -795,7 +795,7 @@ precedent.
 | Getting started | 8/10 | env vars already exist and are documented |
 | API/CLI naming | 7/10 | `publish_interrupt` mirrors `publish_brief` cleanly |
 | Error messages | 3/10 | three new silent failure paths (D3) |
-| Docs | —/10 | not yet written; RUNBOOK §11.x + cos-guide.html both need it, and `.html` must be in the staleness check (prior learning) |
+| Docs | —/10 | not yet written; RUNBOOK §11.x needs it (`cos-guide.html` retired, no longer a second doc to keep in sync) |
 | Upgrade path | 8/10 | additive; no migration |
 | Observability | 2/10 | no liveness signal, no mute, no suppression record |
 | **Control / reversibility** | **1/10** | **D1 — no way to stop it** |

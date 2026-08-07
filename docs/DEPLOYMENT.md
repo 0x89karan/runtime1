@@ -131,11 +131,10 @@ none) by PUTting the list without it, then restore.
 
 ## Path 1 — Mac + Docker
 
-> **Canonical source for the Mac + Docker quickstart.** The rendered guide
-> `docs/cos-guide.html` (published at
-> https://claude.ai/code/artifact/936e816a-d052-4799-85ff-8acfe71ee544) is a view of this section —
-> **when these steps change, update `docs/cos-guide.html` and redeploy the artifact** so the two do
-> not drift.
+> **Canonical source for the Mac + Docker quickstart.** No separate rendered guide is
+> maintained — a prior version of this doc (`docs/cos-guide.html`, published as a standalone
+> artifact) was retired because a second copy drifts from this one. `docs/RUNBOOK.md` §11 has
+> the deep operational reference; this section is the quickstart.
 
 **Prerequisites:** Docker Desktop · Anthropic API key (`sk-ant-…`) · Google Cloud account (free tier)
 · Rust + Cargo (macOS has no prebuilt `agentctl`, so you build it once; Linux can download the

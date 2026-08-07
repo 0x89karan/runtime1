@@ -686,7 +686,7 @@ Autonomy L0 (read-only). All five trust properties are live and verifiable.
 |---|---|
 | Wake on schedule | `cron_mcp.py` `wait_for_trigger` (daily 08:00 UTC default) |
 | Read Gmail without holding the token | `oauth_mcp.py` sidecar — token lives in the process, never in the agent context |
-| Multi-agent | Orchestrator spawns Inbox + Curator each cycle via `spawn_agent` |
+| Multi-agent, de-privileged trigger (sealed-job pipeline, v0.95.0+) | The trigger holds only `{cron_trigger, RunJob}` — no Gmail, no KB, no file write, no `spawn_agent`. It fires two config-declared **sealed jobs**: `run_job("cos-inbox")` (reads Gmail, writes the KB) and `run_job("cos-curator")` (KB-only, writes the brief). Capabilities and instructions for each job are owned by config, not chosen by the trigger, and the trigger receives only a completion signal — never a job's output. This is what stops an injected trigger from reaching live Gmail (closes audit P1-10). |
 | Brief persistence | KB `ops:briefs` (log) + `ops:entities` (scratch) |
 | Tamper-evident (model calls only) | Ed25519-signed receipt chain in `evidence.jsonl`, verified against a **locally-held** key — see `THREAT_MODEL.md` §8.7 for what it does and does not cover |
 
@@ -995,6 +995,34 @@ Two caveats:
 
 If `AGENTOS_APPROVAL_SECRET` is set, these routes are gated like approve/deny — export it in
 the shell running `agentctl`, or every verb returns `HTTP 401` (see `DEPLOYMENT.md`).
+
+#### 11.8b On a Mac, `Sandbox: applied` is not reassuring — know what is actually holding the line
+
+Press `[s]` in `agentctl watch` on Docker Desktop for Apple silicon and you will see something
+like:
+
+```
+Sandbox:   applied
+! Degraded: landlock_net_unavailable
+! Degraded: spawn_enforcement_unavailable_arch
+Isolation: none (arch=aarch64 runsc=none landlock=false seccomp=false)
+```
+
+This is expected and is **not a misconfiguration you can fix**: Landlock is a Linux-kernel
+feature unavailable on Docker Desktop's Mac VM (ABI v0, i.e. no Landlock at all — permanently,
+by construction), and the spawn-denial gate is x86_64-only. **`Sandbox: applied` reads as
+reassuring and is not** — it means the rules were compiled and handed to the kernel, not that
+the kernel enforced them. `Isolation: none` is the line that matters.
+
+**What this means concretely.** The `Net`, `FsRead` and `FsWrite` grants shown on each MCP
+sidecar are *declarative only* here. A sidecar declaring `Net{ports:[443]}` is not actually
+confined to port 443 — per-port enforcement is skipped, and it keeps unrestricted network
+access. What still holds regardless of platform: the Docker network boundary, the credential
+broker's host allowlist (an OAuth sidecar can only reach the provider's own domains), and every
+capability check inside `agentd` itself — ordinary enforced Rust, unaffected by the kernel.
+
+If you need kernel-level enforcement, that is the QEMU/Linux path (`docs/DEPLOYMENT.md` Path 2),
+not Docker on a Mac. See `THREAT_MODEL.md` BP-4 and BP-4a for the full severity rationale.
 
 ### 11.9 Known limits and operational notes
 
