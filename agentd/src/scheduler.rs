@@ -2730,7 +2730,7 @@ fn dispatch_run_job(
         .unwrap_or_default();
     spawn_job_child(
         &job, &job_id, child_id.clone(), Some(parent_id.clone()), parent_depth + 1,
-        &child_model_cfg, state, sched, gateway, registry, recorder,
+        &child_model_cfg, state, sched, gateway, registry, recorder, "run_job",
     );
 
     // Register the awaiting-parent link so the completion signal reaches the caller.
@@ -2764,6 +2764,11 @@ fn spawn_job_child(
     gateway: &Arc<dyn InferenceGateway + Send + Sync>,
     registry: &Arc<ToolRegistry>,
     recorder: &Arc<FlightRecorder>,
+    // run-history start_reason (attn.2-R5 TODOS finding 4): distinguishes an agent-
+    // triggered "run_job" / native-tick fire from an operator's "manual_fire", so a
+    // one-off manual/test fire doesn't silently inflate a job's run-history count
+    // alongside real production fires.
+    start_reason: &str,
 ) {
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let child_caps = Some(job.capabilities.clone());
@@ -2791,7 +2796,7 @@ fn spawn_job_child(
 
     let child_open_tokens = child_task.context_tokens();
     state.agents.insert(child_id.clone(), child_task);
-    state.run_tracker.open(&child_id, parent_id.clone(), "run_job", Some(child_open_tokens), "native");
+    state.run_tracker.open(&child_id, parent_id.clone(), start_reason, Some(child_open_tokens), "native");
     state.spawn_depths.insert(child_id.clone(), depth);
     if let Some(p) = &parent_id {
         state.parent_map.insert(child_id.clone(), p.clone());
@@ -2834,13 +2839,16 @@ fn dispatch_scheduled_job(
     registry: &Arc<ToolRegistry>,
     recorder: &Arc<FlightRecorder>,
     default_model_cfg: &ModelConfig,
+    // "run_job" for a real native-tick fire, "manual_fire" for an operator's on-demand
+    // trigger (attn.2-R5) — see spawn_job_child's start_reason doc.
+    start_reason: &str,
 ) -> Result<String, String> {
     let job = match state.jobs.get(job_id) {
         Some(j) => j.clone(),
         None => return Err("unknown job id (removed from config since scheduling)".to_string()),
     };
     reserve_job_child_id(&child_id, state)?;
-    spawn_job_child(&job, job_id, child_id.clone(), None, 0, default_model_cfg, state, sched, gateway, registry, recorder);
+    spawn_job_child(&job, job_id, child_id.clone(), None, 0, default_model_cfg, state, sched, gateway, registry, recorder, start_reason);
     Ok(child_id)
 }
 
@@ -2944,7 +2952,7 @@ async fn tick_native_jobs(
             }
         } else {
             let child_id = format!("{job_id}-{intended_fire_ts}");
-            match dispatch_scheduled_job(&job_id, child_id.clone(), state, sched, gateway, registry, recorder, default_model_cfg) {
+            match dispatch_scheduled_job(&job_id, child_id.clone(), state, sched, gateway, registry, recorder, default_model_cfg, "run_job") {
                 Ok(_) => {
                     recorder.record(&job_id, None, EventKind::JobFired, json!({
                         "job_id": &job_id, "occurrence_id": &occurrence, "child_id": &child_id,
@@ -3429,7 +3437,42 @@ fn dispatch_control_command(
                 }
             }
         }
+        ControlCommand::RunJobNow { job_id, confirm_tx } => {
+            // attn.2-R5 redesign: reuses dispatch_scheduled_job — the SAME primitive the
+            // native tick calls (parent_id: None, no RunJob capability check needed, since
+            // the job's capabilities are config-declared, not caller-supplied) — rather than
+            // dispatch_run_job's synthetic-parent-id shape, which is what the original R5
+            // design's two filed bugs (a reject() panic on every rejection path, and a
+            // silently-halved token budget from a nonexistent-parent model fallback) came
+            // from. Always dispatches for real: native_cron_shadow governs only the
+            // AUTOMATIC schedule-driven path, never an explicit operator override.
+            let child_id = manual_job_child_id(&job_id);
+            let result = dispatch_scheduled_job(&job_id, child_id, state, sched, gateway, registry, recorder, default_model, "manual_fire");
+            // Unlike SetCaps above, record the outcome unconditionally (both transports),
+            // not only on the FUSE fire-and-forget path — this is a new externally-HTTP-
+            // reachable trigger for a job that may hold live Gmail access, so the flight log
+            // is the audit trail regardless of whether the caller also sees the HTTP error.
+            match &result {
+                Ok(child_id) => recorder.record(&job_id, None, EventKind::JobManualFired,
+                    json!({ "job_id": &job_id, "child_id": child_id })),
+                Err(reason) => recorder.record(&job_id, None, EventKind::JobManualFireRejected,
+                    json!({ "job_id": &job_id, "reason": reason })),
+            }
+            if let Some(tx) = confirm_tx {
+                let _ = tx.send(result);
+            }
+        }
     }
+}
+
+/// Derive a manual-fire child id (attn.2-R5): nanosecond-resolution, so a rapid double-click
+/// of the same job in the TUI produces two distinct ids rather than a `reserve_job_child_id`
+/// collision. Deliberately DISTINCT from the schedule-derived `{job_id}-{intended_fire_ts}`
+/// form the native tick uses, and never touches `state.job_schedules`/the occurrence ledger —
+/// a manual fire is fully independent of the schedule's own dedup/catch-up bookkeeping.
+fn manual_job_child_id(job_id: &str) -> String {
+    let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    format!("{job_id}-manual-{nanos}")
 }
 
 /// Inner handler for ControlCommand::Spawn — injects a new top-level agent.
@@ -9667,5 +9710,114 @@ mod tests {
         let unlimited = da("a1", 10_000_000, 0, &[], &pending, None);
         assert!(!unlimited.iter().any(|s| s.reason == surfaces::AttentionReason::BudgetRisk),
             "unlimited never fires BudgetRisk");
+    }
+
+    // ── attn.2-R5: manual job fire ─────────────────────────────────────────────
+
+    #[test]
+    fn manual_fire_dispatches_a_sealed_job_immediately_with_no_schedule() {
+        use crate::control::ControlCommand;
+        let job = cos_like_job("cos-inbox", vec![]); // schedule: None
+        let mut state = state_with_job(job);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx) }, &mut state);
+        let child_id = rx.blocking_recv().unwrap().expect("a manual fire of a schedule-less job must succeed");
+        assert!(state.agents.contains_key(&child_id), "the sealed child must be materialized");
+    }
+
+    #[test]
+    fn manual_fire_dispatches_for_real_even_under_shadow_mode() {
+        // dispatch() uses unlimited(), whose ..Default::default() gives native_cron_shadow:
+        // true — a manual fire must ignore that entirely; shadow mode governs only the
+        // AUTOMATIC schedule-driven path, never an explicit operator override.
+        use crate::control::ControlCommand;
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("0 8 * * *".to_string());
+        let mut state = state_with_job(job);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx) }, &mut state);
+        let child_id = rx.blocking_recv().unwrap().expect("manual fire must dispatch even in shadow mode");
+        assert!(state.agents.contains_key(&child_id), "shadow mode must not suppress a manual fire");
+    }
+
+    #[test]
+    fn manual_fire_unknown_job_id_errs_without_panicking() {
+        use crate::control::ControlCommand;
+        let mut state = minimal_state("noop-agent"); // no jobs registered
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "ghost-job".into(), confirm_tx: Some(tx) }, &mut state);
+        let e = rx.blocking_recv().unwrap().unwrap_err();
+        assert!(e.contains("unknown job"), "unknown job id → not-found (→404), got: {e}");
+    }
+
+    #[test]
+    fn manual_fire_does_not_perturb_the_schedule_occurrence_ledger() {
+        // A manual fire is fully independent of the schedule's own dedup/catch-up
+        // bookkeeping — it must not touch state.job_schedules at all, or it could confuse
+        // the native tick's next-fire computation or its cross-restart dedup.
+        use crate::control::ControlCommand;
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("0 8 * * *".to_string());
+        let mut state = state_with_job(job);
+        let before = crate::scheduler_cron::JobScheduleState {
+            fingerprint: "0 8 * * *".to_string(),
+            next_fire_ts: now_unix_secs() as i64 + 3600,
+            last_occurrence_id: Some("some-prior-occurrence".to_string()),
+            last_outcome: Some(crate::scheduler_cron::JobFireOutcome::Fired),
+            last_skip_reason: None,
+            pending_catchup: false,
+        };
+        state.job_schedules.insert("cos-inbox".to_string(), before.clone());
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx) }, &mut state);
+        rx.blocking_recv().unwrap().expect("manual fire must succeed");
+
+        assert_eq!(
+            state.job_schedules["cos-inbox"], before,
+            "a manual fire must leave the schedule's own occurrence-ledger state untouched"
+        );
+    }
+
+    #[test]
+    fn manual_fire_rapid_repeats_get_distinct_child_ids_not_a_collision() {
+        use crate::control::ControlCommand;
+        let job = cos_like_job("cos-inbox", vec![]);
+        let mut state = state_with_job(job);
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx1) }, &mut state);
+        let child1 = rx1.blocking_recv().unwrap().expect("first manual fire must succeed");
+
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx2) }, &mut state);
+        let child2 = rx2.blocking_recv().unwrap().expect("a second rapid manual fire must not collide with the first");
+
+        assert_ne!(child1, child2, "nanosecond-resolution ids must not collide on a rapid re-fire");
+        assert!(state.agents.contains_key(&child1) && state.agents.contains_key(&child2));
+    }
+
+    #[test]
+    fn manual_fire_records_job_manual_fired_on_success_and_rejected_on_error() {
+        use crate::control::ControlCommand;
+        let job = cos_like_job("cos-inbox", vec![]);
+        let mut state = state_with_job(job);
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+
+        dispatch_control_command(
+            ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: None },
+            &mdl, &mut state, &unlimited(), &gateway, &registry, &rec,
+        );
+        dispatch_control_command(
+            ControlCommand::RunJobNow { job_id: "ghost-job".into(), confirm_tx: None },
+            &mdl, &mut state, &unlimited(), &gateway, &registry, &rec,
+        );
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fired\""), "success must be audit-logged: {content}");
+        assert!(content.contains("\"job_manual_fire_rejected\""), "rejection must be audit-logged too: {content}");
     }
 }

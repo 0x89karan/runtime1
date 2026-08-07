@@ -88,6 +88,24 @@ pub enum ControlCommand {
         /// layer). `None` on the fire-and-forget FUSE path.
         confirm_tx:   Option<tokio::sync::oneshot::Sender<Result<(usize, usize), String>>>,
     },
+    /// Fire a config-declared sealed job (cap.2b) on demand, bypassing its `schedule`
+    /// entirely (attn.2-R5 redesign). Always dispatches for real — `native_cron_shadow`
+    /// only governs the automatic schedule-driven path; a manual trigger is an explicit
+    /// operator override, and is the only way to exercise the pipeline while shadow mode
+    /// is on. Routes through the SAME `dispatch_scheduled_job` primitive the native tick
+    /// uses (parent_id: None, no RunJob capability check needed — the job's capabilities
+    /// are config-declared, not caller-supplied), which sidesteps the two bugs the
+    /// original R5 design (built on `dispatch_run_job` + a synthetic parent id) was found
+    /// to have: a panic in `reject()` on every rejection path, and a silently-halved
+    /// token budget from a nonexistent-parent model-config fallback.
+    RunJobNow {
+        job_id:     String,
+        /// Confirmation channel. Sends `Ok(child_id)` on success, `Err` for an unknown
+        /// job id (→ 404) or a child-id collision (→ 409 at the HTTP layer — vanishingly
+        /// rare with a nanosecond-timestamp id, but never silent). `None` on the
+        /// fire-and-forget FUSE path.
+        confirm_tx: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
+    },
 }
 
 /// Which budget a `ResetBudget` command targets. Typed (not a bare string) so
@@ -138,6 +156,10 @@ enum TaggedCommand {
     SetCaps {
         agent_id:     String,
         capabilities: Vec<Capability>,
+    },
+    #[serde(rename = "run_job")]
+    RunJobNow {
+        job_id: String,
     },
 }
 
@@ -191,6 +213,11 @@ pub fn parse_control_command(bytes: &[u8]) -> anyhow::Result<ControlCommand> {
             TaggedCommand::SetCaps { agent_id, capabilities } => {
                 anyhow::ensure!(!agent_id.is_empty(), "set_caps: agent_id must not be empty");
                 ControlCommand::SetCaps { agent_id, capabilities, confirm_tx: None }
+            }
+            TaggedCommand::RunJobNow { job_id } => {
+                anyhow::ensure!(!job_id.is_empty(), "run_job: job_id must not be empty");
+                // FUSE path is fire-and-forget; the HTTP path supplies confirm_tx.
+                ControlCommand::RunJobNow { job_id, confirm_tx: None }
             }
         });
     }
@@ -408,5 +435,19 @@ mod tests {
     #[test]
     fn parse_set_caps_empty_id_is_error() {
         assert!(parse_control_command(br#"{"set_caps":{"agent_id":"","capabilities":[]}}"#).is_err());
+    }
+
+    #[test]
+    fn parse_run_job_tagged() {
+        let bytes = br#"{"run_job":{"job_id":"cos-inbox"}}"#;
+        let cmd = parse_control_command(bytes).unwrap();
+        let ControlCommand::RunJobNow { job_id, confirm_tx } = cmd else { panic!("expected RunJobNow") };
+        assert_eq!(job_id, "cos-inbox");
+        assert!(confirm_tx.is_none(), "FUSE path is fire-and-forget");
+    }
+
+    #[test]
+    fn parse_run_job_empty_id_is_error() {
+        assert!(parse_control_command(br#"{"run_job":{"job_id":""}}"#).is_err());
     }
 }

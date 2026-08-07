@@ -217,6 +217,13 @@ pub enum EventKind {
     /// rejected it — unknown job id, spawn depth, or occurrence collision). (attn.4)
     /// data: { job_id, occurrence_id, intended_fire_ts, reason, shadow: bool }
     JobFireSkipped,
+    /// An operator manually fired a config-declared sealed job on demand, bypassing its
+    /// `schedule` entirely — always dispatches for real, ignoring `native_cron_shadow`.
+    /// (attn.2-R5) data: { job_id, child_id }
+    JobManualFired,
+    /// A manual fire request was rejected (unknown job id, or a child-id collision).
+    /// (attn.2-R5) data: { job_id, reason }
+    JobManualFireRejected,
     Error,
 }
 
@@ -323,6 +330,8 @@ impl EventKind {
             EventKind::JobScheduleDegraded => "job_schedule_degraded",
             EventKind::JobFired => "job_fired",
             EventKind::JobFireSkipped => "job_fire_skipped",
+            EventKind::JobManualFired => "job_manual_fired",
+            EventKind::JobManualFireRejected => "job_manual_fire_rejected",
             EventKind::Error => "error",
         }
     }
@@ -416,6 +425,8 @@ impl EventKind {
         EventKind::JobScheduleDegraded,
         EventKind::JobFired,
         EventKind::JobFireSkipped,
+        EventKind::JobManualFired,
+        EventKind::JobManualFireRejected,
         EventKind::Error,
     ];
 }
@@ -630,6 +641,8 @@ mod tests {
                 | EventKind::JobScheduleDegraded
                 | EventKind::JobFired
                 | EventKind::JobFireSkipped
+                | EventKind::JobManualFired
+                | EventKind::JobManualFireRejected
                 | EventKind::Error => {
                     // Every variant must appear in ALL. If you just added a variant to
                     // the enum, the compiler pointed you here — add it to `EventKind::ALL`.
