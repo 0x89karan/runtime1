@@ -24,11 +24,46 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.122.0 (shipped 2026-08-07)
+**Current version:** v0.123.0 (shipped 2026-08-07)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** attn.4 — scheduler-native cron (v0.122.0) — **`[[jobs]]` now has a real
+**Latest shipped:** attn.2-R5 — manual job fire, in the TUI and the CLI (v0.123.0) — operators
+can now fire any `[[jobs]]` entry on demand from `agentctl watch`'s new Jobs view (`[J]`) or
+`agentctl run-job <id>`, always dispatching for real regardless of `native_cron_shadow`. This
+is the answer to "how do I manually fire the brief without waiting for the schedule" — the
+gap CLAUDE.md's own attn.4 entry left open (R5 was filed in TODOS.md, never built, until now).
+- **Redesigned, not built to the original spec.** The original `attn.2-R5` plan
+  (`docs/plans/attn.2-workable-brief.md`) built the route on `dispatch_run_job` + a synthetic
+  parent id and four findings were verified against it. This ships on `dispatch_scheduled_job`
+  instead (the same primitive the native tick already calls, no caller and no `RunJob`
+  capability check needed) — which sidesteps two of those findings BY CONSTRUCTION (no
+  synthetic parent id exists, so `reject()`'s panic-on-missing-key path and the
+  nonexistent-parent model-config fallback are never reached), closes the third directly
+  (`/api/v1/jobs/*/run` is in `is_mutating_route`, pinned by test), and closes the fourth with
+  a new `start_reason = "manual_fire"` distinguishing a manual fire from a real scheduled one
+  in `agentctl runs` — by tagging, deliberately not hiding: hiding it from run history would
+  make debugging "what happened when I clicked fire now" harder, not easier.
+- **New `POST /api/v1/jobs/:id/run`** — accepts only a `job_id` selecting among FIXED,
+  config-declared jobs (no caller-supplied capabilities the way `/spawn` has), so it needs no
+  `AGENTOS_ALLOW_PRIVILEGED_SPAWN`-style opt-in. THREAT_MODEL.md §9.5 documents the real
+  tradeoff this accepts: firing a Gmail-reading job on demand now only requires reaching the
+  loopback-bound management API, not being the in-process trusted orchestrator.
+- **Every attempt is audit-logged regardless of outcome or transport**
+  (`job_manual_fired`/`job_manual_fire_rejected`) — a deliberate departure from every other
+  control command here, which logs only on the fire-and-forget FUSE path, because this is a
+  new HTTP-reachable trigger for a job that may hold live Gmail access.
+- **Three residuals filed, not fixed:** no rate-limit/concurrent-dedup guard (the manual-
+  trigger analog of `attn.4-ratelimit-01`); firing a job on a day it already ran can overwrite
+  that day's real KB data (pre-existing risk for any same-day re-fire, not introduced here);
+  FUSE-source parity (the Jobs view only works over `agentctl watch --url`, since
+  `agents_fs.rs` has no `system/jobs` producer file yet — the same gap as `attn.4-watch-01`).
+- **Verified against the real binary, not just unit tests:** a scratch `agentd` fired
+  three times (two via `curl`, one through the actual TUI, driven with a real pty), producing
+  three distinct children with no collision, zero perturbation of the job's own
+  schedule/occurrence-ledger state, and a complete flight-log audit trail for every attempt.
+
+**Prev:** attn.4 — scheduler-native cron (v0.122.0) — **`[[jobs]]` now has a real
 schedule and the scheduler itself fires due jobs; no LLM sits on the schedule boundary
 anymore.** Ships in shadow mode by default (`native_cron_shadow = true`) — the new path
 computes and logs would-fire decisions but dispatches nothing yet, running alongside the
