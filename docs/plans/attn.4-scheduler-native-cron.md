@@ -815,39 +815,63 @@ if a zero-new-dependency constraint matters enough to reverse this.
 
 **Implementation Tasks — finalized (Approach A, hardened):**
 ```markdown
-- [ ] **T1 (P1, human: ~2h / CC: ~20min)** — config — `Job.schedule: Option<String>` +
+- [x] **T1 (P1, human: ~2h / CC: ~20min)** — config — `Job.schedule: Option<String>` +
       `validate_schedule()`; malformed schedule degrades ONLY that job to manual-fire-only with a
       loud warning, never fails the whole boot
   - Files: `agentd/src/config.rs`
   - Verify: pre-attn.4 config boots unchanged; a bad schedule on one job doesn't stop others
-- [ ] **T2 (P1, human: ~1d / CC: ~1-2h)** — scheduler — Native tick + occurrence ledger
+  - **Done.** Boot-time degrade loop in `agentd/src/main.rs`; `JobScheduleDegraded` event.
+- [x] **T2 (P1, human: ~1d / CC: ~1-2h)** — scheduler — Native tick + occurrence ledger
       (`job_id + fingerprint + intended_fire_ts`) using a small cron crate (`croner` or
       equivalent) for parsing/next-fire; catch-up/fingerprint/persistence hand-built
   - Files: `agentd/src/scheduler.rs` (+ new module), `agentd/Cargo.toml`
   - Verify: restart-mid-window, crash-loop, backward-clock-step tests (test plan artifact)
-- [ ] **T3 (P1, human: ~3h / CC: ~30min)** — scheduler — Fold next-fire + occurrence-ledger state
+  - **Done.** `agentd/src/scheduler_cron.rs` (new) + `tick_native_jobs`/boot-init catch-up in
+    `scheduler.rs`. /review's adversarial pass found and fixed the cross-restart double-fire bug
+    (apply_catchup preserving the persisted timestamp, not `now`); /qa found and fixed the
+    idle-loop SIGTERM-unresponsiveness regression via `tokio::select!`. Both mutation-verified.
+- [x] **T3 (P1, human: ~3h / CC: ~30min)** — scheduler — Fold next-fire + occurrence-ledger state
       into `build_scheduler_checkpoint`, writes conditional on fire/fingerprint-change only
   - Files: `agentd/src/scheduler.rs`
   - Verify: checkpoint write count flat under a long idle period
-- [ ] **T4 (P1, human: ~1d / CC: ~1-1.5h)** — observability + DX — `agentctl watch` row (or mgmt-
+  - **Done.** `job_schedules` in `SchedulerCheckpoint`; force-checkpoint only when a tick found
+    something due.
+- [~] **T4 (P1, human: ~1d / CC: ~1-1.5h)** — observability + DX — `agentctl watch` row (or mgmt-
       API field) showing next/last fire, occurrence id, skip reason, fingerprint, UTC-explicit
       timestamps; `agentctl jobs validate`/`next-fire` dry-run command; interpreted-schedule text
   - Files: `surfaces/`, `agentctl/src/watch/`, `agentctl/src/main.rs`
   - Verify: deliberately trigger each guard rejection, confirm each is visible, not just logged
-- [ ] **T5 (P2, human: ~2h / CC: ~20min)** — docs — `THREAT_MODEL.md` §9.5,
+  - **PARTIAL — scope trimmed during build, not silently dropped.** Built: `agentctl jobs
+    <config>` dry-run/validate CLI (next 3 fire times, non-zero exit for CI use) and the
+    `surfaces::JobScheduleView` snapshot type wired into `update_snapshot`. **NOT built:** no
+    `agentctl watch` TUI row actually renders `JobScheduleView` — the data is exported but has no
+    live dashboard consumer yet. Operator visibility in the meantime is via `agentctl jobs`
+    (dry-run) plus the flight-recorder events (`job_fired`/`job_fire_skipped`/
+    `job_schedule_degraded`) through the existing Logs view. Filed as `attn.4-watch-01` (P2) in
+    TODOS.md — same "declare-then-defer honestly" pattern as `attn.1a`'s split scopes, not a gap
+    discovered later.
+- [x] **T5 (P2, human: ~2h / CC: ~20min)** — docs — `THREAT_MODEL.md` §9.5,
       `docker-compose.yml` comments (same commit as any deletion), `MCP_SERVERS.md`
   - Files: `docs/THREAT_MODEL.md`, `docker-compose.yml`, `docs/MCP_SERVERS.md`
   - Verify: diff review confirms no reference to a deleted node/server remains
-- [ ] **T6 (P1, human: ~1h / CC: ~15min)** — rollout — Ship the new path in **shadow mode**
+  - **Done.**
+- [x] **T6 (P1, human: ~1h / CC: ~15min)** — rollout — Ship the new path in **shadow mode**
       (compute + log would-fire decisions, dispatch nothing) alongside the still-live LLM-polling
       path for one full cycle before cutting over
   - Files: `agentd/cos.agents.toml`, `agentd/src/scheduler.rs`
   - Verify: shadow-computed fire times match the old path's actual fires, zero double-dispatch
+  - **Done.** `native_cron_shadow` defaults `true`; `cos-inbox`/`cos-curator` both carry
+    `schedule =` alongside the still-live LLM-polling path. Proven live at /qa (shadow logs, no
+    dispatch) and live (dispatch, no double-fire across a SIGKILL+restart).
 - [ ] **T7 (P2, human: ~1h / CC: ~10min)** — cleanup — Delete the orchestrator polling prompt +
       `cron_trigger` MCP registration from `cos.agents.toml` once T6's shadow cycle confirms
       equivalence; leave `cron_mcp.py` itself in the image as a legacy fallback for one release
   - Files: `agentd/cos.agents.toml`
   - Verify: no dangling reference to the deleted prompt/server anywhere in config or docs
+  - **Deliberately NOT built this increment** — by the plan's own rollout sequencing, T7 only
+    makes sense after a real shadow cycle confirms equivalence in the field, which hasn't
+    happened yet (the stack isn't even up — CLAUDE.md's roadmap note says bring it up only after
+    this increment lands). Tracked at the CLAUDE.md roadmap level, not abandoned.
 ```
 
 **Not building:** Approach D (rejected alternative, documented above); `attn.1b` wiring; TZ

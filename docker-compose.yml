@@ -56,12 +56,20 @@ services:
       # Google OAuth credentials are read from /run/secrets/google.json (the volume above).
       # cos requires /run/secrets/google.json — there is no env-var fallback for this mode.
       # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
-      # Schedule. TRIGGER_CRON and TRIGGER_INTERVAL are MUTUALLY EXCLUSIVE — cron_mcp.py
-      # exits 1 if both are non-empty. Default is the daily cron, because `every 2m` as a
-      # default meant a plain `docker compose up cos` ran the full Gmail pipeline 30× in a
-      # morning (~4.1M tokens against a 10M/day window) with no indication anything was wrong.
-      # Keep the fire time away from 00:00 UTC: the inbox→curator handoff is date-keyed and
-      # server-stamped per job, so a cycle straddling UTC midnight fails the brief (cap.2b-ar-01).
+      # Schedule (LEGACY PATH — attn.4). TRIGGER_CRON/TRIGGER_INTERVAL drive the OLD
+      # LLM-polling `cron_trigger` MCP server + orchestrator loop, which attn.4 measured at
+      # ~3,456 inference calls/day just to watch a clock (~$50/day, before the pipeline ever
+      # produces a brief). The REAL schedule now lives in `[[jobs]]`'s `schedule` field in
+      # `cos.agents.toml` (native scheduler cron, fired in-process by `agentd` — no LLM on
+      # the schedule boundary). This env-var path is kept ONLY as a legacy/manual fallback
+      # for one release (attn.4 DX finding: no config-level rollback existed for the native
+      # path without it) — TRIGGER_CRON and TRIGGER_INTERVAL are still MUTUALLY EXCLUSIVE,
+      # cron_mcp.py still exits 1 if both are non-empty, and `[scheduler] native_cron_shadow`
+      # defaults to `true` (the native path only LOGS would-fire decisions until an operator
+      # confirms equivalence and sets it to `false` — see cos.agents.toml's own comments on
+      # the `schedule` field). Keep the fire time away from 00:00 UTC either way: the
+      # inbox→curator handoff is date-keyed and server-stamped per job, so a cycle straddling
+      # UTC midnight fails the brief (cap.2b-ar-01).
       #   daily 08:00 UTC (default)  : docker compose up cos
       #   twice daily                : TRIGGER_CRON="0 8,17 * * *" docker compose up cos
       #   interval, for testing only : TRIGGER_CRON= TRIGGER_INTERVAL="every 2m" docker compose up cos
