@@ -33,7 +33,7 @@ pub mod spawn;
 pub mod topology;
 pub mod views;
 
-use app::{App, MemoryPane, PendingSpawn, SpawnFocus, View};
+use app::{App, JobOverlayMode, JobsOverlay, MemoryPane, PendingSpawn, SpawnFocus, View};
 use overlay::{budget_prefill, budget_needs_second_gate, menu_items, DashboardOverlay, MenuAction, OverlayMode, PendingVerb};
 use approvals::ApprovalsMode;
 use pump::{spawn_producers, AppEvent};
@@ -627,6 +627,7 @@ fn step_key(app: &mut App, key: KeyEvent, source: &dyn DataSource) -> Vec<Effect
             }
         }
         View::Logs => handle_logs_key(key, app),
+        View::Jobs => handle_jobs_key(key, app),
     }
     let mut effects = vec![Effect::Redraw];
     if matches!(key.code, KeyCode::Char('q'))
@@ -909,6 +910,13 @@ fn handle_dashboard_key(key: KeyEvent, app: &mut App, source: &dyn DataSource) {
         KeyCode::Char('l') if app.logs_view.available => {
             app.view = View::Logs;
         }
+        // attn.2-R5: `[J]` (capital — lowercase `j` is vim-down navigation above) opens the
+        // Jobs view: job schedule rows with a per-row manual "fire now" verb.
+        KeyCode::Char('J') => {
+            app.view = View::Jobs;
+            app.jobs_selected = 0;
+            app.jobs_overlay = None;
+        }
         _ => {}
     }
 }
@@ -1172,6 +1180,11 @@ fn drain_pending_verb(app: &mut App, source: &dyn DataSource) -> Vec<Effect> {
         // than being routed by an earlier statement — an `unreachable!()` guarded by statement order is
         // a panic waiting for the next edit (/review's maintainability specialist).
         PendingVerb::Chat { target, text } => return drain_chat_turn(app, source, target, text),
+        // Different target entity (jobs_overlay, not dashboard_overlay) and a different
+        // outcome shape (a child id, not a count) — same early-return shape as Chat above,
+        // for the same reason: this needs its own handling, not a fourth special case
+        // wedged into the count-shaped match below.
+        PendingVerb::RunJob { job_id } => return drain_run_job_fire(app, source, job_id),
     };
 
     // Mark the row BEFORE reading the outcome text: on the confirming source the agent may already be
@@ -1325,6 +1338,32 @@ fn drain_chat_turn(
     }
 }
 
+/// Perform a manual job fire from the LOOP (attn.2-R5). Mirrors `drain_chat_turn`'s early-
+/// return shape: this targets `app.jobs_overlay`, not `dashboard_overlay`, and its outcome is
+/// a child id, not a count, so it does not fit the shared match in `drain_pending_verb`.
+///
+/// Deliberately does NOT replicate that function's discard-buffered-keys-during-the-call
+/// block (same accepted gap as `drain_chat_turn` — a Ctrl-C or resize during the ~2 s HTTP
+/// round-trip is dropped rather than honoured immediately). Lower risk here than for Chat
+/// (whose blocking window can reach ~8 s): filed as a residual, not fixed, given the
+/// smaller window and the size of what already shipped this increment.
+fn drain_run_job_fire(app: &mut App, source: &dyn DataSource, job_id: &str) -> Vec<Effect> {
+    let outcome = source.run_job(job_id);
+    let (text, ok) = match outcome {
+        Ok(child_id) => (format!("Fired '{job_id}' — child '{child_id}'"), true),
+        Err(e) => (format!("Fire failed: {}", explain_verb_error(&e)), false),
+    };
+    // Only update the overlay if it's still pinned to the SAME job — resolve-at-use, same
+    // discipline `DashboardOverlay::target` uses, in case the operator somehow left the view
+    // and reopened a different job's overlay while this call was in flight.
+    if let Some(ov) = &mut app.jobs_overlay {
+        if ov.target_job_id == job_id {
+            ov.mode = JobOverlayMode::Result { text, ok };
+        }
+    }
+    vec![Effect::Redraw, Effect::Reconcile]
+}
+
 /// Rewrite a raw transport/HTTP error into WHAT happened, WHY, and WHAT TO DO.
 ///
 /// Shared with `verbs.rs` so `agentctl cancel` and the cockpit's `[x]` explain a failure the same way
@@ -1354,8 +1393,9 @@ pub fn explain_verb_error(raw: &str) -> String {
     }
     if raw.contains("HTTP 404") {
         return format!(
-            "Action not sent: agentd does not know this agent or route ({}). It may have already \
-             finished — check the agent list.",
+            "Action not sent: agentd does not know this agent, job, or route ({}). An agent may \
+             have already finished — check the agent list; a job id must match [[jobs]] in the \
+             connected agentd's config.",
             raw.trim(),
         );
     }
@@ -1366,6 +1406,10 @@ fn verb_target(verb: &PendingVerb) -> &str {
     match verb {
         PendingVerb::Cancel { agent_id } | PendingVerb::SetBudget { agent_id, .. } => agent_id,
         PendingVerb::Chat { target, .. } => target,
+        // Never rendered, same as Chat above: RunJob returns early from drain_pending_verb
+        // (drain_run_job_fire) and never reaches the code that calls this. Present only to
+        // keep this match exhaustive over PendingVerb's full type.
+        PendingVerb::RunJob { job_id } => job_id,
     }
 }
 
@@ -1393,6 +1437,8 @@ fn verb_requested_text(verb: &PendingVerb, count: u64, resettable: bool) -> Stri
             format!("Budget for {agent_id} set to {limit} tokens"),
         // Never rendered: the chat turn reports through the rail transcript, not an overlay result.
         PendingVerb::Chat { target, .. } => format!("Sent to {target}"),
+        // Never rendered — see verb_target's comment above.
+        PendingVerb::RunJob { job_id } => format!("Fired {job_id}"),
     }
 }
 
@@ -1443,6 +1489,74 @@ fn handle_logs_key(key: KeyEvent, app: &mut App) {
         // view-opening key, which is why the Logs key is `[l]`.
         KeyCode::Char('g') | KeyCode::Home => lv.scroll_to_top(),
         KeyCode::Char('G') | KeyCode::End   => lv.scroll_to_bottom(),
+        _ => {}
+    }
+}
+
+/// attn.2-R5: Jobs view keys. While `jobs_overlay` is open it owns the ENTIRE keyboard —
+/// same unconditional-early-return idiom `handle_dashboard_key` uses for
+/// `dashboard_overlay`, for the same reason (an unmapped key falling through to row
+/// navigation underneath a confirm/in-flight/result frame would desync the highlight or,
+/// worse, let a key meant to dismiss a Result frame instead move the selection).
+fn handle_jobs_key(key: KeyEvent, app: &mut App) {
+    let code = key.code;
+
+    if let Some(ov) = &app.jobs_overlay {
+        match &ov.mode {
+            JobOverlayMode::ConfirmFire => match code {
+                // `y` (not a bare Enter) — a manual fire calls live capabilities right now
+                // and can overwrite today's real data if the job already ran today
+                // (attn.2-R5 residual); the confirm gate should cost a deliberate keypress,
+                // not the same Enter that opened it.
+                KeyCode::Char('y') => {
+                    let job_id = ov.target_job_id.clone();
+                    app.jobs_overlay = Some(JobsOverlay {
+                        target_job_id: job_id.clone(),
+                        mode: JobOverlayMode::InFlight,
+                    });
+                    // The key handler never calls the DataSource directly for a verb whose
+                    // HTTP round-trip can take ~2 s (same H1 finding PendingVerb exists
+                    // for) — parked here, performed by drain_pending_verb/
+                    // drain_run_job_fire on the next loop iteration.
+                    app.pending_verb = Some(PendingVerb::RunJob { job_id });
+                }
+                KeyCode::Char('n') | KeyCode::Esc | KeyCode::Char('q') => {
+                    app.jobs_overlay = None;
+                }
+                _ => {}
+            },
+            // Keys are ignored while in flight — the InFlight frame's own hint promises this.
+            JobOverlayMode::InFlight => {}
+            JobOverlayMode::Result { .. } => {
+                // Any key dismisses. Deliberately not auto-cleared otherwise (same M3 finding
+                // as the Dashboard's Result frame): an operator who taps a key while reading
+                // must not lose the only report of what the fire did.
+                app.jobs_overlay = None;
+            }
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.jobs_selected = app.jobs_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !app.jobs.is_empty() {
+                app.jobs_selected = (app.jobs_selected + 1).min(app.jobs.len() - 1);
+            }
+        }
+        KeyCode::Char('f') | KeyCode::Enter => {
+            if let Some(job) = app.jobs.get(app.jobs_selected) {
+                app.jobs_overlay = Some(JobsOverlay {
+                    target_job_id: job.job_id.clone(),
+                    mode: JobOverlayMode::ConfirmFire,
+                });
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.view = View::Dashboard;
+        }
         _ => {}
     }
 }
@@ -1818,11 +1932,11 @@ mod tests {
 
     use super::{
         do_spawn_action, drain_events, drain_pending_verb, explain_verb_error, handle_approvals_key,
-        handle_dashboard_key, handle_inspector_key, handle_logs_key, handle_memory_key,
+        handle_dashboard_key, handle_inspector_key, handle_jobs_key, handle_logs_key, handle_memory_key,
         handle_spawn_key, logs, on_resize, overlay, parse_budget, route_paste, set_mode, step,
-        step_key, App, Effect, View, MAX_PASTE_CHARS,
+        step_key, App, Effect, View, MAX_PASTE_CHARS, PendingVerb,
     };
-    use crate::watch::app::{CancelMarker, MemoryPane, SpawnFocus};
+    use crate::watch::app::{CancelMarker, JobOverlayMode, JobsOverlay, MemoryPane, SpawnFocus};
     use crate::watch::approvals::ApprovalsMode;
     use crate::watch::pump::AppEvent;
     use crate::watch::reader::{self, AgentInfo, BudgetKind, PendingAction, Snapshot};
@@ -1831,7 +1945,7 @@ mod tests {
     struct TestSource;
     impl DataSource for TestSource {
         fn load_snapshot(&self) -> Snapshot {
-            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("mock: no control".into()) }
@@ -1895,7 +2009,7 @@ mod tests {
                 pid:             0,
                 attention:       vec![],
             }).collect(),
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         }
     }
 
@@ -2192,7 +2306,7 @@ mod tests {
     struct ResolvesDifferentIdSource;
     impl DataSource for ResolvesDifferentIdSource {
         fn load_snapshot(&self) -> Snapshot {
-            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
@@ -2276,7 +2390,7 @@ mod tests {
         struct ChatRejectSource;
         impl DataSource for ChatRejectSource {
             fn load_snapshot(&self) -> Snapshot {
-                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
             }
             fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
             fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
@@ -2714,7 +2828,7 @@ mod tests {
     impl DataSource for FuseSpawnGuard {
         fn load_snapshot(&self) -> Snapshot {
             Snapshot { agents: vec![], budget: None, queue: None, sandbox: None,
-                       provider: None, isolation: None, credentials: None, error: None }
+                       provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
@@ -3031,7 +3145,7 @@ mod tests {
     }
     impl DataSource for RecordingApprovalSource {
         fn load_snapshot(&self) -> Snapshot {
-            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, id: &str) -> Result<(), String> {
@@ -3562,7 +3676,7 @@ mod tests {
     }
     impl DataSource for VerbSource {
         fn load_snapshot(&self) -> Snapshot {
-            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
@@ -3720,7 +3834,7 @@ mod tests {
         impl DataSource for NoCountSource {
             fn confirms_mutations(&self) -> bool { true }
             fn load_snapshot(&self) -> Snapshot {
-                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
             }
             fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
             fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
@@ -3747,7 +3861,7 @@ mod tests {
         struct FuseLikeVerbSource;
         impl DataSource for FuseLikeVerbSource {
             fn load_snapshot(&self) -> Snapshot {
-                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
             }
             fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
             fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
@@ -4158,7 +4272,7 @@ mod tests {
         struct PlainApproveSource(std::sync::Mutex<Vec<String>>);
         impl DataSource for PlainApproveSource {
             fn load_snapshot(&self) -> Snapshot {
-                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+                Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
             }
             fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
             fn approve(&self, id: &str) -> Result<(), String> {
@@ -4594,5 +4708,189 @@ mod tests {
         route_paste(&mut app, "clip");
         assert_eq!(app.converse_view.input.value(), "clip",
             "paste must be inserted into the focused converse rail input");
+    }
+
+    // ── attn.2-R5: Jobs view + manual fire ──────────────────────────────────────
+
+    fn job_row(job_id: &str) -> reader::SysJob {
+        reader::SysJob {
+            job_id: job_id.to_string(),
+            schedule_described: "0 8 * * * (UTC)".to_string(),
+            next_fire_ts: 1_800_000_000,
+            last_outcome: String::new(),
+            last_skip_reason: None,
+            shadow_mode: true,
+        }
+    }
+
+    fn app_with_jobs(ids: &[&str]) -> App {
+        let mut app = App::new(PathBuf::from("/agents"));
+        app.apply_snapshot(Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
+            isolation: None, credentials: None, error: None,
+            jobs: ids.iter().map(|id| job_row(id)).collect(),
+        });
+        app
+    }
+
+    /// Records exactly what reached the `DataSource`, mirroring `VerbSource` above — the
+    /// same two-phase-split proof (nothing during key dispatch, exactly once from the loop).
+    #[derive(Default)]
+    struct RunJobSource {
+        calls: std::sync::Mutex<Vec<String>>,
+        fail:  Option<String>,
+    }
+    impl RunJobSource {
+        fn failing(msg: &str) -> Self {
+            Self { fail: Some(msg.to_string()), ..Default::default() }
+        }
+    }
+    impl DataSource for RunJobSource {
+        fn load_snapshot(&self) -> Snapshot {
+            Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
+        }
+        fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
+        fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
+        fn deny(&self, _id: &str, _r: Option<&str>) -> Result<(), String> { Err("n/a".into()) }
+        fn run_job(&self, job_id: &str) -> Result<String, String> {
+            self.calls.lock().unwrap().push(job_id.to_string());
+            match &self.fail {
+                Some(e) => Err(e.clone()),
+                None => Ok(format!("{job_id}-manual-1")),
+            }
+        }
+    }
+
+    #[test]
+    fn jobs_key_up_down_clamp_to_the_list_bounds() {
+        let mut app = app_with_jobs(&["cos-inbox", "cos-curator"]);
+        handle_jobs_key(kev(KeyCode::Up), &mut app);
+        assert_eq!(app.jobs_selected, 0, "cannot go above row 0");
+        handle_jobs_key(kev(KeyCode::Down), &mut app);
+        handle_jobs_key(kev(KeyCode::Down), &mut app);
+        handle_jobs_key(kev(KeyCode::Down), &mut app);
+        assert_eq!(app.jobs_selected, 1, "cannot go past the last row");
+    }
+
+    #[test]
+    fn jobs_key_enter_opens_confirm_pinned_to_the_selected_row() {
+        let mut app = app_with_jobs(&["cos-inbox", "cos-curator"]);
+        app.jobs_selected = 1;
+        handle_jobs_key(kev(KeyCode::Enter), &mut app);
+        let ov = app.jobs_overlay.as_ref().expect("overlay must open");
+        assert_eq!(ov.target_job_id, "cos-curator");
+        assert_eq!(ov.mode, JobOverlayMode::ConfirmFire);
+    }
+
+    #[test]
+    fn jobs_key_y_on_confirm_arms_pending_verb_and_moves_to_in_flight() {
+        let mut app = app_with_jobs(&["cos-inbox"]);
+        handle_jobs_key(kev(KeyCode::Enter), &mut app);
+        handle_jobs_key(kev(KeyCode::Char('y')), &mut app);
+        assert_eq!(
+            app.pending_verb,
+            Some(PendingVerb::RunJob { job_id: "cos-inbox".to_string() }),
+            "the key handler must never call the DataSource directly — it parks the verb"
+        );
+        assert_eq!(app.jobs_overlay.as_ref().unwrap().mode, JobOverlayMode::InFlight);
+    }
+
+    #[test]
+    fn jobs_key_n_esc_q_on_confirm_closes_without_arming_anything() {
+        for key in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = app_with_jobs(&["cos-inbox"]);
+            handle_jobs_key(kev(KeyCode::Enter), &mut app);
+            handle_jobs_key(kev(key), &mut app);
+            assert!(app.jobs_overlay.is_none(), "{key:?} must close the confirm overlay");
+            assert!(app.pending_verb.is_none(), "{key:?} must not arm a fire");
+        }
+    }
+
+    #[test]
+    fn jobs_key_any_key_dismisses_the_result_frame() {
+        let mut app = app_with_jobs(&["cos-inbox"]);
+        app.jobs_overlay = Some(JobsOverlay {
+            target_job_id: "cos-inbox".to_string(),
+            mode: JobOverlayMode::Result { text: "Fired".to_string(), ok: true },
+        });
+        handle_jobs_key(kev(KeyCode::Char('z')), &mut app);
+        assert!(app.jobs_overlay.is_none());
+    }
+
+    #[test]
+    fn jobs_key_in_flight_ignores_every_key() {
+        let mut app = app_with_jobs(&["cos-inbox"]);
+        app.jobs_overlay = Some(JobsOverlay {
+            target_job_id: "cos-inbox".to_string(),
+            mode: JobOverlayMode::InFlight,
+        });
+        for key in [KeyCode::Char('y'), KeyCode::Esc, KeyCode::Enter] {
+            handle_jobs_key(kev(key), &mut app);
+            assert_eq!(app.jobs_overlay.as_ref().unwrap().mode, JobOverlayMode::InFlight,
+                "{key:?} must be a no-op while a call is in flight");
+        }
+    }
+
+    #[test]
+    fn jobs_key_esc_q_with_no_overlay_returns_to_dashboard() {
+        let mut app = app_with_jobs(&["cos-inbox"]);
+        app.view = View::Jobs;
+        handle_jobs_key(kev(KeyCode::Esc), &mut app);
+        assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn drain_run_job_fire_success_writes_the_result_into_jobs_overlay() {
+        let mut app = app_with_jobs(&["cos-inbox"]);
+        app.jobs_overlay = Some(JobsOverlay {
+            target_job_id: "cos-inbox".to_string(),
+            mode: JobOverlayMode::InFlight,
+        });
+        app.pending_verb = Some(PendingVerb::RunJob { job_id: "cos-inbox".to_string() });
+        let src = RunJobSource::default();
+        drain_pending_verb(&mut app, &src);
+        assert_eq!(src.calls.lock().unwrap().as_slice(), ["cos-inbox"]);
+        let JobOverlayMode::Result { ok, .. } = &app.jobs_overlay.as_ref().unwrap().mode else {
+            panic!("expected Result mode");
+        };
+        assert!(*ok);
+        assert!(app.pending_verb.is_none(), "the slot must be drained, not re-armed");
+    }
+
+    #[test]
+    fn drain_run_job_fire_error_writes_a_non_ok_result() {
+        let mut app = app_with_jobs(&["cos-inbox"]);
+        app.jobs_overlay = Some(JobsOverlay {
+            target_job_id: "cos-inbox".to_string(),
+            mode: JobOverlayMode::InFlight,
+        });
+        app.pending_verb = Some(PendingVerb::RunJob { job_id: "cos-inbox".to_string() });
+        let src = RunJobSource::failing("unknown job id");
+        drain_pending_verb(&mut app, &src);
+        let JobOverlayMode::Result { ok, text } = &app.jobs_overlay.as_ref().unwrap().mode else {
+            panic!("expected Result mode");
+        };
+        assert!(!ok);
+        assert!(text.contains("unknown job id") || !text.is_empty());
+    }
+
+    #[test]
+    fn drain_run_job_fire_does_not_clobber_a_different_jobs_overlay() {
+        // Resolve-at-use (same discipline DashboardOverlay::target uses): if the operator
+        // somehow reopened the overlay against a DIFFERENT job while the first call was in
+        // flight, the stale call's result must not overwrite the new target's frame.
+        let mut app = app_with_jobs(&["cos-inbox", "cos-curator"]);
+        app.jobs_overlay = Some(JobsOverlay {
+            target_job_id: "cos-curator".to_string(),
+            mode: JobOverlayMode::ConfirmFire,
+        });
+        app.pending_verb = Some(PendingVerb::RunJob { job_id: "cos-inbox".to_string() });
+        let src = RunJobSource::default();
+        drain_pending_verb(&mut app, &src);
+        assert_eq!(
+            app.jobs_overlay.as_ref().unwrap().mode,
+            JobOverlayMode::ConfirmFire,
+            "a stale in-flight result for a different job must not touch the current overlay"
+        );
     }
 }

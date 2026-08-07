@@ -9,7 +9,7 @@ use super::inspector::InspectorState;
 use super::logs::LogsState;
 use super::memory::{read_agent_memory, read_kb_segments, AgentMemory, KbSegment};
 use super::overlay::{DashboardOverlay, PendingVerb};
-use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue, SysSandbox};
+use super::reader::{self, AgentInfo, PendingAction, Snapshot, SysBudget, SysCredentials, SysIsolation, SysJob, SysProvider, SysQueue, SysSandbox};
 use super::source::{DataSource, SpawnRequest};
 use super::spawn::{load_spawn_templates, SpawnTemplate};
 use super::topology::{build_graph, TopologyGraph};
@@ -38,6 +38,36 @@ pub enum View {
     /// ux.10-A: live tail of `docker compose logs` (only reachable when a Compose project
     /// was detected at startup — see `LogsState::available`).
     Logs,
+    /// attn.2-R5: job schedule rows (next/last fire, shadow-or-live) with a manual "fire
+    /// now" verb per row. HTTP-source only — see `App.jobs`'s doc comment.
+    Jobs,
+}
+
+// ── Jobs view (attn.2-R5) ────────────────────────────────────────────────────
+
+/// Which step of the manual-fire flow is in progress, pinned to the job it was opened
+/// against. Deliberately NOT reusing `overlay::OverlayMode`/`DashboardOverlay`: those are
+/// agent-row-specific (a `target()` lookup against `app.agents`, a menu of several verbs)
+/// and this view has exactly one verb, against a different entity (jobs, not agents).
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobOverlayMode {
+    /// Second gate before firing — a manual fire calls the job's real capabilities (live
+    /// Gmail, KB writes) right now, ignoring shadow mode, and (attn.2-R5 residual) can
+    /// overwrite today's real data if the job already ran today. Never armed straight off
+    /// the row.
+    ConfirmFire,
+    /// Drawn BEFORE the blocking call — `drain_pending_verb` performs it on the next loop
+    /// iteration, never in the key handler (same H1 finding `PendingVerb` exists for).
+    InFlight,
+    /// Outcome, held until dismissed by any key.
+    Result { text: String, ok: bool },
+}
+
+/// A manual-fire flow in progress, pinned to the job it was opened against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobsOverlay {
+    pub target_job_id: String,
+    pub mode:          JobOverlayMode,
 }
 
 // ── Spawn view ───────────────────────────────────────────────────────────────
@@ -544,6 +574,17 @@ pub struct App {
     /// `InFlight` overlay frame, the loop draws, and `drain_pending_verb` performs the call on the next
     /// iteration. Same shape as `spawn_view.pending_exec`.
     pub pending_verb:      Option<PendingVerb>,
+    /// attn.2-R5: job schedule rows from the latest snapshot. Empty on the FUSE source (no
+    /// producer file yet — `SysJob`'s doc comment).
+    pub jobs:            Vec<SysJob>,
+    /// Highlighted row in the Jobs view. Clamped to `jobs.len()` on every snapshot apply,
+    /// mirroring `selected_id`'s stability handling but simpler: jobs are config-static
+    /// within a session, so there is no auto-select-first/pending-focus dance to replicate.
+    pub jobs_selected:   usize,
+    /// The Jobs view's own manual-fire flow, when one is open. Parallel to
+    /// `dashboard_overlay` — kept separate because it targets a different entity (jobs,
+    /// not agents) with a single verb, not a menu.
+    pub jobs_overlay:    Option<JobsOverlay>,
     /// ux.1: last-known terminal size `(cols, rows)`, refreshed once per tick in
     /// `run_tui_loop` (NOT queried ad-hoc from key-handling logic — that broke a test
     /// under `cargo test`'s no-TTY environment and would be equally fragile in any
@@ -662,6 +703,9 @@ impl App {
             cli_conn:          String::new(),
             pending_cancel:    std::collections::HashMap::new(),
             pending_verb:      None,
+            jobs:            vec![],
+            jobs_selected:   0,
+            jobs_overlay:    None,
             term_size:       DEFAULT_TERM_SIZE,
         }
     }
@@ -740,6 +784,16 @@ impl App {
         self.provider    = snap.provider;
         self.isolation   = snap.isolation;
         self.credentials = snap.credentials;
+        self.jobs        = snap.jobs;
+        // Clamp rather than clear on selection: jobs are config-static within a session, so
+        // (unlike selected_id above) there is no vanished-row case to detect — only a
+        // shrunk list from a stale prior poll landing after a smaller one, which clamping
+        // handles without a flicker back to row 0.
+        if !self.jobs.is_empty() {
+            self.jobs_selected = self.jobs_selected.min(self.jobs.len() - 1);
+        } else {
+            self.jobs_selected = 0;
+        }
         self.error       = snap.error;
         // Parse flight.jsonl for message edges only while the Topology view is
         // active — reading up to 512 KB on every tick in other views causes stutter.
@@ -953,7 +1007,7 @@ mod tests {
     impl DataSource for FuseLikeSource {
         fn load_snapshot(&self) -> Snapshot {
             Snapshot { agents: vec![], budget: None, queue: None, sandbox: None,
-                       provider: None, isolation: None, credentials: None, error: None }
+                       provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
         }
         fn load_approvals(&self) -> Vec<PendingAction> { vec![] }
         fn approve(&self, _id: &str) -> Result<(), String> { Err("n/a".into()) }
@@ -989,6 +1043,7 @@ mod tests {
             provider:    None,
             isolation:   None,
             credentials: None,
+            jobs:        vec![],
             error:       None,
         }
     }
@@ -1922,7 +1977,7 @@ mod tests {
 
         let failed = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
-            isolation: None, credentials: None, error: Some("HTTP error: connection refused".into()),
+            isolation: None, credentials: None, jobs: vec![], error: Some("HTTP error: connection refused".into()),
         };
         app.apply_snapshot(failed);
         assert!(app.cancel_marker("scout-2").is_some(),

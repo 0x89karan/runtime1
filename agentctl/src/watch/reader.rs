@@ -422,6 +422,21 @@ pub fn read_sys_provider(agents_dir: &Path) -> Option<SysProvider> {
     read_json(&agents_dir.join("system").join("provider"))
 }
 
+/// Parsed content of one entry of the HTTP snapshot's `job_schedules` array (attn.4 /
+/// attn.2-R5). Mirrors `surfaces::JobScheduleView` field-for-field. No FUSE producer exists
+/// yet for this (`agents_fs.rs` has no `system/jobs` file — filed as a residual alongside
+/// `attn.4-watch-01`), so this is populated only over the HTTP source today.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct SysJob {
+    pub job_id:            String,
+    pub schedule_described: String,
+    pub next_fire_ts:       i64,
+    pub last_outcome:       String,
+    #[serde(default)]
+    pub last_skip_reason:   Option<String>,
+    pub shadow_mode:        bool,
+}
+
 /// Load a full snapshot: agent list + system files.
 pub struct Snapshot {
     pub agents:      Vec<AgentInfo>,
@@ -431,6 +446,8 @@ pub struct Snapshot {
     pub provider:    Option<SysProvider>,
     pub isolation:   Option<SysIsolation>,
     pub credentials: Option<SysCredentials>,
+    /// Job schedule rows (attn.2-R5) — empty on the FUSE source (no producer yet).
+    pub jobs:        Vec<SysJob>,
     pub error:       Option<String>,
 }
 
@@ -484,6 +501,9 @@ pub fn load_snapshot(agents_dir: &Path) -> Snapshot {
         provider:    read_sys_provider(agents_dir),
         isolation:   read_sys_isolation(agents_dir),
         credentials: read_sys_credentials(agents_dir),
+        // attn.2-R5: no FUSE producer yet (agents_fs.rs has no system/jobs file) — filed
+        // as a residual alongside attn.4-watch-01.
+        jobs:        vec![],
         agents,
         error,
     }

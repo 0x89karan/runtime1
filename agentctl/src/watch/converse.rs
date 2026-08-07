@@ -827,7 +827,7 @@ mod tests {
             };
             super::super::reader::Snapshot {
                 agents, budget: None, queue: None, sandbox: None, provider: None,
-                isolation: None, credentials: None, error: None,
+                isolation: None, credentials: None, jobs: vec![], error: None,
             }
         }
         fn load_approvals(&self) -> Vec<super::super::reader::PendingAction> { vec![] }
