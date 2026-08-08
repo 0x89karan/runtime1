@@ -1349,9 +1349,18 @@ fn drain_chat_turn(
 /// smaller window and the size of what already shipped this increment.
 fn drain_run_job_fire(app: &mut App, source: &dyn DataSource, job_id: &str) -> Vec<Effect> {
     let outcome = source.run_job(job_id);
-    let (text, ok) = match outcome {
-        Ok(child_id) => (format!("Fired '{job_id}' — child '{child_id}'"), true),
-        Err(e) => (format!("Fire failed: {}", explain_verb_error(&e)), false),
+    let (text, ok) = match &outcome {
+        Ok(child_id) => {
+            // attn.2-R5 fix: record the fire session-locally, independent of the occurrence
+            // ledger the Jobs table's own `last_outcome` column is sourced from (which a
+            // manual fire deliberately never touches) — see jobs_last_manual_fire's doc.
+            app.jobs_last_manual_fire.insert(
+                job_id.to_string(),
+                (child_id.clone(), std::time::Instant::now()),
+            );
+            (format!("Fired '{job_id}' — child '{child_id}'"), true)
+        }
+        Err(e) => (format!("Fire failed: {}", explain_verb_error(e)), false),
     };
     // Only update the overlay if it's still pinned to the SAME job — resolve-at-use, same
     // discipline `DashboardOverlay::target` uses, in case the operator somehow left the view

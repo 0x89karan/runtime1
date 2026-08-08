@@ -2030,7 +2030,7 @@ fn render_jobs(f: &mut Frame, app: &App) {
             } else {
                 j.last_outcome.clone()
             })];
-            let outcome_height = if let Some(reason) = j.last_skip_reason.as_deref().filter(|r| !r.is_empty()) {
+            let mut outcome_height = if let Some(reason) = j.last_skip_reason.as_deref().filter(|r| !r.is_empty()) {
                 outcome_lines.push(Line::from(Span::styled(
                     format!("  {}", sanitize(reason)),
                     Style::default().fg(Color::DarkGray),
@@ -2039,6 +2039,22 @@ fn render_jobs(f: &mut Frame, app: &App) {
             } else {
                 1
             };
+            // attn.2-R5 fix (/autoplan retroactive review): last_outcome above is sourced
+            // from the occurrence ledger, which a manual fire deliberately never touches —
+            // so this column is structurally incapable of ever reflecting one on its own.
+            // jobs_last_manual_fire is the session-local, client-side acknowledgement that
+            // closes that gap without perturbing the ledger.
+            if let Some((_child_id, fired_at)) = app.jobs_last_manual_fire.get(&j.job_id) {
+                // Child id deliberately omitted here — the 28-col "Last outcome" column has
+                // no room for a nanosecond-suffixed id (the Result overlay already showed
+                // the full id when the fire happened); this row exists only to acknowledge
+                // "yes, that just happened", which "manually fired Ns ago" does on its own.
+                outcome_lines.push(Line::from(Span::styled(
+                    format!("  manually fired {}s ago", fired_at.elapsed().as_secs()),
+                    Style::default().fg(Color::Cyan),
+                )));
+                outcome_height += 1;
+            }
             let mode_text = if j.shadow_mode { "shadow" } else { "live" };
             let mode_style = if j.shadow_mode {
                 Style::default().fg(Color::Yellow)
@@ -4093,6 +4109,20 @@ mod tests {
         assert!(out.contains("2026") || out.contains("UTC"), "next fire must render as explicit UTC, not a bare timestamp:\n{out}");
         assert!(out.contains("shadow"));
         assert!(out.contains("live"));
+    }
+
+    #[test]
+    fn render_jobs_shows_a_manual_fire_even_though_last_outcome_never_will() {
+        // /autoplan retroactive review (2026-08-07, CRITICAL): last_outcome is sourced from
+        // the occurrence ledger, which a manual fire deliberately never touches — so this is
+        // the fix, not a duplicate of render_jobs_lists_every_row_with_schedule_and_next_fire.
+        let mut app = app_with_jobs(vec![job_row("cos-inbox", "", true)]);
+        app.jobs_last_manual_fire.insert(
+            "cos-inbox".to_string(),
+            ("cos-inbox-manual-123".to_string(), std::time::Instant::now()),
+        );
+        let out = render_to_text(&app, 100, 30, render_jobs);
+        assert!(out.contains("manually fired"), "the manual fire must be acknowledged in the row:\n{out}");
     }
 
     #[test]

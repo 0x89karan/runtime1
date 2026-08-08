@@ -585,6 +585,17 @@ pub struct App {
     /// `dashboard_overlay` — kept separate because it targets a different entity (jobs,
     /// not agents) with a single verb, not a menu.
     pub jobs_overlay:    Option<JobsOverlay>,
+    /// attn.2-R5 fix (/autoplan retroactive review — CRITICAL, cross-model-confirmed):
+    /// job_id → (child_id, fired_at) for the most recent SUCCESSFUL manual fire this
+    /// session. The Jobs table's `last_outcome` column is sourced from
+    /// `state.job_schedules`, which a manual fire deliberately never touches (so it can't
+    /// perturb the schedule's own occurrence-ledger dedup) — which means, structurally, NO
+    /// amount of polling can ever make that column reflect a manual fire. Verified against
+    /// real-binary QA: the table was byte-identical before and after a confirmed, successful
+    /// fire. This field is the fix — session-local, client-side, deliberately NOT sourced
+    /// from the occurrence ledger, so the operator sees SOMETHING acknowledging the fire
+    /// they just watched succeed, without perturbing the state that must stay untouched.
+    pub jobs_last_manual_fire: std::collections::HashMap<String, (String, std::time::Instant)>,
     /// ux.1: last-known terminal size `(cols, rows)`, refreshed once per tick in
     /// `run_tui_loop` (NOT queried ad-hoc from key-handling logic — that broke a test
     /// under `cargo test`'s no-TTY environment and would be equally fragile in any
@@ -706,6 +717,7 @@ impl App {
             jobs:            vec![],
             jobs_selected:   0,
             jobs_overlay:    None,
+            jobs_last_manual_fire: std::collections::HashMap::new(),
             term_size:       DEFAULT_TERM_SIZE,
         }
     }
