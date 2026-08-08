@@ -764,10 +764,21 @@ async fn route(
                 .and_then(|s| s.strip_suffix("/run"))
                 .unwrap_or("")
                 .trim();
+            // /review (2026-08-07): these four early returns bypassed dispatch_control_command
+            // entirely, so none of them were ever audit-logged — contradicting the "every
+            // attempt is audit-logged regardless of outcome or transport" claim this route's
+            // own doc comment (and CLAUDE.md/CHANGELOG.md/THREAT_MODEL.md §9.5) makes. Logged
+            // here as JobManualFireRejected, the SAME event kind the scheduler-side rejection
+            // uses, so a flight-log reader sees one consistent kind for "a manual fire attempt
+            // failed" regardless of which layer rejected it.
             if job_id.is_empty() {
+                state.recorder.record("agentd", None, EventKind::JobManualFireRejected,
+                    json!({ "job_id": job_id, "reason": "job id must not be empty", "via": "http" }));
                 return error_response(StatusCode::BAD_REQUEST, "job id must not be empty");
             }
             let Some(tx) = &state.control_tx else {
+                state.recorder.record(job_id, None, EventKind::JobManualFireRejected,
+                    json!({ "job_id": job_id, "reason": "control channel not available", "via": "http" }));
                 return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
             };
             let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
@@ -775,16 +786,22 @@ async fn route(
             match tx.try_send(cmd) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
+                    state.recorder.record(job_id, None, EventKind::JobManualFireRejected,
+                        json!({ "job_id": job_id, "reason": "control channel full, retry", "via": "http" }));
                     return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry");
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
+                    state.recorder.record(job_id, None, EventKind::JobManualFireRejected,
+                        json!({ "job_id": job_id, "reason": "scheduler not running", "via": "http" }));
                     return error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running");
                 }
             }
             match tokio::time::timeout(std::time::Duration::from_secs(2), confirm_rx).await {
                 Ok(Ok(Ok(child_id))) => json_response(StatusCode::OK, json!({ "job_id": job_id, "child_id": child_id })),
-                // unknown job id → 404; a child-id collision (vanishingly rare with a
-                // nanosecond-resolution id) → 409, distinguishing it from "job doesn't exist".
+                // unknown job id → 404; 409 covers two causes, distinguished from "job doesn't
+                // exist": the common one is reject_if_job_already_running's guard refusing a
+                // repeat fire while one is still live; the rare one is a bare nanosecond-
+                // timestamp child_id collision.
                 Ok(Ok(Err(e))) => {
                     let code = if e.contains("unknown job") { StatusCode::NOT_FOUND } else { StatusCode::CONFLICT };
                     error_response(code, &e)
@@ -1466,6 +1483,30 @@ mod tests {
     }
 
     // attn.2-R5: POST /api/v1/jobs/:id/run
+
+    /// Builds an ApiState the SAME way make_state_with_control does, but also returns the
+    /// flight-log tmpfile — needed for the /review audit-log-gap tests below, which assert on
+    /// recorded content that make_state's own tmp handle (dropped inside the helper) can't see.
+    fn make_state_with_control_and_tmp(
+        snap: SchedulerSnapshot,
+        control_tx: Option<mpsc::Sender<ControlCommand>>,
+    ) -> (Arc<ApiState>, tempfile::NamedTempFile) {
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap());
+        let state = Arc::new(ApiState {
+            snapshot: Arc::new(RwLock::new(snap)),
+            memory_store: None,
+            runs_store: None,
+            broadcast_tx: tx,
+            recorder,
+            control_tx,
+            credential_gateway: None,
+            approval_secret: None,
+        });
+        (state, tmp)
+    }
+
     #[tokio::test]
     async fn run_job_route_503_without_control_tx() {
         let state = make_state(SchedulerSnapshot::default());
@@ -1478,6 +1519,56 @@ mod tests {
         let state = make_state(SchedulerSnapshot::default());
         let resp = route(state, Method::POST, "/api/v1/jobs//run", "", &[]).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // /review (2026-08-07): these four early returns bypassed dispatch_control_command
+    // entirely, so — before this fix — none of them were ever audit-logged, contradicting the
+    // route's own "every attempt is audit-logged regardless of outcome or transport" claim.
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_for_an_empty_job_id() {
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), None);
+        let resp = route(state, Method::POST, "/api/v1/jobs//run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\""),
+            "an empty job id must be audit-logged, not just returned as a bare 400: {content}");
+    }
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_when_the_control_channel_is_unavailable() {
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), None);
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\"") && content.contains("cos-inbox"),
+            "a missing control channel must be audit-logged, naming the job that was requested: {content}");
+    }
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_when_the_control_channel_is_full() {
+        // Bounded capacity 1, pre-filled, so the route's own try_send hits Full.
+        let (tx, rx) = mpsc::channel::<ControlCommand>(1);
+        tx.try_send(ControlCommand::Cancel { agent_id: "occupy-the-slot".into(), confirm_tx: None }).unwrap();
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\"") && content.contains("control channel full"),
+            "a full control channel must be audit-logged: {content}");
+        drop(rx); // silence "channel dropped while messages are pending" noise
+    }
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_when_the_scheduler_is_gone() {
+        let (tx, rx) = mpsc::channel::<ControlCommand>(4);
+        drop(rx); // closes the receiver side — try_send now hits Closed
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\"") && content.contains("scheduler not running"),
+            "a closed control channel must be audit-logged: {content}");
     }
 
     #[tokio::test]
