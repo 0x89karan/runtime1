@@ -5978,12 +5978,20 @@ mod tests {
         let (rec, tmp) = recorder();
         let mut job = cos_like_job("cos-inbox", vec![]);
         job.schedule = Some(schedule.to_string());
+        // Same false-green class as boot_init_discards_persisted_next_fire (see its note
+        // above): zero agents, an active job schedule, and no control channel mean run()
+        // has no legitimate exit besides a lucky concurrent SIGTERM from another test.
+        // Traced directly (QA_TRACE_LOOP) and confirmed: after the one real dispatch-and-
+        // fail cycle this test exercises, it sits in the 60s idle sleep for real, sometimes
+        // rescued fast by chance, sometimes not — never a difference in the test's OWN logic.
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<crate::control::ControlCommand>(1);
+        drop(control_tx);
         let sched = Scheduler::new(
             vec![], &model_cfg(),
             SchedulerConfig { native_cron_shadow: false, checkpoint_interval_turns: 0, ..unlimited() },
             Arc::new(gw), Arc::new(ToolRegistry::new()), rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())), Some(cp),
-        ).unwrap().with_jobs(vec![job]);
+        ).unwrap().with_jobs(vec![job]).with_control(control_rx);
 
         let outcomes = sched.run().await;
 
@@ -6026,6 +6034,11 @@ mod tests {
         let (rec, tmp) = recorder();
         let mut job = cos_like_job("cos-inbox", vec![]);
         job.schedule = Some("* * * * *".to_string());
+        // Same false-green class as boot_init_discards_persisted_next_fire (see its note
+        // above): zero agents, an active job schedule, and no control channel mean run()
+        // has no legitimate exit besides a lucky concurrent SIGTERM from another test.
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<crate::control::ControlCommand>(1);
+        drop(control_tx);
         let sched = Scheduler::new(
             vec![], // no [[agents]] — only the scheduled job fires anything
             &model_cfg(),
@@ -6037,7 +6050,8 @@ mod tests {
             Some(cp),
         )
         .unwrap()
-        .with_jobs(vec![job]);
+        .with_jobs(vec![job])
+        .with_control(control_rx);
 
         let outcomes = sched.run().await;
 
