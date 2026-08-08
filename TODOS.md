@@ -2084,10 +2084,20 @@ is ~2 minutes**
   assembles a brief from missing data — **no error, just a thin or empty brief with no visible
   cause.** Same silent-failure shape as `brief-06` (carry-forward found nothing) and the
   `suppressed_count` gap.
-- **This gates the `native_cron_shadow = false` flip.** `cos-inbox` is proven equivalent;
-  `cos-curator` is proven different. Options, cheapest first: (a) widen the production offset
-  from 5 to ~15 min to buy margin; (b) accept and watch for thin briefs; (c) build a real native
-  inbox→curator dependency — does not exist today, that is new work.
+- **RESOLVED (partially) 2026-08-08 — operator chose option (a): offset widened 5 → 15 min.**
+  `cos-curator` now `schedule = "15 8 * * *"`. Margin goes from ~2m to ~12m, i.e. `cos-inbox`
+  may run ~5× longer than the measured 2m58s before the brief silently degrades. Options (b)
+  accept-and-watch and (c) a real native inbox→curator dependency were not taken; (c) remains
+  the only actual fix and is still unbuilt.
+- **This still gates `native_cron_shadow = false`, just with more headroom.** Widening buys
+  margin; it does not make the two paths equivalent. The native path still fires curator on a
+  wall clock while the legacy path waits for inbox to COMPLETE. **The offset is a deadline, not
+  a delay** — if inbox ever overruns 15 min the brief degrades silently, exactly as before.
+  Anyone shortening this must re-measure inbox's runtime first, not reason about it.
+- **Residual risk unchanged and unmonitored:** nothing detects "curator ran before inbox
+  finished." There is no assertion, no event, and no brief field that would reveal it — the
+  failure looks like a quiet news day. A cheap guard (curator records whether the inbox
+  occurrence it expected is present) does not exist and is not filed as built.
 - **Related, same cycle: native tick latency is not tight.** Shadow-log lag vs `intended_fire_ts`
   measured at +0.01s, +1.97s, **+14.25s** across three fires. That is the scheduler's idle-sleep
   granularity, not a defect — but "native cron" here means "within seconds to tens of seconds,"

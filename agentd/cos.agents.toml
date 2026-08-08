@@ -467,10 +467,22 @@ STEP 4 — Persist the OperatingBrief for the curator:
 
 [[jobs]]
 id           = "cos-curator"
-# attn.4: fires 5 minutes after cos-inbox — there is NO automatic inbox→curator handoff in
-# Rust (the sequencing was always the orchestrator's own prompt loop, not a guarantee); a
-# fixed offset is the simplest native equivalent. Same shadow-mode default as cos-inbox above.
-schedule     = "5 8 * * *"
+# attn.4: fires AFTER cos-inbox — there is NO automatic inbox→curator handoff in Rust (the
+# sequencing was always the orchestrator's own prompt loop, not a guarantee); a fixed offset
+# is the simplest native equivalent. Same shadow-mode default as cos-inbox above.
+#
+# ⚠ THE OFFSET IS A DEADLINE, NOT A DELAY. The legacy LLM path fires curator when inbox
+# COMPLETES; the native path fires it at a wall-clock time whether inbox finished or not. If
+# inbox overruns the offset, curator reads `mail:raw`/`ops:entities` before they are written
+# and assembles a brief from missing data — no error, just a thin or empty brief with no
+# visible cause (same silent-failure shape as brief-06).
+#
+# Widened 5 → 15 min on 2026-08-08 (attn.4-curator-offset-01). MEASURED in a live shadow
+# cycle against real Gmail: cos-inbox took 2m58s, and the legacy handoff fired curator 3s
+# after inbox completed (19:23:01 → 19:23:04). The old 5-min offset left ~2m of margin; 15
+# gives ~12m, i.e. inbox may run ~5× longer than observed before the brief silently degrades.
+# If you shorten this, re-measure inbox's runtime first — do not reason about it.
+schedule     = "15 8 * * *"
 # Larger than inbox: brief assembly + kb_search + runs_query all run here (cap.2b F7d — the
 # old 200k curator would brick mid-brief now that assembly moved off the trigger).
 token_budget = 500_000
