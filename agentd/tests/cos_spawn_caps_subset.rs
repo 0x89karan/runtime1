@@ -5,11 +5,21 @@
 //! trigger (or leaks Gmail into the curator job) fails here rather than shipping a reopened P1-10.
 //!
 //! Loads each real config via the boot loader and asserts, per config:
-//!   - the cos-orchestrator holds ONLY {cron_trigger, RunJob} — no Gmail, Credential, KB,
-//!     FsWrite, BriefPublish, or Spawn (it can trigger predeclared work, nothing else);
 //!   - the cos-inbox job holds Gmail (`Mcp{google_oauth}`) — the one node that touches email;
 //!   - the cos-curator job is Gmail-FREE (no `Mcp{google_oauth}`, no Credential, no Spawn) yet
 //!     owns the brief (`FsWrite` + `BriefPublish`).
+//!
+//! The two configs now diverge on WHO holds the clock, so the trigger invariant is asserted
+//! per-config rather than shared (attn.4 T7, 2026-08-08):
+//!   - **dev/docker** (`cos.agents.toml`) declares ZERO `[[agents]]`. The scheduler fires the
+//!     jobs natively from their `schedule =` keys. The invariant is therefore STRONGER, not
+//!     weaker: NO agent may hold `RunJob` at all, so nothing but the scheduler can fire a job.
+//!     Re-adding an LLM trigger here would resurrect the cos-curator double-fire that T7 closed
+//!     (the native path fires curator on a wall clock; the legacy path fired it when inbox
+//!     COMPLETED, and `reject_if_job_already_running` only refuses while a run is LIVE).
+//!   - **distro/QEMU** carries no per-job `schedule =`, so it still needs the LLM trigger, and
+//!     the original cap.2b assertion still applies there: cos-orchestrator holds ONLY
+//!     {cron_trigger, RunJob} — no Gmail, Credential, KB, FsWrite, BriefPublish, or Spawn.
 
 use agentd::capability::Capability;
 use agentd::config::{Config, Job};
@@ -35,12 +45,13 @@ fn has_mcp(caps: &[Capability], server: &str) -> bool {
     caps.iter().any(|c| matches!(c, Capability::Mcp { server: s, .. } if s == server))
 }
 
-/// Assert the shared cap.2b invariants for a given config (dev or distro).
-fn assert_cos2b_topology(rel_path: &str) {
+/// Assert the cap.2b DE-PRIVILEGED-TRIGGER invariant. Only applies to configs that still have
+/// an LLM trigger — i.e. distro/QEMU, which carries no per-job `schedule =` (attn.4 T7).
+fn assert_llm_trigger_is_deprivileged(rel_path: &str) {
     let cfg = load(rel_path);
     let orch = orchestrator_caps(&cfg);
 
-    // 1. The trigger is de-privileged: RunJob + cron_trigger, and NOTHING dangerous.
+    // The trigger is de-privileged: RunJob + cron_trigger, and NOTHING dangerous.
     assert!(
         orch.iter().any(|c| matches!(c, Capability::RunJob)),
         "{rel_path}: cos-orchestrator must hold RunJob (it triggers the sealed jobs)"
@@ -57,6 +68,31 @@ fn assert_cos2b_topology(rel_path: &str) {
         }
     }
     assert!(!has_mcp(&orch, "google_oauth"), "{rel_path}: trigger must NOT hold Mcp{{google_oauth}}");
+}
+
+/// Assert that NOTHING but the scheduler can fire a job (attn.4 T7). The dev/docker config
+/// fires `[[jobs]]` natively from their `schedule =` keys, so an agent holding `RunJob` is not
+/// merely redundant — it reintroduces the cos-curator DOUBLE-FIRE this increment closed.
+fn assert_no_agent_can_fire_jobs(rel_path: &str) {
+    let cfg = load(rel_path);
+    for agent in &cfg.agents {
+        let caps = agent.capabilities.clone().unwrap_or_default();
+        assert!(
+            !caps.iter().any(|c| matches!(c, Capability::RunJob)),
+            "{rel_path}: agent '{}' holds RunJob, but this config fires [[jobs]] natively from \
+             their `schedule =` keys. Two live dispatch paths double-fire cos-curator: the \
+             native tick fires it on a wall clock while an LLM trigger fires it when cos-inbox \
+             COMPLETES, and `reject_if_job_already_running` only refuses while a run is LIVE — \
+             the two do not overlap, so nothing stops the second. Either delete the trigger \
+             (attn.4 T7) or remove the per-job `schedule =` keys, not both.",
+            agent.id
+        );
+    }
+}
+
+/// Assert the shared cap.2b JOB invariants (identical across both configs).
+fn assert_cos2b_topology(rel_path: &str) {
+    let cfg = load(rel_path);
 
     // 2. The inbox job is the ONE node with Gmail.
     let inbox = &job(&cfg, "cos-inbox").capabilities;
@@ -93,9 +129,44 @@ fn dev_cos2b_topology() {
     assert_cos2b_topology("cos.agents.toml");
 }
 
+/// attn.4 T7: the dev/docker config has no LLM trigger at all — the scheduler owns the clock.
+/// Pins BOTH halves: zero agents declared, and (independently) no agent may hold RunJob, so
+/// this keeps guarding even if an agent is added back for some unrelated reason.
+#[test]
+fn dev_config_has_no_llm_trigger() {
+    let cfg = load("cos.agents.toml");
+    // RunJob check FIRST, deliberately. It carries the specific double-fire explanation, and
+    // ordering it after `is_empty` would let that broader assertion shadow it — which would
+    // make the RunJob guard un-mutation-testable through this test (it can never be the one
+    // that fires). Both are proven independently only in this order.
+    assert_no_agent_can_fire_jobs("cos.agents.toml");
+    assert!(
+        cfg.agents.is_empty(),
+        "cos.agents.toml must declare zero [[agents]] — the cos-orchestrator was deleted in \
+         attn.4 T7 because it existed only to poll a clock (~3456 turns/day). Found: {:?}",
+        cfg.agents.iter().map(|a| &a.id).collect::<Vec<_>>()
+    );
+    // The native path must actually be live, or deleting the trigger leaves nothing firing.
+    assert!(
+        !cfg.scheduler.native_cron_shadow,
+        "cos.agents.toml has no LLM trigger, so native_cron_shadow MUST be false — otherwise \
+         the schedule is computed and logged but never dispatched, and no brief is ever produced."
+    );
+    for id in ["cos-inbox", "cos-curator"] {
+        assert!(
+            job(&cfg, id).schedule.is_some(),
+            "job '{id}' must carry a `schedule =` key — with the LLM trigger deleted it is the \
+             only thing that can fire it"
+        );
+    }
+}
+
 #[test]
 fn distro_cos2b_topology() {
     assert_cos2b_topology("../distro/overlay/etc/agentd/cos.agents.toml");
+    // Distro/QEMU has no per-job `schedule =`, so it still relies on the LLM trigger and the
+    // original cap.2b de-privilege invariant still applies there.
+    assert_llm_trigger_is_deprivileged("../distro/overlay/etc/agentd/cos.agents.toml");
     // The QEMU/production config runs no semantic-kb sidecar — neither job may reference it.
     let cfg = load("../distro/overlay/etc/agentd/cos.agents.toml");
     for id in ["cos-inbox", "cos-curator"] {

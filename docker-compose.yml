@@ -56,25 +56,22 @@ services:
       # Google OAuth credentials are read from /run/secrets/google.json (the volume above).
       # cos requires /run/secrets/google.json — there is no env-var fallback for this mode.
       # Run once on the Mac host: agentctl auth google --client-id ... --client-secret ...
-      # Schedule (LEGACY PATH — attn.4). TRIGGER_CRON/TRIGGER_INTERVAL drive the OLD
-      # LLM-polling `cron_trigger` MCP server + orchestrator loop, which attn.4 measured at
-      # ~3,456 inference calls/day just to watch a clock (~$50/day, before the pipeline ever
-      # produces a brief). The REAL schedule now lives in `[[jobs]]`'s `schedule` field in
-      # `cos.agents.toml` (native scheduler cron, fired in-process by `agentd` — no LLM on
-      # the schedule boundary). This env-var path is kept ONLY as a legacy/manual fallback
-      # for one release (attn.4 DX finding: no config-level rollback existed for the native
-      # path without it) — TRIGGER_CRON and TRIGGER_INTERVAL are still MUTUALLY EXCLUSIVE,
-      # cron_mcp.py still exits 1 if both are non-empty, and `[scheduler] native_cron_shadow`
-      # defaults to `true` (the native path only LOGS would-fire decisions until an operator
-      # confirms equivalence and sets it to `false` — see cos.agents.toml's own comments on
-      # the `schedule` field). Keep the fire time away from 00:00 UTC either way: the
-      # inbox→curator handoff is date-keyed and server-stamped per job, so a cycle straddling
-      # UTC midnight fails the brief (cap.2b-ar-01).
-      #   daily 08:00 UTC (default)  : docker compose up cos
-      #   twice daily                : TRIGGER_CRON="0 8,17 * * *" docker compose up cos
-      #   interval, for testing only : TRIGGER_CRON= TRIGGER_INTERVAL="every 2m" docker compose up cos
-      # Note the single-dash ${VAR-default}: it substitutes only when VAR is UNSET, so an
-      # explicitly empty TRIGGER_CRON= passes through empty and interval mode works.
+      # ⚠ INERT FOR THIS SERVICE since attn.4 T7 (2026-08-08). TRIGGER_CRON/TRIGGER_INTERVAL
+      # drove the OLD LLM-polling `cron_trigger` MCP server + `cos-orchestrator` loop, which
+      # attn.4 measured at ~3,456 inference calls/day just to watch a clock (~414k tokens per
+      # 29 min to produce nothing). T7 DELETED both from `cos.agents.toml`, so nothing in the
+      # cos image reads these any more — setting them has no effect.
+      #
+      # The schedule now lives in `[[jobs]]`'s `schedule` field, fired in-process by the
+      # scheduler with `[scheduler] native_cron_shadow = false`. To change when the brief
+      # runs, edit `cos.agents.toml` and REBUILD (`docker compose up -d --build`) — the config
+      # is baked in at `Dockerfile:70`, so a restart alone will not pick it up.
+      #
+      # They are left declared because the distro/QEMU config still carries the LLM trigger
+      # (it has no per-job `schedule =` keys) and shares this env contract. Removing them here
+      # would diverge the two deployment paths for no gain. Keep fire times away from 00:00
+      # UTC either way: the inbox→curator handoff is date-keyed and server-stamped per job, so
+      # a cycle straddling UTC midnight fails the brief (cap.2b-ar-01).
       - TRIGGER_CRON=${TRIGGER_CRON-0 8 * * *}
       - TRIGGER_INTERVAL=${TRIGGER_INTERVAL-}
       # OpenAI API key — OPTIONAL since attn.2 R1. Enables semantic KB search (email
