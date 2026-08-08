@@ -5886,6 +5886,21 @@ mod tests {
         // was a false green: it recomputed `fingerprint()` locally and never touched the
         // actual restore path, so breaking the real `.filter(|s| s.fingerprint == fp)` guard
         // in `run()` would not have failed it.
+        //
+        // SECOND false green, found investigating a real aarch64/QEMU CI hang (2026-08-07):
+        // with zero agents, no control channel, and native_cron_shadow's schedule keeping
+        // should_keep_idling_with_no_control_channel true forever, `run()` has NO legitimate
+        // way to return — its only exit paths are a real process SIGTERM/SIGINT or a closed
+        // control channel, neither of which this test ever provides. It "passed" on x86_64 CI
+        // ONLY because it happened to run concurrently with sigterm_drains_scheduler, whose
+        // self-raised SIGTERM is PROCESS-WIDE and leaks into this test's own signal handler,
+        // rescuing it by accident (verified directly: run alone → hangs past 90s; run
+        // alongside sigterm_drains_scheduler → passes in 0.11s). Under aarch64/QEMU that lucky
+        // rescue didn't happen, exposing the real bug: a 42-minute silent hang until the CI
+        // job's own 45-minute timeout killed it. Fixed by giving this test a REAL, deterministic
+        // exit — a control channel whose sender is dropped before `run()` starts, so the loop's
+        // `Some(rx) => rx.recv() → None → break 'main` path fires immediately, independent of
+        // any other test's signals.
         let past = (now_unix_secs() as i64) - 3600;
         let mut cp = minimal_scheduler_checkpoint(&[]);
         cp.agents = vec![];
@@ -5905,12 +5920,17 @@ mod tests {
         let (rec, _tmp) = recorder();
         let mut job = cos_like_job("cos-inbox", vec![]);
         job.schedule = Some("* * * * *".to_string()); // schedule CHANGED since the checkpoint
+        // Real, deterministic exit for a config that otherwise idles forever (see the false-
+        // green note above): a control channel whose sender is dropped immediately, so the
+        // loop's closed-channel path (not a lucky cross-test signal) ends the run.
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<crate::control::ControlCommand>(1);
+        drop(control_tx);
         let sched = Scheduler::new(
             vec![], &model_cfg(),
             SchedulerConfig { native_cron_shadow: true, checkpoint_interval_turns: 0, ..unlimited() },
             Arc::new(gw), Arc::new(ToolRegistry::new()), rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())), Some(cp),
-        ).unwrap().with_jobs(vec![job]);
+        ).unwrap().with_jobs(vec![job]).with_control(control_rx);
 
         sched.run().await;
         // The scheduler consumes itself in run(); assert indirectly is not possible here, so
