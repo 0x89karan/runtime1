@@ -24,6 +24,19 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
+**⚠ OPERATOR OVERRIDE (2026-08-07): the "name mv design partners" gate below is
+DEPRIORITIZED until the operator explicitly reactivates it.** Every mention of it further
+down this file (the "external gate 2026-10-01" / "needs zero engineering" / "ranked above this
+entire track" language, recorded across the attn.2/attn.3/attn.4 `/autoplan` sessions) is a
+HISTORICAL RECORD of what was true THEN — do not treat it as a live instruction to rank mv
+above other work. The operator's own words, from a retroactive `/autoplan` review that
+surfaced this as a User Challenge: *"i want the mv design partner requirement relaxed till i
+specifically reactivate it. remove it from all consideration till i have the system functional
+for my need first."* Do not resurface mv as a priority concern, in this file's own voice or in
+any `/autoplan`/`/plan-ceo-review` session, until the operator says otherwise. The gate,
+deadline, and candidate pipeline are still real — this is a deliberate sequencing choice by the
+operator, not a claim the opportunity is gone.
+
 **Current version:** v0.123.0 (shipped 2026-08-07)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
