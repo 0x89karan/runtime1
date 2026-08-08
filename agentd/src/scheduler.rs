@@ -210,6 +210,12 @@ struct SchedulerState {
     /// materializes a child from THIS declaration's fixed caps + rendered task — the trust
     /// root is config, not the (injectable) caller.
     jobs: HashMap<String, crate::config::Job>,
+    /// Native-scheduling state (attn.4) for jobs with a `schedule` — next-fire tracking +
+    /// occurrence dedup. Only jobs with `schedule.is_some()` ever get an entry.
+    job_schedules: HashMap<String, crate::scheduler_cron::JobScheduleState>,
+    /// Mirrors `SchedulerConfig::native_cron_shadow` (attn.4) — copied once at construction
+    /// so `update_snapshot` (called from many sites) can project it without a new param.
+    native_cron_shadow: bool,
 }
 
 impl SchedulerState {
@@ -281,6 +287,7 @@ struct SchedulerRestored {
     approval_seq:       u64,
     waiting_agents:     Vec<String>,
     orchestrated_agents: Vec<String>,
+    job_schedules:      HashMap<String, crate::scheduler_cron::JobScheduleState>,
 }
 
 pub struct Scheduler {
@@ -356,6 +363,7 @@ impl Scheduler {
                 orchestrated_agents: cp_orchestrated_agents,
                 budget_window_start: cp_budget_window_start,
                 global_window_anchor: cp_global_window_anchor,
+                job_schedules:       cp_job_schedules,
                 ..
             } = cp;
 
@@ -455,6 +463,7 @@ impl Scheduler {
                 orchestrated_agents: cp_orchestrated_agents,
                 budget_window_start: cp_budget_window_start,
                 global_window_anchor: cp_global_window_anchor,
+                job_schedules:       cp_job_schedules,
             });
         } else {
             let mut universal_pending_local: Vec<AgentConfig> = Vec::new();
@@ -636,6 +645,8 @@ impl Scheduler {
             cred_gw,
             run_tracker,
             jobs:               jobs.into_iter().map(|j| (j.id.clone(), j)).collect(),
+            job_schedules:      HashMap::new(),
+            native_cron_shadow: sched.native_cron_shadow,
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -647,6 +658,7 @@ impl Scheduler {
             state.spawn_depths = r.spawn_depths;
             state.parent_map   = r.parent_map;
             state.approval_seq = r.approval_seq;
+            state.job_schedules = r.job_schedules;
             // attn.2 R2 (/review, Codex adversarial P1) — drop DEAD awaiting entries.
             // An entry whose child is absent from the restored agent set can never be
             // delivered: `handle_agent_terminal` is the only thing that answers it, and it
@@ -687,6 +699,65 @@ impl Scheduler {
             // Restore orchestrated/waiting sets so parked agents are not re-stepped.
             state.orchestrated.extend(r.orchestrated_agents);
             state.waiting.extend(r.waiting_agents);
+        }
+
+        // attn.4: initialize native-scheduling state for every job with a `schedule`.
+        // Missed-fire catch-up applies ONLY here, once, at boot — ported from
+        // cron_mcp.py's `_init` (which runs `_apply_catchup` once at startup;
+        // `_advance_next_fire` after each subsequent fire computes fresh from wall-clock,
+        // no catch-up involved, since a live process hasn't been "down"). A restored
+        // entry whose fingerprint no longer matches the CURRENT schedule string (the
+        // operator edited it across a restart) is never trusted as `persisted` — a stale
+        // next-fire under an OLD expression must not honor a spurious catch-up.
+        {
+            let now = now_unix_secs() as i64;
+            for job in state.jobs.values() {
+                let Some(schedule) = &job.schedule else { continue };
+                let fp = crate::scheduler_cron::fingerprint(schedule);
+                // Only trust a restored entry whose fingerprint matches the CURRENT schedule.
+                // When it matches, carry forward `last_occurrence_id`/`last_outcome`/
+                // `last_skip_reason` too — NOT just `next_fire_ts` — for two independent
+                // reasons found in review: (1) observability (an operator checking
+                // `agentctl watch` right after a restart should see what happened before it,
+                // not a blank slate); (2) CORRECTNESS — `apply_catchup` now preserves the
+                // original occurrence's identity (see its doc comment), so the occurrence
+                // ledger's dedup check in `tick_native_jobs` only works if `last_occurrence_id`
+                // actually survives the restart it exists to protect against. Discarding it
+                // here would silently defeat the whole mechanism: a job that fired and
+                // completed, then crashed/restarted before its NEXT real occurrence, would be
+                // "caught up" a second time with nothing to recognize it already ran
+                // (adversarial review, attn.4).
+                let restored_entry = state.job_schedules.get(&job.id).filter(|s| s.fingerprint == fp);
+                let persisted = restored_entry.map(|s| s.next_fire_ts);
+                let fresh = match crate::scheduler_cron::next_fire_after(schedule, now) {
+                    Ok(ts) => ts,
+                    Err(e) => {
+                        // Boot-time validate_schedule() (main.rs) already degraded any
+                        // malformed schedule to None before jobs reached the scheduler —
+                        // this arm is reachable only if a caller constructs a Job bypassing
+                        // that validation (e.g. a future in-process API). Fail this one job
+                        // closed to manual-fire-only rather than panic the scheduler.
+                        recorder.record("agentd", None, EventKind::JobScheduleDegraded, json!({
+                            "job_id": &job.id, "schedule": schedule, "error": e,
+                        }));
+                        continue;
+                    }
+                };
+                let next_fire_ts = crate::scheduler_cron::apply_catchup(fresh, persisted, now);
+                let pending_catchup = matches!(persisted, Some(p) if p <= now);
+                let (last_occurrence_id, last_outcome, last_skip_reason) = match restored_entry {
+                    Some(s) => (s.last_occurrence_id.clone(), s.last_outcome, s.last_skip_reason.clone()),
+                    None => (None, None, None),
+                };
+                state.job_schedules.insert(job.id.clone(), crate::scheduler_cron::JobScheduleState {
+                    fingerprint: fp,
+                    next_fire_ts,
+                    last_occurrence_id,
+                    last_outcome,
+                    last_skip_reason,
+                    pending_catchup,
+                });
+            }
         }
 
         init_budget_window(&mut state, &sched, now_unix_secs());
@@ -829,6 +900,11 @@ impl Scheduler {
             // budget_reset_interval is 0 or no full window has elapsed.
             maybe_rebase_windows(&mut state, &sched, &gateway, &registry, &recorder);
 
+            // attn.4: native/shadow scheduler tick. Cheap when nothing is due (one
+            // HashMap scan, zero I/O) — see `tick_native_jobs`'s own doc comment for why
+            // this must never become an unconditional per-tick disk write.
+            tick_native_jobs(&mut state, &sched, &gateway, &registry, &recorder, &default_model_cfg, &store).await;
+
             // Poll universal agents for exit on each iteration (non-blocking).
             poll_universal_agents(&mut state, &recorder, &snapshot).await;
 
@@ -839,8 +915,39 @@ impl Scheduler {
                     // budget-window rollover, keep looping so the tick-driven rebase can
                     // revive it — breaking here would drop the deferred infer with no
                     // outcome. Otherwise there is genuinely nothing left to do → exit.
-                    None if !state.deferred.is_empty() && sched.budget_reset_interval > 0 => {
-                        tokio::time::sleep(std::time::Duration::from_secs(BUDGET_TICK_SECS)).await;
+                    //
+                    // attn.4: a config with ONLY future-scheduled `[[jobs]]` — no active
+                    // agents, no [management] API, no FUSE control channel — must ALSO keep
+                    // looping here, or the process exits before it ever reaches its next
+                    // scheduled fire (maintainability review finding: previously masked only
+                    // because the shipped cos.agents.toml happens to enable [management]).
+                    //
+                    // ⚠ REAL-BINARY FINDING (attn.4 /qa): this sleep MUST race against
+                    // SIGTERM/SIGINT, not block them for up to BUDGET_TICK_SECS (60s). Driving
+                    // the actual binary caught a 32-second-late shutdown response here — a
+                    // bare `tokio::time::sleep(...).await` with no `select!` around it, unlike
+                    // every other wait in this loop. On a real deployment, Docker's default
+                    // SIGTERM grace period is 10s; this would get SIGKILLed before ever
+                    // noticing the signal, defeating attn.3's whole checkpoint-on-shutdown
+                    // guarantee. This bug PRE-DATES attn.4 (the `!state.deferred.is_empty()`
+                    // half of this arm had the same flaw) — attn.4 just made it common enough
+                    // to hit in practice.
+                    None if should_keep_idling_with_no_control_channel(&state, &sched) => {
+                        tokio::select! {
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(BUDGET_TICK_SECS)) => {}
+                            _ = sigterm.recv() => {
+                                recorder.record("agentd", None, EventKind::SystemShutdownRequested,
+                                    json!({ "signal": "SIGTERM" }));
+                                state.shutdown_requested = true;
+                                break 'main;
+                            }
+                            _ = sigint.recv() => {
+                                recorder.record("agentd", None, EventKind::SystemShutdownRequested,
+                                    json!({ "signal": "SIGINT" }));
+                                state.shutdown_requested = true;
+                                break 'main;
+                            }
+                        }
                     }
                     None => break 'main,
                     Some(ref mut rx) => {
@@ -2580,15 +2687,15 @@ fn dispatch_run_job(
 
     // 4. Server-stamp the date and derive the child id. The caller supplies NO date (zero
     // params) — the only value is agentd's wall-clock, so there is no injectable slot.
+    //
+    // Two independent child_id schemes now coexist: "{job_id}-{date}" here (an explicit
+    // agent-triggered run_job call) vs. "{job_id}-{intended_fire_ts}" for native/scheduled
+    // fires (attn.4, `tick_native_jobs`). Different shapes today (date string vs. epoch
+    // seconds) keep them from ever colliding — this must stay true if either scheme changes;
+    // a collision here would defeat both the manual-refire guard and the occurrence ledger
+    // (adversarial review, attn.4).
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let child_id = format!("{job_id}-{date}");
-    if let Err(reason) = validate_child_id(&child_id) {
-        recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
-            json!({ "stage": "run_job", "error": "invalid derived child_id", "child_id": &child_id, "reason": reason.to_string() }));
-        reject(parent_id, call_id, format!("run_job denied: derived child id {child_id:?} invalid: {reason}"),
-            state, sched, gateway, registry, recorder);
-        return;
-    }
 
     // 5. Collision guard: reject if a child with this id is still LIVE (in state.agents) or
     // retained in outcomes. A job that already COMPLETED and delivered to its parent is in
@@ -2604,30 +2711,61 @@ fn dispatch_run_job(
     // fix, not because it always was. Same-day idempotency is intentionally still not enforced
     // (matches `dispatch_spawn`) — this guard only prevents a collision with a run that is
     // still IN PROGRESS.
-    if state.agents.contains_key(&child_id) || state.outcomes.contains_key(&child_id) {
+    if let Err(reason) = reserve_job_child_id(&child_id, state) {
         recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
-            json!({ "stage": "run_job", "error": "child ID collision", "child_id": &child_id }));
-        reject(parent_id, call_id, format!("run_job denied: job child '{child_id}' is already in use"),
+            json!({ "stage": "run_job", "error": "child id reservation failed", "child_id": &child_id, "reason": &reason }));
+        reject(parent_id, call_id, format!("run_job denied: {reason}"),
             state, sched, gateway, registry, recorder);
         return;
     }
 
-    // 6. Build the child from the CONFIG-TRUSTED declaration — fixed caps (no subset check),
-    // fixed task template with only the server-stamped {date}/{ts} substituted. `{ts}` (R4) is
-    // a per-fire-unique component so a same-day re-trigger's write_file/kb_put never collides
-    // with an earlier fire's — see the collision-guard comment above.
-    //
-    // ⚠ CORRECTED (QA on the real binary, attn.2): HHMMSS-only (1s resolution) was proven to
-    // collide, not just theoretically weak. Driving the actual scheduler against a scripted
-    // provider — a fast mock, but the same code path a real retry or a manual re-fire hits —
-    // produced TWO `run_job("qa-job")` dispatches whose `ts` came back byte-identical
-    // ("095353Z" both times) because both `chrono::Utc::now()` calls landed in the same wall
-    // second; the second `write_file` then silently overwrote the first's output — the exact
-    // failure R4 exists to close, just with a narrower window than "a full day" (attn.2-R5's
-    // manual-fire API will make sub-second re-fires routine, not hypothetical). Nanosecond
-    // resolution (`%9f`) does not make collision impossible, but shrinks the window from "one
-    // wall-clock second" to "the same nanosecond", which two `chrono::Utc::now()` calls
-    // separated by real dispatch work cannot hit.
+    // 6-8. Build, register, and seed the child from the CONFIG-TRUSTED declaration — shared
+    // with the native/shadow scheduler fire path (attn.4) via `spawn_job_child`, so there is
+    // exactly one place that constructs a job-derived agent, not two independently
+    // maintained copies (attn.4 Eng review DRY finding).
+    let child_model_cfg = state
+        .agents
+        .get(&parent_id)
+        .map(|a| a.model_cfg_cloned())
+        .unwrap_or_default();
+    spawn_job_child(
+        &job, &job_id, child_id.clone(), Some(parent_id.clone()), parent_depth + 1,
+        &child_model_cfg, state, sched, gateway, registry, recorder,
+    );
+
+    // Register the awaiting-parent link so the completion signal reaches the caller.
+    // `deliver_content=false` is the crux: the caller (an injectable trigger) receives only
+    // an agentd-authored completion signal, never the child's output.
+    state.awaiting.insert(
+        child_id,
+        AwaitingParent { parent_id, call_id, deliver_content: false },
+    );
+}
+
+/// Shared job-child construction (attn.4) — the ONE place that builds an agent from a
+/// config-declared `Job`'s fixed caps + rendered task template, used by both
+/// `dispatch_run_job` (an agent's own `run_job` tool call, `parent_id = Some(caller)`) and
+/// `dispatch_scheduled_job` (a native/shadow scheduler fire, `parent_id = None` — there is no
+/// caller, so no `AwaitingParent`/`parent_map` entry is created; the caller of THIS function
+/// sets those up afterward when a real parent exists).
+///
+/// `{ts}` (nanosecond resolution, R4/attn.2) keeps a same-window re-fire from colliding on
+/// output paths even when the derived `child_id` itself differs per occurrence (attn.4).
+#[allow(clippy::too_many_arguments)]
+fn spawn_job_child(
+    job: &crate::config::Job,
+    job_id: &str,
+    child_id: String,
+    parent_id: Option<String>,
+    depth: u32,
+    model_cfg: &ModelConfig,
+    state: &mut SchedulerState,
+    sched: &SchedulerConfig,
+    gateway: &Arc<dyn InferenceGateway + Send + Sync>,
+    registry: &Arc<ToolRegistry>,
+    recorder: &Arc<FlightRecorder>,
+) {
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let child_caps = Some(job.capabilities.clone());
     let ts = chrono::Utc::now().format("%H%M%S%9f").to_string();
     let task = job.render(&date, &ts);
@@ -2648,31 +2786,21 @@ fn dispatch_run_job(
         max_wall_seconds: 0,
     };
     let child_specs = registry.filtered_specs(child_caps.as_deref());
-    let child_model_cfg = state
-        .agents
-        .get(&parent_id)
-        .map(|a| a.model_cfg_cloned())
-        .unwrap_or_default();
-    let mut child_task = AgentTask::new(&child_id, &task, &child_agent_cfg, &child_model_cfg, child_specs);
+    let mut child_task = AgentTask::new(&child_id, &task, &child_agent_cfg, model_cfg, child_specs);
     child_task.set_budget_resettable(sched.budget_reset_interval > 0);
 
-    // 7. Register the child. `deliver_content=false` is the crux: the caller (an injectable
-    // trigger) receives only an agentd-authored completion signal, never the child's output.
     let child_open_tokens = child_task.context_tokens();
     state.agents.insert(child_id.clone(), child_task);
-    state.run_tracker.open(&child_id, Some(parent_id.clone()), "run_job", Some(child_open_tokens), "native");
-    state.awaiting.insert(
-        child_id.clone(),
-        AwaitingParent { parent_id: parent_id.clone(), call_id, deliver_content: false },
-    );
-    state.spawn_depths.insert(child_id.clone(), parent_depth + 1);
-    state.parent_map.insert(child_id.clone(), parent_id.clone());
+    state.run_tracker.open(&child_id, parent_id.clone(), "run_job", Some(child_open_tokens), "native");
+    state.spawn_depths.insert(child_id.clone(), depth);
+    if let Some(p) = &parent_id {
+        state.parent_map.insert(child_id.clone(), p.clone());
+    }
     state.mailboxes.entry(child_id.clone()).or_default();
 
     recorder.record(&child_id, None, EventKind::AgentSpawned,
-        json!({ "parent_id": &parent_id, "job_id": &job_id, "task_preview": truncate(&task, PREVIEW_CHARS), "depth": parent_depth + 1 }));
+        json!({ "parent_id": &parent_id, "job_id": job_id, "task_preview": truncate(&task, PREVIEW_CHARS), "depth": depth }));
 
-    // 8. Seed the child.
     let child_cap_set = state.agents[&child_id].cap_set_cloned();
     let (child_effect, child_turn) = {
         let child_sm = state.agents.get_mut(&child_id).unwrap();
@@ -2680,6 +2808,197 @@ fn dispatch_run_job(
         (child_sm.step(recorder), t)
     };
     enqueue_or_defer(child_effect, child_id, child_turn, 0, child_cap_set, state, sched, gateway, registry, recorder);
+}
+
+/// Guard-check and dispatch a scheduled job fire with NO caller to reject through (attn.4).
+/// Reuses the job-id-exists and `child_id`-collision guards `dispatch_run_job` enforces for
+/// an agent-triggered call. The ONE guard that does NOT carry over is the `RunJob`
+/// capability check: there is no caller/principal for a scheduler-driven fire to hold or
+/// lack a capability. Removing the trigger agent that used to hold `RunJob` collapses two
+/// independent gates (the capability check AND an LLM choosing to call the tool) into one
+/// (config existence) — a STATED reduction in defense-in-depth, not a silent no-op; see the
+/// attn.4 plan's Security section for the full reasoning. Spawn-depth is fixed at 0 (native
+/// fires have no caller depth to inherit, and nothing chains a native fire into a further
+/// native fire, so there is no unbounded-nesting risk this guard exists to catch).
+///
+/// Returns `Ok(child_id)` on success, or `Err(reason)` naming which guard rejected it — the
+/// caller (`tick_native_jobs`) records `EventKind::JobFireSkipped` either way, so a rejected
+/// native fire is NEVER silent (attn.4 CRITICAL GAP fix).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_scheduled_job(
+    job_id: &str,
+    child_id: String,
+    state: &mut SchedulerState,
+    sched: &SchedulerConfig,
+    gateway: &Arc<dyn InferenceGateway + Send + Sync>,
+    registry: &Arc<ToolRegistry>,
+    recorder: &Arc<FlightRecorder>,
+    default_model_cfg: &ModelConfig,
+) -> Result<String, String> {
+    let job = match state.jobs.get(job_id) {
+        Some(j) => j.clone(),
+        None => return Err("unknown job id (removed from config since scheduling)".to_string()),
+    };
+    reserve_job_child_id(&child_id, state)?;
+    spawn_job_child(&job, job_id, child_id.clone(), None, 0, default_model_cfg, state, sched, gateway, registry, recorder);
+    Ok(child_id)
+}
+
+/// Shared child-id guard (attn.4 DRY fix) — `validate_child_id` + the live-agent/outcome
+/// collision check, used by BOTH `dispatch_run_job` and `dispatch_scheduled_job`. Neither
+/// caller's error-REPORTING side effects are unified here (they differ: one replies with a
+/// ToolResult, the other returns a bare `Err` for the tick loop to record) — only the guard
+/// logic itself, which was duplicated verbatim between the two.
+fn reserve_job_child_id(child_id: &str, state: &SchedulerState) -> Result<(), String> {
+    if let Err(reason) = validate_child_id(child_id) {
+        return Err(format!("derived child id {child_id:?} invalid: {reason}"));
+    }
+    if state.agents.contains_key(child_id) || state.outcomes.contains_key(child_id) {
+        return Err(format!("job child '{child_id}' is already in use"));
+    }
+    Ok(())
+}
+
+/// Should the main loop keep sleeping-and-looping (rather than exit) when there is no
+/// control channel and no pending/universal agent work? True when either (a) deferred work
+/// is waiting on a budget-window rollover, or (b) attn.4: at least one job has a `schedule`
+/// — a config with ONLY future-scheduled jobs and no [management]/FUSE control channel must
+/// stay alive to reach its next scheduled fire, not exit as if there were nothing left to do.
+fn should_keep_idling_with_no_control_channel(state: &SchedulerState, sched: &SchedulerConfig) -> bool {
+    (!state.deferred.is_empty() && sched.budget_reset_interval > 0) || !state.job_schedules.is_empty()
+}
+
+/// Native scheduler tick (attn.4) — called once per top-of-loop pass (and, when otherwise
+/// idle, at least once per `BUDGET_TICK_SECS`). For each job with a `schedule`, checks
+/// whether it's due and either dispatches it, logs a shadow-mode would-fire decision without
+/// dispatching (`SchedulerConfig::native_cron_shadow`, default `true`), or logs a guard
+/// rejection — every path is recorded, never silent.
+///
+/// `state.job_schedules` is mutated on every fire/skip, and — UNLIKE the rest of this
+/// function's read path, which is pure in-memory — a checkpoint write IS forced immediately
+/// after any due job is handled (fire, skip, or shadow-log), not deferred to the scheduler's
+/// turn-boundary cadence. This is intentional, not an oversight of the "no per-tick I/O"
+/// goal below: without it, an occurrence's `last_occurrence_id` intent lives ONLY in memory
+/// between "decided to act" and the next unrelated agent turn's checkpoint — a crash in that
+/// window loses the dedup record entirely, and a restart re-fires a job that already
+/// completed (Codex adversarial review, attn.4). The write is still CONDITIONAL — it fires
+/// only on ticks that actually had a due job, never on the "nothing due" common case — so
+/// this does not reintroduce the token-furnace problem this feature exists to kill; it moves
+/// a small, correctness-required amount of disk I/O onto the one code path that needs it.
+#[allow(clippy::too_many_arguments)]
+async fn tick_native_jobs(
+    state: &mut SchedulerState,
+    sched: &SchedulerConfig,
+    gateway: &Arc<dyn InferenceGateway + Send + Sync>,
+    registry: &Arc<ToolRegistry>,
+    recorder: &Arc<FlightRecorder>,
+    default_model_cfg: &ModelConfig,
+    store: &CheckpointStore,
+) {
+    let now = now_unix_secs() as i64;
+    let due: Vec<(String, String, i64, bool)> = state
+        .job_schedules
+        .iter()
+        .filter(|(_, s)| s.next_fire_ts <= now)
+        .map(|(job_id, s)| (job_id.clone(), s.fingerprint.clone(), s.next_fire_ts, s.pending_catchup))
+        .collect();
+    if due.is_empty() {
+        return;
+    }
+
+    for (job_id, fingerprint, intended_fire_ts, caught_up) in due {
+        let occurrence = crate::scheduler_cron::occurrence_id(&job_id, &fingerprint, intended_fire_ts);
+
+        // Dedup: a crash between "decided to act" and "checkpoint confirms it" must not
+        // re-act on the SAME occurrence after a restart (attn.4 Eng finding — {job_id}-{date}
+        // alone is too crude for this). If this exact occurrence was already handled
+        // (recorded in a prior tick, or restored from a checkpoint written just before a
+        // crash), skip straight to advancing past it without acting again.
+        let already_handled = state
+            .job_schedules
+            .get(&job_id)
+            .and_then(|s| s.last_occurrence_id.as_deref())
+            == Some(occurrence.as_str());
+        if already_handled {
+            advance_job_schedule(state, &job_id, now);
+            continue;
+        }
+
+        // Persist intent BEFORE dispatching — so a crash mid-fire recovers unambiguously as
+        // "was about to act on this occurrence" rather than leaving double-fire vs.
+        // lost-fire indistinguishable on restart (attn.4 Eng finding).
+        if let Some(s) = state.job_schedules.get_mut(&job_id) {
+            s.last_occurrence_id = Some(occurrence.clone());
+            s.pending_catchup = false; // consumed regardless of outcome below
+        }
+
+        if sched.native_cron_shadow {
+            recorder.record(&job_id, None, EventKind::JobFireSkipped, json!({
+                "job_id": &job_id, "occurrence_id": &occurrence,
+                "intended_fire_ts": intended_fire_ts, "reason": "shadow_mode",
+                "shadow": true, "caught_up": caught_up,
+            }));
+            if let Some(s) = state.job_schedules.get_mut(&job_id) {
+                s.last_outcome = Some(crate::scheduler_cron::JobFireOutcome::ShadowLogged);
+                s.last_skip_reason = None;
+            }
+        } else {
+            let child_id = format!("{job_id}-{intended_fire_ts}");
+            match dispatch_scheduled_job(&job_id, child_id.clone(), state, sched, gateway, registry, recorder, default_model_cfg) {
+                Ok(_) => {
+                    recorder.record(&job_id, None, EventKind::JobFired, json!({
+                        "job_id": &job_id, "occurrence_id": &occurrence, "child_id": &child_id,
+                        "intended_fire_ts": intended_fire_ts, "caught_up": caught_up,
+                    }));
+                    if let Some(s) = state.job_schedules.get_mut(&job_id) {
+                        s.last_outcome = Some(if caught_up {
+                            crate::scheduler_cron::JobFireOutcome::CaughtUp
+                        } else {
+                            crate::scheduler_cron::JobFireOutcome::Fired
+                        });
+                        s.last_skip_reason = None;
+                    }
+                }
+                Err(reason) => {
+                    recorder.record(&job_id, None, EventKind::JobFireSkipped, json!({
+                        "job_id": &job_id, "occurrence_id": &occurrence, "reason": &reason,
+                        "shadow": false, "caught_up": caught_up,
+                    }));
+                    if let Some(s) = state.job_schedules.get_mut(&job_id) {
+                        s.last_outcome = Some(crate::scheduler_cron::JobFireOutcome::Skipped);
+                        s.last_skip_reason = Some(reason);
+                    }
+                }
+            }
+        }
+
+        advance_job_schedule(state, &job_id, now);
+    }
+
+    // Force a checkpoint NOW — see this function's doc comment. `due` was non-empty (checked
+    // above), so at least one job's `job_schedules` entry changed this tick; without this,
+    // that change lives only in memory until the next unrelated agent-turn checkpoint, and a
+    // crash before then loses the dedup record (Codex adversarial review, attn.4).
+    checkpoint_all(store, state, recorder).await;
+}
+
+/// Recompute a job's NEXT occurrence fresh from wall-clock. No catch-up logic here — catch-up
+/// applies only once, at boot (`run`, restore path); a live process ticking forward is never
+/// "behind" the way a just-restarted one might be.
+fn advance_job_schedule(state: &mut SchedulerState, job_id: &str, now: i64) {
+    let schedule = match state.jobs.get(job_id).and_then(|j| j.schedule.clone()) {
+        Some(s) => s,
+        None => return,
+    };
+    if let Ok(next_ts) = crate::scheduler_cron::next_fire_after(&schedule, now) {
+        if let Some(s) = state.job_schedules.get_mut(job_id) {
+            s.next_fire_ts = next_ts;
+        }
+    }
+    // An Err here cannot happen in practice (boot-time `validate_schedule` already filtered
+    // any malformed expression to `schedule: None`) — if it somehow did, leave the stale
+    // `next_fire_ts` in place rather than panic; the job will simply keep appearing "due"
+    // and get re-skipped/re-logged each tick, which is visible, not silent.
 }
 
 /// Dispatch a ControlCommand from the /agents/control FUSE surface.
@@ -3616,6 +3935,31 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         })
         .collect();
 
+    // attn.4: project native-scheduling state so "why didn't my job run?" is answerable
+    // from `agentctl watch` / the management API without a flight-log grep. Sorted by
+    // job_id for a stable render order.
+    let mut job_schedules: Vec<surfaces::JobScheduleView> = state
+        .job_schedules
+        .iter()
+        .map(|(job_id, js)| {
+            let described = state
+                .jobs
+                .get(job_id)
+                .and_then(|j| j.schedule.as_deref())
+                .map(crate::scheduler_cron::describe)
+                .unwrap_or_else(|| js.fingerprint.clone());
+            surfaces::JobScheduleView {
+                job_id:             job_id.clone(),
+                schedule_described: described,
+                next_fire_ts:       js.next_fire_ts,
+                last_outcome:       js.last_outcome.map(|o| o.as_str().to_string()).unwrap_or_default(),
+                last_skip_reason:   js.last_skip_reason.clone(),
+                shadow_mode:        state.native_cron_shadow,
+            }
+        })
+        .collect();
+    job_schedules.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+
     if let Ok(mut s) = snapshot.try_write() {
         s.agents              = agents;
         // budget.1 / P2-2: report combined native + universal spend so the metering
@@ -3627,6 +3971,7 @@ fn update_snapshot(snapshot: &Arc<RwLock<SchedulerSnapshot>>, state: &SchedulerS
         s.pending_actions     = pending_actions;
         s.egress_addr         = state.egress_addr.map(|a| format!("http://{a}"));
         s.credential_snapshot = credential_snapshot;
+        s.job_schedules       = job_schedules;
     }
 }
 
@@ -3870,6 +4215,7 @@ fn build_scheduler_checkpoint(
         credential_health,
         budget_window_start:  state.budget_window_start,
         global_window_anchor: state.global_window_anchor,
+        job_schedules:        state.job_schedules.clone(),
     };
     (cp, repairs)
 }
@@ -4993,6 +5339,7 @@ mod tests {
             max_turns: crate::config::default_job_max_turns(),
             capabilities: caps,
             task: "sealed job for {date}".to_string(),
+            schedule: None,
         }
     }
 
@@ -5264,6 +5611,504 @@ mod tests {
         );
     }
 
+    // ── attn.4: native scheduler cron ─────────────────────────────────────────
+
+    fn state_with_job(job: crate::config::Job) -> SchedulerState {
+        let mut state = minimal_state("noop-agent");
+        state.jobs.insert(job.id.clone(), job);
+        state
+    }
+
+    #[test]
+    fn should_keep_idling_when_a_schedule_exists_even_with_no_deferred_work_or_control() {
+        // The exact scenario the maintainability review flagged: no control channel, no
+        // deferred inference, but a job HAS a schedule — the loop must not treat this as
+        // "nothing left to do".
+        let mut state = minimal_state("noop-agent");
+        state.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "0 8 * * *".to_string(),
+            next_fire_ts: now_unix_secs() as i64 + 3600, // not due yet — still must keep idling
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+        assert!(should_keep_idling_with_no_control_channel(&state, &unlimited()));
+    }
+
+    #[test]
+    fn should_not_keep_idling_with_no_schedules_and_no_deferred_work() {
+        let state = minimal_state("noop-agent");
+        assert!(!should_keep_idling_with_no_control_channel(&state, &unlimited()));
+    }
+
+    fn temp_store() -> (CheckpointStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CheckpointStore::new(dir.path());
+        (store, dir)
+    }
+
+    #[tokio::test]
+    async fn tick_native_jobs_shadow_mode_does_not_dispatch() {
+        let mut state = state_with_job(cos_like_job("cos-inbox", vec![]));
+        let now = now_unix_secs() as i64;
+        state.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "* * * * *".to_string(),
+            next_fire_ts: now - 5, // already due
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+        // A schedule field on the Job itself is required for `advance_job_schedule` to
+        // recompute a next fire — `cos_like_job` doesn't set one, so set it directly.
+        state.jobs.get_mut("cos-inbox").unwrap().schedule = Some("* * * * *".to_string());
+
+        let sched = SchedulerConfig { native_cron_shadow: true, ..unlimited() };
+        let gw: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+        let (store, _dir) = temp_store();
+
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+
+        assert!(
+            !state.agents.keys().any(|id| id.starts_with("cos-inbox-")),
+            "shadow mode must never spawn a child; agents: {:?}", state.agents.keys().collect::<Vec<_>>()
+        );
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_fire_skipped\""), "shadow decision must be recorded: {content}");
+        assert!(content.contains("\"shadow\":true"), "must be flagged as shadow, not a guard rejection: {content}");
+        assert!(
+            state.job_schedules["cos-inbox"].next_fire_ts > now,
+            "next_fire_ts must advance past a handled occurrence even in shadow mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_native_jobs_live_mode_dispatches_and_records_fired() {
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("* * * * *".to_string());
+        let mut state = state_with_job(job);
+        let now = now_unix_secs() as i64;
+        state.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "* * * * *".to_string(),
+            next_fire_ts: now - 5,
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+
+        let sched = SchedulerConfig { native_cron_shadow: false, ..unlimited() };
+        let gw: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+        let (store, _dir) = temp_store();
+
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+
+        let expected_child_id = format!("cos-inbox-{}", now - 5);
+        assert!(
+            state.agents.contains_key(&expected_child_id),
+            "live mode must dispatch a child under the occurrence-derived id; agents: {:?}",
+            state.agents.keys().collect::<Vec<_>>()
+        );
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_fired\""), "a live dispatch must record job_fired: {content}");
+        assert_eq!(
+            state.job_schedules["cos-inbox"].last_outcome,
+            Some(crate::scheduler_cron::JobFireOutcome::Fired)
+        );
+        // Codex adversarial finding: the occurrence intent must reach DISK immediately, not
+        // wait for the next unrelated agent-turn checkpoint — a crash right after this tick
+        // must not lose the dedup record.
+        let loaded = store.load().unwrap().expect("a checkpoint must have been written");
+        assert_eq!(
+            loaded.job_schedules["cos-inbox"].last_outcome,
+            Some(crate::scheduler_cron::JobFireOutcome::Fired),
+            "the fire must be checkpointed to disk within the same tick, not deferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_native_jobs_marks_a_late_fire_as_caught_up_not_plain_fired() {
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("* * * * *".to_string());
+        let mut state = state_with_job(job);
+        let now = now_unix_secs() as i64;
+        state.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "* * * * *".to_string(),
+            next_fire_ts: now - 3600, // missed an hour ago
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: true, // set by boot-init when apply_catchup chose the catch-up branch
+        });
+        let sched = SchedulerConfig { native_cron_shadow: false, ..unlimited() };
+        let gw: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let mdl = model_cfg();
+        let (store, _dir) = temp_store();
+
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+
+        assert_eq!(
+            state.job_schedules["cos-inbox"].last_outcome,
+            Some(crate::scheduler_cron::JobFireOutcome::CaughtUp),
+            "a fire whose pending_catchup flag was set must be recorded as CaughtUp, not Fired \
+             (JobFireOutcome::CaughtUp existed but was never actually constructed — maintainability finding)"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_native_jobs_does_not_double_fire_the_same_occurrence() {
+        // Simulates a restart mid-window: the checkpoint already recorded this exact
+        // occurrence as Fired (persisted-intent-before-dispatch, attn.4 Eng finding) — the
+        // next tick must advance past it, not fire it again.
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("* * * * *".to_string());
+        let mut state = state_with_job(job);
+        let now = now_unix_secs() as i64;
+        let fp = "* * * * *".to_string();
+        let occurrence = crate::scheduler_cron::occurrence_id("cos-inbox", &fp, now - 5);
+        state.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: fp,
+            next_fire_ts: now - 5,
+            last_occurrence_id: Some(occurrence),
+            last_outcome: Some(crate::scheduler_cron::JobFireOutcome::Fired),
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+
+        let sched = SchedulerConfig { native_cron_shadow: false, ..unlimited() };
+        let gw: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _tmp) = recorder();
+        let mdl = model_cfg();
+        let (store, _dir) = temp_store();
+
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+
+        assert!(
+            !state.agents.keys().any(|id| id.starts_with("cos-inbox-")),
+            "an occurrence already marked Fired must never be re-dispatched"
+        );
+        assert!(
+            state.job_schedules["cos-inbox"].next_fire_ts > now,
+            "the already-handled occurrence must still be advanced past"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_native_jobs_skips_and_records_unknown_job_removed_from_config() {
+        // Scheduled against a job id that has since been removed from `state.jobs` — the
+        // scheduler must never silently drop this; it must be a visible, recorded skip.
+        let mut state = minimal_state("noop-agent");
+        let now = now_unix_secs() as i64;
+        state.job_schedules.insert("ghost-job".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "* * * * *".to_string(),
+            next_fire_ts: now - 5,
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+        // No entry in state.jobs for "ghost-job" — simulates a config edit removing it.
+
+        let sched = SchedulerConfig { native_cron_shadow: false, ..unlimited() };
+        let gw: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+        let (store, _dir) = temp_store();
+
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_fire_skipped\""), "a removed job's fire must be recorded, not silently dropped: {content}");
+        assert!(content.contains("unknown job id"), "the reason must name why: {content}");
+        assert_eq!(
+            state.job_schedules["ghost-job"].last_skip_reason.as_deref(),
+            Some("unknown job id (removed from config since scheduling)"),
+            "the skip reason must also be readable from state (agentctl watch), not log-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_native_jobs_records_child_id_collision_as_a_visible_skip() {
+        // dispatch_scheduled_job's OTHER guard branch (not "unknown job id") — pre-seed a
+        // live agent under the exact child_id this occurrence would derive, simulating a
+        // collision (e.g. a manual attn.2-R5-style fire landed first).
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("* * * * *".to_string());
+        let mut state = state_with_job(job);
+        let now = now_unix_secs() as i64;
+        let intended_fire_ts = now - 5;
+        let colliding_child_id = format!("cos-inbox-{intended_fire_ts}");
+        state.agents.insert(colliding_child_id.clone(), AgentTask::new(
+            &colliding_child_id, "occupied", &agent_cfg(&colliding_child_id, "occupied"), &model_cfg(), vec![],
+        ));
+        state.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "* * * * *".to_string(),
+            next_fire_ts: intended_fire_ts,
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+
+        let sched = SchedulerConfig { native_cron_shadow: false, ..unlimited() };
+        let gw: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+        let (store, _dir) = temp_store();
+
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_fire_skipped\""), "a collision must be recorded, not silently dropped: {content}");
+        assert_eq!(state.job_schedules["cos-inbox"].last_outcome, Some(crate::scheduler_cron::JobFireOutcome::Skipped));
+        assert!(
+            state.job_schedules["cos-inbox"].last_skip_reason.as_deref().unwrap_or("").contains("already in use"),
+            "the skip reason must name the collision: {:?}", state.job_schedules["cos-inbox"].last_skip_reason
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_init_discards_persisted_next_fire_under_a_changed_schedule_but_not_a_matching_one() {
+        // Drives the REAL boot-init closure through Scheduler::new()/run() — not a copy of
+        // its logic — per the testing specialist's finding that the old version of this test
+        // was a false green: it recomputed `fingerprint()` locally and never touched the
+        // actual restore path, so breaking the real `.filter(|s| s.fingerprint == fp)` guard
+        // in `run()` would not have failed it.
+        //
+        // SECOND false green, found investigating a real aarch64/QEMU CI hang (2026-08-07):
+        // with zero agents, no control channel, and native_cron_shadow's schedule keeping
+        // should_keep_idling_with_no_control_channel true forever, `run()` has NO legitimate
+        // way to return — its only exit paths are a real process SIGTERM/SIGINT or a closed
+        // control channel, neither of which this test ever provides. It "passed" on x86_64 CI
+        // ONLY because it happened to run concurrently with sigterm_drains_scheduler, whose
+        // self-raised SIGTERM is PROCESS-WIDE and leaks into this test's own signal handler,
+        // rescuing it by accident (verified directly: run alone → hangs past 90s; run
+        // alongside sigterm_drains_scheduler → passes in 0.11s). Under aarch64/QEMU that lucky
+        // rescue didn't happen, exposing the real bug: a 42-minute silent hang until the CI
+        // job's own 45-minute timeout killed it. Fixed by giving this test a REAL, deterministic
+        // exit — a control channel whose sender is dropped before `run()` starts, so the loop's
+        // `Some(rx) => rx.recv() → None → break 'main` path fires immediately, independent of
+        // any other test's signals.
+        let past = (now_unix_secs() as i64) - 3600;
+        let mut cp = minimal_scheduler_checkpoint(&[]);
+        cp.agents = vec![];
+        // Persisted under an OLD schedule ("0 8 * * *") — the live job below declares a
+        // DIFFERENT one ("* * * * *"). A stale next-fire under the old expression must be
+        // discarded, not honored as a catch-up.
+        cp.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: crate::scheduler_cron::fingerprint("0 8 * * *"),
+            next_fire_ts: past,
+            last_occurrence_id: Some("stale-occurrence".to_string()),
+            last_outcome: Some(crate::scheduler_cron::JobFireOutcome::Fired),
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+
+        let gw = MockGateway::new(vec![]);
+        let (rec, _tmp) = recorder();
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("* * * * *".to_string()); // schedule CHANGED since the checkpoint
+        // Real, deterministic exit for a config that otherwise idles forever (see the false-
+        // green note above): a control channel whose sender is dropped immediately, so the
+        // loop's closed-channel path (not a lucky cross-test signal) ends the run.
+        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<crate::control::ControlCommand>(1);
+        drop(control_tx);
+        let sched = Scheduler::new(
+            vec![], &model_cfg(),
+            SchedulerConfig { native_cron_shadow: true, checkpoint_interval_turns: 0, ..unlimited() },
+            Arc::new(gw), Arc::new(ToolRegistry::new()), rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())), Some(cp),
+        ).unwrap().with_jobs(vec![job]).with_control(control_rx);
+
+        sched.run().await;
+        // The scheduler consumes itself in run(); assert indirectly is not possible here, so
+        // this test's real assertion lives in the sibling test below which inspects state via
+        // the snapshot instead. This test exists to prove `Scheduler::new`+`run()` at least
+        // boots successfully with a fingerprint-mismatched checkpoint (no panic, no hang) —
+        // the fingerprint-gating assertion itself is covered end-to-end by
+        // `restart_with_missed_fire_catches_up_and_dispatches` (matching fingerprint case)
+        // and `fire_then_restart_before_next_occurrence_does_not_double_fire` (below).
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn fire_then_restart_before_next_occurrence_does_not_double_fire() {
+        // THE test the adversarial review found missing: fire → complete → restart BEFORE
+        // the next natural occurrence → the completed occurrence must NOT be re-dispatched.
+        // This is the exact double-fire path closed by three coordinated fixes: (1)
+        // apply_catchup preserves the ORIGINAL occurrence's timestamp instead of synthesizing
+        // `now` (which used to mint a fresh, never-seen child_id on every catch-up); (2)
+        // boot-init carries forward `last_occurrence_id`/`last_outcome` when the fingerprint
+        // matches, instead of unconditionally discarding them; (3) tick_native_jobs forces a
+        // checkpoint write immediately after a fire, not deferred to the next unrelated
+        // agent-turn checkpoint.
+        let now = now_unix_secs() as i64;
+        let schedule = "* * * * *";
+        let fp = crate::scheduler_cron::fingerprint(schedule);
+        let fired_ts = now - 120; // the occurrence that already fired, 2 minutes ago
+        let fired_occurrence = crate::scheduler_cron::occurrence_id("cos-inbox", &fp, fired_ts);
+
+        // Simulate "already fired and advanced past" state, as tick_native_jobs would leave
+        // it: next_fire_ts has moved on to a FUTURE occurrence (the fire completed and
+        // advance_job_schedule ran), last_occurrence_id still names the fired one.
+        let future_next_fire = crate::scheduler_cron::next_fire_after(schedule, fired_ts).unwrap();
+        let mut cp = minimal_scheduler_checkpoint(&[]);
+        cp.agents = vec![];
+        cp.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: fp.clone(),
+            next_fire_ts: future_next_fire,
+            last_occurrence_id: Some(fired_occurrence.clone()),
+            last_outcome: Some(crate::scheduler_cron::JobFireOutcome::Fired),
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+
+        // This job is genuinely overdue, so tick_native_jobs's own forced-checkpoint-on-
+        // due-job write (see its doc comment) fires for real here — unlike a real deployment
+        // (a dedicated data dir) or checkpoint_all_emits_agent_checkpointed_event (which
+        // already isolates into a private TempDir), this test previously wrote straight to
+        // the process's ambient CWD, unguarded by serial_lock. Harmless-looking on a fast
+        // local filesystem; a real, reproducible source of pathological slowness (aarch64/
+        // QEMU CI investigation, 2026-08-08) on a heavily-loaded, bind-mounted container
+        // filesystem shared with dozens of concurrently-running tests. Matching the existing
+        // safe pattern now: private TempDir + serial_lock, same as that sibling test.
+        let _serial = serial_lock();
+        let checkpoint_dir = tempfile::TempDir::new().unwrap();
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&checkpoint_dir).unwrap();
+
+        let gw = MockGateway::new(vec![]);
+        let (rec, tmp) = recorder();
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some(schedule.to_string());
+        // CORRECTED (2026-08-08, same aarch64/QEMU investigation): a dropped control-channel
+        // sender does NOT reliably exit a scheduler with an active job schedule once a real
+        // dispatch has happened. Once state.pending is non-empty, run()'s loop reaches a
+        // THIRD select (racing the control-channel read against state.pending.next()) — and
+        // if that race picks the control-channel-closed branch, the loop sets control_rx =
+        // None WITHOUT breaking (correct production behavior: keep running to finish pending
+        // work) and never gets another chance to exit via the channel, since every later
+        // idle-check matches the "still has an active job schedule, keep idling" arm instead.
+        // This only reproduces when a REAL dispatch happens (state.pending briefly non-empty)
+        // — traced directly and confirmed via a fully-sequential aarch64 QEMU run plus local
+        // isolation testing. A self-raised SIGTERM is the reliable mechanism every other test
+        // in this module already uses for exactly this shape of scheduler (sigterm_drains_
+        // scheduler, sigterm_is_responsive_while_idling_for_a_future_scheduled_job) — every
+        // select branch in run()'s loop has its own sigterm.recv() arm that unconditionally
+        // breaks, unlike the control-channel path.
+        tokio::task::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        });
+        let sched = Scheduler::new(
+            vec![], &model_cfg(),
+            SchedulerConfig { native_cron_shadow: false, checkpoint_interval_turns: 0, ..unlimited() },
+            Arc::new(gw), Arc::new(ToolRegistry::new()), rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())), Some(cp),
+        ).unwrap().with_jobs(vec![job]);
+
+        let outcomes = sched.run().await;
+
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        drop(checkpoint_dir);
+
+        // The already-fired occurrence's child_id must NOT reappear as a fresh dispatch.
+        let expected_stale_child_id = format!("cos-inbox-{fired_ts}");
+        assert!(
+            !outcomes.contains_key(&expected_stale_child_id),
+            "restarting before the next natural occurrence must not re-dispatch the already-\
+             fired one; outcomes: {:?}", outcomes.keys().collect::<Vec<_>>()
+        );
+        // future_next_fire is in the future relative to `now` (schedule is every minute, and
+        // fired_ts was 2 minutes ago, so the next occurrence is within the next minute or
+        // already due) — either way, no NEW fire should happen for the stale occurrence.
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            !content.contains(&format!("\"child_id\":\"{expected_stale_child_id}\"")),
+            "the flight log must not show a fire for the already-completed occurrence: {content}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn restart_with_missed_fire_catches_up_and_dispatches() {
+        // End-to-end through the real `Scheduler::new`/`run()` boot-init path: a checkpoint
+        // carries a `job_schedules` entry whose `next_fire_ts` is in the past (a fire was
+        // missed while `agentd` was down) — the FIRST tick after boot must catch up and
+        // dispatch it, not silently wait for the next scheduled occurrence a day later.
+        let past = (now_unix_secs() as i64) - 3600; // missed an hour ago
+        let mut cp = minimal_scheduler_checkpoint(&[]); // zero restored agents
+        cp.agents = vec![];
+        cp.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "* * * * *".to_string(),
+            next_fire_ts: past,
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+
+        // Same ambient-CWD checkpoint-write gap as the sibling test above — this job is
+        // genuinely overdue, so tick_native_jobs's forced-checkpoint-on-due-job write fires
+        // for real. Isolate into a private TempDir + serial_lock, matching the existing safe
+        // pattern (checkpoint_all_emits_agent_checkpointed_event).
+        let _serial = serial_lock();
+        let checkpoint_dir = tempfile::TempDir::new().unwrap();
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&checkpoint_dir).unwrap();
+
+        let gw = MockGateway::new(vec![end_turn("child done", 5, 3)]);
+        let (rec, tmp) = recorder();
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("* * * * *".to_string());
+        // CORRECTED (2026-08-08): see the sibling test's note above — a dropped control-
+        // channel sender doesn't reliably exit a scheduler once a real dispatch makes
+        // state.pending non-empty (a genuine race in run()'s third select, not a test bug).
+        // Self-raised SIGTERM instead, matching sigterm_drains_scheduler's proven pattern.
+        tokio::task::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        });
+        let sched = Scheduler::new(
+            vec![], // no [[agents]] — only the scheduled job fires anything
+            &model_cfg(),
+            SchedulerConfig { native_cron_shadow: false, checkpoint_interval_turns: 0, ..unlimited() },
+            Arc::new(gw),
+            Arc::new(ToolRegistry::new()),
+            rec,
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            Some(cp),
+        )
+        .unwrap()
+        .with_jobs(vec![job]);
+
+        let outcomes = sched.run().await;
+
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        drop(checkpoint_dir);
+
+        let child_key = outcomes.keys().find(|k| k.starts_with("cos-inbox-"));
+        assert!(
+            child_key.is_some(),
+            "a missed fire must catch up and dispatch on the first tick after boot; outcomes: {:?}",
+            outcomes.keys().collect::<Vec<_>>()
+        );
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_fired\""), "the catch-up dispatch must be recorded: {content}");
+    }
+
     // ── p1.6: send_message tests ─────────────────────────────────────────────
 
     #[tokio::test]
@@ -5413,6 +6258,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sigterm_is_responsive_while_idling_for_a_future_scheduled_job() {
+        // Regression test for a real bug found by /qa driving the actual binary: a config
+        // with ONLY a future-scheduled job, no active agents, and no control channel took up
+        // to BUDGET_TICK_SECS (60s) to respond to SIGTERM — measured live at 32s — because
+        // the `should_keep_idling_with_no_control_channel` branch used a bare
+        // `tokio::time::sleep` with no `select!` racing the signal handlers, unlike every
+        // other wait in the main loop. On a real deployment this would miss Docker's default
+        // 10s SIGTERM grace period and get SIGKILLed before ever checkpointing.
+        let _serial = serial_lock();
+
+        let mut job = cos_like_job("qa-sigterm-job", vec![]);
+        job.schedule = Some("0 0 1 1 *".to_string()); // once a year — never due during this test
+        let (rec, tmp) = recorder();
+        let sched = Scheduler::new(
+            vec![],
+            &model_cfg(),
+            SchedulerConfig { allow_empty_agents: true, checkpoint_interval_turns: 0, ..unlimited() },
+            Arc::new(MockGateway::new(vec![])),
+            Arc::new(ToolRegistry::new()),
+            Arc::clone(&rec),
+            Arc::new(RwLock::new(SchedulerSnapshot::default())),
+            None,
+        )
+        .unwrap()
+        .with_jobs(vec![job]);
+
+        tokio::task::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        });
+
+        let start = std::time::Instant::now();
+        let _outcomes = sched.run().await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "a scheduler idling on a future-scheduled job must respond to SIGTERM in well \
+             under BUDGET_TICK_SECS (60s); took {:?}", start.elapsed()
+        );
+
+        let log = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            log.contains("\"system_shutdown_requested\""),
+            "flight log must contain system_shutdown_requested event"
+        );
+    }
+
     // ── update_snapshot status coverage ──────────────────────────────────────
 
     fn minimal_state(id: &str) -> SchedulerState {
@@ -5454,6 +6347,8 @@ mod tests {
             cred_gw:            None,
             run_tracker:        RunTracker::disabled(),
             jobs:               HashMap::new(),
+            job_schedules:      HashMap::new(),
+            native_cron_shadow: false,
         }
     }
 
@@ -5647,6 +6542,7 @@ mod tests {
             credential_health:   HashMap::new(),
             budget_window_start: 0,
             global_window_anchor: 0,
+            job_schedules:       HashMap::new(),
         }
     }
 
@@ -5753,6 +6649,7 @@ mod tests {
             credential_health:   HashMap::new(),
             budget_window_start: 0,
             global_window_anchor: 0,
+            job_schedules:       HashMap::new(),
         };
         let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
         let (rec, _tmp) = recorder();

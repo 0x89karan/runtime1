@@ -143,6 +143,9 @@ Phase 0 kinds (canonical — do not rename):
 | `agent_cancelled` | operator cancelled an agent at runtime; emitted once per cancelled node, including cascaded children (cause: "cascade from <parent>") (ux.13+) |
 | `runs_unavailable` | runs.redb could not be opened; run history unavailable this boot (hint, error) (ux.11b+) |
 | `brief_written` | CoS published a morning brief, authored deterministically from runs.redb (agent_id, brief_id, window_from, window_to, run_count, failed_count, spend_total) (ux.11c+) |
+| `job_schedule_degraded` | a job's `schedule` string failed to parse at boot; that job alone degrades to manual-fire-only — never fails the whole boot (job_id, schedule, error) (attn.4+) |
+| `job_fired` | native/scheduler fire dispatched a job with no LLM in the loop (job_id, occurrence_id, intended_fire_ts, child_id, caught_up: bool) (attn.4+) |
+| `job_fire_skipped` | a native/shadow fire was computed but not dispatched — shadow mode, or a guard rejected it (job_id, occurrence_id, intended_fire_ts, reason, shadow: bool) (attn.4+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

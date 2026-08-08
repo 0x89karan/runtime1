@@ -1,5 +1,52 @@
 # TODOS
 
+## attn.4 review residuals — Open (2026-08-07, filed at /review)
+
+Three findings from `/review`'s adversarial + security specialist passes on attn.4 (scheduler-
+native cron), judged as genuine design questions rather than mechanical fixes — the review's
+other findings (a real double-fire bug across restarts, a dead enum variant, a boot-init
+history-discard bug, a croner field-count leniency gap, and several test-coverage gaps) were
+all fixed directly in the same pass; these three were not.
+
+- **attn.4-clock-01 (P2) — no sanity bound on the system clock before trusting it to compute
+  schedules at boot.** `agentd` is explicitly designed to eventually run as PID 1 on bare
+  metal, where NTP may not have synced yet at boot. A garbage clock (e.g. near-epoch-zero)
+  produces a garbage `next_fire_ts`/occurrence identity, gets checkpointed, and the instant
+  NTP steps the clock forward every job whose stale `next_fire_ts` is now in the past fires
+  once as a "catch-up" — not a thundering herd, but a fire at an unpredictable,
+  clock-dependent moment rather than the operator's intended schedule, with nothing
+  distinguishing "clock was wrong" from "we were legitimately down." Needs a design decision
+  (refuse to trust `now` before some sanity threshold? require an NTP-synced signal at boot?)
+  before it's buildable, not a mechanical fix. Found by the adversarial review subagent.
+- **attn.4-croner-01 (P3) — `croner`'s panic-safety on adversarial/malformed input is
+  unverified.** `Job::validate_schedule` (config.rs) is called for every job at boot and is
+  documented to degrade ONE job to manual-fire-only on a parse error — never fail the whole
+  boot. That contract only holds if `croner::Cron::from_str` always returns `Err` rather than
+  panicking on some pathological input (huge field values, unusual unicode, extreme ranges).
+  Nothing in this codebase pins that contract with a fuzz/property test against the actual
+  pinned `croner` version. Low priority: `croner` is a maintained third-party crate, not
+  hand-rolled code we're the primary auditor of, and this is a boot-time-only path.
+- **attn.4-ratelimit-01 (P2) — native cron removes the only soft rate-limiting friction on
+  side-effecting scheduled jobs.** Before attn.4, an LLM had to actively decide to call
+  `run_job` each time (a weak throttle). A native `schedule` now fires unconditionally on
+  every matching cron tick, bounded only by the pre-existing per-fire `token_budget` (already
+  documented elsewhere as "per-fire, not a daily fence"). A schedule like `"* * * * *"` on a
+  job holding write/Gmail capabilities would now fire every minute with no LLM in the loop to
+  notice something is wrong — a config typo has a bigger blast radius than it used to. Not a
+  new authz bypass (same actor who can edit `cos.agents.toml` could already grant itself any
+  capability directly), but a real operational-risk increase worth a considered answer: a
+  per-job max-fires-per-window guard independent of `token_budget`, or at minimum an
+  `agentctl jobs` warning when a schedule fires more often than some threshold. Found by the
+  security specialist.
+- **attn.4-watch-01 (P2) — Task T4's `agentctl watch` row was never built.** T4's stated scope
+  was both a CLI dry-run (`agentctl jobs`, built) and a live dashboard row surfacing next/last
+  fire, occurrence id, skip reason, and fingerprint (not built). `surfaces::JobScheduleView` is
+  populated in `update_snapshot` but has no consumer in `agentctl/src/watch/` — the data is
+  exported and then read by nothing. Filed at plan-completion audit, not discovered later.
+  Operator visibility until this lands: `agentctl jobs <config>` (dry-run) plus the
+  `job_fired`/`job_fire_skipped`/`job_schedule_degraded` flight events via the existing Logs
+  view. See `docs/plans/attn.4-scheduler-native-cron.md` T4.
+
 ## zk track — Open (reshaped at /autoplan premise gate, 2026-08-06)
 
 Plan + increment ladder: `docs/plans/zk.1-hybrid-crypto-verification.md`. The inline-zkVM

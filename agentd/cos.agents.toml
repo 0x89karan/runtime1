@@ -340,6 +340,14 @@ native = [
 
 [[jobs]]
 id           = "cos-inbox"
+# attn.4: native/shadow schedule, UTC only (nothing in this stack understands local time —
+# see docs/THREAT_MODEL.md §9.5 and CLAUDE.md). Matches the retiring TRIGGER_CRON default
+# (0 8 * * *). SHADOW MODE IS ON BY DEFAULT (`[scheduler] native_cron_shadow`, default true):
+# this schedule is computed and logged, never dispatched, until the operator flips it to
+# false after confirming (via a shadow-mode QA cycle) that it fires equivalently to the
+# still-live LLM-polling `cron_trigger` path below. `agentctl jobs cos.agents.toml` prints
+# the next few computed fire times without touching a running daemon.
+schedule     = "0 8 * * *"
 # Budget bounded by the metadata-only fetch (cap.2b-ar-02): STEP 2 pulls headers + Gmail's
 # snippet, never full base64 bodies, so context stays small (~50 messages × ≤1 KB) and 1.5M
 # is ample. (The old format=full fetch ballooned to ~1.8M by turn 6 and deferred.)
@@ -459,6 +467,10 @@ STEP 4 — Persist the OperatingBrief for the curator:
 
 [[jobs]]
 id           = "cos-curator"
+# attn.4: fires 5 minutes after cos-inbox — there is NO automatic inbox→curator handoff in
+# Rust (the sequencing was always the orchestrator's own prompt loop, not a guarantee); a
+# fixed offset is the simplest native equivalent. Same shadow-mode default as cos-inbox above.
+schedule     = "5 8 * * *"
 # Larger than inbox: brief assembly + kb_search + runs_query all run here (cap.2b F7d — the
 # old 200k curator would brick mid-brief now that assembly moved off the trigger).
 token_budget = 500_000

@@ -24,11 +24,69 @@ These were decided deliberately. Do not relitigate or quietly violate them:
 
 ## Current status
 
-**Current version:** v0.121.0 (shipped 2026-08-04)
+**Current version:** v0.122.0 (shipped 2026-08-07)
 <!-- Updated on every release; test-enforced against agentd/Cargo.toml by
      agentd/tests/repo_consistency.rs — a stale line here fails cargo test. -->
 
-**Latest shipped:** attn.2 R3+R4 (v0.121.0) — **the brief is readable (exclusive
+**Latest shipped:** attn.4 — scheduler-native cron (v0.122.0) — **`[[jobs]]` now has a real
+schedule and the scheduler itself fires due jobs; no LLM sits on the schedule boundary
+anymore.** Ships in shadow mode by default (`native_cron_shadow = true`) — the new path
+computes and logs would-fire decisions but dispatches nothing yet, running alongside the
+still-live LLM-polling `wait_for_trigger` path until an operator confirms equivalence in the
+field. Plan: `docs/plans/attn.4-scheduler-native-cron.md`.
+- **This is the fix CLAUDE.md's own roadmap note said was required before bringing the stack
+  back up.** Measured: 63/63 tool calls in a 29-minute window were `wait_for_trigger`, 414k
+  tokens spent to watch a clock — ~3,456 inference calls/day, which empties the 10M/24h window
+  in ~2.6h with zero briefs produced. Native `schedule` (5-field UTC cron via `croner`) removes
+  the LLM from the schedule boundary entirely.
+- **A new occurrence ledger** (`job_id + schedule-fingerprint + intended_fire_ts`,
+  `agentd/src/scheduler_cron.rs`) replaces the too-coarse `{job_id}-{date}` scheme for native
+  fires — gives every fire a stable, restart-safe identity instead of a once-daily assumption.
+  Missed-fire catch-up on boot is fingerprint-gated: a restored `next_fire_ts` is trusted only
+  if the schedule string hasn't changed since it was persisted.
+- **A malformed `schedule` degrades ONLY that job** to manual-fire-only with a loud warning
+  (`job_schedule_degraded`) — corrected mid-review from an earlier draft that said "fails boot
+  closed," which would have let one operator typo brick the whole PID-1 process.
+- **`/review`'s adversarial pass found and fixed a real cross-restart double-fire bug before it
+  shipped** — three coordinated defects (catch-up synthesizing `now` instead of the persisted
+  occurrence timestamp; boot-init discarding the ledger on every restart; the ledger update not
+  guaranteed to reach disk before a crash), fixed together and proven via a new restart-across-
+  a-fire test plus live SIGKILL-then-restart testing.
+- **`/qa` driving the real binary found a second real bug invisible to all 970+ passing unit
+  tests: a pre-existing 32-second SIGTERM-unresponsiveness regression.** The schedule-only idle
+  branch used a bare `tokio::time::sleep` racing nothing, so SIGTERM landing mid-sleep waited out
+  the full interval — long enough for Docker's ~10s default grace period to SIGKILL `agentd`
+  before it could checkpoint. Predated attn.4 but this increment's own idle-loop keep-alive fix
+  made the branch common enough to hit. Fixed with `tokio::select!`; measured 32s → 0.23s live,
+  mutation-verified.
+- **New `agentctl jobs <config>`** — validates every job's schedule, prints its next three fire
+  times, non-zero exit on any invalid schedule (usable in CI/pre-deploy checks). Reuses the
+  scheduler's own parsing/next-fire logic so it can never drift from what the real scheduler
+  would do.
+- **T4's scope was trimmed honestly, not silently dropped.** The plan called for both the CLI
+  dry-run (built) and a live `agentctl watch` dashboard row surfacing next/last fire per job
+  (NOT built — `surfaces::JobScheduleView` is populated but has no consumer in
+  `agentctl/src/watch/`). Filed as `attn.4-watch-01` (P2) in TODOS.md at the plan-completion
+  audit. Operator visibility until it lands: `agentctl jobs` plus the
+  `job_fired`/`job_fire_skipped`/`job_schedule_degraded` flight events via the existing Logs
+  view.
+- **Three more residuals filed, not fixed, as genuine design questions rather than mechanical
+  fixes:** `attn.4-clock-01` (P2, no sanity bound on the system clock before trusting it at
+  boot — relevant once this runs as bare-metal PID 1 with no NTP guarantee yet),
+  `attn.4-croner-01` (P3, `croner`'s panic-safety on adversarial input is unpinned by a test),
+  `attn.4-ratelimit-01` (P2, native cron removes the soft rate-limiting friction an LLM-driven
+  `run_job` call used to provide — a config typo like `schedule = "* * * * *"` on a capable job
+  now has a bigger blast radius with nothing in the loop to notice).
+- **Task T7 (delete the now-legacy LLM-polling prompt + `cron_trigger` MCP registration) is
+  deliberately NOT built this increment** — by the plan's own rollout sequencing it only makes
+  sense once a real shadow cycle confirms equivalence in the field, which requires the stack to
+  actually be running first.
+- **Do NOT bring the stack up or start the 14-day brief-adoption measure yet.** Per the roadmap
+  note this increment closes: bring it up with `docker compose up -d` (not `start`), let shadow
+  mode run at least one full cycle, confirm shadow-computed fire times match reality, THEN flip
+  `native_cron_shadow = false` and start the measure.
+
+**Prev:** attn.2 R3+R4 (v0.121.0) — **the brief is readable (exclusive
 important/response_needed classification, narrowed sender-text escaping, a real
 `suppressed_count`) and non-destructive to write (a per-fire `{ts}` in both the brief
 filename and the KB key).** R5 (manual fire) is explicitly NOT in this increment — split
@@ -350,21 +408,22 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **attn.4 — scheduler-native cron. This is what brings the brief back.**
-Do NOT bring the stack up first and do NOT start the 14-day measure yet.
-1. **`attn.4` (P1) — give `[[jobs]]` a schedule and fire them from the scheduler**, so no LLM sits
-   on the schedule boundary. Measured: the trigger burns **~3,456 inference calls/day** to watch a
-   clock (63/63 tool calls in a 29-min window were `wait_for_trigger`, 414k tokens **to wait**), and
-   that is what empties the 10M/24h window in ~2.6 h. Rejected at the gate: raising `MCP_TIMEOUT`
-   globally (`mcp.rs:23` covers every MCP call, so a hung sidecar would pin an agent for minutes on
-   a PID-1 process). **Verified NOT a config flip** — `Job` has no schedule field and the scheduler
-   has no native job cron. Six open design questions in
-   `docs/plans/attn.3-real-context-window.md` §4, including the **timezone gap** (no `chrono::Local`,
-   no `tzdata`, no `TZ`, so "08:00" silently means UTC) and the fate of the other two h7.3 trigger
-   servers. Needs its own `/autoplan`.
-2. **Then** `docker compose up -d cos` (**`up -d`, not `start`**) and leave it. Booting before
-   attn.4 costs ~$50/day of inference to poll a clock and still emits nothing.
-3. The D4 measure: **does the operator stop checking email manually?** 14 days.
+**Next (roadmap):** **attn.4 has shipped (v0.122.0) — the scheduler-native cron path exists,
+but it ships in shadow mode. Do NOT flip it live or start the 14-day measure yet.**
+1. ~~**`attn.4` (P1) — give `[[jobs]]` a schedule and fire them from the scheduler**~~ ✅ shipped
+   v0.122.0. `cos-inbox`/`cos-curator` both carry `schedule =` now, alongside the still-live
+   LLM-polling path, gated by `native_cron_shadow = true` (default). The timezone gap from the
+   original note is unchanged and deliberately out of scope: no `chrono::Local`, no `tzdata`, no
+   `TZ`, so `schedule = "0 8 * * *"` means 08:00 **UTC**, not local time.
+2. **Bring the stack up now** (`docker compose up -d cos`, **`up -d`, not `start`**) and let
+   shadow mode run at least one full cycle. Confirm the shadow-computed fire times
+   (`job_fired`/`job_fire_skipped` events, or `agentctl jobs cos.agents.toml`) match what the
+   still-live LLM-polling path actually does before touching anything.
+3. **Then, and only then,** flip `native_cron_shadow = false` in `cos.agents.toml`'s
+   `[scheduler]` block to cut the LLM out of the schedule boundary for real.
+4. **Then** the D4 measure: **does the operator stop checking email manually?** 14 days.
+5. Task T7 (delete the now-legacy polling prompt + `cron_trigger` MCP registration) rides after
+   step 3 confirms equivalence in the field — tracked, not abandoned.
 
 **In parallel, needing zero engineering, and now flagged by four consecutive CEO voices:** name mv
 design partners. Gate 2026-10-01, **0 of 10 named, 0 of 3 demos**. Both CEO voices in attn.3's

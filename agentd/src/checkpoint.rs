@@ -177,6 +177,14 @@ pub struct SchedulerCheckpoint {
     /// Windowed global spend = `tokens_spent − global_window_anchor`.
     #[serde(default)]
     pub global_window_anchor: u64,
+    /// Per-job native-scheduling state (attn.4) — next-fire tracking + occurrence dedup for
+    /// `[[jobs]]` entries with a `schedule`. Written ONLY when a job fires or its schedule's
+    /// fingerprint changes (never on every scheduler tick) — an unconditional per-tick write
+    /// would reintroduce a smaller version of the token-furnace problem this feature exists
+    /// to kill, just moved from LLM tokens to disk I/O. Absent in pre-attn.4 checkpoints →
+    /// empty (every job starts fresh, computing its first next-fire from the live schedule).
+    #[serde(default)]
+    pub job_schedules: HashMap<String, crate::scheduler_cron::JobScheduleState>,
 }
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
@@ -446,6 +454,7 @@ mod tests {
             credential_health:  HashMap::new(),
             budget_window_start: 0,
             global_window_anchor: 0,
+            job_schedules:      HashMap::new(),
         }
     }
 

@@ -159,6 +159,23 @@ async fn run_agent(path: PathBuf, no_fuse: bool, log_path_override: Option<PathB
         recorder.record("agentd", None, EventKind::CapabilitiesResolved, payload);
     }
 
+    // attn.4: validate each job's `schedule` at boot. A malformed expression degrades ONLY
+    // that job to manual-fire-only (never fails the whole boot — agentd runs as PID 1, and a
+    // single job's config typo is a per-job feature failing safe, not a process-level
+    // security boundary; see `config::Job::validate_schedule`'s doc comment).
+    for job in cfg.jobs.iter_mut() {
+        if let Err(error) = job.validate_schedule() {
+            tracing::warn!(job_id = %job.id, %error, "job schedule invalid — degrading to manual-fire-only");
+            recorder.record(
+                "agentd",
+                None,
+                EventKind::JobScheduleDegraded,
+                serde_json::json!({ "job_id": &job.id, "schedule": &job.schedule, "error": &error }),
+            );
+            job.schedule = None;
+        }
+    }
+
     let mut agent_cfgs = cfg.agent_configs()?;
 
     // stdin fallback: only for the single [agent] form with an empty task

@@ -85,6 +85,17 @@ pub struct Job {
     /// Fixed task template. The ONLY substitution is `{date}` (server-stamped at dispatch).
     /// No caller-supplied text ever reaches here — this is the injection firewall.
     pub task: String,
+    /// A 5-field (Vixie-compatible) cron expression, UTC only (attn.4). `None` (the
+    /// default — omit the field entirely) means this job is manual-fire-only: the
+    /// scheduler never fires it natively, only an explicit `run_job` tool call can.
+    ///
+    /// A malformed expression degrades ONLY this job to manual-fire-only with a loud,
+    /// persistent warning (`EventKind::JobScheduleDegraded`) — it does NOT fail boot.
+    /// `agentd` runs as PID 1; one job's config typo is a per-job feature failing safe,
+    /// not a process-level security boundary, so the fail-closed instinct that governs
+    /// the rest of this codebase is the wrong UNIT here. See `validate_schedule`.
+    #[serde(default)]
+    pub schedule: Option<String>,
 }
 
 impl Job {
@@ -99,6 +110,22 @@ impl Job {
     /// so a prompt asking for a timestamp shipped a new FIXED name that still truncated.
     pub fn render(&self, date: &str, ts: &str) -> String {
         self.task.replace("{date}", date).replace("{ts}", ts)
+    }
+
+    /// Parse-check `schedule` without side effects. Returns a human-readable error
+    /// naming what's wrong and a corrected example — never a bare parser token error
+    /// (attn.4 DX finding) — or `Ok(())` if `schedule` is `None` or parses cleanly.
+    pub fn validate_schedule(&self) -> Result<(), String> {
+        let Some(expr) = &self.schedule else { return Ok(()) };
+        crate::scheduler_cron::validate(expr)
+            .map_err(|e| {
+                format!(
+                    "job \"{id}\": schedule = \"{expr}\" is invalid ({e}). \
+                     Use a 5-field UTC cron expression, e.g. schedule = \"0 8 * * *\" \
+                     (minute hour day-of-month month day-of-week).",
+                    id = self.id,
+                )
+            })
     }
 }
 
@@ -447,6 +474,15 @@ pub struct SchedulerConfig {
     /// the management API and FUSE surface come up for an operator to spawn into.
     #[serde(default)]
     pub allow_empty_agents: bool,
+    /// attn.4 rollout: when `true` (the default), native/scheduled job fires are computed
+    /// and logged (`EventKind::JobFireSkipped` with `shadow: true`) but NEVER dispatched —
+    /// the old LLM-polling `cron_trigger` path (if still wired in config) remains the only
+    /// thing that actually fires jobs. Flip to `false` only after a shadow-mode QA cycle
+    /// confirms the native path's computed fire decisions match the old path's actual fires,
+    /// with zero double-dispatch (attn.4 Eng finding: running both paths live at once can
+    /// itself double-fire a job).
+    #[serde(default = "default_native_cron_shadow")]
+    pub native_cron_shadow: bool,
 }
 
 fn default_max_spawn_depth() -> u32 {
@@ -455,6 +491,10 @@ fn default_max_spawn_depth() -> u32 {
 
 fn default_checkpoint_interval_turns() -> u32 {
     1
+}
+
+fn default_native_cron_shadow() -> bool {
+    true
 }
 
 impl Default for SchedulerConfig {
@@ -466,6 +506,7 @@ impl Default for SchedulerConfig {
             max_spawn_depth:           default_max_spawn_depth(),
             checkpoint_interval_turns: default_checkpoint_interval_turns(),
             allow_empty_agents:        false,
+            native_cron_shadow:        default_native_cron_shadow(),
         }
     }
 }
@@ -2266,6 +2307,52 @@ allow_insecure_local = true
         }
     }
 
+    /// attn.4: `schedule = None` (the default — field omitted) is always valid; a job never
+    /// declaring a schedule must never be treated as a validation error.
+    #[test]
+    fn validate_schedule_none_is_ok() {
+        let job = Job {
+            id: "x".into(),
+            token_budget: 1,
+            max_turns: 1,
+            capabilities: vec![],
+            task: "t".into(),
+            schedule: None,
+        };
+        assert!(job.validate_schedule().is_ok());
+    }
+
+    #[test]
+    fn validate_schedule_valid_expression_is_ok() {
+        let job = Job {
+            id: "cos-inbox".into(),
+            token_budget: 1,
+            max_turns: 1,
+            capabilities: vec![],
+            task: "t".into(),
+            schedule: Some("0 8 * * *".into()),
+        };
+        assert!(job.validate_schedule().is_ok());
+    }
+
+    /// attn.4 DX finding: the error must name the job id, the invalid string, and show a
+    /// corrected example — never a bare parser token error.
+    #[test]
+    fn validate_schedule_malformed_names_job_and_shows_example() {
+        let job = Job {
+            id: "cos-inbox".into(),
+            token_budget: 1,
+            max_turns: 1,
+            capabilities: vec![],
+            task: "t".into(),
+            schedule: Some("not a cron string".into()),
+        };
+        let err = job.validate_schedule().unwrap_err();
+        assert!(err.contains("cos-inbox"), "error must name the job: {err}");
+        assert!(err.contains("not a cron string"), "error must echo the invalid value: {err}");
+        assert!(err.contains("0 8 * * *"), "error must show a corrected example: {err}");
+    }
+
     /// R4.1 (attn.2): `Job::render` substitutes `{ts}` in addition to `{date}`.
     #[test]
     fn job_render_substitutes_ts_alongside_date() {
@@ -2275,6 +2362,7 @@ allow_insecure_local = true
             max_turns: 1,
             capabilities: vec![],
             task: "brief-{date}T{ts}Z.md and kb key {date}T{ts}".into(),
+            schedule: None,
         };
         let rendered = job.render("2026-08-04", "091500");
         assert_eq!(rendered, "brief-2026-08-04T091500Z.md and kb key 2026-08-04T091500");

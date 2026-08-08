@@ -3856,6 +3856,7 @@ max_requests_per_agent = 100
             credential_health:   health,
             budget_window_start: 0,
             global_window_anchor: 0,
+            job_schedules:       HashMap::new(),
         };
         let json = serde_json::to_string(&cp).expect("serialize must succeed");
         let back: crate::checkpoint::SchedulerCheckpoint =

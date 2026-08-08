@@ -8,6 +8,7 @@ mod auth;
 mod brief;
 mod docker;
 mod inject;
+mod jobs;
 mod list;
 mod orchestrate;
 mod spawn;
@@ -39,6 +40,9 @@ enum Commands {
     Brief(brief::BriefArgs),
     /// Inject a new user turn into a waiting orchestrated agent
     Inject(inject::InjectArgs),
+    /// Validate [[jobs]] schedules and print upcoming fire times — no running daemon
+    /// needed (attn.4 DX: answers "will my schedule work?" without waiting up to 24h)
+    Jobs(jobs::Args),
     /// Cancel an agent (cascade-cancels its spawned subtree) — ux.13
     Cancel(verbs::CancelArgs),
     /// Set a per-agent token budget at runtime (0 = unlimited) — ux.13
@@ -61,6 +65,7 @@ fn main() {
         Commands::Auth(cmd) => auth::run(cmd),
         Commands::Brief(args) => brief::run(args),
         Commands::Inject(args) => inject::run(args),
+        Commands::Jobs(args) => jobs::run(args),
         Commands::Cancel(args) => verbs::run_cancel(args),
         Commands::SetBudget(args) => verbs::run_set_budget(args),
         Commands::SetCaps(args) => verbs::run_set_caps(args),

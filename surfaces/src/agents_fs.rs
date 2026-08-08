@@ -1468,6 +1468,7 @@ mod tests {
             isolation_caps:      None,
             credential_snapshot: None,
             budget_resettable:   false,
+            job_schedules:       vec![],
         }))
     }
 
@@ -1491,6 +1492,7 @@ mod tests {
             isolation_caps:      None,
             credential_snapshot: None,
             budget_resettable:   false,
+            job_schedules:       vec![],
         }))
     }
 
@@ -2505,6 +2507,7 @@ mod tests {
             isolation_caps:      None,
             credential_snapshot: None,
             budget_resettable:   false,
+            job_schedules:       vec![],
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_SANDBOX).unwrap();
@@ -2616,6 +2619,7 @@ mod tests {
             isolation_caps:      None,
             credential_snapshot: None,
             budget_resettable:   false,
+            job_schedules:       vec![],
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a1");
@@ -2644,6 +2648,7 @@ mod tests {
             isolation_caps:      None,
             credential_snapshot: None,
             budget_resettable:   false,
+            job_schedules:       vec![],
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a2");
@@ -2683,6 +2688,7 @@ mod tests {
             isolation_caps:      None,
             credential_snapshot: None,
             budget_resettable:   false,
+            job_schedules:       vec![],
         }));
         let mut fs = AgentsFs::new(snap, None, None);
         let base = fs.alloc_dir("a3");
@@ -2970,6 +2976,7 @@ mod tests {
                 ],
             }),
             budget_resettable:   false,
+            job_schedules:       vec![],
         }));
         let fs = AgentsFs::new(snap, None, None);
         let content = fs.sys_file_content(INO_SYS_CREDENTIALS).unwrap();

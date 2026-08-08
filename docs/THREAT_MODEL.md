@@ -840,6 +840,31 @@ only (`brief-03`), and open-item content derived from untrusted email is read ba
 every morning, so a stored injection persists across days in a context holding
 `FsWrite ./output` and `BriefPublish`.
 
+**Update (attn.4 — scheduler-native cron): the trigger node this section describes is being
+deleted, not just re-privileged.** `cos.agents.toml`'s cron TRIGGER — the "summary-free" node
+holding `{Mcp{cron_trigger}, RunJob}` described above — is retired once native/shadow firing is
+proven equivalent (attn.4 T7); `[[jobs]]` gains a `schedule` field and `agentd`'s scheduler fires
+`cos-inbox`/`cos-curator` directly. This changes, not merely removes, part of the picture above:
+
+- **The trigger's `RunJob` capability check is gone because the trigger is gone — not "gone but
+  equivalent."** A native fire dispatches on the job's own config-declared capabilities with no
+  caller/principal to check against. This is a STATED reduction in defence-in-depth, not a silent
+  no-op: removing the trigger collapses two independent gates (the capability check on the caller,
+  AND an LLM having to actively choose to call `run_job`) into one (the job existing in config).
+  Under this project's single-tenant trust model that reduction is judged acceptable — the
+  trigger's `RunJob` grant conferred no authority beyond "may call run_job," nothing broader — but
+  it is a real change to the authorization surface, not a cosmetic one.
+- **The residual described above (a misleading brief; forged link destinations) is UNCHANGED.**
+  Native scheduling only touches *when* `cos-inbox`/`cos-curator` fire, never *what* they can do or
+  what they read — both jobs keep their existing sealed capability sets and task templates, owned
+  by config exactly as before. The injected-curator brief-integrity residual, and everything in
+  this section about `thread_id`/entity-escaping being prompt-level only, carries forward verbatim.
+- **A new, narrower attack surface exists only if the "bridge" alternative had been chosen instead
+  of native scheduling** (evaluated and rejected at `/autoplan` review, `docs/plans/attn.4-
+  scheduler-native-cron.md`): a sidecar-to-management-API call would have needed its own
+  bridge-network-aware authentication. Native scheduling (what actually shipped) has no such
+  surface — the fire happens in-process, inside `agentd` itself.
+
 ---
 
 ## 9.6 Telegram reach: remote approve/deny writer (ux.12)

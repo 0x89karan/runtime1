@@ -235,6 +235,16 @@ write events to durable storage before POSTing.
 
 ### cron_mcp
 
+**LEGACY (attn.4) — the CoS deployment no longer drives its schedule through this server.**
+`wait_for_trigger` requires an LLM to poll it in a loop, which attn.4 measured at ~3,456
+inference calls/day just to watch a clock. The real schedule for `cos.agents.toml`'s
+`cos-inbox`/`cos-curator` jobs now lives in `[[jobs]]`'s `schedule` field, fired natively
+in-process by `agentd`'s scheduler — no LLM on the schedule boundary at all. This server is
+kept in the image as a manual/legacy fallback for one release (config-level rollback path,
+per the attn.4 DX review), not as the deployed mechanism. It remains a fine choice for any
+OTHER agent that genuinely needs an LLM-visible wake signal rather than a config-declared
+sealed job.
+
 Fires on a cron schedule (UTC) or fixed interval.
 
 ```bash

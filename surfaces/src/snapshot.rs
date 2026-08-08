@@ -159,6 +159,36 @@ pub struct SchedulerSnapshot {
     /// budget-based soft stop ("Park" in `agentctl watch`) is not reversible on this deployment.
     /// Default `false`, matching the config default: only the CoS configs set an interval.
     pub budget_resettable:   bool,
+    /// Native-scheduling state (attn.4) for jobs with a `schedule` — the answer to "why
+    /// didn't my job run?" without reading logs or Rust source. Empty when no job declares
+    /// a schedule.
+    #[serde(default)]
+    pub job_schedules:       Vec<JobScheduleView>,
+}
+
+/// Operator-facing view of one scheduled job's native-firing state (attn.4). Surfaced via
+/// `agentctl watch` and `agentctl jobs status` — see the attn.4 DX review: "a bare next-fire
+/// row is insufficient; the operator needs enabled/disabled, next fire, last outcome, skip
+/// reason, and the schedule fingerprint to diagnose a missed fire without logs or source."
+#[derive(Clone, Debug, Serialize)]
+pub struct JobScheduleView {
+    pub job_id:            String,
+    /// Human-readable interpretation ("0 8 * * * (UTC)") — rendered, not just echoed, so a
+    /// stale comment elsewhere in config can never mislead the operator about what will
+    /// actually fire (attn.4 DX finding).
+    pub schedule_described: String,
+    /// Next computed fire time, UTC epoch seconds. Always rendered as "UTC" explicitly
+    /// wherever this is displayed — never a bare "08:00" (attn.4 DX finding: bare local-
+    /// looking timestamps launder the project-wide TZ-confusion gap).
+    pub next_fire_ts:      i64,
+    /// "fired" | "skipped" | "shadow_logged" | "caught_up" | "" (never yet due).
+    pub last_outcome:      String,
+    /// Present only when `last_outcome == "skipped"` — why the last fire attempt was
+    /// rejected (unknown job id, collision, invalid child id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_skip_reason:  Option<String>,
+    /// Whether shadow mode is currently active for this job (rollout in progress vs. live).
+    pub shadow_mode:       bool,
 }
 
 /// Why an agent's `attention` signal fired — see `docs/plans/ux.2-attention-evidence.md`.
