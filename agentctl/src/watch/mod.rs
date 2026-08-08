@@ -1394,9 +1394,40 @@ pub fn explain_verb_error(raw: &str) -> String {
             .to_string();
     }
     if raw.contains("HTTP 503") {
+        // attn.2-R5 fix (/autoplan retroactive review — HIGH, DX phase): the generic "Action
+        // not sent" framing is FALSE for run_job's timeout specifically. The server's own
+        // route already `try_send`s the command successfully before the 2 s confirm-wait —
+        // a timeout means the confirmation didn't arrive in time, not that nothing happened.
+        // Telling the operator to "retry" here can cause exactly the double real-Gmail-fire
+        // the concurrent-fire guard exists to prevent. Every other 503 case here (budget/
+        // cancel/set-caps/spawn) genuinely has NOT been sent yet — only run_job's server-side
+        // string ("timed out waiting for run_job", `management.rs`) distinguishes this one.
+        if raw.contains("timed out waiting for run_job") {
+            return format!(
+                "Uncertain: agentd may have already started this fire even though the \
+                 confirmation didn't arrive in time ({}). Check the Jobs view or the flight \
+                 log before firing again — retrying blind risks a second, concurrent run of \
+                 the same job.",
+                raw.trim(),
+            );
+        }
         return format!(
             "Action not sent: agentd's control channel is unavailable or busy ({}). Wait a second and \
              retry; if it persists, restart agentd.",
+            raw.trim(),
+        );
+    }
+    if raw.contains("HTTP 409") {
+        // attn.2-R5 fix: the ONE failure mode genuinely new to run_job (a job already has a
+        // live run — the concurrent-fire guard's own rejection) was falling through to raw,
+        // unexplained JSON. Nanosecond-id collisions (the OTHER thing that could produce a
+        // 409 here) are vanishingly rare and self-resolve on retry either way, so one message
+        // covering both is accurate without needing to distinguish them.
+        return format!(
+            "Action not sent: this job already has a live run in progress, or a rare id \
+             collision occurred ({}). If a run is genuinely in progress, wait for it to finish \
+             (check the Jobs view or the flight log) — firing again now would not be a retry, \
+             it would be a second concurrent run.",
             raw.trim(),
         );
     }
@@ -4846,6 +4877,36 @@ mod tests {
         app.view = View::Jobs;
         handle_jobs_key(kev(KeyCode::Esc), &mut app);
         assert_eq!(app.view, View::Dashboard);
+    }
+
+    #[test]
+    fn explain_verb_error_409_names_the_concurrent_run_not_raw_json() {
+        let raw = "HTTP 409: {\"error\":\"job 'cos-inbox' already has a live run in progress (1 child(ren)); concurrent fire refused\"}";
+        let out = explain_verb_error(raw);
+        assert!(out.contains("live run in progress") || out.contains("second concurrent run"),
+            "409 must be humanized, not passed through as raw JSON: {out}");
+        assert!(!out.starts_with("HTTP 409"), "must not just echo the raw error: {out}");
+    }
+
+    #[test]
+    fn explain_verb_error_run_job_timeout_does_not_claim_action_not_sent() {
+        // /autoplan retroactive review: for run_job specifically, "Action not sent" can be
+        // FALSE (the command may already be queued) — telling the operator to retry blind
+        // risks the exact concurrent-fire race the guard exists to prevent.
+        let raw = "HTTP 503: {\"error\":\"timed out waiting for run_job\"}";
+        let out = explain_verb_error(raw);
+        assert!(!out.contains("Action not sent"),
+            "run_job's timeout must not claim nothing happened: {out}");
+        assert!(out.contains("Uncertain") || out.contains("may have already"), "{out}");
+    }
+
+    #[test]
+    fn explain_verb_error_other_503s_still_say_action_not_sent() {
+        // Every OTHER 503 (cancel/set-budget/set-caps/spawn) genuinely has not been sent yet
+        // — the run_job-specific wording must not leak into these.
+        let raw = "HTTP 503: {\"error\":\"timed out waiting for cancel\"}";
+        let out = explain_verb_error(raw);
+        assert!(out.contains("Action not sent"), "{out}");
     }
 
     #[test]

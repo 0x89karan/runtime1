@@ -3545,11 +3545,16 @@ fn dispatch_control_command(
             // not only on the FUSE fire-and-forget path — this is a new externally-HTTP-
             // reachable trigger for a job that may hold live Gmail access, so the flight log
             // is the audit trail regardless of whether the caller also sees the HTTP error.
+            // `confirm_tx.is_some()` is the SAME signal every other confirm_tx doc comment in
+            // control.rs already uses to distinguish the two transports (Some = HTTP, None =
+            // fire-and-forget FUSE) — read here before it's consumed below, so the audit trail
+            // records which surface fired the job without a new field on ControlCommand.
+            let via = if confirm_tx.is_some() { "http" } else { "fuse" };
             match &result {
                 Ok(child_id) => recorder.record(&job_id, None, EventKind::JobManualFired,
-                    json!({ "job_id": &job_id, "child_id": child_id })),
+                    json!({ "job_id": &job_id, "child_id": child_id, "via": via })),
                 Err(reason) => recorder.record(&job_id, None, EventKind::JobManualFireRejected,
-                    json!({ "job_id": &job_id, "reason": reason })),
+                    json!({ "job_id": &job_id, "reason": reason, "via": via })),
             }
             if let Some(tx) = confirm_tx {
                 let _ = tx.send(result);
@@ -9871,6 +9876,56 @@ mod tests {
         assert_eq!(
             state.job_schedules["cos-inbox"], before,
             "a manual fire must leave the schedule's own occurrence-ledger state untouched"
+        );
+    }
+
+    #[test]
+    fn manual_fire_flight_event_tags_the_http_transport() {
+        // /autoplan retroactive review, T4 (mechanical): JobManualFired/JobManualFireRejected
+        // carried no caller-identity — an operator reading flight.jsonl could not tell a TUI/
+        // CLI-initiated fire (HTTP, confirm_tx: Some) from a FUSE-initiated one (confirm_tx:
+        // None) apart. `confirm_tx.is_some()` is the exact signal control.rs's own doc comments
+        // already use for this distinction on every other command, so no new field is needed.
+        use crate::control::ControlCommand;
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+        let mut state = state_with_job(cos_like_job("cos-inbox", vec![]));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch_control_command(
+            ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx) },
+            &mdl, &mut state, &unlimited(), &gateway, &registry, &rec,
+        );
+        rx.blocking_recv().unwrap().expect("manual fire must succeed");
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            content.contains("\"job_manual_fired\"") && content.contains("\"via\":\"http\""),
+            "an HTTP-initiated manual fire must record via=http, got: {content}"
+        );
+    }
+
+    #[test]
+    fn manual_fire_flight_event_tags_the_fuse_transport() {
+        use crate::control::ControlCommand;
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+        let mut state = state_with_job(cos_like_job("cos-inbox", vec![]));
+
+        // FUSE's parse_control_command always sets confirm_tx: None (fire-and-forget).
+        dispatch_control_command(
+            ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: None },
+            &mdl, &mut state, &unlimited(), &gateway, &registry, &rec,
+        );
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            content.contains("\"job_manual_fired\"") && content.contains("\"via\":\"fuse\""),
+            "a FUSE-initiated manual fire must record via=fuse, got: {content}"
         );
     }
 

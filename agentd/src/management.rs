@@ -28,6 +28,9 @@
 //!     (per-agent native-tier only; universal-tier agents are proxy-metered and return 404)
 //!   GET  /api/v1/credentials                     → 200 CredentialSnapshot JSON (cred.5)
 //!   POST /api/v1/credentials/:provider/reset-attention → 200 | 404 (cred.7)
+//!   POST /api/v1/jobs/:id/run                    → 200 {job_id,child_id} | 400 | 404 | 409 | 503 (attn.2-R5)
+//!     (fires a config-declared job on demand, bypassing its schedule; 409 on a same-job
+//!      collision with an already-live run, distinguishing it from "job doesn't exist")
 
 use std::convert::Infallible;
 use std::net::SocketAddr;

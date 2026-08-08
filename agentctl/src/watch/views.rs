@@ -2075,7 +2075,9 @@ fn render_jobs(f: &mut Frame, app: &App) {
             [
                 Constraint::Min(16),    // Job ID
                 Constraint::Length(18), // Schedule
-                Constraint::Length(22), // Next fire
+                Constraint::Length(24), // Next fire — format_fire_ts is 23 chars ("...UTC"); +1
+                                        // margin (/autoplan retroactive review: 22 clipped
+                                        // "UTC" to "UT" on every single row, deterministically)
                 Constraint::Length(28), // Last outcome (+ skip reason on a second line)
                 Constraint::Length(8),  // Mode
             ],
@@ -2119,12 +2121,25 @@ fn render_jobs_overlay(f: &mut Frame, app: &App, ov: &JobsOverlay, area: Rect) {
 
     match &ov.mode {
         JobOverlayMode::ConfirmFire => {
+            // /autoplan retroactive review (2026-08-07): this text used to be identical
+            // regardless of the row's own shadow/live mode, understating the risk on exactly
+            // the jobs where it mattered most. Now scaled by it, and updated to reflect the
+            // concurrent-fire guard's fix — that risk is refused server-side now, not raced.
+            let shadow = app.jobs.iter().find(|j| j.job_id == ov.target_job_id).map(|j| j.shadow_mode).unwrap_or(false);
+            let risk = if shadow {
+                "This job is in SHADOW mode — the automatic scheduler never dispatches it, so \
+                 there is no risk of racing a concurrent scheduled fire."
+            } else {
+                "This job is LIVE — if a run is already in progress (scheduled or manual), \
+                 this fire will be REFUSED, not raced, so there is no risk of two concurrent runs."
+            };
             for line in wrap_plain(
                 &format!(
                     "Fire '{}' now? This calls its real capabilities immediately — live Gmail/KB \
-                     writes, whatever this job is configured to do — ignoring shadow mode. If this \
-                     job already fired today, firing it again OVERWRITES today's real data with \
-                     this run's (last-writer-wins on the job's KB key; attn.2-R5 residual).",
+                     writes, whatever this job is configured to do — ignoring shadow mode. {risk} \
+                     Separately, if this job already fired today, firing it again still \
+                     OVERWRITES today's real data with this run's (last-writer-wins on the \
+                     job's date-keyed KB key) — this is NOT guarded, only warned about here.",
                     sanitize(&ov.target_job_id),
                 ),
                 overlay_text_width(area),
@@ -4107,6 +4122,12 @@ mod tests {
         assert!(out.contains("cos-inbox"));
         assert!(out.contains("cos-curator"));
         assert!(out.contains("2026") || out.contains("UTC"), "next fire must render as explicit UTC, not a bare timestamp:\n{out}");
+        // /autoplan retroactive review: Constraint::Length(22) clipped "UTC" to "UT" on every
+        // row, deterministically (format_fire_ts is 23 chars). Widened to 24 — this must
+        // never regress to a bare "UT".
+        assert!(out.contains("UTC"), "the column must not clip \"UTC\" down to \"UT\":\n{out}");
+        assert!(!out.contains(" UT ") && !out.contains(" UT\n") && !out.contains(" UT│"),
+            "must never render a clipped \"UT\" with no trailing C:\n{out}");
         assert!(out.contains("shadow"));
         assert!(out.contains("live"));
     }
@@ -4163,6 +4184,26 @@ mod tests {
         assert!(out.contains("OVERWRITES") || out.contains("overwrite"),
             "the confirm frame must state the attn.2-R5 same-day KB-overwrite risk, not just \"are you sure\":\n{out}");
         assert!(out.contains("shadow mode"), "must state that a manual fire ignores shadow mode:\n{out}");
+        assert!(!out.contains("attn.2-R5 residual"), "internal ticket jargon must not leak into operator-facing copy:\n{out}");
+    }
+
+    #[test]
+    fn jobs_overlay_confirm_frame_scales_by_shadow_vs_live_mode() {
+        // /autoplan retroactive review: the warning used to be IDENTICAL regardless of the
+        // row's own Mode, under-warning on exactly the live jobs where the concurrent-fire
+        // race was real. Now scaled by it (and updated to reflect the guard's fix).
+        let mut shadow_app = app_with_jobs(vec![job_row("cos-inbox", "", true)]);
+        shadow_app.term_size = (100, 30);
+        shadow_app.jobs_overlay = Some(JobsOverlay { target_job_id: "cos-inbox".to_string(), mode: JobOverlayMode::ConfirmFire });
+        let shadow_out = render_to_text(&shadow_app, 100, 30, render_jobs);
+        assert!(shadow_out.contains("SHADOW mode"), "{shadow_out}");
+
+        let mut live_app = app_with_jobs(vec![job_row("cos-inbox", "", false)]);
+        live_app.term_size = (100, 30);
+        live_app.jobs_overlay = Some(JobsOverlay { target_job_id: "cos-inbox".to_string(), mode: JobOverlayMode::ConfirmFire });
+        let live_out = render_to_text(&live_app, 100, 30, render_jobs);
+        assert!(live_out.contains("LIVE"), "{live_out}");
+        assert_ne!(shadow_out, live_out, "the two modes must render genuinely different copy, not the same boilerplate");
     }
 
     #[test]
