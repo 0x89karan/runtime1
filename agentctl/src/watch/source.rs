@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use super::reader::{
     self, AgentInfo, AgentSandbox, AttentionSignal, BudgetKind, PendingAction, ProvHealthInfo,
-    ServerEnforcement, Snapshot, SysBudget, SysCredentials, SysIsolation, SysProvider, SysQueue,
-    SysSandbox,
+    ServerEnforcement, Snapshot, SysBudget, SysCredentials, SysIsolation, SysJob, SysProvider,
+    SysQueue, SysSandbox,
 };
 
 /// Spawn request sent to the management API (orch.1+).
@@ -89,6 +89,14 @@ pub trait DataSource: Send + Sync {
     /// JSON array of Capability values (e.g. `[{"KbRead":{"segment":"ops:briefs"}}]`).
     fn set_caps(&self, _agent_id: &str, _caps_json: &str) -> Result<(), String> {
         Err("set_caps not supported on this data source".to_string())
+    }
+    /// Fire a config-declared sealed job on demand, bypassing its `schedule` and ignoring
+    /// shadow mode (attn.2-R5). Returns the assigned child id on success. Not implemented
+    /// on the FUSE source yet — `agents_fs.rs` has no `system/jobs` producer file, so the
+    /// FUSE reader can't populate the Jobs view in the first place (filed alongside
+    /// `attn.4-watch-01` in TODOS.md).
+    fn run_job(&self, _job_id: &str) -> Result<String, String> {
+        Err("run_job not supported on this data source (use --url to connect to management API)".to_string())
     }
     /// Returns the base URL for SSE event streaming, if supported.
     fn event_stream_url(&self) -> Option<String> {
@@ -232,16 +240,16 @@ pub struct HttpSource {
 /// template name, and an encoded slash would just fail server-side anyway. Flagged by /review's security
 /// specialist; the URL building predates this branch, but the new confirm dialogs are what make a
 /// mismatch consequential. No new crate — CLAUDE.md's "justify every crate" applies.
-fn check_path_segment(agent_id: &str) -> Result<(), String> {
-    let bad = agent_id.is_empty()
-        || agent_id == "."
-        || agent_id == ".."
-        || agent_id.chars().any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%') || c.is_control());
+fn check_path_segment(value: &str, kind: &str) -> Result<(), String> {
+    let bad = value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.chars().any(|c| matches!(c, '/' | '\\' | '?' | '#' | '%') || c.is_control());
     if bad {
         return Err(format!(
-            "Refusing to send: '{}' is not a usable agent id (it would change which route the \
-             request reaches). Agent ids may not contain / \\ ? # % or control characters.",
-            agent_id.escape_debug(),
+            "Refusing to send: '{}' is not a usable {kind} (it would change which route the \
+             request reaches). {kind}s may not contain / \\ ? # % or control characters.",
+            value.escape_debug(),
         ));
     }
     Ok(())
@@ -377,7 +385,19 @@ pub(crate) fn snapshot_from_json(val: &Value, credentials: Option<SysCredentials
 
     let isolation = isolation_from_json(&val["isolation_caps"]);
 
-    Snapshot { agents, budget, queue, sandbox, provider, isolation, credentials, error: None }
+    // attn.2-R5: job_schedules serializes field-for-field as surfaces::JobScheduleView, so
+    // a direct Deserialize round-trip needs no per-field extraction (unlike the ad-hoc SysX
+    // structs above, which map flat top-level keys with different names).
+    let jobs: Vec<SysJob> = val["job_schedules"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|j| serde_json::from_value(j.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Snapshot { agents, budget, queue, sandbox, provider, isolation, credentials, jobs, error: None }
 }
 
 impl DataSource for HttpSource {
@@ -392,6 +412,7 @@ impl DataSource for HttpSource {
                 provider:    None,
                 isolation:   None,
                 credentials: None,
+                jobs:        vec![],
                 error:       Some(format!("HTTP error: {e:#}")),
             },
         };
@@ -412,12 +433,12 @@ impl DataSource for HttpSource {
         // interpolating verbs validate and the same commit added `sanitize()` to the displayed approval id
         // on the argument that the next id source may not be — one predicate for every id that lands in a
         // URL path (the fix-review pass caught the two halves disagreeing).
-        check_path_segment(id)?;
+        check_path_segment(id, "approval id")?;
         self.post_mutation(&format!("/api/v1/approvals/{id}/approve"), None)
     }
 
     fn deny(&self, id: &str, reason: Option<&str>) -> Result<(), String> {
-        check_path_segment(id)?;
+        check_path_segment(id, "approval id")?;
         let body = reason.map(|r| serde_json::json!({"reason": r}));
         self.post_mutation(&format!("/api/v1/approvals/{id}/deny"), body.as_ref())
     }
@@ -456,13 +477,13 @@ impl DataSource for HttpSource {
     }
 
     fn inject(&self, agent_id: &str, text: &str) -> Result<(), String> {
-        check_path_segment(agent_id)?;
+        check_path_segment(agent_id, "agent id")?;
         let body = serde_json::json!({"text": text});
         self.post_mutation(&format!("/api/v1/agents/{agent_id}/inject"), Some(&body))
     }
 
     fn cancel(&self, agent_id: &str) -> Result<u64, String> {
-        check_path_segment(agent_id)?;
+        check_path_segment(agent_id, "agent id")?;
         // The route replies `{"cancelled": "<id>", "count": N}` after the scheduler confirms. `count`
         // is the native subtree PLUS universal agents parented into it — a number the client cannot
         // compute, which is why this reads the body instead of discarding it.
@@ -476,17 +497,26 @@ impl DataSource for HttpSource {
         // inconsistency that turns into a bug the next time someone moves a parameter (Codex, reviewing
         // the review fixes). `FuseSource` needs no equivalent: it writes JSON into a control FILE, with
         // no path interpolation anywhere.
-        check_path_segment(agent_id)?;
+        check_path_segment(agent_id, "agent id")?;
         let body = serde_json::json!({"target": {"agent": agent_id}, "limit": limit});
         self.post_confirm("/api/v1/budget/set", Some(&body))
     }
 
     fn set_caps(&self, agent_id: &str, caps_json: &str) -> Result<(), String> {
-        check_path_segment(agent_id)?;
+        check_path_segment(agent_id, "agent id")?;
         let caps: Value = serde_json::from_str(caps_json)
             .map_err(|e| format!("capabilities must be a JSON array: {e}"))?;
         let body = serde_json::json!({"capabilities": caps});
         self.post_confirm(&format!("/api/v1/agents/{agent_id}/caps"), Some(&body))
+    }
+
+    fn run_job(&self, job_id: &str) -> Result<String, String> {
+        check_path_segment(job_id, "job id")?;
+        let body = self.post_confirm_json(&format!("/api/v1/jobs/{job_id}/run"), None)?;
+        body["child_id"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| "run_job succeeded but response had no child_id".to_string())
     }
 
     fn event_stream_url(&self) -> Option<String> {
@@ -1070,6 +1100,72 @@ mod tests {
         assert!(aliased.resettable, "either wire name must parse — a rename must not degrade to false");
         let absent: SysBudget = serde_json::from_str(r#"{"spent":1,"total":0}"#).unwrap();
         assert!(!absent.resettable);
+    }
+
+    /// attn.2-R5: `job_schedules` round-trips field-for-field into `Vec<SysJob>` with no
+    /// per-field remapping, unlike the other ad-hoc SysX structs above.
+    #[test]
+    fn snapshot_from_json_parses_job_schedules() {
+        let val: Value = serde_json::from_str(
+            r#"{"agents":[],"job_schedules":[
+                {"job_id":"cos-inbox","schedule_described":"0 8 * * * (UTC)",
+                 "next_fire_ts":1000,"last_outcome":"fired","shadow_mode":true},
+                {"job_id":"cos-curator","schedule_described":"5 8 * * * (UTC)",
+                 "next_fire_ts":2000,"last_outcome":"skipped","last_skip_reason":"unknown job id",
+                 "shadow_mode":false}
+            ]}"#,
+        ).unwrap();
+        let snap = snapshot_from_json(&val, None);
+        assert_eq!(snap.jobs.len(), 2);
+        assert_eq!(snap.jobs[0].job_id, "cos-inbox");
+        assert_eq!(snap.jobs[0].next_fire_ts, 1000);
+        assert!(snap.jobs[0].shadow_mode);
+        assert_eq!(snap.jobs[1].last_skip_reason.as_deref(), Some("unknown job id"));
+        assert!(!snap.jobs[1].shadow_mode);
+    }
+
+    #[test]
+    fn snapshot_from_json_absent_job_schedules_is_an_empty_vec_not_an_error() {
+        let val: Value = serde_json::from_str(r#"{"agents":[]}"#).unwrap();
+        assert_eq!(snapshot_from_json(&val, None).jobs.len(), 0);
+    }
+
+    /// `HttpSource::run_job` must read the SERVER's assigned child_id out of the real body
+    /// shape, and the job_id must land in the path as a single segment (mirrors `cancel`'s
+    /// existing coverage above).
+    #[test]
+    fn http_run_job_reads_the_child_id_from_the_response_body() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 2048];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"{"job_id":"cos-inbox","child_id":"cos-inbox-manual-12345"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body,
+            );
+            let _ = sock.write_all(resp.as_bytes());
+            req
+        });
+
+        let src = HttpSource::new(format!("http://{addr}"));
+        assert_eq!(src.run_job("cos-inbox"), Ok("cos-inbox-manual-12345".to_string()));
+        let req = server.join().expect("server thread");
+        assert!(req.starts_with("POST /api/v1/jobs/cos-inbox/run"),
+            "the job id must land in the path as a single segment: {req}");
+    }
+
+    #[test]
+    fn run_job_refuses_a_path_breaking_job_id_before_any_request_goes_out() {
+        let src = HttpSource::new("http://127.0.0.1:1".to_string());
+        for id in ["victim/run?x=", "..", "a#b", "a%2fb", ""] {
+            let err = src.run_job(id).expect_err("must refuse {id}");
+            assert!(err.contains("not a usable"), "id {id:?} → {err}");
+        }
     }
 
     /// `HttpSource::cancel` must read the SERVER's cascade count out of the real body shape. Proved

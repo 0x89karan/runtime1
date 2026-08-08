@@ -116,6 +116,11 @@ pub enum PendingVerb {
     /// (`TODOS.md`'s ranked P2). Leaving it inline would also have left two contradictory I/O idioms
     /// in one function, and the next contributor copies whichever arm they read first.
     Chat { target: String, text: String },
+    /// Fire a config-declared sealed job on demand (attn.2-R5). Targets `App.jobs_overlay`,
+    /// not `dashboard_overlay` — `drain_pending_verb` special-cases this variant because its
+    /// outcome shape (a child id, not a count) and target entity (a job, not an agent) both
+    /// differ from every other verb here.
+    RunJob { job_id: String },
 }
 
 impl PendingVerb {
@@ -140,6 +145,9 @@ impl PendingVerb {
             PendingVerb::Chat { target, .. } => {
                 format!("agentctl inject {} '<text>'{conn}", shell_arg(target))
             }
+            PendingVerb::RunJob { job_id } => {
+                format!("agentctl run-job {}{conn}", shell_arg(job_id))
+            }
         }
     }
 
@@ -151,6 +159,7 @@ impl PendingVerb {
             PendingVerb::SetBudget { agent_id, park: true, .. } => format!("parking {agent_id}…"),
             PendingVerb::SetBudget { agent_id, .. } => format!("setting budget on {agent_id}…"),
             PendingVerb::Chat { target, .. } => format!("sending to {target}…"),
+            PendingVerb::RunJob { job_id } => format!("firing {job_id}…"),
         }
     }
 }

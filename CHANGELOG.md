@@ -3,6 +3,53 @@
 All notable changes to agentd are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [v0.123.0] - 2026-08-07
+
+### Added
+- **attn.2-R5 — manual job fire, in the TUI and the CLI.** `agentctl watch`'s new Jobs view
+  (`[J]`) lists every scheduled `[[jobs]]` entry (schedule, next fire, last outcome, shadow-
+  or-live) and lets the operator fire one on demand with a confirm gate, an in-flight frame,
+  and a result frame — `agentctl run-job <job_id> --url ...` is the CLI equivalent. Backed by
+  a new `POST /api/v1/jobs/:id/run` management-API route and `ControlCommand::RunJobNow`.
+  - Always dispatches for real, ignoring `native_cron_shadow` — a manual trigger is an
+    explicit operator override, and is the only way to exercise a job's real capabilities
+    before flipping shadow mode off.
+  - Reuses `dispatch_scheduled_job` (the same primitive the native scheduler tick calls, with
+    no caller and no `RunJob` capability check needed — the job's capabilities are
+    config-declared, not caller-supplied), which sidesteps the two bugs a prior design attempt
+    (`attn.2-R5`, filed in TODOS.md, built on `dispatch_run_job` + a synthetic parent id) was
+    found to have: a panic in `reject()` on every rejection path, and a silently-halved token
+    budget from a nonexistent-parent model-config fallback.
+  - A new `start_reason = "manual_fire"` (native-tick fires keep `"run_job"`) makes a manual
+    fire distinguishable from a real scheduled fire in `agentctl runs` — tagged, not hidden:
+    hiding it from run history would make debugging "what happened when I clicked fire now"
+    harder, not easier.
+  - Every attempt is audit-logged regardless of outcome or transport
+    (`job_manual_fired`/`job_manual_fire_rejected`) — this is a new HTTP-reachable trigger for
+    a job that may hold live Gmail access, so the flight log is the record of who tried to
+    fire what, unlike most other control commands, which only log on the fire-and-forget FUSE
+    path.
+
+### Fixed (2026-08-07, retroactive `/autoplan` review — see TODOS.md)
+- **Concurrent-fire race, cross-model-confirmed CRITICAL.** The three dispatch paths (native
+  tick, manual fire, agent-triggered `run_job`) derived deliberately disjoint `child_id` shapes,
+  so the existing string-collision guard could never detect two OVERLAPPING fires of the same
+  job. A new `reject_if_job_already_running` lease closes it — a second fire while the first is
+  still live now gets a clean 409, across all three paths.
+- **Job-child memory leak.** Job-fired children with no parent (native tick, manual fire) were
+  never removed from `state.agents` on termination — a full retained `AgentTask` per fire,
+  forever. Fixed, scoped to job children only (root/operator-spawned agents keep their
+  Dashboard-visible terminal status, unchanged).
+
+### Known residuals (filed, not fixed — see TODOS.md)
+- **Still no rate limit** — the guard above blocks concurrent/overlapping fires, not repeated
+  sequential ones: fire, wait for it to terminate, fire again, and nothing throttles that.
+- Firing a job on a day it already ran can overwrite that day's real KB data
+  (last-writer-wins on the job's date-keyed KB key) — pre-existing risk for any same-day
+  re-fire, not introduced here, but the confirm overlay is the only guard.
+- FUSE-source parity: the Jobs view and its fire-now verb work only over the HTTP source
+  (`agentctl watch --url`) — `agents_fs.rs` has no `system/jobs` producer file yet.
+
 ## [v0.122.0] - 2026-08-07
 
 ### Added

@@ -28,6 +28,9 @@
 //!     (per-agent native-tier only; universal-tier agents are proxy-metered and return 404)
 //!   GET  /api/v1/credentials                     → 200 CredentialSnapshot JSON (cred.5)
 //!   POST /api/v1/credentials/:provider/reset-attention → 200 | 404 (cred.7)
+//!   POST /api/v1/jobs/:id/run                    → 200 {job_id,child_id} | 400 | 404 | 409 | 503 (attn.2-R5)
+//!     (fires a config-declared job on demand, bypassing its schedule; 409 on a same-job
+//!      collision with an already-live run, distinguishing it from "job doesn't exist")
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -147,6 +150,7 @@ fn is_mutating_route(method: &Method, path: &str) -> bool {
         p if p.starts_with("/api/v1/agents/")
             && (p.ends_with("/inject") || p.ends_with("/cancel") || p.ends_with("/caps")) => true,
         p if p.starts_with("/api/v1/credentials/") && p.ends_with("/reset-attention") => true,
+        p if p.starts_with("/api/v1/jobs/") && p.ends_with("/run") => true,
         _ => false,
     }
 }
@@ -744,6 +748,66 @@ async fn route(
                 }
                 Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
                 Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for set-caps"),
+            }
+        }
+
+        (Method::POST, path) if path.starts_with("/api/v1/jobs/") && path.ends_with("/run") => {
+            // attn.2-R5: fire a config-declared sealed job on demand, bypassing its
+            // `schedule` and ignoring `native_cron_shadow` entirely — a manual trigger is
+            // an explicit operator override. No caller-supplied capabilities are involved
+            // (job_id only selects among FIXED, config-declared jobs), so this needs no
+            // AGENTOS_ALLOW_PRIVILEGED_SPAWN-style opt-in — same trust model as the native
+            // scheduler's own dispatch. See THREAT_MODEL.md for the externally-reachable-
+            // trigger tradeoff this accepts.
+            let job_id = path
+                .strip_prefix("/api/v1/jobs/")
+                .and_then(|s| s.strip_suffix("/run"))
+                .unwrap_or("")
+                .trim();
+            // /review (2026-08-07): these four early returns bypassed dispatch_control_command
+            // entirely, so none of them were ever audit-logged — contradicting the "every
+            // attempt is audit-logged regardless of outcome or transport" claim this route's
+            // own doc comment (and CLAUDE.md/CHANGELOG.md/THREAT_MODEL.md §9.5) makes. Logged
+            // here as JobManualFireRejected, the SAME event kind the scheduler-side rejection
+            // uses, so a flight-log reader sees one consistent kind for "a manual fire attempt
+            // failed" regardless of which layer rejected it.
+            if job_id.is_empty() {
+                state.recorder.record("agentd", None, EventKind::JobManualFireRejected,
+                    json!({ "job_id": job_id, "reason": "job id must not be empty", "via": "http" }));
+                return error_response(StatusCode::BAD_REQUEST, "job id must not be empty");
+            }
+            let Some(tx) = &state.control_tx else {
+                state.recorder.record(job_id, None, EventKind::JobManualFireRejected,
+                    json!({ "job_id": job_id, "reason": "control channel not available", "via": "http" }));
+                return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel not available");
+            };
+            let (confirm_tx, confirm_rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+            let cmd = ControlCommand::RunJobNow { job_id: job_id.to_string(), confirm_tx: Some(confirm_tx) };
+            match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    state.recorder.record(job_id, None, EventKind::JobManualFireRejected,
+                        json!({ "job_id": job_id, "reason": "control channel full, retry", "via": "http" }));
+                    return error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "control channel full, retry");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    state.recorder.record(job_id, None, EventKind::JobManualFireRejected,
+                        json!({ "job_id": job_id, "reason": "scheduler not running", "via": "http" }));
+                    return error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler not running");
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(2), confirm_rx).await {
+                Ok(Ok(Ok(child_id))) => json_response(StatusCode::OK, json!({ "job_id": job_id, "child_id": child_id })),
+                // unknown job id → 404; 409 covers two causes, distinguished from "job doesn't
+                // exist": the common one is reject_if_job_already_running's guard refusing a
+                // repeat fire while one is still live; the rare one is a bare nanosecond-
+                // timestamp child_id collision.
+                Ok(Ok(Err(e))) => {
+                    let code = if e.contains("unknown job") { StatusCode::NOT_FOUND } else { StatusCode::CONFLICT };
+                    error_response(code, &e)
+                }
+                Ok(Err(_)) => error_response(StatusCode::SERVICE_UNAVAILABLE, "scheduler closed confirmation channel"),
+                Err(_) => error_response_with_retry(StatusCode::SERVICE_UNAVAILABLE, "timed out waiting for run_job"),
             }
         }
 
@@ -1416,6 +1480,147 @@ mod tests {
         let state = make_state(SchedulerSnapshot::default());
         let resp = route(state, Method::POST, "/api/v1/agents/solo/caps", "", b"{not json}").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // attn.2-R5: POST /api/v1/jobs/:id/run
+
+    /// Builds an ApiState the SAME way make_state_with_control does, but also returns the
+    /// flight-log tmpfile — needed for the /review audit-log-gap tests below, which assert on
+    /// recorded content that make_state's own tmp handle (dropped inside the helper) can't see.
+    fn make_state_with_control_and_tmp(
+        snap: SchedulerSnapshot,
+        control_tx: Option<mpsc::Sender<ControlCommand>>,
+    ) -> (Arc<ApiState>, tempfile::NamedTempFile) {
+        let (tx, _) = broadcast::channel(16);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let recorder = Arc::new(crate::flight_recorder::FlightRecorder::new(tmp.path()).unwrap());
+        let state = Arc::new(ApiState {
+            snapshot: Arc::new(RwLock::new(snap)),
+            memory_store: None,
+            runs_store: None,
+            broadcast_tx: tx,
+            recorder,
+            control_tx,
+            credential_gateway: None,
+            approval_secret: None,
+        });
+        (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn run_job_route_503_without_control_tx() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn run_job_route_empty_id_400() {
+        let state = make_state(SchedulerSnapshot::default());
+        let resp = route(state, Method::POST, "/api/v1/jobs//run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // /review (2026-08-07): these four early returns bypassed dispatch_control_command
+    // entirely, so — before this fix — none of them were ever audit-logged, contradicting the
+    // route's own "every attempt is audit-logged regardless of outcome or transport" claim.
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_for_an_empty_job_id() {
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), None);
+        let resp = route(state, Method::POST, "/api/v1/jobs//run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\""),
+            "an empty job id must be audit-logged, not just returned as a bare 400: {content}");
+    }
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_when_the_control_channel_is_unavailable() {
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), None);
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\"") && content.contains("cos-inbox"),
+            "a missing control channel must be audit-logged, naming the job that was requested: {content}");
+    }
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_when_the_control_channel_is_full() {
+        // Bounded capacity 1, pre-filled, so the route's own try_send hits Full.
+        let (tx, rx) = mpsc::channel::<ControlCommand>(1);
+        tx.try_send(ControlCommand::Cancel { agent_id: "occupy-the-slot".into(), confirm_tx: None }).unwrap();
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\"") && content.contains("control channel full"),
+            "a full control channel must be audit-logged: {content}");
+        drop(rx); // silence "channel dropped while messages are pending" noise
+    }
+
+    #[tokio::test]
+    async fn run_job_route_logs_the_rejection_when_the_scheduler_is_gone() {
+        let (tx, rx) = mpsc::channel::<ControlCommand>(4);
+        drop(rx); // closes the receiver side — try_send now hits Closed
+        let (state, tmp) = make_state_with_control_and_tmp(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_manual_fire_rejected\"") && content.contains("scheduler not running"),
+            "a closed control channel must be audit-logged: {content}");
+    }
+
+    #[tokio::test]
+    async fn run_job_route_happy_path_reports_child_id() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        tokio::spawn(async move {
+            if let Some(ControlCommand::RunJobNow { confirm_tx: Some(c), .. }) = rx.recv().await {
+                let _ = c.send(Ok("cos-inbox-manual-12345".to_string()));
+            }
+        });
+        let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["job_id"], "cos-inbox");
+        assert_eq!(v["child_id"], "cos-inbox-manual-12345");
+    }
+
+    #[tokio::test]
+    async fn run_job_route_unknown_job_returns_404() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        tokio::spawn(async move {
+            if let Some(ControlCommand::RunJobNow { confirm_tx: Some(c), .. }) = rx.recv().await {
+                let _ = c.send(Err("unknown job id (removed from config since scheduling)".to_string()));
+            }
+        });
+        let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/jobs/ghost-job/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn run_job_route_collision_returns_409_not_404() {
+        use crate::control::ControlCommand;
+        let (tx, mut rx) = mpsc::channel::<ControlCommand>(4);
+        tokio::spawn(async move {
+            if let Some(ControlCommand::RunJobNow { confirm_tx: Some(c), .. }) = rx.recv().await {
+                let _ = c.send(Err("job child 'cos-inbox-manual-1' is already in use".to_string()));
+            }
+        });
+        let state = make_state_with_control(SchedulerSnapshot::default(), Some(tx));
+        let resp = route(state, Method::POST, "/api/v1/jobs/cos-inbox/run", "", &[]).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "a collision must be distinguishable from a missing job");
+    }
+
+    #[test]
+    fn run_job_route_is_gated_as_mutating() {
+        assert!(is_mutating_route(&Method::POST, "/api/v1/jobs/cos-inbox/run"));
+        assert!(!is_mutating_route(&Method::GET, "/api/v1/jobs/cos-inbox/run"));
     }
 
     #[tokio::test]

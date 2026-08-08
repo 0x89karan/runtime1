@@ -960,6 +960,8 @@ Key views:
 - **Row actions** (`[x]`, v0.115.0): park / set budget / cancel the *selected* agent —
   see §11.8a. `?` opens the full key map, which is the authoritative list; this one is a
   summary and the footer only shows what fits.
+- **Jobs** (`[J]`, attn.2-R5): job schedule rows (next/last fire, shadow-or-live) with a
+  manual "fire now" verb — see §11.8b.
 
 #### 11.8a Stopping a runaway agent
 
@@ -996,7 +998,55 @@ Two caveats:
 If `AGENTOS_APPROVAL_SECRET` is set, these routes are gated like approve/deny — export it in
 the shell running `agentctl`, or every verb returns `HTTP 401` (see `DEPLOYMENT.md`).
 
-#### 11.8b On a Mac, `Sandbox: applied` is not reassuring — know what is actually holding the line
+#### 11.8b Manually firing a job (attn.2-R5)
+
+Press `[J]` to open the Jobs view — one row per `[[jobs]]` entry with a `schedule`
+(`cos-inbox`, `cos-curator`). Select a row and press `[f]` or `Enter` to open a confirm
+gate, then `[y]` to fire it right now:
+
+```bash
+# Or from the shell, without the TUI:
+agentctl run-job cos-inbox --url http://localhost:7999
+```
+
+Or hit the route directly — `agentctl run-job` is a thin wrapper over this same call
+(`POST /api/v1/jobs/:id/run`, see §11's route inventory in `agentd/src/management.rs`):
+
+```bash
+curl -sS -X POST http://localhost:7999/api/v1/jobs/cos-inbox/run \
+  -H "X-Approval-Token: $AGENTOS_APPROVAL_SECRET"   # only needed if that env var is set on agentd
+# 200 {"job_id":"cos-inbox","child_id":"cos-inbox-manual-1735689123456789000"}
+# 404 {"error":"unknown job id (removed from config since scheduling)"} — no such job in this config
+# 409 {"error":"...already has a live run..."}       — a fire for this job is already in flight
+# 503 {"error":"timed out waiting for run_job"}       — agentd may have already started this fire
+#                                                        even though the confirmation didn't arrive in
+#                                                        time; check the Jobs view/flight log before
+#                                                        retrying — do NOT treat this as safe to retry
+#                                                        blind, it risks a second concurrent run
+```
+
+Three things to know before using this:
+
+1. **It always dispatches for real, even in shadow mode.** `native_cron_shadow` (the
+   default) only governs the *automatic* schedule-driven path — a manual fire is an
+   explicit operator override, and is the only way to exercise a job's real capabilities
+   (live Gmail, KB writes) before flipping shadow mode off. There is no shadow-mode
+   equivalent of this verb.
+2. **Firing a job that already ran today can overwrite today's real data.** `cos-inbox`
+   writes to a KB key keyed by calendar date, last-writer-wins — a manual test-fire after
+   the real 08:00 UTC fire replaces the morning's real inbox read with the test run's. The
+   confirm overlay states this; there is no code-level guard against it (filed as a
+   residual in `TODOS.md`).
+3. **No rate limit.** Firing the same job repeatedly in quick succession dispatches every
+   time — each one a real, separate agent run against the job's real capabilities. Nothing
+   currently stops a script (or a slipped finger) from doing this many times in a row.
+
+Same authentication story as `[x]`'s row actions: gated by `AGENTOS_APPROVAL_SECRET` if set,
+fire-and-forget with no confirmation over the FUSE surface (`docker compose exec cos
+agentctl watch --agents-dir /agents` — this view has no FUSE producer yet, so it shows no
+rows there at all; use `--url http://localhost:7999`).
+
+#### 11.8c On a Mac, `Sandbox: applied` is not reassuring — know what is actually holding the line
 
 Press `[s]` in `agentctl watch` on Docker Desktop for Apple silicon and you will see something
 like:
@@ -1042,7 +1092,9 @@ on each cycle. These date-stamped IDs are required; a static ID like `inbox-agen
 collide on the second cron cycle (terminated children stay in the scheduler's outcome map).
 
 **cron_mcp restarts** — on agentd restart, `cron_mcp.py` recomputes the next fire time.
-Events that would have fired during downtime are not replayed.
+Events that would have fired during downtime are not replayed. To produce a brief right now
+instead of waiting for the next scheduled fire (or to backfill a missed one), use the manual
+fire verb — see §11.8b.
 
 ### 11.10 Troubleshooting
 
@@ -1059,6 +1111,8 @@ Events that would have fired during downtime are not replayed.
 | `agent_admission_denied` in flight.jsonl | Child ID collision guard fired | Child ID is already in outcomes map; confirm date-stamping |
 | An agent is looping / burning tokens with nothing to show | Runaway task prompt or a tool that never settles | `agentctl watch` → select the row → `[x]` → Cancel (cascades to its children), or `agentctl cancel <id> --url http://localhost:7999`. See §11.8a |
 | `[x]` verbs return `HTTP 401` | `AGENTOS_APPROVAL_SECRET` set on `agentd` but not exported to the shell running `agentctl` | Export the same value, then restart `agentctl watch` (cap.4 gates every mutating route, not just approve/deny) |
+| `agentctl run-job <id>` returns `HTTP 409` | The job already has a live, not-yet-terminal run (native tick, a prior manual fire, or an agent-triggered `run_job` call) | Wait for it to finish, or check `agentctl watch` → Jobs view for the still-running child; this is the concurrent-fire guard working as intended, not a bug — see §11.8b |
+| `agentctl run-job` fired against the wrong `agentd` | No `--url`/`--agents-dir` given, so it silently used the auto-detected default (`http://127.0.0.1:7999`) | The CLI now prints the resolved target before firing — read that line; pass `--url` explicitly when more than one `agentd` could be reachable |
 
 ### 11.11 Credential broker operations (cred.3.2+)
 

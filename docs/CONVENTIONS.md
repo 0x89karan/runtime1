@@ -146,6 +146,8 @@ Phase 0 kinds (canonical — do not rename):
 | `job_schedule_degraded` | a job's `schedule` string failed to parse at boot; that job alone degrades to manual-fire-only — never fails the whole boot (job_id, schedule, error) (attn.4+) |
 | `job_fired` | native/scheduler fire dispatched a job with no LLM in the loop (job_id, occurrence_id, intended_fire_ts, child_id, caught_up: bool) (attn.4+) |
 | `job_fire_skipped` | a native/shadow fire was computed but not dispatched — shadow mode, or a guard rejected it (job_id, occurrence_id, intended_fire_ts, reason, shadow: bool) (attn.4+) |
+| `job_manual_fired` | an operator manually fired a config-declared sealed job on demand, bypassing its `schedule` and ignoring `native_cron_shadow` (job_id, child_id) (attn.2-R5+) |
+| `job_manual_fire_rejected` | a manual fire request was rejected — unknown job id, or a child-id collision (job_id, reason) (attn.2-R5+) |
 
 Adding events: new behavior gets new kinds, in the same snake_case style, with a
 small flat `data` object. The table above is the canonical reference — update it

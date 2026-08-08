@@ -865,6 +865,40 @@ proven equivalent (attn.4 T7); `[[jobs]]` gains a `schedule` field and `agentd`'
   bridge-network-aware authentication. Native scheduling (what actually shipped) has no such
   surface — the fire happens in-process, inside `agentd` itself.
 
+**Update (attn.2-R5 — manual trigger via `POST /api/v1/jobs/:id/run`): this DOES add a new
+externally-reachable trigger surface, unlike the native tick above.** The route lets any caller
+that can reach the management API (`:7999`, loopback-bound by default, on `cos-net` — separate
+from `agent-net` per §9.2) fire `cos-inbox` or `cos-curator` on demand, bypassing `schedule` and
+ignoring `native_cron_shadow` entirely (a manual trigger is an explicit operator override; shadow
+mode governs only the automatic path).
+
+- **Same trust root as the native tick — config, not the caller.** The route accepts only a
+  `job_id`, which selects among a FIXED, config-declared set; it grants no caller-supplied
+  capabilities the way `/spawn` does (which is why `/spawn` gates privileged capabilities behind
+  `AGENTOS_ALLOW_PRIVILEGED_SPAWN` and this route does not — there is nothing for a caller to
+  widen). Whoever can edit `cos.agents.toml` already controls exactly what this route can trigger.
+- **What genuinely changes: WHO can make a Gmail-reading job run, and WHEN.** Before this, firing
+  `cos-inbox` outside its schedule required either the in-process trusted orchestrator calling
+  `run_job` (never externally reachable) or waiting for the schedule. Now any caller reaching
+  `:7999` can fire it repeatedly, on demand. Practical exposure is low (loopback-only, separate
+  bridge network from `agent`) but real — a compromised host process, or a script left running
+  against the wrong port.
+- **Concurrent-dedup is now guarded; rate-limiting is not.** A retroactive `/autoplan` review
+  (2026-08-07) found `reserve_job_child_id`'s string-collision check couldn't see this — the
+  native tick, a manual fire, and an agent's own `run_job` call each derive a deliberately
+  disjoint `child_id` shape, so two overlapping fires of the SAME job never collided as strings.
+  `reject_if_job_already_running` (a `job_id → live child_ids` lease in `SchedulerState`) closes
+  that: a second fire of a job with a still-live child is refused (HTTP 409), across all three
+  dispatch paths. What remains open: this is a concurrency guard, not a rate limit — fire, wait
+  for it to terminate, fire again, repeat, and every SEQUENTIAL fire still dispatches for real
+  with no cooldown. Manual-trigger analog of `attn.4-ratelimit-01` (filed against the automatic
+  path); the sequential-repeat gap is filed as a residual, not fixed, in `TODOS.md`.
+- **Every attempt is audit-logged regardless of outcome or transport** (`job_manual_fired` /
+  `job_manual_fire_rejected`), unlike most other control-command handlers, which only log on
+  the fire-and-forget FUSE path — deliberate, since this route can reach live Gmail on an
+  unbounded
+  cadence and the flight log is the only record of who tried to fire what.
+
 ---
 
 ## 9.6 Telegram reach: remote approve/deny writer (ux.12)

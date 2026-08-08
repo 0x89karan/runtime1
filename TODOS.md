@@ -47,6 +47,25 @@ all fixed directly in the same pass; these three were not.
   `job_fired`/`job_fire_skipped`/`job_schedule_degraded` flight events via the existing Logs
   view. See `docs/plans/attn.4-scheduler-native-cron.md` T4.
 
+## attn.2-R5 fix-batch /review residuals — Open (2026-08-07, filed at /review)
+
+One finding from `/review`'s adversarial pass on the T1-T5 fix batch, judged a genuine design
+question rather than a mechanical fix — the pass's other findings (a checkpoint/restore
+lease-loss bug, a permanently-dropped cron occurrence under a concurrent manual fire, an
+incomplete leak fix, several stale comments, a missing `?` help-overlay key, and an audit-log
+gap on four pre-dispatch failure branches) were all fixed directly in the same pass.
+
+- **attn.2-R5-string-01 (P3) — `agentctl`'s `explain_verb_error` string-matches a literal
+  ("timed out waiting for run_job") owned by a DIFFERENT crate (`agentd/src/management.rs`).**
+  No shared constant, no cross-crate test pinning the coupling. If that server-side wording
+  ever changes, the client-side match silently breaks and falls through to the generic "Action
+  not sent, retry" advice — which is actively wrong for this one case (the fire may have
+  already started; blind retry risks a second concurrent run). A real fix needs either a small
+  shared crate both `agentd` and `agentctl` depend on for this one literal, or a structured
+  machine-readable error code in the JSON body instead of prose-matching — genuine design work,
+  not a mechanical fix, and no wording change is pending today that would trip it. Operator
+  chose to file rather than fix at the review gate (2026-08-07).
+
 ## zk track — Open (reshaped at /autoplan premise gate, 2026-08-06)
 
 Plan + increment ladder: `docs/plans/zk.1-hybrid-crypto-verification.md`. The inline-zkVM
@@ -329,37 +348,57 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   NOT bundled into attn.3 — it needs plumbing through the restore return type, which is more surgery
   than a log-hygiene fix warrants at the end of an increment. The field-name half **is** fixed
   (`repaired_ids` + `repaired_count`, matching the checkpoint side).
-- **attn.2-R5 (P2) [attn.2 /autoplan 2026-08-04, split from R3/R4] — manual fire as a
-  management-API verb. Fully spec'd (docs/plans/attn.2-workable-brief.md, "R5 REDESIGNED"
-  section), NOT a thin route — needs real engineering, four findings independently verified:**
-  (1) `dispatch_run_job`'s `reject()` (`scheduler.rs:2534-2545`) indexes
-  `state.agents[&parent_id]` — `HashMap` `Index`, panics on a missing key — on EVERY
-  rejection path (capability denied, unknown job, depth exceeded, collision). A synthetic
-  never-live parent id (the only safe design for the completion-delivery side, per
-  `handle_agent_terminal`'s existing `parent_live` check) makes any rejection **crash the
-  process** — `panic = "abort"`, PID 1. The single most likely real-world trigger (firing the
-  endpoint twice, hitting the collision guard) kills agentd entirely. Needs `reject()` made
-  parent-live-aware, mirroring the pattern `handle_agent_terminal` already uses for delivery.
-  (2) `child_model_cfg` (`scheduler.rs:2626-2630`) falls back to `ModelConfig::default()`
-  (`max_tokens: 4096`) for a nonexistent parent — every existing `run_job` caller is a real
-  live agent, so this arm has never executed in production; a manual-fire route would silently
-  halve the configured `8192` output budget. Needs an explicit default-model parameter (mirror
-  the `Spawn` control-command's existing `default_model` param at `scheduler.rs:3158`).
-  (3) `is_mutating_route` (`management.rs:139-152`) is a hand-enumerated allowlist — a new
-  route not added to it ships **unauthenticated even with `AGENTOS_APPROVAL_SECRET`
-  configured**, the exact hole `cap.4`/AUDIT-v0.97 P2-3 fixed once already for the whole
-  mutating surface.
-  (4) The stats-exclusion pattern proposed at the CEO gate (`start_reason != "config_seed"`)
-  is **only inside `runs/store.rs`'s `still_running` arm** — `terminal_in_window`, the branch
-  a *completed* manually-fired job actually matches, has no filter at all. Needs a NEW
-  condition on `terminal_in_window` plus a distinct `start_reason = "manual_fire"` threaded
-  through `dispatch_run_job` (today hardcoded to `"run_job"` at `scheduler.rs:2638`;
-  `run_tracker.open()`'s signature already accepts an arbitrary `&str`, no type change needed).
-  Also resolved: there is NO automatic `cos-inbox`→`cos-curator` handoff anywhere in Rust —
-  100% the trigger's own prompt behavior. The route needs `job_id` as an explicit request
-  parameter (fire one job per call); auto-chaining is possible but does not survive an `agentd`
-  restart (no checkpoint, no restart hook — a new, undocumented failure mode if built).
-  10 new tests specified with mutation controls in the plan doc's Phase 3 Eng section.
+- **attn.2-R5 — CLOSED (2026-08-07), superseded by a redesign, not the original spec.** The
+  original design (`docs/plans/attn.2-workable-brief.md`, "R5 REDESIGNED") built the route on
+  `dispatch_run_job` + a synthetic parent id, and four findings were verified against it (below,
+  kept for the record). The shipped design instead reuses `dispatch_scheduled_job` — the SAME
+  primitive `tick_native_jobs` (attn.4) already calls, with `parent_id: None` and no caller to
+  reject through — which sidesteps findings (1) and (2) **by construction**, not by fixing them:
+  there is no synthetic parent id, so `reject()`'s panic-on-missing-key path and the
+  nonexistent-parent `child_model_cfg` fallback are never reached at all. (3) is closed directly
+  (`/api/v1/jobs/*/run` is in `is_mutating_route`, pinned by test). (4) is closed by threading a
+  distinct `start_reason = "manual_fire"` through `spawn_job_child`/`dispatch_scheduled_job`
+  (native-tick fires keep `"run_job"`) — **deliberately NOT** also excluding `manual_fire` from
+  `runs/store.rs`'s stats arms the way `config_seed` is excluded from `still_running`: a manual
+  fire is real work, not a restore non-event, and hiding it from `agentctl runs` would make
+  debugging "what happened when I clicked fire now" harder, not easier. Tagging, not hiding, is
+  the fix. Auto-chaining `cos-inbox`→`cos-curator` was in scope for the original spec; the
+  shipped design fires one job per call, unchanged from that finding's conclusion (chaining
+  doesn't survive a restart with no checkpoint hook).
+  - **Concurrent-dedup guard CLOSED (2026-08-07, retroactive /autoplan review, cross-model-
+    confirmed CRITICAL).** `reserve_job_child_id`'s guard is a pure string collision check on
+    the derived `child_id` — but the native tick (`{job_id}-{ts}`), a manual fire
+    (`{job_id}-manual-{nanos}`), and an agent's own `run_job` call (`{job_id}-{date}`) each
+    construct a deliberately disjoint id shape, so it could never detect "this job already has
+    a live run" across paths. Fixed by `reject_if_job_already_running` (a `job_id → live
+    child_ids` lease in `SchedulerState`), checked before every dispatch path and cleared on
+    termination — see THREAT_MODEL.md §9.5's update.
+  - **New residual, not fixed:** still no rate limit — the guard above blocks OVERLAPPING
+    fires of the same job, not repeated SEQUENTIAL ones. Fire, wait for it to terminate, fire
+    again: nothing throttles that pattern. Manual-trigger analog of `attn.4-ratelimit-01`.
+  - **New residual, not fixed:** `cos-inbox`'s `ops:entities` key is `inbox-{date}` with no
+    `{ts}` (unlike the curator's R4-fixed `ops:briefs` key) — a manual fire on a day cos-inbox
+    already ran overwrites that day's real inbox data with the manual run's, last-writer-wins.
+    Pre-existing (any same-day re-fire already had this risk — attn.2-ts-01's same class), not
+    introduced here, but manual fire makes it much easier to trigger by hand. The TUI's confirm
+    overlay must warn about this explicitly.
+  - **New residual, not fixed:** FUSE-source parity. The TUI's Jobs view and fire-now verb only
+    work over the HTTP source (`agentctl watch --url`); `DataSource::run_job`'s FUSE
+    implementation is not built (the FUSE producer side, `surfaces/src/agents_fs.rs`, has no
+    `system/jobs` file yet either — same gap as `attn.4-watch-01`, now shared by two features).
+    Matches how the operator actually runs `agentctl watch` today (HTTP, against the Dockerized
+    `cos`), but is a real gap for the Linux/QEMU FUSE path.
+  - Original findings, verified against the SUPERSEDED design, kept for the record: (1)
+    `dispatch_run_job`'s `reject()` indexed `state.agents[&parent_id]` — panics on a missing
+    key — on every rejection path; a synthetic never-live parent id would have crashed `agentd`
+    on the single most likely real trigger (firing twice, hitting the collision guard). (2)
+    `child_model_cfg` fell back to `ModelConfig::default()` (4096 max_tokens) for a nonexistent
+    parent, silently halving the configured 8192 budget. (3) `is_mutating_route` is a
+    hand-enumerated allowlist; a new route omitted from it ships unauthenticated even with
+    `AGENTOS_APPROVAL_SECRET` configured — the exact hole cap.4/AUDIT-v0.97 P2-3 fixed once
+    already. (4) `start_reason != "config_seed"` was proposed but only implemented in
+    `still_running`, never `terminal_in_window` — the branch a completed manual fire actually
+    matches.
 - **attn.4 (P1) [attn.3 /autoplan, operator-chosen] — the CoS burns ~3,456 inference calls a day
   to watch a clock. Scheduler-native cron.** MEASURED: 63 of 63 tool calls in a 29-min window were
   `wait_for_trigger(timeout_s=20)`, each answering "next fire 14 h from now"; 414,016 input tokens
@@ -1369,8 +1408,10 @@ Compose bridge. Verified via `docker compose config` showing each service's reso
   stated scope was "non-destructive for a same-day re-fire under normal operation", not
   "collision-proof under adversarial clock manipulation" — the nanosecond fix already closes
   the measured, reproduced failure mode; this is defense-in-depth for a much rarer trigger.
-  Revisit before/with attn.2-R5 (manual fire), which is expected to make rapid re-fires routine
-  rather than exceptional. Depends on: none.
+  Revisit now that attn.2-R5 (manual fire) has shipped — it makes rapid re-fires routine
+  rather than exceptional; the manual-fire confirm overlay warns about the SAME-DAY overwrite
+  risk in prose, but this clock-skew collision is a narrower, code-level gap that prose can't
+  close. Depends on: none.
 - **attn.2-esc-01 (P3) — the sender-text neutralisation rule has never covered `<`/`>`, in
   either the pre- or post-R3.3 entity list.** Found at /ship's adversarial pass (Claude
   subagent): verified against `git show <pre-attn.2-commit>:agentd/cos.agents.toml` — the

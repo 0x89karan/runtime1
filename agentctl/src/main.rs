@@ -49,6 +49,9 @@ enum Commands {
     SetBudget(verbs::SetBudgetArgs),
     /// Narrow an agent's capabilities at runtime (revoke/narrow-only) — ux.13
     SetCaps(verbs::SetCapsArgs),
+    /// Fire a config-declared sealed job on demand, bypassing its schedule and ignoring
+    /// shadow mode — attn.2-R5
+    RunJob(verbs::RunJobArgs),
     ListTemplates(list::Args),
     /// Start an interactive orchestration REPL (orch.1+)
     Orchestrate(orchestrate::OrchestrateArgs),
@@ -69,6 +72,7 @@ fn main() {
         Commands::Cancel(args) => verbs::run_cancel(args),
         Commands::SetBudget(args) => verbs::run_set_budget(args),
         Commands::SetCaps(args) => verbs::run_set_caps(args),
+        Commands::RunJob(args) => verbs::run_run_job(args),
         Commands::ListTemplates(args) => list::run(args),
         Commands::Orchestrate(args) => orchestrate::run(args),
         Commands::Spawn(args) => spawn::run(args),

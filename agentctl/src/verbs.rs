@@ -82,3 +82,42 @@ pub fn run_set_caps(args: SetCapsArgs) -> anyhow::Result<()> {
     println!("capabilities for '{}' narrowed", args.agent_id);
     Ok(())
 }
+
+/// attn.2-R5: `agentctl run-job <job_id>` — the CLI equivalent of the Jobs view's manual-fire
+/// verb, and what its confirm overlay's "equivalent CLI" line actually prints
+/// (`PendingVerb::RunJob::equivalent_cli`) — this must exist and stay in sync, or the TUI would
+/// teach a command that does not run (the exact class of bug `explain_verb_error`'s doc comment
+/// warns about for error text).
+#[derive(Args, Debug)]
+pub struct RunJobArgs {
+    /// Job id to fire (from `[[jobs]]` in the connected agentd's config)
+    pub job_id: String,
+    /// Management API URL (overrides auto-detection)
+    #[arg(long, env = "AGENTCTL_URL")]
+    pub url: Option<String>,
+    /// FUSE agents directory
+    #[arg(long, default_value = "/agents")]
+    pub agents_dir: std::path::PathBuf,
+}
+
+pub fn run_run_job(args: RunJobArgs) -> anyhow::Result<()> {
+    let source = crate::watch::source::detect_source(args.url.as_deref(), &args.agents_dir)?;
+    // attn.2-R5 fix (/autoplan retroactive review, empirically-verified CRITICAL): unlike
+    // cancel/set-budget/set-caps — which can only act on an agent that already EXISTS, so a
+    // wrong auto-detected target just 404s harmlessly — a bare `agentctl run-job <id>` with
+    // no `--url`/`--agents-dir` can CREATE a brand-new privileged, real-side-effect-having
+    // agent against whatever agentd happens to be reachable on the default port, with zero
+    // disclosure of which daemon it just talked to. Printing the resolved target before the
+    // mutating request makes a silent wrong-target fire visible in the terminal/script output
+    // before it happens, rather than after.
+    let target = source.cli_connection_flags();
+    let target_desc = if target.is_empty() {
+        "the auto-detected default management API (http://127.0.0.1:7999)".to_string()
+    } else {
+        format!("agentd resolved via{target}")
+    };
+    eprintln!("firing '{}' against {target_desc}...", args.job_id);
+    let child_id = source.run_job(&args.job_id).map_err(explain)?;
+    println!("fired '{}' — child '{child_id}'", args.job_id);
+    Ok(())
+}

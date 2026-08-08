@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table},
 };
 
-use super::app::{App, CancelMarker, MemoryAbsence, MemoryPane, SpawnFocus, View};
+use super::app::{App, CancelMarker, JobOverlayMode, JobsOverlay, MemoryAbsence, MemoryPane, SpawnFocus, View};
 use super::approvals::ApprovalsMode;
 use super::converse::{ConversePhase, TurnRole};
 use super::logs::{clip_payload, format_ts, logs_viewport_rows};
@@ -87,6 +87,7 @@ pub fn render(f: &mut Frame, app: &App) {
         View::Approvals   => render_approvals(f, app),
         View::Credentials => render_credentials(f, app),
         View::Logs        => render_logs(f, app),
+        View::Jobs        => render_jobs(f, app),
     }
 }
 
@@ -554,6 +555,12 @@ const DASHBOARD_KEYS: &[KeyHint] = &[
     KeyHint { short: "[l]og",      key: "l",       what: "logs — tail the docker compose project", footer: true, docker: true },
     KeyHint { short: "q quit",     key: "q",       what: "quit (inside an overlay it dismisses instead)", footer: true, docker: false },
     // Not in the footer — real keys with no room, which is precisely what `?` is for.
+    // /autoplan retroactive review (2026-08-07): `[J]` opened the Jobs view (mod.rs's
+    // handle_dashboard_key) but was never added here, so it was undiscoverable via `?` too —
+    // the exact copy-drift this table's own doc comment above exists to prevent. The footer
+    // itself is already at MAX_FOOTER_COLS with no room (footer: false is correct, not a
+    // compromise).
+    KeyHint { short: "", key: "J", what: "jobs — scheduled [[jobs]] entries, with a manual fire-now verb", footer: false, docker: false },
     KeyHint { short: "", key: "Ctrl-c", what: "quit from anywhere, including mid-verb", footer: false, docker: false },
     KeyHint { short: "", key: "Esc",    what: "leave a view, dismiss an overlay, or unfocus the chat rail", footer: false, docker: false },
 ];
@@ -1967,6 +1974,239 @@ fn now_unix() -> i64 {
 /// pass): header 1 + footer 1 + 2 border rows + at least 2 usable rows.
 const MIN_LOGS_HEIGHT: u16 = 6;
 
+/// Minimum frame the Jobs view's confirm/in-flight/result box can be drawn in — same
+/// `overlay_fits` predicate the Dashboard's row-action overlay uses, against THIS view's own
+/// (simpler, no chat-rail) chrome instead of `dashboard_chrome_rows`.
+fn overlay_fits_jobs(term_size: (u16, u16)) -> bool {
+    let (w, h) = term_size;
+    // header (1) + table border (2) + footer (1) — conservative on purpose, same "fail closed,
+    // never enable a box that can't be seen" direction as overlay_fits_dashboard.
+    const JOBS_CHROME_ROWS: u16 = 4;
+    overlay_fits(w, h.saturating_sub(JOBS_CHROME_ROWS))
+}
+
+/// UTC epoch seconds → an explicit-UTC human string. Never a bare "08:00": this project has no
+/// local-timezone concept anywhere (attn.4 DX finding — the whole reason `agentctl jobs`
+/// prints "(UTC)" too), and a bare timestamp here would launder that gap right back in.
+fn format_fire_ts(ts: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .unwrap_or_else(|| format!("{ts} (unparseable)"))
+}
+
+fn render_jobs(f: &mut Frame, app: &App) {
+    let (header_area, content_area, footer_area) = header_footer_layout(f.area());
+
+    let title = Span::styled(" Jobs ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    f.render_widget(Paragraph::new(Line::from(vec![title])), header_area);
+
+    if app.jobs.is_empty() {
+        let msg = if app.error.is_some() {
+            format!("error: {}", sanitize(app.error.as_deref().unwrap_or("")))
+        } else {
+            "no [[jobs]] with a schedule declared — or this source has no job data \
+             (FUSE has no producer yet; connect with --url to see jobs)".to_string()
+        };
+        f.render_widget(
+            Paragraph::new(msg).block(Block::default().borders(Borders::ALL).title(" jobs ")),
+            content_area,
+        );
+    } else {
+        let header_row = Row::new(vec![
+            Cell::from("Job ID").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Schedule").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Next fire").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Last outcome").style(Style::default().add_modifier(Modifier::BOLD)),
+            Cell::from("Mode").style(Style::default().add_modifier(Modifier::BOLD)),
+        ]).style(Style::default().bg(Color::DarkGray));
+
+        let rows: Vec<Row> = app.jobs.iter().enumerate().map(|(i, j)| {
+            let is_sel = i == app.jobs_selected;
+            let bg = if is_sel { Color::Blue } else { Color::Reset };
+            let outcome_style = match j.last_outcome.as_str() {
+                "fired" | "caught_up" => Style::default().fg(Color::Green),
+                "skipped" => Style::default().fg(Color::Red),
+                "shadow_logged" => Style::default().fg(Color::Yellow),
+                _ => Style::default().fg(Color::DarkGray),
+            };
+            // Second line under the skip reason, when there is one — same "why", not just
+            // "what happened" idiom the Dashboard's attention-reason line uses.
+            let mut outcome_lines = vec![Line::from(if j.last_outcome.is_empty() {
+                "(never)".to_string()
+            } else {
+                j.last_outcome.clone()
+            })];
+            let mut outcome_height = if let Some(reason) = j.last_skip_reason.as_deref().filter(|r| !r.is_empty()) {
+                outcome_lines.push(Line::from(Span::styled(
+                    format!("  {}", sanitize(reason)),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                2
+            } else {
+                1
+            };
+            // attn.2-R5 fix (/autoplan retroactive review): last_outcome above is sourced
+            // from the occurrence ledger, which a manual fire deliberately never touches —
+            // so this column is structurally incapable of ever reflecting one on its own.
+            // jobs_last_manual_fire is the session-local, client-side acknowledgement that
+            // closes that gap without perturbing the ledger.
+            if let Some((_child_id, fired_at)) = app.jobs_last_manual_fire.get(&j.job_id) {
+                // Child id deliberately omitted here — the 28-col "Last outcome" column has
+                // no room for a nanosecond-suffixed id (the Result overlay already showed
+                // the full id when the fire happened); this row exists only to acknowledge
+                // "yes, that just happened", which "manually fired Ns ago" does on its own.
+                outcome_lines.push(Line::from(Span::styled(
+                    format!("  manually fired {}s ago", fired_at.elapsed().as_secs()),
+                    Style::default().fg(Color::Cyan),
+                )));
+                outcome_height += 1;
+            }
+            let mode_text = if j.shadow_mode { "shadow" } else { "live" };
+            let mode_style = if j.shadow_mode {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::Green)
+            };
+            Row::new(vec![
+                Cell::from(sanitize(&j.job_id)),
+                Cell::from(sanitize(&j.schedule_described)),
+                Cell::from(format_fire_ts(j.next_fire_ts)),
+                Cell::from(ratatui::text::Text::from(outcome_lines)).style(outcome_style),
+                Cell::from(mode_text).style(mode_style),
+            ]).style(Style::default().bg(bg)).height(outcome_height)
+        }).collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Min(16),    // Job ID
+                Constraint::Length(18), // Schedule
+                Constraint::Length(24), // Next fire — format_fire_ts is 23 chars ("...UTC"); +1
+                                        // margin (/autoplan retroactive review: 22 clipped
+                                        // "UTC" to "UT" on every single row, deterministically)
+                Constraint::Length(28), // Last outcome (+ skip reason on a second line)
+                Constraint::Length(8),  // Mode
+            ],
+        )
+        .header(header_row)
+        .block(Block::default().borders(Borders::ALL).title(" jobs "));
+        f.render_widget(table, content_area);
+    }
+
+    let footer = Line::from(Span::styled(
+        " [↑/k ↓/j] select  [f/Enter] fire now  [Esc/q] back ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(footer), footer_area);
+
+    if let Some(ov) = &app.jobs_overlay {
+        render_jobs_overlay(f, app, ov, content_area);
+    }
+}
+
+fn render_jobs_overlay(f: &mut Frame, app: &App, ov: &JobsOverlay, area: Rect) {
+    // Degraded path for a terminal too small for a box — mirrors render_dashboard_overlay's
+    // fail-closed direction exactly, against this view's own (simpler) chrome predicate.
+    if !overlay_fits_jobs(app.term_size) {
+        let line = format!(" {} — fire confirmation needs a bigger terminal; Esc/q dismisses ", sanitize(&ov.target_job_id));
+        let row = Rect { x: area.x, y: area.y + area.height.saturating_sub(1), width: area.width, height: 1 };
+        f.render_widget(
+            Paragraph::new(line).style(Style::default().bg(Color::Yellow).fg(Color::Black)),
+            row.intersection(area),
+        );
+        return;
+    }
+
+    let mut body: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled("job  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(sanitize(&ov.target_job_id), Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+    ];
+
+    match &ov.mode {
+        JobOverlayMode::ConfirmFire => {
+            // /autoplan retroactive review (2026-08-07): this text used to be identical
+            // regardless of the row's own shadow/live mode, understating the risk on exactly
+            // the jobs where it mattered most. Now scaled by it, and updated to reflect the
+            // concurrent-fire guard's fix — that risk is refused server-side now, not raced.
+            let shadow = app.jobs.iter().find(|j| j.job_id == ov.target_job_id).map(|j| j.shadow_mode).unwrap_or(false);
+            let risk = if shadow {
+                "This job is in SHADOW mode — the automatic scheduler never dispatches it, so \
+                 there is no risk of racing a concurrent scheduled fire."
+            } else {
+                "This job is LIVE — if a run is already in progress (scheduled or manual), \
+                 this fire will be REFUSED, not raced, so there is no risk of two concurrent runs."
+            };
+            for line in wrap_plain(
+                &format!(
+                    "Fire '{}' now? This calls its real capabilities immediately — live Gmail/KB \
+                     writes, whatever this job is configured to do — ignoring shadow mode. {risk} \
+                     Separately, if this job already fired today, firing it again still \
+                     OVERWRITES today's real data with this run's (last-writer-wins on the \
+                     job's date-keyed KB key) — this is NOT guarded, only warned about here.",
+                    sanitize(&ov.target_job_id),
+                ),
+                overlay_text_width(area),
+            ) {
+                body.push(Line::from(Span::styled(line, Style::default().fg(Color::Yellow))));
+            }
+        }
+        JobOverlayMode::InFlight => {
+            body.push(Line::from(format!("firing {}…", sanitize(&ov.target_job_id))));
+            body.push(Line::from(""));
+            body.push(Line::from(Span::styled(
+                "Keys are ignored until this completes.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        JobOverlayMode::Result { text, ok } => {
+            let style = if *ok { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) };
+            for line in wrap_plain(text, overlay_text_width(area)) {
+                body.push(Line::from(Span::styled(line, style)));
+            }
+        }
+    }
+    body.push(Line::from(""));
+
+    let hints = Line::from(Span::styled(
+        match &ov.mode {
+            JobOverlayMode::ConfirmFire => " [y] fire now  [n/Esc] cancel ",
+            JobOverlayMode::InFlight    => " working… ",
+            JobOverlayMode::Result { .. } => " any key dismisses ",
+        },
+        Style::default().bg(Color::DarkGray).fg(Color::White),
+    ));
+
+    let rect = overlay_rect(area, body.len() as u16 + 3);
+    if rect.is_empty() {
+        return;
+    }
+    let inner_rows = rect.height.saturating_sub(2) as usize;
+    if inner_rows > 0 {
+        body.truncate(inner_rows - 1);
+        body.push(hints);
+    } else {
+        body.clear();
+    }
+    let title = match &ov.mode {
+        JobOverlayMode::ConfirmFire    => " confirm fire ",
+        JobOverlayMode::InFlight       => " working ",
+        JobOverlayMode::Result { .. }  => " result ",
+    };
+    f.render_widget(Clear, rect);
+    f.render_widget(
+        Paragraph::new(body).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(title),
+        ),
+        rect,
+    );
+}
+
 fn render_logs(f: &mut Frame, app: &App) {
     let (header_area, content_area, footer_area) = header_footer_layout(f.area());
     let lv = &app.logs_view;
@@ -2888,7 +3128,7 @@ mod tests {
     #[test]
     fn render_plain_no_agents_outputs_none_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: (none)"), "empty agent list must produce '(none)' line");
@@ -2897,7 +3137,7 @@ mod tests {
     #[test]
     fn render_plain_no_provider_omits_provider_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("provider:"), "no provider → no provider line");
@@ -2906,7 +3146,7 @@ mod tests {
     #[test]
     fn render_plain_no_budget_omits_tokens_line() {
         let snap = Snapshot {
-            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("tokens_spent:"), "no budget → no tokens_spent line");
@@ -2918,7 +3158,7 @@ mod tests {
     fn render_plain_error_appears_in_output() {
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
-            isolation: None, credentials: None, error: Some("permission denied".to_string()),
+            isolation: None, credentials: None, jobs: vec![], error: Some("permission denied".to_string()),
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("error: permission denied"));
@@ -2931,7 +3171,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
             provider: Some(SysProvider { model: "claude-opus-4".to_string(), backend: "anthropic".to_string() }),
-            isolation: None, credentials: None, error: None,
+            isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("provider: claude-opus-4 (anthropic)"));
@@ -2942,7 +3182,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![],
             budget: Some(SysBudget { spent: 99_000, total: 0, resettable: false }),
-            queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("tokens_spent: 99000"));
@@ -2953,7 +3193,7 @@ mod tests {
         let snap = Snapshot {
             agents: vec![], budget: None,
             queue: Some(SysQueue { depth: 7 }),
-            sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("queue_depth: 7"));
@@ -2967,7 +3207,7 @@ mod tests {
             agents: vec![
                 make_agent("scout-1", "running", 1500, vec!["read_file".to_string(), "write_file".to_string()]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: 1"));
@@ -2985,7 +3225,7 @@ mod tests {
                 make_agent("a", "done", 0, vec![]),
                 make_agent("b", "failed", 500, vec![]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("agents: 2"));
@@ -2997,7 +3237,7 @@ mod tests {
     fn render_plain_agent_with_no_tools_shows_zero() {
         let snap = Snapshot {
             agents: vec![make_agent("agent-x", "running", 0, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("tools=0"));
@@ -3011,7 +3251,7 @@ mod tests {
         a.parent_id = None;
         let snap = Snapshot {
             agents: vec![a],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("topology:"), "topology header must appear");
@@ -3024,7 +3264,7 @@ mod tests {
         child.parent_id = Some("coordinator".to_string());
         let snap = Snapshot {
             agents: vec![child],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("parent=coordinator"), "child agent must show parent id");
@@ -3052,7 +3292,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, isolation: None, credentials: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("sandbox: any_sandboxed=true"), "any_sandboxed must appear");
@@ -3084,7 +3324,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, isolation: None, credentials: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("transport=http"), "HTTP transport must appear in render_plain output");
@@ -3107,7 +3347,7 @@ mod tests {
         };
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None,
-            sandbox: Some(sb), provider: None, isolation: None, credentials: None, error: None,
+            sandbox: Some(sb), provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("isolation=gvisor"), "gvisor isolation must appear in render_plain output");
@@ -3122,7 +3362,7 @@ mod tests {
         for status in &["running", "deferred", "awaiting_child", "done", "failed", "unknown-xyz"] {
             let snap = Snapshot {
                 agents: vec![make_agent("a", status, 0, vec![])],
-                budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+                budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
             };
             let out = render_plain(&app_from_snap(snap));
             assert!(out.contains(&format!("[{status}]")),
@@ -3135,7 +3375,7 @@ mod tests {
     fn tmpdir() -> tempfile::TempDir { tempfile::tempdir().unwrap() }
 
     fn empty_snap() -> Snapshot {
-        Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None }
+        Snapshot { agents: vec![], budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None }
     }
 
     fn app_with_dir(dir: &std::path::Path, snap: Snapshot) -> App {
@@ -3182,7 +3422,7 @@ mod tests {
         std::fs::write(mem.join("short_term"), "key insight here\nfact two\n").unwrap();
         let snap = Snapshot {
             agents: vec![make_agent("agent-1", "running", 0, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_with_dir(d.path(), snap));
         assert!(out.contains("key insight here"), "short_term item must appear in output");
@@ -3232,7 +3472,7 @@ mod tests {
                 make_agent("agent-a", "running", 0, vec![]),
                 make_agent("agent-b", "running", 0, vec![]),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_with_dir(d.path(), snap));
         assert!(out.contains("agent-a"), "agent-a must appear in memory section");
@@ -3319,6 +3559,7 @@ mod tests {
                 seccomp:  true,
             }),
             credentials: None,
+            jobs: vec![],
             error: None,
         };
         let out = render_plain(&app_from_snap(snap));
@@ -3342,6 +3583,7 @@ mod tests {
                 seccomp:  false,
             }),
             credentials: None,
+            jobs: vec![],
             error: None,
         };
         let out = render_plain(&app_from_snap(snap));
@@ -3375,7 +3617,7 @@ mod tests {
         use crate::watch::reader::Snapshot;
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, isolation: None, credentials: None, error: None,
+            provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(!out.contains("isolation_tier:"),
@@ -3387,7 +3629,7 @@ mod tests {
         use crate::watch::reader::{Snapshot, SysIsolation};
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, credentials: None, error: None,
+            provider: None, credentials: None, jobs: vec![], error: None,
             isolation: Some(SysIsolation {
                 tier:     "capability".to_string(),
                 arch:     "aarch64".to_string(),
@@ -3408,7 +3650,7 @@ mod tests {
         use crate::watch::reader::{Snapshot, SysIsolation};
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, credentials: None, error: None,
+            provider: None, credentials: None, jobs: vec![], error: None,
             isolation: Some(SysIsolation {
                 tier:     "none".to_string(),
                 arch:     "x86_64".to_string(),
@@ -3428,7 +3670,7 @@ mod tests {
     fn render_plain_credentials_not_configured_shows_message() {
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, isolation: None, credentials: None, error: None,
+            provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("credentials: gateway not configured"),
@@ -3440,7 +3682,7 @@ mod tests {
         use crate::watch::reader::SysCredentials;
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, isolation: None, error: None,
+            provider: None, isolation: None, jobs: vec![], error: None,
             credentials: Some(SysCredentials {
                 gateway_enabled:      false,
                 configured_providers: vec![],
@@ -3457,7 +3699,7 @@ mod tests {
         use crate::watch::reader::{SysCredentials, ProvHealthInfo};
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, isolation: None, error: None,
+            provider: None, isolation: None, jobs: vec![], error: None,
             credentials: Some(SysCredentials {
                 gateway_enabled:      true,
                 configured_providers: vec!["google".to_string()],
@@ -3486,7 +3728,7 @@ mod tests {
         use crate::watch::reader::{SysCredentials, ProvHealthInfo};
         let snap = Snapshot {
             agents: vec![], budget: None, queue: None, sandbox: None,
-            provider: None, isolation: None, error: None,
+            provider: None, isolation: None, jobs: vec![], error: None,
             credentials: Some(SysCredentials {
                 gateway_enabled:      true,
                 configured_providers: vec!["google".to_string()],
@@ -3595,7 +3837,7 @@ mod tests {
     fn render_plain_clean_agent_shows_ok_marker() {
         let snap = Snapshot {
             agents: vec![make_agent_with_attention("scout-1", vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("[OK]"));
@@ -3610,7 +3852,7 @@ mod tests {
     fn render_plain_attn_marker_and_status_bracket_have_a_space_between_them() {
         let snap = Snapshot {
             agents: vec![make_agent_with_attention("scout-1", vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("[OK] ["), "attn marker and status bracket must be space-separated, not concatenated: {out}");
@@ -3624,7 +3866,7 @@ mod tests {
                 "scout-1",
                 vec![signal(reader::AttentionReason::ApprovalPending, Some("act_1"))],
             )],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("[!]"));
@@ -3639,7 +3881,7 @@ mod tests {
                 "scout-1",
                 vec![signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway"))],
             )],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("[?]"));
@@ -3664,7 +3906,7 @@ mod tests {
                     vec![signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway"))],
                 ),
             ],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(
@@ -3689,7 +3931,7 @@ mod tests {
                     signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway")),
                 ],
             )],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("degraded (google)"), "Degraded label text must render verbatim: {out}");
@@ -3715,7 +3957,7 @@ mod tests {
                     signal(reader::AttentionReason::EvaluationUnavailable, Some("credential_gateway")),
                 ],
             )],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("budget risk (92%) · active"), "BudgetRisk must show 'active', not a fake elapsed time: {out}");
@@ -3733,7 +3975,7 @@ mod tests {
                 "scout-1",
                 vec![signal(reader::AttentionReason::ApprovalPending, Some("act_1"))],
             )],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("s ago"), "ApprovalPending must still show real elapsed time, not 'active': {out}");
@@ -3756,7 +3998,7 @@ mod tests {
                     evidence: Some("brave_search".to_string()),
                 }],
             )],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_plain(&app_from_snap(snap));
         assert!(out.contains("degraded (brave_search) · active"), "since:0 sentinel must show 'active': {out}");
@@ -3838,7 +4080,7 @@ mod tests {
     fn dashboard_overlay_renders_without_panicking_at_every_frame_size() {
         let snap = Snapshot {
             agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let mut app = app_from_snap(snap);
         app.dashboard_overlay = Some(crate::watch::overlay::DashboardOverlay::menu("scout-2"));
@@ -3849,6 +4091,155 @@ mod tests {
         }
     }
 
+    // ── attn.2-R5: Jobs view + manual-fire overlay ────────────────────────────────────
+
+    fn job_row(job_id: &str, last_outcome: &str, shadow: bool) -> reader::SysJob {
+        reader::SysJob {
+            job_id: job_id.to_string(),
+            schedule_described: "0 8 * * * (UTC)".to_string(),
+            next_fire_ts: 1_800_000_000,
+            last_outcome: last_outcome.to_string(),
+            last_skip_reason: None,
+            shadow_mode: shadow,
+        }
+    }
+
+    fn app_with_jobs(jobs: Vec<reader::SysJob>) -> App {
+        app_from_snap(Snapshot {
+            agents: vec![], budget: None, queue: None, sandbox: None, provider: None,
+            isolation: None, credentials: None, jobs, error: None,
+        })
+    }
+
+    #[test]
+    fn render_jobs_empty_list_shows_a_message_not_a_panic() {
+        let app = app_with_jobs(vec![]);
+        let out = render_to_text(&app, 100, 30, render_jobs);
+        assert!(out.contains("no [[jobs]]") || out.contains("no job data"));
+    }
+
+    #[test]
+    fn render_jobs_lists_every_row_with_schedule_and_next_fire() {
+        let app = app_with_jobs(vec![
+            job_row("cos-inbox", "fired", true),
+            job_row("cos-curator", "skipped", false),
+        ]);
+        let out = render_to_text(&app, 100, 30, render_jobs);
+        assert!(out.contains("cos-inbox"));
+        assert!(out.contains("cos-curator"));
+        assert!(out.contains("2026") || out.contains("UTC"), "next fire must render as explicit UTC, not a bare timestamp:\n{out}");
+        // /autoplan retroactive review: Constraint::Length(22) clipped "UTC" to "UT" on every
+        // row, deterministically (format_fire_ts is 23 chars). Widened to 24 — this must
+        // never regress to a bare "UT".
+        assert!(out.contains("UTC"), "the column must not clip \"UTC\" down to \"UT\":\n{out}");
+        assert!(!out.contains(" UT ") && !out.contains(" UT\n") && !out.contains(" UT│"),
+            "must never render a clipped \"UT\" with no trailing C:\n{out}");
+        assert!(out.contains("shadow"));
+        assert!(out.contains("live"));
+    }
+
+    #[test]
+    fn render_jobs_shows_a_manual_fire_even_though_last_outcome_never_will() {
+        // /autoplan retroactive review (2026-08-07, CRITICAL): last_outcome is sourced from
+        // the occurrence ledger, which a manual fire deliberately never touches — so this is
+        // the fix, not a duplicate of render_jobs_lists_every_row_with_schedule_and_next_fire.
+        let mut app = app_with_jobs(vec![job_row("cos-inbox", "", true)]);
+        app.jobs_last_manual_fire.insert(
+            "cos-inbox".to_string(),
+            ("cos-inbox-manual-123".to_string(), std::time::Instant::now()),
+        );
+        let out = render_to_text(&app, 100, 30, render_jobs);
+        assert!(out.contains("manually fired"), "the manual fire must be acknowledged in the row:\n{out}");
+    }
+
+    #[test]
+    fn render_jobs_shows_the_skip_reason_when_present() {
+        let mut job = job_row("cos-inbox", "skipped", true);
+        job.last_skip_reason = Some("unknown job id".to_string());
+        let app = app_with_jobs(vec![job]);
+        let out = render_to_text(&app, 100, 30, render_jobs);
+        assert!(out.contains("unknown job id"), "the skip reason must be visible, not just the bare outcome:\n{out}");
+    }
+
+    #[test]
+    fn jobs_overlay_renders_without_panicking_at_every_frame_size() {
+        let mut app = app_with_jobs(vec![job_row("cos-inbox", "", true)]);
+        for mode in [
+            JobOverlayMode::ConfirmFire,
+            JobOverlayMode::InFlight,
+            JobOverlayMode::Result { text: "Fired 'cos-inbox' — child 'cos-inbox-manual-1'".to_string(), ok: true },
+        ] {
+            app.jobs_overlay = Some(JobsOverlay { target_job_id: "cos-inbox".to_string(), mode });
+            for (w, h) in [(10, 3), (34, 8), (40, 14), (44, 11), (80, 24), (200, 50)] {
+                app.term_size = (w, h);
+                let out = render_to_text(&app, w, h, render_jobs);
+                assert!(!out.is_empty(), "no frame drawn at {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn jobs_overlay_confirm_frame_warns_about_the_same_day_overwrite_risk() {
+        let mut app = app_with_jobs(vec![job_row("cos-inbox", "fired", true)]);
+        app.term_size = (100, 30);
+        app.jobs_overlay = Some(JobsOverlay {
+            target_job_id: "cos-inbox".to_string(),
+            mode: JobOverlayMode::ConfirmFire,
+        });
+        let out = render_to_text(&app, 100, 30, render_jobs);
+        assert!(out.contains("OVERWRITES") || out.contains("overwrite"),
+            "the confirm frame must state the attn.2-R5 same-day KB-overwrite risk, not just \"are you sure\":\n{out}");
+        assert!(out.contains("shadow mode"), "must state that a manual fire ignores shadow mode:\n{out}");
+        assert!(!out.contains("attn.2-R5 residual"), "internal ticket jargon must not leak into operator-facing copy:\n{out}");
+    }
+
+    #[test]
+    fn jobs_overlay_confirm_frame_scales_by_shadow_vs_live_mode() {
+        // /autoplan retroactive review: the warning used to be IDENTICAL regardless of the
+        // row's own Mode, under-warning on exactly the live jobs where the concurrent-fire
+        // race was real. Now scaled by it (and updated to reflect the guard's fix).
+        let mut shadow_app = app_with_jobs(vec![job_row("cos-inbox", "", true)]);
+        shadow_app.term_size = (100, 30);
+        shadow_app.jobs_overlay = Some(JobsOverlay { target_job_id: "cos-inbox".to_string(), mode: JobOverlayMode::ConfirmFire });
+        let shadow_out = render_to_text(&shadow_app, 100, 30, render_jobs);
+        assert!(shadow_out.contains("SHADOW mode"), "{shadow_out}");
+
+        let mut live_app = app_with_jobs(vec![job_row("cos-inbox", "", false)]);
+        live_app.term_size = (100, 30);
+        live_app.jobs_overlay = Some(JobsOverlay { target_job_id: "cos-inbox".to_string(), mode: JobOverlayMode::ConfirmFire });
+        let live_out = render_to_text(&live_app, 100, 30, render_jobs);
+        assert!(live_out.contains("LIVE"), "{live_out}");
+        assert_ne!(shadow_out, live_out, "the two modes must render genuinely different copy, not the same boilerplate");
+    }
+
+    #[test]
+    fn jobs_overlay_result_frame_shows_ok_and_error_distinctly() {
+        for (ok, text) in [(true, "Fired 'cos-inbox' — child 'x'"), (false, "Fire failed: unknown job id")] {
+            let mut app = app_with_jobs(vec![job_row("cos-inbox", "", true)]);
+            app.term_size = (100, 30);
+            app.jobs_overlay = Some(JobsOverlay {
+                target_job_id: "cos-inbox".to_string(),
+                mode: JobOverlayMode::Result { text: text.to_string(), ok },
+            });
+            let out = render_to_text(&app, 100, 30, render_jobs);
+            assert!(out.contains(text) || out.contains(&text[..20]), "result text must render:\n{out}");
+        }
+    }
+
+    #[test]
+    fn jobs_overlay_too_small_degrades_to_a_single_line_not_a_panic() {
+        let mut app = app_with_jobs(vec![job_row("cos-inbox", "", true)]);
+        app.term_size = (20, 5);
+        app.jobs_overlay = Some(JobsOverlay {
+            target_job_id: "cos-inbox".to_string(),
+            mode: JobOverlayMode::ConfirmFire,
+        });
+        let out = render_to_text(&app, 20, 5, render_jobs);
+        // Truncated at 20 cols before "bigger terminal" — the degraded MESSAGE still starts
+        // rendering (no panic, no silently-empty frame), which is what this guards.
+        assert!(out.contains("cos-inbox") && out.contains("fire"), "degraded line must at least start rendering:\n{out}");
+    }
+
     // ── ux.13-TUI step 5: every overlay mode has to be readable on a real frame ───────
 
     fn overlay_frame(mode: crate::watch::overlay::OverlayMode, spent: u64, w: u16, h: u16) -> String {
@@ -3857,7 +4248,7 @@ mod tests {
         a.budget = BudgetKind::Tokens(200_000);
         let snap = Snapshot {
             agents: vec![a],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let mut app = app_from_snap(snap);
         let mut ov = crate::watch::overlay::DashboardOverlay::menu("scout-2");
@@ -3909,7 +4300,7 @@ mod tests {
         s2.parent_id = Some("cos-coordinator".to_string());
         let snap = Snapshot {
             agents: vec![coordinator, s1, s2],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let mut app = app_from_snap(snap);
         let mut ov = DashboardOverlay::menu("cos-coordinator");
@@ -3973,7 +4364,7 @@ mod tests {
             for status in ["running", "awaiting_approval"] {
                 let snap = Snapshot {
                     agents: vec![make_agent("scout-2", status, 12_000, vec![])],
-                    budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+                    budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
                 };
                 let mut app = app_from_snap(snap);
                 app.term_size = (w, h);
@@ -4097,7 +4488,7 @@ mod tests {
     fn the_narrow_footer_is_actually_on_screen_at_eighty_columns() {
         let snap = Snapshot {
             agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let out = render_to_text(&app_from_snap(snap), 80, 24, render_dashboard);
         assert!(out.contains("q quit"), "the quit key must be ON SCREEN at 80 cols: {out}");
@@ -4146,11 +4537,15 @@ mod tests {
         }
         // And it documents keys the footer has no room for — the reason `?` exists at all.
         assert!(help.iter().any(|(k, _)| *k == "Ctrl-c"));
+        // /autoplan retroactive review: `[J]` (Jobs view) is real and shipped but was missing
+        // from this table entirely, so it was undiscoverable via `?` on top of having no
+        // footer room — the exact drift this table exists to prevent.
+        assert!(help.iter().any(|(k, _)| *k == "J"), "the Jobs view key must be documented in ?: {help:?}");
 
         let mut app = App::new(PathBuf::from("/agents"));
         app.apply_snapshot(Snapshot {
             agents: vec![make_agent("scout-2", "running", 1, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         });
         let mut ov = DashboardOverlay::help();
         ov.mode = OverlayMode::Help;
@@ -4171,7 +4566,7 @@ mod tests {
         use crate::watch::overlay::DashboardOverlay;
         let snap = Snapshot {
             agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let mut app = app_from_snap(snap);
         app.term_size = (40, 8); // below the box floor
@@ -4191,7 +4586,7 @@ mod tests {
         for (w, h) in [(40u16, 8u16), (80, 11), (80, 12), (100, 13), (120, 30), (34, 24)] {
             let snap = Snapshot {
                 agents: vec![make_agent("scout-2", "running", 1_000, vec![])],
-                budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+                budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
             };
             let mut app = app_from_snap(snap);
             app.term_size = (w, h);
@@ -4229,7 +4624,7 @@ mod tests {
     fn dashboard_overlay_renders_the_vanished_target_branch() {
         let snap = Snapshot {
             agents: vec![make_agent("cos-coordinator", "running", 1_000, vec![])],
-            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, error: None,
+            budget: None, queue: None, sandbox: None, provider: None, isolation: None, credentials: None, jobs: vec![], error: None,
         };
         let mut app = app_from_snap(snap);
         app.dashboard_overlay = Some(crate::watch::overlay::DashboardOverlay::menu("scout-2"));
