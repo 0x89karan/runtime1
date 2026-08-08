@@ -1009,6 +1009,18 @@ gate, then `[y]` to fire it right now:
 agentctl run-job cos-inbox --url http://localhost:7999
 ```
 
+Or hit the route directly — `agentctl run-job` is a thin wrapper over this same call
+(`POST /api/v1/jobs/:id/run`, see §11's route inventory in `agentd/src/management.rs`):
+
+```bash
+curl -sS -X POST http://localhost:7999/api/v1/jobs/cos-inbox/run \
+  -H "X-Approval-Token: $AGENTOS_APPROVAL_SECRET"   # only needed if that env var is set on agentd
+# 200 {"job_id":"cos-inbox","child_id":"cos-inbox-manual-1735689123456789000"}
+# 404 {"error":"unknown job 'cos-inbox'"}            — no such job in this config
+# 409 {"error":"...already has a live run..."}       — a fire for this job is already in flight
+# 503 {"error":"timed out waiting for run_job"}       — scheduler didn't confirm within 2s; safe to retry
+```
+
 Three things to know before using this:
 
 1. **It always dispatches for real, even in shadow mode.** `native_cron_shadow` (the
@@ -1076,7 +1088,9 @@ on each cycle. These date-stamped IDs are required; a static ID like `inbox-agen
 collide on the second cron cycle (terminated children stay in the scheduler's outcome map).
 
 **cron_mcp restarts** — on agentd restart, `cron_mcp.py` recomputes the next fire time.
-Events that would have fired during downtime are not replayed.
+Events that would have fired during downtime are not replayed. To produce a brief right now
+instead of waiting for the next scheduled fire (or to backfill a missed one), use the manual
+fire verb — see §11.8b.
 
 ### 11.10 Troubleshooting
 
@@ -1093,6 +1107,8 @@ Events that would have fired during downtime are not replayed.
 | `agent_admission_denied` in flight.jsonl | Child ID collision guard fired | Child ID is already in outcomes map; confirm date-stamping |
 | An agent is looping / burning tokens with nothing to show | Runaway task prompt or a tool that never settles | `agentctl watch` → select the row → `[x]` → Cancel (cascades to its children), or `agentctl cancel <id> --url http://localhost:7999`. See §11.8a |
 | `[x]` verbs return `HTTP 401` | `AGENTOS_APPROVAL_SECRET` set on `agentd` but not exported to the shell running `agentctl` | Export the same value, then restart `agentctl watch` (cap.4 gates every mutating route, not just approve/deny) |
+| `agentctl run-job <id>` returns `HTTP 409` | The job already has a live, not-yet-terminal run (native tick, a prior manual fire, or an agent-triggered `run_job` call) | Wait for it to finish, or check `agentctl watch` → Jobs view for the still-running child; this is the concurrent-fire guard working as intended, not a bug — see §11.8b |
+| `agentctl run-job` fired against the wrong `agentd` | No `--url`/`--agents-dir` given, so it silently used the auto-detected default (`http://127.0.0.1:7999`) | The CLI now prints the resolved target before firing — read that line; pass `--url` explicitly when more than one `agentd` could be reachable |
 
 ### 11.11 Credential broker operations (cred.3.2+)
 
