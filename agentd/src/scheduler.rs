@@ -216,6 +216,22 @@ struct SchedulerState {
     /// Mirrors `SchedulerConfig::native_cron_shadow` (attn.4) — copied once at construction
     /// so `update_snapshot` (called from many sites) can project it without a new param.
     native_cron_shadow: bool,
+    /// job_id → live child_ids for that job (attn.2-R5 fix, found by /autoplan retroactive
+    /// review). The native tick and a manual fire construct DISJOINT child-id spaces on
+    /// purpose (`{job_id}-{ts}` vs. `{job_id}-manual-{nanos}`), so `reserve_job_child_id`'s
+    /// string-collision check can never catch "this job already has a live run" — it was
+    /// built to catch double-manual/double-native collisions, not cross-path overlap, and
+    /// has no `job_id` concept to repurpose. This is the guard that closes that gap: checked
+    /// in `dispatch_scheduled_job` before every dispatch, so a native fire and a manual fire
+    /// (or two manual fires) for the SAME job can never both become live children racing on
+    /// the same KB write. NOT checkpointed — a live run cannot survive a restart anyway (its
+    /// `AgentTask` doesn't either), so a stale lease would only need to be reconciled against
+    /// `state.agents` on restore, which is exactly what "not persisted" already gives for free.
+    live_job_runs: HashMap<String, std::collections::HashSet<String>>,
+    /// child_id → job_id reverse index (attn.2-R5 fix) — O(1) cleanup of `live_job_runs` at
+    /// termination without scanning every job's set. Populated alongside `live_job_runs` in
+    /// `spawn_job_child`; drained in `handle_agent_terminal`'s no-`awaiting`-parent branch.
+    child_job: HashMap<String, String>,
 }
 
 impl SchedulerState {
@@ -647,6 +663,8 @@ impl Scheduler {
             jobs:               jobs.into_iter().map(|j| (j.id.clone(), j)).collect(),
             job_schedules:      HashMap::new(),
             native_cron_shadow: sched.native_cron_shadow,
+            live_job_runs:      HashMap::new(),
+            child_job:          HashMap::new(),
         };
 
         // Restore scheduler-level state from checkpoint when present.
@@ -1447,6 +1465,31 @@ fn handle_agent_terminal(
     // Always clear orchestration membership on termination — prevents phantom entries.
     state.waiting.remove(&agent_id);
     state.orchestrated.remove(&agent_id);
+    // attn.2-R5 fix: release this agent's job lease (if it held one) regardless of which
+    // branch below handles it — a job child can terminate via the awaiting-parent path
+    // (dispatch_run_job) or the no-parent path (native tick / manual fire), and the lease
+    // must clear either way or a job would be permanently refused after its first fire.
+    // Also remembered as `was_job_child` for the leak fix below: the awaiting-parent branch
+    // ALREADY calls `state.agents.remove` for a job child (dispatch_run_job's caller is a
+    // live parent that gets a ToolResult, not a permanent record) — the no-awaiting branch
+    // (native tick / manual fire) never did, which is the retention leak /autoplan's
+    // retroactive review found (a full AgentTask + conversation history kept forever per
+    // fire, exploitable via an unrate-limited HTTP endpoint once cron cadence no longer
+    // bounds how fast it grows). Scoped to job children ONLY — a root/operator-spawned
+    // agent (never in `child_job`) is deliberately still retained in `state.agents` so its
+    // final "done"/"failed" status stays visible in the Dashboard; only job-fired children
+    // are made consistent with how the awaiting-parent path already treats them.
+    let was_job_child = if let Some(job_id) = state.child_job.remove(&agent_id) {
+        if let Some(live) = state.live_job_runs.get_mut(&job_id) {
+            live.remove(&agent_id);
+            if live.is_empty() {
+                state.live_job_runs.remove(&job_id);
+            }
+        }
+        true
+    } else {
+        false
+    };
     // ux.6a: drop this agent's deny-episode state. Every scheduler deny site is a TERMINAL
     // denial, so without this the agent's entry can never be reclaimed — it will never record
     // another allowed inference to re-arm itself — and `denied_edges` grows for the life of the
@@ -1565,6 +1608,14 @@ fn handle_agent_terminal(
             );
         }
     } else {
+        // attn.2-R5 fix: a job-fired child (native tick or manual fire) has no parent to
+        // notify and was never going to be inspected via state.agents again — the awaiting
+        // branch above already removes an agent-triggered job child the same way once its
+        // result is delivered. Root/operator-spawned agents (was_job_child == false) are
+        // deliberately left in state.agents so their final status stays visible.
+        if was_job_child {
+            state.agents.remove(&agent_id);
+        }
         state.outcomes.insert(agent_id, result);
     }
 }
@@ -2675,6 +2726,19 @@ fn dispatch_run_job(
         }
     };
 
+    // 2.5. Same-job-already-running guard (attn.2-R5 fix) — this path funnels through
+    // spawn_job_child exactly like the native tick and manual fire, and shares the same
+    // disjoint-child-id-shape problem that made reserve_job_child_id blind to cross-path
+    // overlap. Checked here too so an agent's own run_job call can't race a concurrent
+    // native/manual fire of the same job either.
+    if let Err(reason) = reject_if_job_already_running(&job_id, state) {
+        recorder.record(&parent_id, Some(parent_turn), EventKind::Error,
+            json!({ "stage": "run_job", "error": "job already running", "job_id": &job_id, "reason": &reason }));
+        reject(parent_id, call_id, format!("run_job denied: {reason}"),
+            state, sched, gateway, registry, recorder);
+        return;
+    }
+
     // 3. Depth limit (mirror dispatch_spawn — jobs count against nesting depth too).
     let parent_depth = state.spawn_depths.get(&parent_id).copied().unwrap_or(0);
     if parent_depth >= state.max_spawn_depth {
@@ -2796,6 +2860,13 @@ fn spawn_job_child(
 
     let child_open_tokens = child_task.context_tokens();
     state.agents.insert(child_id.clone(), child_task);
+    // attn.2-R5 fix (/autoplan retroactive review, cross-model-confirmed CRITICAL): register
+    // this job's lease BEFORE the run_tracker/spawn_depths bookkeeping below, so a concurrent
+    // dispatch of the SAME job_id (from either dispatch_run_job, the native tick, or a manual
+    // fire — all three funnel through this one function) can be refused by the caller-side
+    // check in dispatch_scheduled_job/dispatch_run_job. Cleared in handle_agent_terminal.
+    state.live_job_runs.entry(job_id.to_string()).or_default().insert(child_id.clone());
+    state.child_job.insert(child_id.clone(), job_id.to_string());
     state.run_tracker.open(&child_id, parent_id.clone(), start_reason, Some(child_open_tokens), "native");
     state.spawn_depths.insert(child_id.clone(), depth);
     if let Some(p) = &parent_id {
@@ -2847,9 +2918,31 @@ fn dispatch_scheduled_job(
         Some(j) => j.clone(),
         None => return Err("unknown job id (removed from config since scheduling)".to_string()),
     };
+    reject_if_job_already_running(job_id, state)?;
     reserve_job_child_id(&child_id, state)?;
     spawn_job_child(&job, job_id, child_id.clone(), None, 0, default_model_cfg, state, sched, gateway, registry, recorder, start_reason);
     Ok(child_id)
+}
+
+/// Refuse a dispatch if `job_id` already has a live child (attn.2-R5 fix, /autoplan
+/// retroactive review — cross-model-confirmed CRITICAL). `reserve_job_child_id`'s guard is a
+/// STRING collision check on the derived `child_id`; the native tick (`{job_id}-{ts}`),
+/// manual fire (`{job_id}-manual-{nanos}`), and agent-triggered `run_job` (`{job_id}-{date}`)
+/// each construct a DIFFERENT, deliberately-disjoint id shape, so that guard can never detect
+/// "this job already has a live run in progress" — it was built to catch same-path repeats,
+/// not cross-path overlap, and has no `job_id` concept to repurpose. This check has one.
+/// Shared by `dispatch_scheduled_job` (native tick + manual fire) and `dispatch_run_job`
+/// (agent-triggered) so all three dispatch paths are mutually exclusive per job_id.
+fn reject_if_job_already_running(job_id: &str, state: &SchedulerState) -> Result<(), String> {
+    if let Some(live) = state.live_job_runs.get(job_id) {
+        if !live.is_empty() {
+            return Err(format!(
+                "job '{job_id}' already has a live run in progress ({} child(ren)); concurrent fire refused",
+                live.len()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Shared child-id guard (attn.4 DRY fix) — `validate_child_id` + the live-agent/outcome
@@ -6314,6 +6407,8 @@ mod tests {
             jobs:               HashMap::new(),
             job_schedules:      HashMap::new(),
             native_cron_shadow: false,
+            live_job_runs:      HashMap::new(),
+            child_job:          HashMap::new(),
         }
     }
 
@@ -9780,7 +9875,36 @@ mod tests {
     }
 
     #[test]
-    fn manual_fire_rapid_repeats_get_distinct_child_ids_not_a_collision() {
+    fn manual_fire_rapid_repeat_while_the_first_is_still_live_is_rejected() {
+        // /autoplan retroactive review (2026-08-07): this test used to assert the UNSAFE
+        // behavior as correct — that a second rapid manual fire always succeeds with a
+        // distinct child id. That was true only because nothing checked whether the job
+        // already had a live run; two independent Gmail-reading, same-KB-key-writing
+        // children could both be created. The fix (`reject_if_job_already_running`) makes
+        // this the regression test: the SECOND fire while the first is still live (not yet
+        // terminal — nothing in this synchronous test path steps it to completion) must be
+        // refused, not silently succeed with a fresh nanosecond id.
+        use crate::control::ControlCommand;
+        let job = cos_like_job("cos-inbox", vec![]);
+        let mut state = state_with_job(job);
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx1) }, &mut state);
+        let child1 = rx1.blocking_recv().unwrap().expect("first manual fire must succeed");
+        assert!(state.agents.contains_key(&child1), "first child must be live");
+
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx2) }, &mut state);
+        let result2 = rx2.blocking_recv().unwrap();
+        assert!(result2.is_err(), "a second concurrent fire of the SAME job must be refused, got {result2:?}");
+        assert!(result2.unwrap_err().contains("already has a live run"));
+    }
+
+    #[test]
+    fn manual_fire_succeeds_again_once_the_first_run_has_terminated() {
+        // The lease is per-LIVE-run, not a permanent one-shot lock: once the first child
+        // terminates (clearing live_job_runs via handle_agent_terminal), a later manual fire
+        // of the same job must succeed again.
         use crate::control::ControlCommand;
         let job = cos_like_job("cos-inbox", vec![]);
         let mut state = state_with_job(job);
@@ -9789,12 +9913,103 @@ mod tests {
         dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx1) }, &mut state);
         let child1 = rx1.blocking_recv().unwrap().expect("first manual fire must succeed");
 
+        handle_agent_terminal(
+            child1.clone(), Ok("done".to_string()), &mut state, &unlimited(),
+            &(Arc::new(MockGateway::new(vec![])) as Arc<dyn InferenceGateway + Send + Sync>),
+            &Arc::new(ToolRegistry::new()), &recorder().0,
+        );
+        assert!(!state.live_job_runs.contains_key("cos-inbox"), "lease must clear on termination");
+
         let (tx2, rx2) = tokio::sync::oneshot::channel();
         dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx2) }, &mut state);
-        let child2 = rx2.blocking_recv().unwrap().expect("a second rapid manual fire must not collide with the first");
+        let child2 = rx2.blocking_recv().unwrap().expect("a fire after the prior run terminated must succeed");
+        assert_ne!(child1, child2);
+    }
 
-        assert_ne!(child1, child2, "nanosecond-resolution ids must not collide on a rapid re-fire");
-        assert!(state.agents.contains_key(&child1) && state.agents.contains_key(&child2));
+    #[test]
+    fn job_fired_children_are_removed_from_state_agents_on_termination() {
+        // /autoplan retroactive review (2026-08-07): a job-fired child (native tick or
+        // manual fire) had no `awaiting` entry, so it fell into handle_agent_terminal's
+        // no-parent branch, which never removed it from state.agents — a full AgentTask
+        // (conversation history) retained forever per fire. This predates attn.2-R5 (attn.4's
+        // daily cron already leaked one per day) but R5 removes the only thing (cron
+        // cadence) that made the leak slow. Fixed by scoping the SAME removal the
+        // awaiting-parent branch already does (for dispatch_run_job's job children) to ALSO
+        // cover job children with no parent — consistent, not a new behavior.
+        use crate::control::ControlCommand;
+        let job = cos_like_job("cos-inbox", vec![]);
+        let mut state = state_with_job(job);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx) }, &mut state);
+        let child = rx.blocking_recv().unwrap().expect("manual fire must succeed");
+        assert!(state.agents.contains_key(&child), "child must be live before termination");
+
+        handle_agent_terminal(
+            child.clone(), Ok("done".to_string()), &mut state, &unlimited(),
+            &(Arc::new(MockGateway::new(vec![])) as Arc<dyn InferenceGateway + Send + Sync>),
+            &Arc::new(ToolRegistry::new()), &recorder().0,
+        );
+
+        assert!(!state.agents.contains_key(&child),
+            "a job-fired child must be removed from state.agents on termination, not retained forever");
+        assert!(state.outcomes.contains_key(&child), "the terminal outcome itself must still be recorded");
+    }
+
+    #[test]
+    fn root_agents_are_still_retained_in_state_agents_after_termination() {
+        // The leak fix above is scoped to job children ONLY — a root/operator-spawned agent
+        // (never registered in child_job) must keep its final status visible in the
+        // Dashboard, exactly as before this fix.
+        let mut state = minimal_state("root-agent");
+        handle_agent_terminal(
+            "root-agent".to_string(), Ok("done".to_string()), &mut state, &unlimited(),
+            &(Arc::new(MockGateway::new(vec![])) as Arc<dyn InferenceGateway + Send + Sync>),
+            &Arc::new(ToolRegistry::new()), &recorder().0,
+        );
+        assert!(state.agents.contains_key("root-agent"),
+            "a root agent with no job lease must remain visible in state.agents after termination");
+    }
+
+    #[test]
+    fn native_tick_fire_live_blocks_a_manual_fire_of_the_same_job() {
+        // The cross-model-confirmed CRITICAL finding, made concrete: fire natively first
+        // (parent_id: None, exactly like tick_native_jobs would), leave it live, then attempt
+        // a manual fire of the SAME job_id and confirm it is refused, not raced.
+        use crate::control::ControlCommand;
+        let job = cos_like_job("cos-inbox", vec![]);
+        let mut state = state_with_job(job);
+        let gateway: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, _t) = recorder();
+        let mdl = model_cfg();
+
+        let native_child = dispatch_scheduled_job(
+            "cos-inbox", "cos-inbox-1699999999".to_string(), &mut state, &unlimited(),
+            &gateway, &registry, &rec, &mdl, "run_job",
+        ).expect("native fire must succeed");
+        assert!(state.agents.contains_key(&native_child), "native child must still be live");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx) }, &mut state);
+        let result = rx.blocking_recv().unwrap();
+        assert!(result.is_err(), "a manual fire while the native tick's child is still live must be rejected, got {result:?}");
+        assert!(result.unwrap_err().contains("already has a live run"));
+    }
+
+    #[test]
+    fn different_jobs_can_run_concurrently() {
+        // The guard is per-job_id, not a global one-run-at-a-time lock.
+        use crate::control::ControlCommand;
+        let mut state = state_with_job(cos_like_job("cos-inbox", vec![]));
+        state.jobs.insert("cos-curator".to_string(), cos_like_job("cos-curator", vec![]));
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-inbox".into(), confirm_tx: Some(tx1) }, &mut state);
+        rx1.blocking_recv().unwrap().expect("cos-inbox fire must succeed");
+
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        dispatch(ControlCommand::RunJobNow { job_id: "cos-curator".into(), confirm_tx: Some(tx2) }, &mut state);
+        rx2.blocking_recv().unwrap().expect("a DIFFERENT job must not be blocked by cos-inbox's live run");
     }
 
     #[test]
