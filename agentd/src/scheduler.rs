@@ -5943,6 +5943,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn fire_then_restart_before_next_occurrence_does_not_double_fire() {
         // THE test the adversarial review found missing: fire → complete → restart BEFORE
         // the next natural occurrence → the completed occurrence must NOT be re-dispatched.
@@ -5974,26 +5975,54 @@ mod tests {
             pending_catchup: false,
         });
 
+        // This job is genuinely overdue, so tick_native_jobs's own forced-checkpoint-on-
+        // due-job write (see its doc comment) fires for real here — unlike a real deployment
+        // (a dedicated data dir) or checkpoint_all_emits_agent_checkpointed_event (which
+        // already isolates into a private TempDir), this test previously wrote straight to
+        // the process's ambient CWD, unguarded by serial_lock. Harmless-looking on a fast
+        // local filesystem; a real, reproducible source of pathological slowness (aarch64/
+        // QEMU CI investigation, 2026-08-08) on a heavily-loaded, bind-mounted container
+        // filesystem shared with dozens of concurrently-running tests. Matching the existing
+        // safe pattern now: private TempDir + serial_lock, same as that sibling test.
+        let _serial = serial_lock();
+        let checkpoint_dir = tempfile::TempDir::new().unwrap();
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&checkpoint_dir).unwrap();
+
         let gw = MockGateway::new(vec![]);
         let (rec, tmp) = recorder();
         let mut job = cos_like_job("cos-inbox", vec![]);
         job.schedule = Some(schedule.to_string());
-        // Same false-green class as boot_init_discards_persisted_next_fire (see its note
-        // above): zero agents, an active job schedule, and no control channel mean run()
-        // has no legitimate exit besides a lucky concurrent SIGTERM from another test.
-        // Traced directly (QA_TRACE_LOOP) and confirmed: after the one real dispatch-and-
-        // fail cycle this test exercises, it sits in the 60s idle sleep for real, sometimes
-        // rescued fast by chance, sometimes not — never a difference in the test's OWN logic.
-        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<crate::control::ControlCommand>(1);
-        drop(control_tx);
+        // CORRECTED (2026-08-08, same aarch64/QEMU investigation): a dropped control-channel
+        // sender does NOT reliably exit a scheduler with an active job schedule once a real
+        // dispatch has happened. Once state.pending is non-empty, run()'s loop reaches a
+        // THIRD select (racing the control-channel read against state.pending.next()) — and
+        // if that race picks the control-channel-closed branch, the loop sets control_rx =
+        // None WITHOUT breaking (correct production behavior: keep running to finish pending
+        // work) and never gets another chance to exit via the channel, since every later
+        // idle-check matches the "still has an active job schedule, keep idling" arm instead.
+        // This only reproduces when a REAL dispatch happens (state.pending briefly non-empty)
+        // — traced directly and confirmed via a fully-sequential aarch64 QEMU run plus local
+        // isolation testing. A self-raised SIGTERM is the reliable mechanism every other test
+        // in this module already uses for exactly this shape of scheduler (sigterm_drains_
+        // scheduler, sigterm_is_responsive_while_idling_for_a_future_scheduled_job) — every
+        // select branch in run()'s loop has its own sigterm.recv() arm that unconditionally
+        // breaks, unlike the control-channel path.
+        tokio::task::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        });
         let sched = Scheduler::new(
             vec![], &model_cfg(),
             SchedulerConfig { native_cron_shadow: false, checkpoint_interval_turns: 0, ..unlimited() },
             Arc::new(gw), Arc::new(ToolRegistry::new()), rec,
             Arc::new(RwLock::new(SchedulerSnapshot::default())), Some(cp),
-        ).unwrap().with_jobs(vec![job]).with_control(control_rx);
+        ).unwrap().with_jobs(vec![job]);
 
         let outcomes = sched.run().await;
+
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        drop(checkpoint_dir);
 
         // The already-fired occurrence's child_id must NOT reappear as a fresh dispatch.
         let expected_stale_child_id = format!("cos-inbox-{fired_ts}");
@@ -6013,6 +6042,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn restart_with_missed_fire_catches_up_and_dispatches() {
         // End-to-end through the real `Scheduler::new`/`run()` boot-init path: a checkpoint
         // carries a `job_schedules` entry whose `next_fire_ts` is in the past (a fire was
@@ -6030,15 +6060,27 @@ mod tests {
             pending_catchup: false,
         });
 
+        // Same ambient-CWD checkpoint-write gap as the sibling test above — this job is
+        // genuinely overdue, so tick_native_jobs's forced-checkpoint-on-due-job write fires
+        // for real. Isolate into a private TempDir + serial_lock, matching the existing safe
+        // pattern (checkpoint_all_emits_agent_checkpointed_event).
+        let _serial = serial_lock();
+        let checkpoint_dir = tempfile::TempDir::new().unwrap();
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&checkpoint_dir).unwrap();
+
         let gw = MockGateway::new(vec![end_turn("child done", 5, 3)]);
         let (rec, tmp) = recorder();
         let mut job = cos_like_job("cos-inbox", vec![]);
         job.schedule = Some("* * * * *".to_string());
-        // Same false-green class as boot_init_discards_persisted_next_fire (see its note
-        // above): zero agents, an active job schedule, and no control channel mean run()
-        // has no legitimate exit besides a lucky concurrent SIGTERM from another test.
-        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<crate::control::ControlCommand>(1);
-        drop(control_tx);
+        // CORRECTED (2026-08-08): see the sibling test's note above — a dropped control-
+        // channel sender doesn't reliably exit a scheduler once a real dispatch makes
+        // state.pending non-empty (a genuine race in run()'s third select, not a test bug).
+        // Self-raised SIGTERM instead, matching sigterm_drains_scheduler's proven pattern.
+        tokio::task::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+        });
         let sched = Scheduler::new(
             vec![], // no [[agents]] — only the scheduled job fires anything
             &model_cfg(),
@@ -6050,10 +6092,12 @@ mod tests {
             Some(cp),
         )
         .unwrap()
-        .with_jobs(vec![job])
-        .with_control(control_rx);
+        .with_jobs(vec![job]);
 
         let outcomes = sched.run().await;
+
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        drop(checkpoint_dir);
 
         let child_key = outcomes.keys().find(|k| k.starts_with("cos-inbox-"));
         assert!(
