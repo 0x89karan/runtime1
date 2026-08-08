@@ -2060,6 +2060,44 @@ projection whose denial class is structurally empty**
   classes that actually fire (`agent_admission_denied`, deferrals, `ActionReceiptEmitted`), or the
   increment states plainly that denial coverage is empty-by-construction in the default config.
 
+**attn.4-curator-offset-01 (P1) [new, MEASURED in a live shadow cycle, 2026-08-08] — native
+cron changes `cos-curator` from a sequential handoff to a fixed offset, and the measured margin
+is ~2 minutes**
+- **Measured, not reasoned.** A live shadow-equivalence cycle was run with both paths forced onto
+  the same clock (`[[jobs]].schedule = "*/10 * * * *"` + `TRIGGER_CRON="*/10 * * * *"`), on a real
+  agentd against real Gmail:
+
+  | Job | Native shadow computed | Legacy LLM actually fired | Verdict |
+  |---|---|---|---|
+  | `cos-inbox` | 19:20:00.013 (lag +0.01s) | 19:20:03 | **equivalent** — 3s delta is `wait_for_trigger(timeout_s=20)` poll granularity; native is the more punctual of the two |
+  | `cos-curator` | 19:15:00 / 19:25:00 (fixed offset) | **19:23:04** | **NOT equivalent — semantic difference** |
+
+- **The legacy path is a sequential handoff.** `cos-inbox` completed 19:23:01; `cos-curator`
+  spawned 19:23:04, three seconds later. Curator waits for inbox to FINISH — that sequencing
+  lives in the orchestrator's prompt loop, not in Rust. Native cron instead fires curator on a
+  fixed wall-clock offset regardless of inbox's state. `cos.agents.toml` already admits this
+  ("there is NO automatic inbox→curator handoff in Rust… a fixed offset is the simplest native
+  equivalent"); what this cycle adds is the NUMBER.
+- **`cos-inbox` took 2m58s. The production offset is 5 minutes. Margin ≈ 2m02s.** If inbox ever
+  runs long (heavier mail day, slow Gmail, a retry), native fires curator BEFORE inbox has
+  written `mail:raw` / `ops:entities`. Curator's `kb_search` then returns nothing and it
+  assembles a brief from missing data — **no error, just a thin or empty brief with no visible
+  cause.** Same silent-failure shape as `brief-06` (carry-forward found nothing) and the
+  `suppressed_count` gap.
+- **This gates the `native_cron_shadow = false` flip.** `cos-inbox` is proven equivalent;
+  `cos-curator` is proven different. Options, cheapest first: (a) widen the production offset
+  from 5 to ~15 min to buy margin; (b) accept and watch for thin briefs; (c) build a real native
+  inbox→curator dependency — does not exist today, that is new work.
+- **Related, same cycle: native tick latency is not tight.** Shadow-log lag vs `intended_fire_ts`
+  measured at +0.01s, +1.97s, **+14.25s** across three fires. That is the scheduler's idle-sleep
+  granularity, not a defect — but "native cron" here means "within seconds to tens of seconds,"
+  which matters for any two jobs scheduled close together.
+- **Still open and unchanged: the double-fire risk on flip.** With `native_cron_shadow = false`
+  and the orchestrator's polling prompt still registered (task T7 unbuilt), BOTH paths fire. The
+  three `child_id` schemes are documented as coexisting at `scheduler.rs:2784` and the collision
+  guard is a plain STRING check, so it cannot dedupe `{job_id}-{intended_fire_ts}` (native)
+  against `{job_id}-{date}` (legacy `run_job`). T7 should land with the flip, not after it.
+
 **gov1-evidence-durability-01 (P1) [new, from gov.1's /autoplan, 2026-08-08] — the signed
 evidence chain does not survive a `docker compose down`; the unsigned briefs do**
 - `evidence.jsonl` exists in exactly ONE place in this repo: `agentd/tests/fixtures/evidence/`.
