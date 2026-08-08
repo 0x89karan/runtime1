@@ -185,6 +185,18 @@ pub struct SchedulerCheckpoint {
     /// empty (every job starts fresh, computing its first next-fire from the live schedule).
     #[serde(default)]
     pub job_schedules: HashMap<String, crate::scheduler_cron::JobScheduleState>,
+    /// child_id → job_id for every job-fired child that was LIVE (non-terminal) at checkpoint
+    /// time (attn.2-R5 fix, adversarial-review CRITICAL, 2026-08-07). Without this, a restart
+    /// while a job is mid-run rebuilds that child in `state.agents` (checkpoint/restore already
+    /// persists and revives every non-terminal agent) but with `live_job_runs`/`child_job`
+    /// initialized empty — silently defeating BOTH `reject_if_job_already_running` (a fresh
+    /// fire of the same job right after boot is wrongly admitted, racing the restored child)
+    /// and the job-child memory-leak fix (the restored child's eventual termination finds no
+    /// `child_job` entry, so it is never removed from `state.agents`). Absent in pre-attn.2-R5
+    /// checkpoints → empty (nothing to reconcile, matches the old — buggy — behavior only for
+    /// checkpoints written before this fix existed).
+    #[serde(default)]
+    pub child_job: HashMap<String, String>,
 }
 
 /// Handles checkpoint I/O. Writes are atomic: tmp → rename.
@@ -455,6 +467,7 @@ mod tests {
             budget_window_start: 0,
             global_window_anchor: 0,
             job_schedules:      HashMap::new(),
+            child_job:          HashMap::new(),
         }
     }
 

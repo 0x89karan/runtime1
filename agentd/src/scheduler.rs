@@ -304,6 +304,11 @@ struct SchedulerRestored {
     waiting_agents:     Vec<String>,
     orchestrated_agents: Vec<String>,
     job_schedules:      HashMap<String, crate::scheduler_cron::JobScheduleState>,
+    /// child_id → job_id for job children that were live at checkpoint time (attn.2-R5 fix,
+    /// adversarial-review CRITICAL). Reconciled against the FINAL restored `state.agents` in
+    /// `run()` — not applied here — because whether each one is still non-terminal is only
+    /// knowable once `agents` is fully built (TOML overlay + dynamically-spawned children).
+    child_job:          HashMap<String, String>,
 }
 
 pub struct Scheduler {
@@ -380,6 +385,7 @@ impl Scheduler {
                 budget_window_start: cp_budget_window_start,
                 global_window_anchor: cp_global_window_anchor,
                 job_schedules:       cp_job_schedules,
+                child_job:           cp_child_job,
                 ..
             } = cp;
 
@@ -480,6 +486,7 @@ impl Scheduler {
                 budget_window_start: cp_budget_window_start,
                 global_window_anchor: cp_global_window_anchor,
                 job_schedules:       cp_job_schedules,
+                child_job:           cp_child_job,
             });
         } else {
             let mut universal_pending_local: Vec<AgentConfig> = Vec::new();
@@ -717,6 +724,21 @@ impl Scheduler {
             // Restore orchestrated/waiting sets so parked agents are not re-stepped.
             state.orchestrated.extend(r.orchestrated_agents);
             state.waiting.extend(r.waiting_agents);
+
+            // attn.2-R5 fix (adversarial-review CRITICAL, 2026-08-07): rebuild live_job_runs/
+            // child_job from the checkpoint's child_job map, filtered against the FINAL
+            // restored `state.agents` — checked here, not earlier, because whether each entry
+            // is still genuinely live is only knowable once `agents` is fully built (TOML
+            // overlay applied, dynamically-spawned children re-inserted above). Without this,
+            // a restart while a job is mid-run revives the child (checkpoint/restore already
+            // persists and re-materializes every non-terminal agent) but with an EMPTY lease —
+            // silently defeating reject_if_job_already_running (a fresh fire right after boot
+            // races the restored child) AND the job-child memory-leak fix (the restored
+            // child's eventual termination finds no child_job entry, so it is never removed
+            // from state.agents).
+            let (live, cj) = reconcile_job_leases_after_restore(&state.agents, r.child_job);
+            state.live_job_runs = live;
+            state.child_job = cj;
         }
 
         // attn.4: initialize native-scheduling state for every job with a `schedule`.
@@ -1610,11 +1632,18 @@ fn handle_agent_terminal(
     } else {
         // attn.2-R5 fix: a job-fired child (native tick or manual fire) has no parent to
         // notify and was never going to be inspected via state.agents again — the awaiting
-        // branch above already removes an agent-triggered job child the same way once its
-        // result is delivered. Root/operator-spawned agents (was_job_child == false) are
-        // deliberately left in state.agents so their final status stays visible.
+        // branch above already removes an agent-triggered job child's state.agents AND
+        // spawn_depths entry the same way once its result is delivered (line ~1544). Codex
+        // adversarial review (2026-08-07, HIGH): the ORIGINAL version of this fix only mirrored
+        // half of that — spawn_depths and mailboxes were left leaking here just like
+        // state.agents used to, so repeated native-tick/manual fires still grew both maps (and
+        // the checkpoint they're written into) forever. Root/operator-spawned agents
+        // (was_job_child == false) are deliberately left in ALL THREE so their final status
+        // stays visible and any pending mail isn't silently dropped.
         if was_job_child {
             state.agents.remove(&agent_id);
+            state.spawn_depths.remove(&agent_id);
+            state.mailboxes.remove(&agent_id);
         }
         state.outcomes.insert(agent_id, result);
     }
@@ -2752,12 +2781,15 @@ fn dispatch_run_job(
     // 4. Server-stamp the date and derive the child id. The caller supplies NO date (zero
     // params) — the only value is agentd's wall-clock, so there is no injectable slot.
     //
-    // Two independent child_id schemes now coexist: "{job_id}-{date}" here (an explicit
-    // agent-triggered run_job call) vs. "{job_id}-{intended_fire_ts}" for native/scheduled
-    // fires (attn.4, `tick_native_jobs`). Different shapes today (date string vs. epoch
-    // seconds) keep them from ever colliding — this must stay true if either scheme changes;
-    // a collision here would defeat both the manual-refire guard and the occurrence ledger
-    // (adversarial review, attn.4).
+    // THREE independent child_id schemes now coexist: "{job_id}-{date}" here (an explicit
+    // agent-triggered run_job call), "{job_id}-{intended_fire_ts}" for native/scheduled fires
+    // (attn.4, `tick_native_jobs`), and "{job_id}-manual-{nanos}" for an operator's manual fire
+    // (attn.2-R5, `manual_job_child_id`). Different shapes keep them from ever colliding as
+    // STRINGS — this must stay true if any scheme changes, since `reserve_job_child_id`'s
+    // guard is a pure string check (adversarial review, attn.4). That string-disjointness is
+    // now defense-in-depth, not the primary guard against a real overlapping-fire race:
+    // `reject_if_job_already_running` (checked above, per job_id) is what actually blocks two
+    // LIVE runs of the same job regardless of which of the three paths each one took.
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let child_id = format!("{job_id}-{date}");
 
@@ -2945,6 +2977,39 @@ fn reject_if_job_already_running(job_id: &str, state: &SchedulerState) -> Result
     Ok(())
 }
 
+/// Rebuild `live_job_runs`/`child_job` from a checkpoint's `child_job` map, filtered against
+/// the FINAL restored agent set (attn.2-R5 fix, adversarial-review CRITICAL, 2026-08-07).
+///
+/// Checkpoint/restore already persists and re-materializes every non-terminal agent — a job
+/// child that was mid-run at checkpoint time comes back in `agents`, but `live_job_runs`/
+/// `child_job` are constructed fresh (empty) on every `Scheduler::new`, with nothing else
+/// reconciling them against what was actually restored. Left unfixed, that silently defeats
+/// `reject_if_job_already_running` (a fresh fire of the same job right after boot races the
+/// restored child, since the guard reports nothing live) and the job-child memory-leak fix (the
+/// restored child's eventual termination finds no `child_job` entry, so `was_job_child` is
+/// false and it is never removed from `state.agents`).
+///
+/// A pure function over `agents` (not `state: &mut SchedulerState`) so the restore-time
+/// decision — is this checkpointed entry still genuinely live? — is unit-testable without
+/// racing agents through the async scheduler loop, which is what actually determines each
+/// entry's fate in production (a checkpointed job that already terminated before restore, or
+/// whose agent id collided with something else, is correctly dropped, not restored).
+fn reconcile_job_leases_after_restore(
+    agents: &HashMap<String, AgentTask>,
+    checkpointed_child_job: HashMap<String, String>,
+) -> (HashMap<String, std::collections::HashSet<String>>, HashMap<String, String>) {
+    let mut live_job_runs: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut child_job: HashMap<String, String> = HashMap::new();
+    for (child_id, job_id) in checkpointed_child_job {
+        let still_live = agents.get(&child_id).map(|a| !a.is_terminal()).unwrap_or(false);
+        if still_live {
+            live_job_runs.entry(job_id.clone()).or_default().insert(child_id.clone());
+            child_job.insert(child_id, job_id);
+        }
+    }
+    (live_job_runs, child_job)
+}
+
 /// Shared child-id guard (attn.4 DRY fix) — `validate_child_id` + the live-agent/outcome
 /// collision check, used by BOTH `dispatch_run_job` and `dispatch_scheduled_job`. Neither
 /// caller's error-REPORTING side effects are unified here (they differ: one replies with a
@@ -3025,6 +3090,19 @@ async fn tick_native_jobs(
             continue;
         }
 
+        // Codex adversarial review (2026-08-07, HIGH): captured so a transient rejection below
+        // (the same job already has a live run — attn.2-R5's concurrent-fire guard) can be
+        // ROLLED BACK to this value instead of leaving the just-set occurrence committed. That
+        // guard did not exist when this dedup design was built; its only failure modes at the
+        // time (unknown job, a vanishingly-rare id collision) are both PERMANENT — retrying
+        // could never succeed, so committing the occurrence and advancing past it was correct.
+        // "Already running" is the opposite: the SAME occurrence will very likely succeed on a
+        // later tick once the concurrent run (a manual fire, or an agent's own run_job call)
+        // finishes. Without the rollback, a manual fire that happens to overlap the scheduled
+        // time permanently and silently drops that day's real production cron fire — exactly
+        // the class of silent data loss this project has been burned by before.
+        let previous_occurrence_id = state.job_schedules.get(&job_id).and_then(|s| s.last_occurrence_id.clone());
+
         // Persist intent BEFORE dispatching — so a crash mid-fire recovers unambiguously as
         // "was about to act on this occurrence" rather than leaving double-fire vs.
         // lost-fire indistinguishable on restart (attn.4 Eng finding).
@@ -3065,9 +3143,21 @@ async fn tick_native_jobs(
                         "job_id": &job_id, "occurrence_id": &occurrence, "reason": &reason,
                         "shadow": false, "caught_up": caught_up,
                     }));
+                    // "already has a live run" (reject_if_job_already_running) is transient —
+                    // roll back the occurrence commit and retry the SAME occurrence next tick
+                    // instead of advancing past it. Every other rejection reason here (unknown
+                    // job, a bare child_id collision) is permanent; advancing past those is
+                    // correct, unchanged behavior.
+                    let transient = reason.contains("already has a live run");
                     if let Some(s) = state.job_schedules.get_mut(&job_id) {
                         s.last_outcome = Some(crate::scheduler_cron::JobFireOutcome::Skipped);
                         s.last_skip_reason = Some(reason);
+                        if transient {
+                            s.last_occurrence_id = previous_occurrence_id;
+                        }
+                    }
+                    if transient {
+                        continue;
                     }
                 }
             }
@@ -4357,6 +4447,12 @@ fn build_scheduler_checkpoint(
         budget_window_start:  state.budget_window_start,
         global_window_anchor: state.global_window_anchor,
         job_schedules:        state.job_schedules.clone(),
+        // attn.2-R5 fix (adversarial-review CRITICAL): state.child_job only ever holds LIVE
+        // entries (cleared in handle_agent_terminal on termination), so no extra filtering is
+        // needed here — cloning it as-is is exactly "every job child that's still live right
+        // now", which is what restore needs to reconcile live_job_runs against the agents this
+        // same checkpoint is about to revive.
+        child_job:            state.child_job.clone(),
     };
     (cp, repairs)
 }
@@ -5682,6 +5778,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_job_own_dispatch_path_is_blocked_by_a_concurrent_live_run_of_the_same_job() {
+        // /autoplan retroactive review (testing specialist, 2026-08-07): every existing test for
+        // reject_if_job_already_running drives it via dispatch_scheduled_job (native tick /
+        // RunJobNow) — dispatch_run_job's OWN call site of the SAME guard (the agent-triggered
+        // `run_job` tool path) had zero direct coverage, even though it's the exact path the
+        // guard's own comment says it protects ("an agent's own run_job call can't race a
+        // concurrent native/manual fire"). Two independent trigger agents, each firing run_job
+        // for the SAME job_id in their first turn, land in the same scheduler tick before either
+        // spawned child gets a turn — so whichever trigger's effect is applied second must see
+        // the first trigger's child still live and be rejected via dispatch_run_job's own guard
+        // check, not dispatch_scheduled_job's.
+        use crate::tools::native::register_native;
+        let mut registry = ToolRegistry::new();
+        register_native(&mut registry, &["run_job".to_string()], None, None, None, None).unwrap();
+
+        let make_run = |id: &str| InferenceResponse {
+            blocks: vec![Block::ToolUse {
+                id: id.to_string(),
+                name: "run_job".to_string(),
+                input: serde_json::json!({ "job_id": "cos-inbox" }),
+            }],
+            stop_reason: StopReason::ToolUse,
+            input_tokens: 10, output_tokens: 5, transport_retries: 0,
+        };
+        // Order-agnostic: whichever of the two triggers is dispatched first consumes the first
+        // run_job block and succeeds; whichever is second is rejected by the live-run guard and
+        // recovers immediately (reject() re-steps it synchronously) — so its recovery end_turn
+        // must be queued right after both run_job blocks, before either child's own end_turn.
+        let gw = MockGateway::new(vec![
+            make_run("rjA"),
+            make_run("rjB"),
+            end_turn("second trigger recovered", 10, 5),
+            end_turn("child ok", 5, 3),
+            end_turn("first trigger recovered", 10, 5),
+        ]);
+        let trigger_a = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("trigger-a", "fire run_job")
+        };
+        let trigger_b = AgentConfig {
+            capabilities: Some(vec![Capability::RunJob]),
+            ..agent_cfg("trigger-b", "fire run_job")
+        };
+        let (sched, _rec, _tmp) =
+            make_scheduler_with_registry(vec![trigger_a, trigger_b], unlimited(), gw, registry);
+        let sched = sched.with_jobs(vec![cos_like_job("cos-inbox", vec![])]);
+        let outcomes = sched.run().await;
+
+        assert!(outcomes["trigger-a"].is_ok(), "trigger-a must recover regardless of win/lose: {:?}", outcomes["trigger-a"]);
+        assert!(outcomes["trigger-b"].is_ok(), "trigger-b must recover regardless of win/lose: {:?}", outcomes["trigger-b"]);
+        // dispatch_run_job always registers an AwaitingParent link (deliver_content=false), so a
+        // job child spawned this way never lands in `outcomes` — unlike the native-tick/manual-
+        // fire path (parent_id: None). Count distinct child agent ids in the flight log instead.
+        let content = std::fs::read_to_string(_tmp.path()).unwrap_or_default();
+        let child_ids: std::collections::HashSet<String> = content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["agent"].as_str().map(str::to_string))
+            .filter(|a| a.starts_with("cos-inbox-"))
+            .collect();
+        assert_eq!(child_ids.len(), 1,
+            "exactly ONE child of a concurrent double-fire may exist, got {child_ids:?}: {content}");
+        assert!(content.contains("\"job already running\""),
+            "dispatch_run_job's own guard check must record the rejection: {content}");
+        assert!(content.contains("already has a live run"),
+            "the ToolResult delivered back to the losing trigger must name the real cause: {content}");
+    }
+
+    #[tokio::test]
     async fn run_job_delivers_completion_signal_not_child_output() {
         // The crux of cap.2b: a sealed job's (email-derived) OUTPUT must never reach the
         // injectable trigger's context — only an agentd-authored completion signal. Drive a job
@@ -6018,6 +6183,62 @@ mod tests {
             state.job_schedules["cos-inbox"].last_skip_reason.as_deref().unwrap_or("").contains("already in use"),
             "the skip reason must name the collision: {:?}", state.job_schedules["cos-inbox"].last_skip_reason
         );
+    }
+
+    #[tokio::test]
+    async fn tick_native_jobs_retries_rather_than_permanently_drops_a_fire_blocked_by_a_concurrent_manual_run() {
+        // Codex adversarial review (2026-08-07, HIGH): reject_if_job_already_running's
+        // rejection reason ("already has a live run") did not exist when the occurrence-ledger
+        // dedup design was built — its only failure modes at the time (unknown job id, a
+        // vanishingly-rare child_id collision) are both PERMANENT, so committing the occurrence
+        // and advancing past it was correct for them. "Already running" is TRANSIENT: a manual
+        // fire (or an agent's own run_job call) that happens to overlap the scheduled time must
+        // not cause that day's real production cron fire to be silently and permanently lost.
+        let mut job = cos_like_job("cos-inbox", vec![]);
+        job.schedule = Some("* * * * *".to_string());
+        let mut state = state_with_job(job);
+        let now = now_unix_secs() as i64;
+        let intended_fire_ts = now - 5;
+        state.job_schedules.insert("cos-inbox".to_string(), crate::scheduler_cron::JobScheduleState {
+            fingerprint: "* * * * *".to_string(),
+            next_fire_ts: intended_fire_ts,
+            last_occurrence_id: None,
+            last_outcome: None,
+            last_skip_reason: None,
+            pending_catchup: false,
+        });
+        // Simulate a concurrent manual fire (or an agent's own run_job call) holding the lease
+        // — the exact scenario reject_if_job_already_running exists to detect.
+        state.live_job_runs.insert("cos-inbox".to_string(), std::collections::HashSet::from(["cos-inbox-manual-1".to_string()]));
+
+        let sched = SchedulerConfig { native_cron_shadow: false, ..unlimited() };
+        let gw: Arc<dyn InferenceGateway + Send + Sync> = Arc::new(MockGateway::new(vec![]));
+        let registry = Arc::new(ToolRegistry::new());
+        let (rec, tmp) = recorder();
+        let mdl = model_cfg();
+        let (store, _dir) = temp_store();
+
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(
+            content.contains("\"job_fire_skipped\"") && content.contains("already has a live run"),
+            "the blocked tick must be a visible, recorded skip: {content}"
+        );
+        assert_eq!(state.job_schedules["cos-inbox"].last_occurrence_id, None,
+            "a TRANSIENT rejection must roll back the occurrence commit — not mark this occurrence \
+             as handled, or the retry below could never fire it");
+        assert_eq!(state.job_schedules["cos-inbox"].next_fire_ts, intended_fire_ts,
+            "the schedule must NOT advance past a transiently-blocked occurrence — next_fire_ts \
+             staying put is what makes it due again on the next tick");
+
+        // The concurrent run finishes (lease clears) — the SAME occurrence must now succeed,
+        // proving this was a retry, not a permanent loss with a well-worded excuse.
+        state.live_job_runs.clear();
+        tick_native_jobs(&mut state, &sched, &gw, &registry, &rec, &mdl, &store).await;
+        let content = std::fs::read_to_string(tmp.path()).unwrap_or_default();
+        assert!(content.contains("\"job_fired\""), "the retried occurrence must actually fire once unblocked: {content}");
+        assert_eq!(state.job_schedules["cos-inbox"].last_outcome, Some(crate::scheduler_cron::JobFireOutcome::Fired));
     }
 
     #[tokio::test]
@@ -6608,6 +6829,7 @@ mod tests {
             budget_window_start: 0,
             global_window_anchor: 0,
             job_schedules:       HashMap::new(),
+            child_job:           HashMap::new(),
         }
     }
 
@@ -6715,6 +6937,7 @@ mod tests {
             budget_window_start: 0,
             global_window_anchor: 0,
             job_schedules:       HashMap::new(),
+            child_job:           HashMap::new(),
         };
         let gw = MockGateway::new(vec![end_turn("done", 10, 5)]);
         let (rec, _tmp) = recorder();
@@ -10008,6 +10231,13 @@ mod tests {
         assert!(!state.agents.contains_key(&child),
             "a job-fired child must be removed from state.agents on termination, not retained forever");
         assert!(state.outcomes.contains_key(&child), "the terminal outcome itself must still be recorded");
+        // Codex adversarial review (2026-08-07, HIGH): the original fix only mirrored HALF of
+        // what the awaiting-parent branch already does for an agent-triggered job child —
+        // spawn_depths and mailboxes leaked here just like state.agents used to.
+        assert!(!state.spawn_depths.contains_key(&child),
+            "a job-fired child's spawn_depths entry must also be released, or it grows forever with the same cadence");
+        assert!(!state.mailboxes.contains_key(&child),
+            "a job-fired child's mailboxes entry must also be released, or it grows forever with the same cadence");
     }
 
     #[test]
@@ -10090,4 +10320,84 @@ mod tests {
         assert!(content.contains("\"job_manual_fired\""), "success must be audit-logged: {content}");
         assert!(content.contains("\"job_manual_fire_rejected\""), "rejection must be audit-logged too: {content}");
     }
+
+    // ── attn.2-R5 fix: job leases must survive a restart (adversarial-review CRITICAL) ──────
+
+    #[test]
+    fn reconcile_job_leases_after_restore_revives_a_still_live_job_child() {
+        // The core bug: checkpoint/restore already re-materializes a non-terminal job child
+        // into `agents` on its own — this function is what stops live_job_runs/child_job from
+        // coming back empty regardless, which would silently readmit a concurrent fire of the
+        // same job right after boot.
+        let mut agents = HashMap::new();
+        agents.insert(
+            "cos-inbox-restored-1".to_string(),
+            crate::agent::AgentTask::from_checkpoint(minimal_agent_checkpoint("cos-inbox-restored-1"), vec![]),
+        );
+        let checkpointed = HashMap::from([("cos-inbox-restored-1".to_string(), "cos-inbox".to_string())]);
+
+        let (live, child_job) = reconcile_job_leases_after_restore(&agents, checkpointed);
+
+        assert_eq!(
+            live.get("cos-inbox"),
+            Some(&std::collections::HashSet::from(["cos-inbox-restored-1".to_string()])),
+            "a genuinely live restored child must be readmitted to the lease"
+        );
+        assert_eq!(child_job.get("cos-inbox-restored-1"), Some(&"cos-inbox".to_string()),
+            "the reverse index must be rebuilt too, or handle_agent_terminal's leak fix can't find this child later");
+    }
+
+    #[test]
+    fn reconcile_job_leases_after_restore_drops_stale_entries() {
+        // Two ways a checkpointed child_job entry can be stale: the agent is gone entirely
+        // (pruned before the checkpoint write, or a since-resolved id collision), or it's
+        // present but already terminal (a race between "decided to terminate" and "checkpoint
+        // written" — handle_agent_terminal's own removal should make this rare in practice, but
+        // the reconciliation must not trust a terminal entry's presence as "still running").
+        let mut terminal_cp = minimal_agent_checkpoint("cos-inbox-done");
+        terminal_cp.terminal = true;
+        let mut agents = HashMap::new();
+        agents.insert("cos-inbox-done".to_string(), crate::agent::AgentTask::from_checkpoint(terminal_cp, vec![]));
+        // "cos-inbox-vanished" is intentionally NOT inserted into `agents` at all.
+
+        let checkpointed = HashMap::from([
+            ("cos-inbox-done".to_string(), "cos-inbox".to_string()),
+            ("cos-inbox-vanished".to_string(), "cos-inbox".to_string()),
+        ]);
+
+        let (live, child_job) = reconcile_job_leases_after_restore(&agents, checkpointed);
+
+        assert!(!live.contains_key("cos-inbox"), "neither stale entry may produce a lease: {live:?}");
+        assert!(child_job.is_empty(), "neither stale entry may survive into the reverse index: {child_job:?}");
+    }
+
+    #[test]
+    fn reconcile_job_leases_after_restore_aggregates_multiple_live_children_of_one_job() {
+        // reject_if_job_already_running only cares whether the set is non-empty, but the
+        // reverse index (child_job) must still map EACH child id back to the job independently
+        // — a single lease entry per job would make handle_agent_terminal's removal of one
+        // child accidentally clear the lease for a sibling that is still running.
+        let mut agents = HashMap::new();
+        for id in ["cos-inbox-r1", "cos-inbox-r2"] {
+            agents.insert(id.to_string(), crate::agent::AgentTask::from_checkpoint(minimal_agent_checkpoint(id), vec![]));
+        }
+        let checkpointed = HashMap::from([
+            ("cos-inbox-r1".to_string(), "cos-inbox".to_string()),
+            ("cos-inbox-r2".to_string(), "cos-inbox".to_string()),
+        ]);
+
+        let (live, child_job) = reconcile_job_leases_after_restore(&agents, checkpointed);
+
+        assert_eq!(live["cos-inbox"].len(), 2, "both live children must share one job-keyed set: {live:?}");
+        assert_eq!(child_job.len(), 2, "each child must still resolve independently in the reverse index");
+    }
+
+    // An end-to-end Scheduler::new + run() version of this test (buffering a RunJobNow on the
+    // control channel before a checkpoint-restored live job child gets a chance to run) was
+    // tried and DROPPED: the restored child's own step and the loop's control-channel drain
+    // race non-deterministically, so the restored child can fully terminate (clearing the
+    // lease) before the buffered command is ever read — observed failing ~1 in 5 runs. The
+    // wiring this would additionally cover beyond the three pure-function tests above is a
+    // two-line assignment (`state.live_job_runs = live; state.child_job = cj;` in run()'s
+    // restore branch) — low enough risk that a flaky integration test isn't worth carrying.
 }
