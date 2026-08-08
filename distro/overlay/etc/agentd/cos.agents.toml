@@ -5,6 +5,16 @@
 #   -append "... agentd.config=/etc/agentd/cos.agents.toml"
 #
 # Key differences from agentd/cos.agents.toml (dev mode):
+#   - ⚠ SCHEDULING ARCHITECTURE (attn.4 T7, 2026-08-08). This file still uses the LLM-polling
+#     trigger: it keeps the `cos-orchestrator` agent + `cron_trigger` MCP server and has NO
+#     per-job `schedule =` keys, so `TRIGGER_CRON` / `TRIGGER_INTERVAL` are LIVE here. The
+#     docker config went the other way — zero `[[agents]]`, per-job `schedule =`, and
+#     `native_cron_shadow = false` — so the two paths now differ in HOW the brief is triggered,
+#     not just in paths and storage. This divergence is deliberate and, as of T7, permanent
+#     rather than transitional: porting native cron here needs its own increment (the QEMU path
+#     has no shadow-cycle evidence). `agentd/tests/cos_spawn_caps_subset.rs` asserts the
+#     de-privileged-trigger invariant against THIS file and the zero-agent invariant against the
+#     docker one. See docs/plans/attn.4-scheduler-native-cron.md.
 #   - MCP server paths use /usr/lib/agentos/docker/ (absolute, in rootfs)
 #   - store_path = "/run/memory/memory.redb" (detachable 9p memory volume)
 #   - [management] bind_addr = "0.0.0.0" so QEMU hostfwd can reach the API from host

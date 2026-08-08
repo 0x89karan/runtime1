@@ -2680,6 +2680,42 @@ allow_insecure_local = true
             .expect("distro overlay cos.agents.toml must parse as a valid Config");
     }
 
+    /// attn.4 T7: `cos.agents.toml` ships ZERO `[[agents]]` and drives everything from
+    /// `[[jobs]]` schedules. `cos_agents_toml_parses_cleanly` above only does a raw
+    /// `toml::from_str` — it never exercises `agent_configs()`, which is the function the BOOT
+    /// path actually calls and the one that enforces the `allow_empty_agents` gate. Without
+    /// this, dropping `allow_empty_agents = true` would fail at container start with a green
+    /// test suite. Mirrors `shipped_cockpit_toml_parses_and_boots_empty` for the other
+    /// zero-agent config we ship.
+    #[test]
+    fn shipped_cos_toml_boots_with_zero_agents() {
+        let raw = include_str!("../cos.agents.toml");
+        let cfg: Config = toml::from_str(raw).expect("cos.agents.toml must parse");
+        assert!(
+            cfg.scheduler.allow_empty_agents,
+            "cos.agents.toml ships zero [[agents]] since attn.4 T7, so it MUST opt into \
+             allow_empty_agents or agentd refuses to boot"
+        );
+        assert!(
+            !cfg.scheduler.native_cron_shadow,
+            "cos.agents.toml has no LLM trigger, so native_cron_shadow must be false — in \
+             shadow mode the schedule is computed and logged but never dispatched, and with no \
+             agent to fire jobs either, NOTHING would ever run"
+        );
+        let cfgs = cfg
+            .agent_configs()
+            .expect("cos.agents.toml must produce a valid (empty) agent list via the boot path");
+        assert!(cfgs.is_empty(), "cos.agents.toml must boot with zero agents by design");
+        assert_eq!(cfg.jobs.len(), 2, "cos-inbox + cos-curator are the only work units left");
+        for j in &cfg.jobs {
+            assert!(
+                j.schedule.is_some(),
+                "job '{}' has no `schedule =` — with zero agents nothing else can fire it",
+                j.id
+            );
+        }
+    }
+
     #[test]
     fn cos_agents_toml_google_oauth_server_has_credential_capability() {
         // Broker mode (cred.6): main.rs builds the credential proxy token's

@@ -28,11 +28,18 @@ fn load(rel_path: &str) -> Config {
 
 /// The native tool each capability is inert without. `Mcp`/`Net`/`Credential` are served by
 /// stdio sidecars rather than the native registry, so they have no entry here.
+///
+/// `FsRead` and `Spawn` are included even though no current job declares them: both ARE
+/// native-tool-backed (`want("read_file")` / `want("spawn_agent")` in `tools/native.rs`), so
+/// omitting them would leave the same silent drift this file exists to catch, just latent
+/// until the first job that needs one.
 fn required_tool(cap: &Capability) -> Option<&'static str> {
     match cap {
         Capability::KbRead { .. } => Some("kb_get"),
         Capability::KbWrite { .. } => Some("kb_put"),
         Capability::FsWrite { .. } => Some("write_file"),
+        Capability::FsRead { .. } => Some("read_file"),
+        Capability::Spawn => Some("spawn_agent"),
         Capability::BriefPublish => Some("publish_brief"),
         Capability::RunsRead => Some("runs_query"),
         Capability::RunJob => Some("run_job"),

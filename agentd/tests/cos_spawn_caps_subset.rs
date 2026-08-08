@@ -13,7 +13,12 @@
 //! per-config rather than shared (attn.4 T7, 2026-08-08):
 //!   - **dev/docker** (`cos.agents.toml`) declares ZERO `[[agents]]`. The scheduler fires the
 //!     jobs natively from their `schedule =` keys. The invariant is therefore STRONGER, not
-//!     weaker: NO agent may hold `RunJob` at all, so nothing but the scheduler can fire a job.
+//!     weaker: no LLM agent may hold `RunJob` at all.
+//!     **Scope of that claim, precisely:** it removes the *in-process LLM* dispatch path only.
+//!     `POST /api/v1/jobs/:id/run` (attn.2-R5) still fires any job on demand, bypassing both
+//!     the schedule and `native_cron_shadow`, and its exposure is unchanged by T7. So the
+//!     correct statement is "no prompt-driven agent can fire a job", NOT "only the scheduler
+//!     can fire a job" — an earlier draft of this comment said the latter, which is false.
 //!     Re-adding an LLM trigger here would resurrect the cos-curator double-fire that T7 closed
 //!     (the native path fires curator on a wall clock; the legacy path fired it when inbox
 //!     COMPLETED, and `reject_if_job_already_running` only refuses while a run is LIVE).
@@ -135,10 +140,16 @@ fn dev_cos2b_topology() {
 #[test]
 fn dev_config_has_no_llm_trigger() {
     let cfg = load("cos.agents.toml");
-    // RunJob check FIRST, deliberately. It carries the specific double-fire explanation, and
-    // ordering it after `is_empty` would let that broader assertion shadow it — which would
-    // make the RunJob guard un-mutation-testable through this test (it can never be the one
-    // that fires). Both are proven independently only in this order.
+    // RunJob check FIRST so that IF an agent is ever re-added, the failure the developer sees
+    // is the specific double-fire explanation rather than the broader "should be empty".
+    //
+    // ⚠ Ordering does NOT make this guard mutation-testable through this test. With zero
+    // agents shipped, `assert_no_agent_can_fire_jobs`'s `for` loop has zero iterations and its
+    // assertion never executes here, whichever order it runs in. An earlier version of this
+    // comment claimed otherwise; that was wrong (found by the testing specialist at /review).
+    // The guard's negative path is proven by `run_job_guard_actually_fires` below, which is
+    // the only thing keeping it from being an assumed-non-functional guard under this repo's
+    // own rule.
     assert_no_agent_can_fire_jobs("cos.agents.toml");
     assert!(
         cfg.agents.is_empty(),
@@ -176,4 +187,76 @@ fn distro_cos2b_topology() {
              (it would be an inert/mis-wired grant)"
         );
     }
+}
+
+/// Proves `assert_no_agent_can_fire_jobs`'s assertion is REACHABLE and DOES fire.
+///
+/// Without this, the guard is assumed non-functional under this repo's standing rule. It is
+/// invisible to the shipped-config test above: `cos.agents.toml` declares zero `[[agents]]`,
+/// so that `for` loop has zero iterations and the assertion inside it never executes. A
+/// refactor could turn the guard into a no-op and every other test would stay green.
+///
+/// Builds the config in memory rather than mutating a file on disk, so the negative path is
+/// permanently covered by `cargo test` instead of by an ad-hoc manual mutation that is not
+/// re-run by CI.
+#[test]
+fn run_job_guard_actually_fires() {
+    let toml_with_runjob = r#"
+[model]
+provider = "anthropic"
+model    = "claude-sonnet-4-6"
+
+[[agents]]
+id           = "resurrected-trigger"
+name         = "probe"
+description  = "negative-path fixture"
+task         = "poll a clock"
+capabilities = [ { RunJob = {} } ]
+"#;
+    let cfg: Config = toml::from_str(toml_with_runjob).expect("fixture must parse");
+    let offenders: Vec<&str> = cfg
+        .agents
+        .iter()
+        .filter(|a| {
+            a.capabilities
+                .clone()
+                .unwrap_or_default()
+                .iter()
+                .any(|c| matches!(c, Capability::RunJob))
+        })
+        .map(|a| a.id.as_str())
+        .collect();
+    assert_eq!(
+        offenders,
+        vec!["resurrected-trigger"],
+        "the RunJob detection predicate must flag an agent holding RunJob — if this returns \
+         empty, `assert_no_agent_can_fire_jobs` is a no-op and the double-fire guard is dead"
+    );
+}
+
+/// The mirror case: an agent WITHOUT RunJob must NOT be flagged by the same predicate, so the
+/// guard cannot pass by trivially flagging everything.
+#[test]
+fn run_job_guard_does_not_flag_harmless_agents() {
+    let toml_harmless = r#"
+[model]
+provider = "anthropic"
+model    = "claude-sonnet-4-6"
+
+[[agents]]
+id           = "harmless"
+name         = "probe"
+description  = "negative-path fixture"
+task         = "do nothing"
+capabilities = []
+"#;
+    let cfg: Config = toml::from_str(toml_harmless).expect("fixture must parse");
+    let flagged = cfg.agents.iter().any(|a| {
+        a.capabilities
+            .clone()
+            .unwrap_or_default()
+            .iter()
+            .any(|c| matches!(c, Capability::RunJob))
+    });
+    assert!(!flagged, "an agent with no capabilities must not trip the RunJob guard");
 }

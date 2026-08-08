@@ -222,6 +222,18 @@ inbox job shed content and told you rather than producing nothing. Check Gmail f
 time-critical. Full anatomy and the known limitations (handled items can reappear; sender-text
 escaping is a prompt rule, not enforcement) are in `docs/RUNBOOK.md` §11.6.
 
+> ⚠ **attn.4 T7 (2026-08-08) — the docker/cos path no longer works this way.**
+> `agentd/cos.agents.toml` now declares **zero `[[agents]]`**: the `cos-orchestrator` trigger and
+> the `cron_trigger` MCP server were deleted, and the scheduler fires `[[jobs]]` directly from
+> their `schedule =` keys (`native_cron_shadow = false`). Consequences for anything below:
+> **`TRIGGER_CRON` / `TRIGGER_INTERVAL` are INERT** for this service — setting them does nothing.
+> To change the schedule, edit `schedule =` in `cos.agents.toml` and **rebuild**
+> (`docker compose up -d --build`); the config is baked in at `Dockerfile:70`, so a plain
+> restart will not pick it up. **Any command naming the agent `cos-orchestrator` will 404** —
+> the work units are the jobs `cos-inbox` and `cos-curator`.
+> The **distro/QEMU** config still uses the LLM trigger (it has no per-job `schedule =`), so
+> trigger-related text below remains correct for that path only.
+
 **Schedule:** `TRIGGER_INTERVAL="every 2m"` is for testing and only accepts `every N(s|m|h)`. For a
 daily brief use the **separate** cron variable: `-e "TRIGGER_CRON=0 8 * * *"` (08:00 UTC) — a cron
 expression in `TRIGGER_INTERVAL` will not parse.
@@ -559,7 +571,9 @@ budget_reset_interval = 86400        # rolling window in seconds (86400 = daily)
 curl -sX POST localhost:7999/api/v1/budget/reset -d '{"target":"global"}'
 #   → {"target":"global","spent_before":<N>,"reset_to":0}
 # A single agent's window:
-curl -sX POST localhost:7999/api/v1/budget/reset -d '{"target":{"agent":"cos-orchestrator"}}'
+# ⚠ attn.4 T7: `cos-orchestrator` was DELETED — this exact call now 404s. Use a job child id
+# (e.g. cos-inbox-<epoch>) from `agentctl runs`, or target "global".
+curl -sX POST localhost:7999/api/v1/budget/reset -d '{"target":{"agent":"cos-inbox"}}'
 #   → 404 if the agent id is unknown
 ```
 
@@ -571,7 +585,8 @@ spend drop reads as a scheduled rollover, not data loss.
 raising revives a deferred agent immediately, and the change survives a restart):
 
 ```bash
-agentctl set-budget cos-orchestrator 50000000 --url http://localhost:7999
+# ⚠ attn.4 T7: `cos-orchestrator` no longer exists; target a job instead.
+agentctl set-budget cos-inbox 50000000 --url http://localhost:7999
 #   limit 0 = UNLIMITED (it removes the cap — it does not mean "stop")
 ```
 
@@ -592,8 +607,9 @@ The raw route is still there if you need it — it takes the same `{target, limi
 
 ```bash
 curl -sX POST localhost:7999/api/v1/budget/set \
-  -d '{"target":{"agent":"cos-orchestrator"},"limit":50000000}'
-#   → {"target":"cos-orchestrator","old_limit":<N>,"limit":50000000}
+  -d '{"target":{"agent":"cos-inbox"},"limit":50000000}'
+#   → {"target":"cos-inbox","old_limit":<N>,"limit":50000000}
+#   ⚠ attn.4 T7: `cos-orchestrator` was deleted — that id 404s now.
 #   → 404 if the agent id is unknown; limit:0 = unlimited
 #   → 400 for {"target":"global"} — the global ceiling is immutable config, not runtime-settable
 ```

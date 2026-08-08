@@ -125,14 +125,47 @@ field. Plan: `docs/plans/attn.4-scheduler-native-cron.md`.
   `attn.4-ratelimit-01` (P2, native cron removes the soft rate-limiting friction an LLM-driven
   `run_job` call used to provide — a config typo like `schedule = "* * * * *"` on a capable job
   now has a bigger blast radius with nothing in the loop to notice).
-- **Task T7 (delete the now-legacy LLM-polling prompt + `cron_trigger` MCP registration) is
-  deliberately NOT built this increment** — by the plan's own rollout sequencing it only makes
-  sense once a real shadow cycle confirms equivalence in the field, which requires the stack to
-  actually be running first.
-- **Do NOT bring the stack up or start the 14-day brief-adoption measure yet.** Per the roadmap
-  note this increment closes: bring it up with `docker compose up -d` (not `start`), let shadow
-  mode run at least one full cycle, confirm shadow-computed fire times match reality, THEN flip
-  `native_cron_shadow = false` and start the measure.
+- ~~**Task T7 (delete the now-legacy LLM-polling prompt + `cron_trigger` MCP registration) is
+  deliberately NOT built this increment**~~ — **T7 SHIPPED 2026-08-08.** See the T7 entry below.
+- ~~**Do NOT bring the stack up or start the 14-day brief-adoption measure yet.**~~ — **the
+  shadow cycle ran on 2026-08-08 and the flip is done.** Superseded by the T7 entry below.
+
+**attn.4 T7 (2026-08-08, on `main`, unreleased) — the LLM is OFF the schedule boundary.**
+`native_cron_shadow = false`; the `cos-orchestrator` agent and the `cron_trigger` MCP server are
+DELETED from `agentd/cos.agents.toml`, which now declares **zero `[[agents]]`**
+(`allow_empty_agents = true`) and two natively-scheduled `[[jobs]]`. `run_job` is out of
+`[tools] native`. **Measured live: an idle agentd now makes ZERO inference calls** (was ~130/hour,
+~3456 turns/day just to watch a clock).
+- **Shadow equivalence was measured, not assumed, and it came back SPLIT.** Both paths were forced
+  onto the same clock (`*/10` + `TRIGGER_CRON="*/10 * * * *"`) against real Gmail. `cos-inbox`
+  MATCHED: native computed 19:20:00.013, the legacy LLM path fired 19:20:03 — native was the
+  punctual one. `cos-curator` did NOT: the legacy path fires it when inbox COMPLETES (19:23:01 →
+  19:23:04), the native path fires it on a wall clock. Filed `attn.4-curator-offset-01`.
+- **The curator offset is a DEADLINE, not a delay.** Widened 5 → 15 min. Inbox took 2m58s, so the
+  old offset left ~2m of margin; 15 gives ~12m. If inbox ever overruns it, curator assembles a
+  brief from unwritten KB data — no error, just a thin brief. **Nothing detects this**; a real
+  native inbox→curator dependency does not exist. Re-measure before ever shortening it.
+- **T7 had to land WITH the flip, not after.** `reject_if_job_already_running` makes the dispatch
+  paths mutually exclusive per job_id but only while a run is LIVE. Inbox was safe (both fire
+  within ~3s, inside a ~3min run); curator was not (legacy ~08:03 vs native 08:15 — no overlap,
+  so nothing refuses the second). An earlier draft of this reasoning blamed the child_id string
+  guard; that was wrong and is corrected on the record.
+- **A self-inflicted regression, caught by driving the binary and not by the suite:** the
+  line-range delete that removed the orchestrator also took out the adjacent `[tools]` section,
+  so `write_file`/`publish_brief` silently un-registered and the pipeline would have run to
+  completion producing no brief. Every test stayed green. New guard
+  `cos_tools_cover_job_caps.rs` maps each capability to the tool it is inert without.
+- **`/review` then found the guard I had "mutation-proven" was a zero-iteration loop** — with zero
+  agents, `assert_no_agent_can_fire_jobs`'s `for` body never executes, so nothing committed proved
+  it. Now covered by `run_job_guard_actually_fires` + its mirror. Same trap, third time this
+  session: **an ad-hoc mutation you revert is not coverage.**
+- **Known, accepted, documented:** a pre-T7 `checkpoint.json` resurrects the deleted orchestrator
+  for exactly one turn on first boot (observed: restored turn 47, ~8.3k tokens, completed, then
+  gone — its tools no longer exist). Self-healing; `gov1`-style runtime reconciliation is NOT
+  built. Also: `POST /api/v1/jobs/:id/run` still fires any job, so "only the scheduler can fire"
+  is false — the true claim is "no prompt-driven agent can fire".
+- **NOT done:** version bump + CHANGELOG entry for T7; the distro/QEMU config still uses the LLM
+  trigger (it has no per-job `schedule =`) and that divergence is now permanent, not transitional.
 
 **Prev:** attn.2 R3+R4 (v0.121.0) — **the brief is readable (exclusive
 important/response_needed classification, narrowed sender-text escaping, a real
@@ -456,22 +489,25 @@ the guard "blind spot" that might have justified a cheap hardening was code-veri
 The working sed stays; revisit only as a build-time generator if it ever matters (`docs/plans/par.3-*.md`).
 Only residual: port-7999 shared constant (trivial low-value config dedup).
 
-**Next (roadmap):** **attn.4 has shipped (v0.122.0) — the scheduler-native cron path exists,
-but it ships in shadow mode. Do NOT flip it live or start the 14-day measure yet.**
+**Next (roadmap):** **steps 1-3 and T7 are DONE (2026-08-08). The live remaining step is the
+14-day D4 measure.**
 1. ~~**`attn.4` (P1) — give `[[jobs]]` a schedule and fire them from the scheduler**~~ ✅ shipped
-   v0.122.0. `cos-inbox`/`cos-curator` both carry `schedule =` now, alongside the still-live
-   LLM-polling path, gated by `native_cron_shadow = true` (default). The timezone gap from the
-   original note is unchanged and deliberately out of scope: no `chrono::Local`, no `tzdata`, no
-   `TZ`, so `schedule = "0 8 * * *"` means 08:00 **UTC**, not local time.
-2. **Bring the stack up now** (`docker compose up -d cos`, **`up -d`, not `start`**) and let
-   shadow mode run at least one full cycle. Confirm the shadow-computed fire times
-   (`job_fired`/`job_fire_skipped` events, or `agentctl jobs cos.agents.toml`) match what the
-   still-live LLM-polling path actually does before touching anything.
-3. **Then, and only then,** flip `native_cron_shadow = false` in `cos.agents.toml`'s
-   `[scheduler]` block to cut the LLM out of the schedule boundary for real.
-4. **Then** the D4 measure: **does the operator stop checking email manually?** 14 days.
-5. Task T7 (delete the now-legacy polling prompt + `cron_trigger` MCP registration) rides after
-   step 3 confirms equivalence in the field — tracked, not abandoned.
+   v0.122.0. The timezone gap is unchanged and deliberately out of scope: no `chrono::Local`, no
+   `tzdata`, no `TZ`, so `schedule = "0 8 * * *"` means 08:00 **UTC**, not local time.
+2. ~~**Bring the stack up and run a shadow cycle**~~ ✅ done 2026-08-08. Result was SPLIT, not a
+   clean pass: `cos-inbox` equivalent (3s apart, native the punctual one), `cos-curator` NOT
+   (legacy waits for inbox to complete; native fires on a wall clock). See
+   `attn.4-curator-offset-01`.
+3. ~~**Flip `native_cron_shadow = false`**~~ ✅ done, together with T7 — they could not be split
+   without double-firing curator (see the T7 entry at the top of this file).
+4. ~~**Task T7** (delete the polling prompt + `cron_trigger` registration)~~ ✅ done. The config
+   now declares zero `[[agents]]`; an idle agentd makes **zero** inference calls.
+5. **← LIVE STEP: the D4 measure. Does the operator stop checking email manually? 14 days.**
+   Nothing engineering-side blocks it. Bring the stack up (`docker compose up -d --build` — the
+   config is baked into the image at `Dockerfile:70`, so a bare `start` will not pick up config
+   edits) and let it run. Watch for a THIN brief, which is the silent failure mode
+   `attn.4-curator-offset-01` leaves open.
+6. Before the next release: version bump + CHANGELOG entry for T7 (not done).
 
 **In parallel, needing zero engineering, and now flagged by four consecutive CEO voices:** name mv
 design partners. Gate 2026-10-01, **0 of 10 named, 0 of 3 demos**. Both CEO voices in attn.3's

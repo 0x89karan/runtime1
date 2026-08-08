@@ -2060,6 +2060,25 @@ projection whose denial class is structurally empty**
   classes that actually fire (`agent_admission_denied`, deferrals, `ActionReceiptEmitted`), or the
   increment states plainly that denial coverage is empty-by-construction in the default config.
 
+**attn.4-t7-ghost-01 (P2) [new, OBSERVED live, 2026-08-08] — a deleted agent is resurrected from
+`checkpoint.json` for one turn on the first boot after removal**
+- Deleting `cos-orchestrator` from config does NOT purge it from a persisted checkpoint.
+  `Scheduler::new` restores every checkpointed non-terminal agent as a dynamically-spawned child,
+  with no reconciliation against the current config's agent set.
+- **Observed, not theorised** (flight log, 2026-08-08T19:52:46): `agent_restored` at turn 47 → one
+  `inference_request` (8,306 input tokens) → `agent_completed` with *"Interrupted — resuming the
+  wait loop immediately."* The next boot showed no `agent_restored` at all.
+- **Self-healing, and double-closed:** it terminates because its tools no longer exist
+  (`cron_trigger` deregistered, `run_job` dropped from `[tools] native`), so it cannot poll or
+  fire anything. Cost is one turn, once.
+- **But the guarantee is weaker than the test implies.** `dev_config_has_no_llm_trigger` asserts
+  zero agents in the CONFIG; it says nothing about the RUNTIME agent set after restore. The Codex
+  adversarial pass rated this Block on exactly that gap.
+- Not fixed by choice (operator decision at /review, 2026-08-08). The real fix is a restore-path
+  reconciliation that drops checkpointed agents absent from config — new behaviour in the
+  fail-closed, `panic = "abort"`, PID-1 boot path, which is the highest-risk code in the process.
+  Do not bolt it on casually; it wants its own increment with QA against a real pre-T7 volume.
+
 **test-env-01 (P2) [new, 2026-08-08] — `cargo test --workspace` FAILS whenever the operator's
 own agentd is running**
 - `agentctl/src/watch/source.rs::detect_source_fallback_to_http_when_no_fuse` asserts
