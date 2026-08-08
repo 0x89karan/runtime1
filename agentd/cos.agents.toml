@@ -275,6 +275,30 @@ capabilities = [
 ]
 
 # ---------------------------------------------------------------------------
+# Native tools
+# ---------------------------------------------------------------------------
+# Registered from THIS list, not derived from capabilities (`register_native` in
+# tools/native.rs). Two consequences that have already bitten once: deleting an agent does
+# NOT prune this list, and deleting an entry here silently un-registers a tool the [[jobs]]
+# still need. Both jobs depend on it — cos-inbox on kb_*, cos-curator on write_file +
+# publish_brief + runs_query. Strand those and the pipeline runs and produces no brief, with
+# no error.
+#
+# `run_job` dropped in attn.4 T7: the scheduler fires [[jobs]] natively and no agent exists
+# to call it. `cos_tools_cover_job_caps.rs` pins this list against the jobs' declared
+# capabilities so the next edit cannot strand the brief silently.
+[tools]
+native = [
+  "kb_get",
+  "kb_put",
+  "kb_search",
+  "write_file",
+  "request_approval",
+  "runs_query",
+  "publish_brief",
+]
+
+# ---------------------------------------------------------------------------
 # Sealed jobs (cap.2b). The trust root for these caps + task templates is THIS config, not
 # the trigger. run_job(job_id) materializes a child with the fixed caps + rendered task below
 # ({date} is stamped server-side, UTC). The trigger holds neither these caps nor any way to

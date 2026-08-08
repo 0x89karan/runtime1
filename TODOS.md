@@ -2060,6 +2060,23 @@ projection whose denial class is structurally empty**
   classes that actually fire (`agent_admission_denied`, deferrals, `ActionReceiptEmitted`), or the
   increment states plainly that denial coverage is empty-by-construction in the default config.
 
+**test-env-01 (P2) [new, 2026-08-08] — `cargo test --workspace` FAILS whenever the operator's
+own agentd is running**
+- `agentctl/src/watch/source.rs::detect_source_fallback_to_http_when_no_fuse` asserts
+  `detect_source(None, tmp)` returns `Err` "when neither FUSE nor HTTP is reachable". The
+  fallback probes the default management port, so if anything is listening on
+  `127.0.0.1:7999` the call SUCCEEDS and the test fails.
+- Reproduced deterministically 2026-08-08: fails with `docker compose up -d cos` running
+  (compose publishes `127.0.0.1:7999->7999`), passes the moment `cos` is stopped. Nothing to do
+  with the code under test.
+- **Why it matters more than a flake:** this project's whole premise is the operator dogfooding
+  a live CoS. The quality gate CLAUDE.md mandates before every commit therefore fails in the
+  exact configuration the project asks the operator to be in, which trains people to ignore a
+  red suite. It also means CI green ≠ local green for anyone running the stack.
+- Fix: bind the probe to an ephemeral port injected by the test, or have `detect_source` take
+  the port as a parameter so the test can point at a closed one. Do NOT "fix" it by asserting
+  either outcome — that would make the guard unfalsifiable.
+
 **attn.4-curator-offset-01 (P1) [new, MEASURED in a live shadow cycle, 2026-08-08] — native
 cron changes `cos-curator` from a sequential handoff to a fixed offset, and the measured margin
 is ~2 minutes**
