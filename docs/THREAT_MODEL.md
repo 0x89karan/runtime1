@@ -883,14 +883,20 @@ mode governs only the automatic path).
   `:7999` can fire it repeatedly, on demand. Practical exposure is low (loopback-only, separate
   bridge network from `agent`) but real — a compromised host process, or a script left running
   against the wrong port.
-- **No rate-limit or concurrent-dedup guard.** `manual_job_child_id`'s nanosecond-resolution id
-  means the SAME job can be fired many times in rapid succession with no rejection — each fire
-  spawns an independent child, all reading Gmail concurrently. This is the manual-trigger analog
-  of `attn.4-ratelimit-01` (filed against the automatic path) and is filed as a residual, not
-  fixed, in `TODOS.md`.
+- **Concurrent-dedup is now guarded; rate-limiting is not.** A retroactive `/autoplan` review
+  (2026-08-07) found `reserve_job_child_id`'s string-collision check couldn't see this — the
+  native tick, a manual fire, and an agent's own `run_job` call each derive a deliberately
+  disjoint `child_id` shape, so two overlapping fires of the SAME job never collided as strings.
+  `reject_if_job_already_running` (a `job_id → live child_ids` lease in `SchedulerState`) closes
+  that: a second fire of a job with a still-live child is refused (HTTP 409), across all three
+  dispatch paths. What remains open: this is a concurrency guard, not a rate limit — fire, wait
+  for it to terminate, fire again, repeat, and every SEQUENTIAL fire still dispatches for real
+  with no cooldown. Manual-trigger analog of `attn.4-ratelimit-01` (filed against the automatic
+  path); the sequential-repeat gap is filed as a residual, not fixed, in `TODOS.md`.
 - **Every attempt is audit-logged regardless of outcome or transport** (`job_manual_fired` /
-  `job_manual_fire_rejected`), unlike most other control-command handlers, which only log on the
-  fire-and-forget FUSE path — deliberate, since this route can reach live Gmail on an unbounded
+  `job_manual_fire_rejected`), unlike most other control-command handlers, which only log on
+  the fire-and-forget FUSE path — deliberate, since this route can reach live Gmail on an
+  unbounded
   cadence and the flight log is the only record of who tried to fire what.
 
 ---

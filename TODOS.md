@@ -47,6 +47,25 @@ all fixed directly in the same pass; these three were not.
   `job_fired`/`job_fire_skipped`/`job_schedule_degraded` flight events via the existing Logs
   view. See `docs/plans/attn.4-scheduler-native-cron.md` T4.
 
+## attn.2-R5 fix-batch /review residuals — Open (2026-08-07, filed at /review)
+
+One finding from `/review`'s adversarial pass on the T1-T5 fix batch, judged a genuine design
+question rather than a mechanical fix — the pass's other findings (a checkpoint/restore
+lease-loss bug, a permanently-dropped cron occurrence under a concurrent manual fire, an
+incomplete leak fix, several stale comments, a missing `?` help-overlay key, and an audit-log
+gap on four pre-dispatch failure branches) were all fixed directly in the same pass.
+
+- **attn.2-R5-string-01 (P3) — `agentctl`'s `explain_verb_error` string-matches a literal
+  ("timed out waiting for run_job") owned by a DIFFERENT crate (`agentd/src/management.rs`).**
+  No shared constant, no cross-crate test pinning the coupling. If that server-side wording
+  ever changes, the client-side match silently breaks and falls through to the generic "Action
+  not sent, retry" advice — which is actively wrong for this one case (the fire may have
+  already started; blind retry risks a second concurrent run). A real fix needs either a small
+  shared crate both `agentd` and `agentctl` depend on for this one literal, or a structured
+  machine-readable error code in the JSON body instead of prose-matching — genuine design work,
+  not a mechanical fix, and no wording change is pending today that would trip it. Operator
+  chose to file rather than fix at the review gate (2026-08-07).
+
 ## zk track — Open (reshaped at /autoplan premise gate, 2026-08-06)
 
 Plan + increment ladder: `docs/plans/zk.1-hybrid-crypto-verification.md`. The inline-zkVM
@@ -346,10 +365,17 @@ are defined in `docs/AUDIT-v0.86.md §6`.
   the fix. Auto-chaining `cos-inbox`→`cos-curator` was in scope for the original spec; the
   shipped design fires one job per call, unchanged from that finding's conclusion (chaining
   doesn't survive a restart with no checkpoint hook).
-  - **New residual, not fixed:** no rate-limit or concurrent-dedup guard — `manual_job_child_id`'s
-    nanosecond resolution means the same job can be fired repeatedly with no rejection, each
-    spawning an independent child reading Gmail concurrently. Manual-trigger analog of
-    `attn.4-ratelimit-01`. See THREAT_MODEL.md §9.5's update.
+  - **Concurrent-dedup guard CLOSED (2026-08-07, retroactive /autoplan review, cross-model-
+    confirmed CRITICAL).** `reserve_job_child_id`'s guard is a pure string collision check on
+    the derived `child_id` — but the native tick (`{job_id}-{ts}`), a manual fire
+    (`{job_id}-manual-{nanos}`), and an agent's own `run_job` call (`{job_id}-{date}`) each
+    construct a deliberately disjoint id shape, so it could never detect "this job already has
+    a live run" across paths. Fixed by `reject_if_job_already_running` (a `job_id → live
+    child_ids` lease in `SchedulerState`), checked before every dispatch path and cleared on
+    termination — see THREAT_MODEL.md §9.5's update.
+  - **New residual, not fixed:** still no rate limit — the guard above blocks OVERLAPPING
+    fires of the same job, not repeated SEQUENTIAL ones. Fire, wait for it to terminate, fire
+    again: nothing throttles that pattern. Manual-trigger analog of `attn.4-ratelimit-01`.
   - **New residual, not fixed:** `cos-inbox`'s `ops:entities` key is `inbox-{date}` with no
     `{ts}` (unlike the curator's R4-fixed `ops:briefs` key) — a manual fire on a day cos-inbox
     already ran overwrites that day's real inbox data with the manual run's, last-writer-wins.

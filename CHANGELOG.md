@@ -30,9 +30,20 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     fire what, unlike most other control commands, which only log on the fire-and-forget FUSE
     path.
 
+### Fixed (2026-08-07, retroactive `/autoplan` review — see TODOS.md)
+- **Concurrent-fire race, cross-model-confirmed CRITICAL.** The three dispatch paths (native
+  tick, manual fire, agent-triggered `run_job`) derived deliberately disjoint `child_id` shapes,
+  so the existing string-collision guard could never detect two OVERLAPPING fires of the same
+  job. A new `reject_if_job_already_running` lease closes it — a second fire while the first is
+  still live now gets a clean 409, across all three paths.
+- **Job-child memory leak.** Job-fired children with no parent (native tick, manual fire) were
+  never removed from `state.agents` on termination — a full retained `AgentTask` per fire,
+  forever. Fixed, scoped to job children only (root/operator-spawned agents keep their
+  Dashboard-visible terminal status, unchanged).
+
 ### Known residuals (filed, not fixed — see TODOS.md)
-- No rate-limit or concurrent-dedup guard: the same job can be fired repeatedly in rapid
-  succession, each one dispatching a real, independent run.
+- **Still no rate limit** — the guard above blocks concurrent/overlapping fires, not repeated
+  sequential ones: fire, wait for it to terminate, fire again, and nothing throttles that.
 - Firing a job on a day it already ran can overwrite that day's real KB data
   (last-writer-wins on the job's date-keyed KB key) — pre-existing risk for any same-day
   re-fire, not introduced here, but the confirm overlay is the only guard.

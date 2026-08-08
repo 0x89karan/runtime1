@@ -1016,9 +1016,13 @@ Or hit the route directly — `agentctl run-job` is a thin wrapper over this sam
 curl -sS -X POST http://localhost:7999/api/v1/jobs/cos-inbox/run \
   -H "X-Approval-Token: $AGENTOS_APPROVAL_SECRET"   # only needed if that env var is set on agentd
 # 200 {"job_id":"cos-inbox","child_id":"cos-inbox-manual-1735689123456789000"}
-# 404 {"error":"unknown job 'cos-inbox'"}            — no such job in this config
+# 404 {"error":"unknown job id (removed from config since scheduling)"} — no such job in this config
 # 409 {"error":"...already has a live run..."}       — a fire for this job is already in flight
-# 503 {"error":"timed out waiting for run_job"}       — scheduler didn't confirm within 2s; safe to retry
+# 503 {"error":"timed out waiting for run_job"}       — agentd may have already started this fire
+#                                                        even though the confirmation didn't arrive in
+#                                                        time; check the Jobs view/flight log before
+#                                                        retrying — do NOT treat this as safe to retry
+#                                                        blind, it risks a second concurrent run
 ```
 
 Three things to know before using this:
