@@ -239,11 +239,18 @@ write events to durable storage before POSTing.
 `wait_for_trigger` requires an LLM to poll it in a loop, which attn.4 measured at ~3,456
 inference calls/day just to watch a clock. The real schedule for `cos.agents.toml`'s
 `cos-inbox`/`cos-curator` jobs now lives in `[[jobs]]`'s `schedule` field, fired natively
-in-process by `agentd`'s scheduler — no LLM on the schedule boundary at all. This server is
-kept in the image as a manual/legacy fallback for one release (config-level rollback path,
-per the attn.4 DX review), not as the deployed mechanism. It remains a fine choice for any
-OTHER agent that genuinely needs an LLM-visible wake signal rather than a config-declared
-sealed job.
+in-process by `agentd`'s scheduler — no LLM on the schedule boundary at all.
+
+**Updated attn.4 T7 (2026-08-08): the registration is GONE, not env-gated.** An earlier version
+of this note called it "a manual/legacy fallback for one release (config-level rollback path)",
+which overstated how reachable that rollback is. T7 deleted the `[[tools.mcp_servers]]` block for
+`cron_trigger` from `agentd/cos.agents.toml` outright, along with the `cos-orchestrator` agent
+that used it. `TRIGGER_CRON` / `TRIGGER_INTERVAL` are therefore **inert for the docker/cos
+image** — reverting means editing the TOML and rebuilding the image, not flipping an env var.
+The script is still copied into the image and is still LIVE for the **distro/QEMU** config, which
+has no per-job `schedule =` keys and continues to use the LLM trigger. It remains a fine choice
+for any OTHER agent that genuinely needs an LLM-visible wake signal rather than a
+config-declared sealed job.
 
 Fires on a cron schedule (UTC) or fixed interval.
 

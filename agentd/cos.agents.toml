@@ -27,10 +27,12 @@
 #   export OAUTH_SCOPES="https://www.googleapis.com/auth/gmail.readonly"
 #   export OAUTH_ALLOWED_HOSTS="accounts.google.com,oauth2.googleapis.com,www.googleapis.com,gmail.googleapis.com"
 #   export OAUTH_PROVIDER_NAME="google"
-#   export TRIGGER_CRON="0 8 * * *"           # daily 08:00 UTC; change to taste
-#   # Keep the fire time away from 00:00 UTC: the inbox→curator handoff is date-keyed and
+#   # TRIGGER_CRON / TRIGGER_INTERVAL are NO LONGER READ (attn.4 T7, 2026-08-08). The
+#   # schedule lives in each [[jobs]] entry's `schedule =` key and is fired by the scheduler
+#   # itself. The env vars are inert; docker-compose still passes TRIGGER_CRON, harmlessly.
+#   # Keep fire times away from 00:00 UTC: the inbox→curator handoff is date-keyed and
 #   # server-stamped per job, so a pipeline that straddles UTC midnight fails the brief
-#   # (cleanly) — see cap.2b-ar-01. 08:00 is safe.
+#   # (cleanly) — see cap.2b-ar-01. 08:00 / 08:15 is safe.
 #   # After first run (skip the browser dance):
 #   export OAUTH_REFRESH_TOKEN="$(jq -r .refresh_token ~/.agentos-oauth/google.json)"
 #
@@ -52,21 +54,21 @@
 #   jq 'select(.kind=="egress_rejected")' flight.jsonl         # → any off-domain attempts
 #
 # LIFETIME LIMITS:
-#   Orchestrator max_turns = 200_000  (cron polling burns ~3456 turns/day — default 20 kills
-#                                      the agent in under 8 min before the first brief)
-#   Orchestrator token_budget = 5_000_000_000  (per-agent windowed ceiling; with the
-#                                               scheduler's budget_reset_interval it rebases
-#                                               every 24h — no longer lifetime-monotonic)
+#   There is no always-on agent any more (attn.4 T7). The old cos-orchestrator needed
+#   max_turns = 200_000 purely to survive ~3456 clock-polling turns/day; deleting it removed
+#   that spend entirely. Only the two [[jobs]] consume budget now, per fire.
 #   → If you see budget_exceeded in flight.jsonl: the window will auto-reset at rollover, or
 #     force it now with `curl -X POST localhost:7999/api/v1/budget/reset -d '{"target":"global"}'`.
 #     (Do NOT rm checkpoint.json — that destroys conversation state and is no longer needed.)
 #
-# JOB CHILD ID NOTE (cap.2b):
-#   run_job stamps the child id as "<job-id>-<YYYY-MM-DD>" (UTC, server-side) — the trigger
-#   passes NO date. The scheduler rejects a duplicate id only while the prior run is still
-#   LIVE (in-flight); a job that already COMPLETED can re-run the same day (harmless — the
-#   brief is log-append/last-writer-wins, and cron normally fires once daily). Same-day
-#   idempotency is not enforced (matching the pre-cap.2b model, which relied on cron cadence).
+# JOB CHILD ID NOTE (cap.2b, updated attn.4 T7):
+#   Three child-id shapes coexist: "<job-id>-<intended_fire_ts>" (native tick),
+#   "<job-id>-manual-<nanos>" (agentctl run-job), and "<job-id>-<YYYY-MM-DD>" (agent-triggered
+#   run_job — now unreachable here, no agent holds RunJob). They are deliberately disjoint, so
+#   the string collision check cannot detect cross-path overlap; `reject_if_job_already_running`
+#   is the guard that can, and it is keyed by job_id. It refuses only while a run is LIVE —
+#   a job that already COMPLETED can re-run the same day. Same-day idempotency is still not
+#   enforced; per-fire {ts} in the brief filename and KB key (attn.2 R4) is what makes that safe.
 
 # ---------------------------------------------------------------------------
 # Shared model config (applies to all agents unless overridden per-agent)
@@ -128,6 +130,28 @@ budget_reset_interval     = 86400   # 24h rolling window (0 = lifetime, self-bri
 max_concurrent_inferences = 3
 max_spawn_depth           = 2
 
+# attn.4 T7 (2026-08-08): the LLM is OFF the schedule boundary. The scheduler itself fires
+# the `[[jobs]]` below from their `schedule =` keys — no agent polls a clock any more.
+#
+# Shadow mode is DONE. A live cycle on 2026-08-08 confirmed cos-inbox equivalence (native
+# computed 19:20:00.013, the legacy LLM path fired 19:20:03 — native was the punctual one),
+# and found cos-curator was NOT equivalent: the legacy path waited for inbox to COMPLETE,
+# the native path fires on a wall clock. See attn.4-curator-offset-01 in TODOS.md.
+native_cron_shadow        = false
+
+# Required because this config now declares ZERO `[[agents]]`. The `cos-orchestrator` trigger
+# and its `cron_trigger` MCP server were DELETED here (attn.4 T7) — they existed only to hold
+# a clock, at ~3456 polling turns/day (measured 414k tokens per 29 min to produce nothing).
+# Everything that does real work is a `[[jobs]]` entry, dispatched natively.
+#
+# ⚠ Deleting the orchestrator was required, not cosmetic. With both paths live, cos-curator
+# would DOUBLE-FIRE: `reject_if_job_already_running` (scheduler.rs) makes the three dispatch
+# paths mutually exclusive per job_id, but only while a run is LIVE. The legacy path fires
+# curator ~3s after inbox completes (~08:03); the native path fires it at 08:15. No overlap,
+# so nothing refuses the second — two runs, two briefs. cos-inbox was safe (both land within
+# ~3s, inside the ~3min live window); curator was not.
+allow_empty_agents        = true
+
 # ---------------------------------------------------------------------------
 # Egress mediator — signed receipts for the trust story
 # ---------------------------------------------------------------------------
@@ -183,16 +207,6 @@ name               = "semantic-kb"
 url                = "http://semantic-kb-mcp:8020"
 allow_insecure_local = true
 tool_override      = true
-
-# cron_trigger: wakes the orchestrator on schedule
-[[tools.mcp_servers]]
-name    = "cron_trigger"
-command = "python3"
-# Dev mode (cargo run from repo root): ../docker/cron_mcp.py
-# Distro/QEMU mode:                   /usr/lib/agentos/docker/cron_mcp.py
-args    = ["../docker/cron_mcp.py"]
-passenv = ["TRIGGER_CRON", "TRIGGER_INTERVAL", "TRIGGER_MAX_WAIT_S"]
-# No capabilities → deny-all spawn + network isolation (cron needs neither).
 
 # google_oauth: OAuth2+PKCE sidecar — broker mode (cred.6).
 # The sidecar holds NO raw credential at rest. It receives an ephemeral broker
@@ -261,66 +275,20 @@ capabilities = [
 ]
 
 # ---------------------------------------------------------------------------
-# Agent 1: Executive TRIGGER (cap.2b — de-privileged)
+# Native tools
 # ---------------------------------------------------------------------------
-[[agents]]
-id          = "cos-orchestrator"
-name        = "Chief of Staff Trigger"
-description = "Cron-triggered coordinator: fires the Inbox→Curator sealed-job pipeline. Reads nothing the jobs produce (cap.2b de-privilege)."
-
-# CRITICAL: max_turns MUST be high. At 25 s/poll the trigger burns ~3456 turns/day
-# just waiting for the cron. Default (20) kills the agent before the first brief fires.
-max_turns    = 200_000
-# Per-agent WINDOWED ceiling (ux.8′): with [scheduler] budget_reset_interval set,
-# spend rebases every 24h — no longer lifetime-monotonic. The trigger's per-turn context
-# is now tiny (it reads nothing), so this headroom is generous.
-token_budget = 5_000_000_000
-priority     = 10
-
-# cap.2b — the orchestrator is DE-PRIVILEGED to a summary-free cron TRIGGER. It holds only
-# the ability to wait on the schedule and to fire config-declared sealed jobs. It has NO
-# Gmail, NO Credential, NO KB, NO file write, NO Spawn — so even a prompt-injected trigger
-# has nothing to leak and can only trigger predeclared work. The real capabilities live on
-# the [[jobs]] below, owned by config, never chosen by this (schedule-exposed) node.
-capabilities = [
-  { Mcp    = { server = "cron_trigger", tools = [] } },
-  { RunJob = {} },
-]
-
-task = """
-You are the always-on Chief-of-Staff TRIGGER. You do NOT read email, summaries, or briefs —
-you only fire the daily pipeline on schedule. The real work runs in two config-declared sealed
-JOBS whose capabilities and instructions are fixed by the operator; you cannot see or change
-them, and you receive only a completion signal from each (never its output). This is by design
-(cap.2b): the node exposed to the schedule holds nothing sensitive, so it has nothing to leak.
-
-## Loop (repeat forever)
-
-STEP 1 — WAIT FOR SCHEDULE
-Call cron_trigger.wait_for_trigger(timeout_s=20) in a loop:
-  - "waiting" → call again next turn (normal; you will wait many turns)
-  - "timeout" → call wait_for_trigger again to reset
-  - "fired"   → proceed to STEP 2
-
-STEP 2 — RUN THE INBOX JOB
-Call run_job(job_id="cos-inbox"). Pass ONLY the job_id — there are no other arguments.
-The job fetches Gmail and writes today's OperatingBrief to the KB itself. You receive only a
-completion signal like "job 'cos-inbox-<date>' completed" — never its contents. If it reports
-failure, skip to STEP 4 (do not retry in a tight loop).
-
-STEP 3 — RUN THE CURATOR JOB
-After the inbox job completes, call run_job(job_id="cos-curator"). Pass ONLY the job_id.
-The curator reads the inbox result from the KB, assembles the brief, writes it, and publishes it.
-You receive only a completion signal.
-
-STEP 4 — LOOP BACK
-Do NOT emit a final answer. Immediately call cron_trigger.wait_for_trigger(timeout_s=20) to park
-until the next schedule. You are always-on; the loop never ends.
-"""
-
+# Registered from THIS list, not derived from capabilities (`register_native` in
+# tools/native.rs). Two consequences that have already bitten once: deleting an agent does
+# NOT prune this list, and deleting an entry here silently un-registers a tool the [[jobs]]
+# still need. Both jobs depend on it — cos-inbox on kb_*, cos-curator on write_file +
+# publish_brief + runs_query. Strand those and the pipeline runs and produces no brief, with
+# no error.
+#
+# `run_job` dropped in attn.4 T7: the scheduler fires [[jobs]] natively and no agent exists
+# to call it. `cos_tools_cover_job_caps.rs` pins this list against the jobs' declared
+# capabilities so the next edit cannot strand the brief silently.
 [tools]
 native = [
-  "run_job",
   "kb_get",
   "kb_put",
   "kb_search",
@@ -342,11 +310,11 @@ native = [
 id           = "cos-inbox"
 # attn.4: native/shadow schedule, UTC only (nothing in this stack understands local time —
 # see docs/THREAT_MODEL.md §9.5 and CLAUDE.md). Matches the retiring TRIGGER_CRON default
-# (0 8 * * *). SHADOW MODE IS ON BY DEFAULT (`[scheduler] native_cron_shadow`, default true):
-# this schedule is computed and logged, never dispatched, until the operator flips it to
-# false after confirming (via a shadow-mode QA cycle) that it fires equivalently to the
-# still-live LLM-polling `cron_trigger` path below. `agentctl jobs cos.agents.toml` prints
-# the next few computed fire times without touching a running daemon.
+# (0 8 * * *). SHADOW MODE IS OFF as of attn.4 T7 (2026-08-08): this schedule is LIVE and the
+# scheduler dispatches from it. The LLM-polling `cron_trigger` path it used to be compared
+# against has been deleted, so this is now the ONLY thing that fires cos-inbox on a clock.
+# `agentctl jobs cos.agents.toml` prints the next few computed fire times without touching a
+# running daemon.
 schedule     = "0 8 * * *"
 # Budget bounded by the metadata-only fetch (cap.2b-ar-02): STEP 2 pulls headers + Gmail's
 # snippet, never full base64 bodies, so context stays small (~50 messages × ≤1 KB) and 1.5M
@@ -467,10 +435,22 @@ STEP 4 — Persist the OperatingBrief for the curator:
 
 [[jobs]]
 id           = "cos-curator"
-# attn.4: fires 5 minutes after cos-inbox — there is NO automatic inbox→curator handoff in
-# Rust (the sequencing was always the orchestrator's own prompt loop, not a guarantee); a
-# fixed offset is the simplest native equivalent. Same shadow-mode default as cos-inbox above.
-schedule     = "5 8 * * *"
+# attn.4: fires AFTER cos-inbox — there is NO automatic inbox→curator handoff in Rust (the
+# sequencing was always the orchestrator's own prompt loop, not a guarantee); a fixed offset
+# is the simplest native equivalent. Same shadow-mode default as cos-inbox above.
+#
+# ⚠ THE OFFSET IS A DEADLINE, NOT A DELAY. The legacy LLM path fires curator when inbox
+# COMPLETES; the native path fires it at a wall-clock time whether inbox finished or not. If
+# inbox overruns the offset, curator reads `mail:raw`/`ops:entities` before they are written
+# and assembles a brief from missing data — no error, just a thin or empty brief with no
+# visible cause (same silent-failure shape as brief-06).
+#
+# Widened 5 → 15 min on 2026-08-08 (attn.4-curator-offset-01). MEASURED in a live shadow
+# cycle against real Gmail: cos-inbox took 2m58s, and the legacy handoff fired curator 3s
+# after inbox completed (19:23:01 → 19:23:04). The old 5-min offset left ~2m of margin; 15
+# gives ~12m, i.e. inbox may run ~5× longer than observed before the brief silently degrades.
+# If you shorten this, re-measure inbox's runtime first — do not reason about it.
+schedule     = "15 8 * * *"
 # Larger than inbox: brief assembly + kb_search + runs_query all run here (cap.2b F7d — the
 # old 200k curator would brick mid-brief now that assembly moved off the trigger).
 token_budget = 500_000

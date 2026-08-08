@@ -6443,6 +6443,15 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
         });
+        // NOTE (attn.4 T7, /review 2026-08-08): this test is ALSO the coverage for the shipped
+        // production topology — `cos.agents.toml` declares zero `[[agents]]` and dispatches
+        // only from `[[jobs]]` schedules. It boots `Scheduler::new(vec![], ...)` with
+        // `native_cron_shadow: false`, runs the real `run()` loop, and asserts both `job_fired`
+        // and a materialized child. A /review specialist flagged that topology as untested and
+        // proposed a second test using a live `* * * * *` tick; that was checked and rejected —
+        // `job_fired` is emitted by `tick_native_jobs` for BOTH paths (the payload's `caught_up`
+        // flag is the only difference), so the extra test bought one boolean for 30-60s of
+        // wall-clock on every suite run. Don't re-add it; extend this one instead.
         let sched = Scheduler::new(
             vec![], // no [[agents]] — only the scheduled job fires anything
             &model_cfg(),

@@ -682,6 +682,19 @@ Autonomy L0 (read-only). All five trust properties are live and verifiable.
 
 ### 11.1 Overview
 
+> ⚠ **attn.4 T7 (2026-08-08) — the docker/cos path no longer works this way.**
+> `agentd/cos.agents.toml` now declares **zero `[[agents]]`**: the `cos-orchestrator` trigger and
+> the `cron_trigger` MCP server were deleted, and the scheduler fires `[[jobs]]` directly from
+> their `schedule =` keys (`native_cron_shadow = false`). Consequences for anything below:
+> **`TRIGGER_CRON` / `TRIGGER_INTERVAL` are INERT** for this service — setting them does nothing.
+> To change the schedule, edit `schedule =` in `cos.agents.toml` and **rebuild**
+> (`docker compose up -d --build`); the config is baked in at `Dockerfile:70`, so a plain
+> restart will not pick it up. **Any command naming the agent `cos-orchestrator` will 404** —
+> the work units are the jobs `cos-inbox` and `cos-curator`.
+> The **distro/QEMU** config still uses the LLM trigger (it has no per-job `schedule =`), so
+> trigger-related text below remains correct for that path only.
+
+
 | Property | How it works |
 |---|---|
 | Wake on schedule | `cron_mcp.py` `wait_for_trigger` (daily 08:00 UTC default) |
@@ -982,7 +995,8 @@ daemon, so an incident note is copy-pasteable:
 
 ```bash
 agentctl cancel     cos-inbox-2026-07-28 --url http://localhost:7999
-agentctl set-budget cos-orchestrator 50000000 --url http://localhost:7999
+# ⚠ `cos-orchestrator` no longer exists (attn.4 T7) — that id now 404s. Target a job child:
+agentctl set-budget cos-inbox 50000000 --url http://localhost:7999
 ```
 
 Two caveats:

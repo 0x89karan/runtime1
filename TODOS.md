@@ -1994,18 +1994,207 @@ See `docs/AUDIT-phase-5.md §8` for full context. p5.9 closed every P1; these P2
 - Fixed: `detect_source_fuse_path_returns_fuse_source` and `detect_source_fallback_to_http_when_no_fuse`
   unit tests added in `source.rs`.
 
-**p7.7-ar-03 (P2 — raised from LOW in ux.6a) — `egress_brokered`/`egress_rejected` hardcoded to 0 in `HttpSource`**
-- `HttpSource::load_snapshot()` maps `/api/v1/snapshot` JSON to `SchedulerSnapshot` but
-  leaves `egress_brokered` and `egress_rejected` as 0 (fields not yet emitted by the HTTP
-  endpoint). The FUSE path reads them from live files. Align in dx.2 when the HTTP endpoint
-  exposes egress counters.
-- **Raised because ux.6a made denials real.** Until then the TUI Detail pane's
-  `"{} brokered  {} denied"` (`agentctl/src/watch/views.rs`, fed by `count_egress_by_agent` in
-  `reader.rs`) read 0 in *both* modes, so the HTTP hardcode was invisible. Now FUSE mode shows
-  true counts while HTTP mode still shows a **false "0 denied"** — a wrong answer about a
-  governance signal, which is worse than a missing one. Not fixed in ux.6a: that increment is
-  explicitly no-UI. Fix = emit the counters from `/api/v1/snapshot` and read them in
-  `HttpSource`.
+**~~p7.7-ar-03~~ (STRUCK 2026-08-08 at its /autoplan premise gate) — the premise was false; `0 denied` is CORRECT**
+- **This entry previously stated three things that are all false.** Corrected here rather than
+  deleted, because the false version was cited as a priority ranking in CLAUDE.md across four
+  sessions. Plan + full evidence: `docs/plans/p7.7-ar-03-egress-counters-http.md`.
+  Three independent voices (Claude subagent, Codex, primary) converged; 5/6 CONFIRMED adverse.
+- **FALSE claim 1: "The FUSE path reads them from live files."** It does not. `agents_fs.rs`
+  exposes `system/egress_addr` and nothing per-agent. BOTH transports get these numbers from the
+  same client-side scanner, `count_egress_by_agent` (`reader.rs:364`), which greps `flight.jsonl`
+  for literal `"egress_brokered"`/`"egress_denied"`. The real split is whether `--log-path` was
+  passed (a CLI arg with no default), not FUSE-vs-HTTP.
+- **FALSE claim 2: "ux.6a made denials real [in this counter]."** `EgressDenied` has two emitters,
+  both in `egress.rs`: `record_denied` (`:303`, `#[deprecated]`, no production callers) and
+  `record_denied_policy` (`:358`), whose only production call sites (`:609`, `:643`) are inside
+  `handle_proxy_request` (`:481`). `egress.rs:637` states in code that the proxy "never starts in
+  production"; neither shipped config sets `[egress] proxy_addr`. ux.6a made denials real in the
+  **receipt chain**, not the flight log — `receipt_denial_once` emits `ActionReceiptEmitted` and
+  deliberately NOT `EgressDenied` (`egress.rs:367`: "so the same fact is not recorded twice").
+- **FALSE claim 3: "HTTP mode shows a false 0 denied."** `0` is the truth *for the metric the
+  pane counts*. The pane counts `egress_denied`, which never fires (claim 2). All three
+  `receipt_denial_once` calls are behind `if sched.budget_reset_interval == 0` and both configs
+  ship `86400`, so no signed refusal receipt fires either. Under a window, budget exhaustion is a
+  **deferral** (ux.8′) and `scheduler.rs:2192` forbids receipting a deferral.
+- **CORRECTION to an earlier draft of this entry (caught by the Codex voice, 2026-08-08).** An
+  earlier version claimed "4 of the 5 `AgentAdmissionDenied` sites are gated". That was
+  overstated — it came from a nearest-preceding-string heuristic, not brace analysis. The
+  accurate breakdown, verified by reading each block:
+
+  | Site | Reason | Reachable in shipped config? |
+  |---|---|---|
+  | `scheduler.rs:1294` | `shutdown` | yes (at shutdown; not a policy verdict per ux.6a) |
+  | `scheduler.rs:1971` | `shutdown` | yes (same) |
+  | `scheduler.rs:1999` | `global_budget_exhausted` | **no** — inside `if !budget_ok { if reset_interval > 0 { return; } … }` |
+  | `scheduler.rs:2082` | `agent_budget_exhausted` | **no** — inside the `terminate_legacy` loop, populated only on the no-window path |
+  | `scheduler.rs:2178` | budget (either) | **YES — fires unconditionally**, then `if reset_interval > 0` defers. Only the RECEIPT is gated |
+
+  So there IS a real production signal for budget pressure: `agent_admission_denied` at `:2178`,
+  followed by a deferral. It is simply not a *refusal*, not receipted, and **not counted by any
+  cockpit surface**. This does not change the strike (the pane counts `egress_denied`, and nothing
+  counts `agent_admission_denied`), but it matters for `gov1-premise-01` below: gov.1 has a real
+  class to cover, if it covers the right one.
+- **Why this was not merely closed:** the counter is measuring the wrong thing, and the surface an
+  operator would reach for (Inspector `Errors` filter, `inspector.rs:74`) omits
+  `agent_admission_denied` from its seven kinds. The real gap — *the cockpit cannot show WHY an
+  agent stopped, and under a window the honest answer is "deferred", which has no denial event by
+  design* — is **folded into `gov.1`** (operator decision, 2026-08-08), which already owns the
+  denial-coverage question. See `gov1-premise-01` below.
+
+**gov1-premise-01 (P1) [new, from p7.7-ar-03's /autoplan, 2026-08-08] — gov.1 plans to sign a
+projection whose denial class is structurally empty**
+- `gov.1`'s coverage bullet (`docs/plans/zk.1-hybrid-crypto-verification.md`) lists the classes its
+  signed projection will cover: *"tool invocations, capability verdicts, approvals/denials, cancels,
+  budget mutations, **egress denials**"*. Per the p7.7-ar-03 evidence above, **egress denials never
+  fire in the shipped config**, no signed refusal receipt fires either, and native budget pressure
+  degrades to a **deferral** under `budget_reset_interval = 86400`.
+- **The class that DOES fire is `agent_admission_denied` (`scheduler.rs:2178`), followed by a
+  deferral.** So gov.1 has real signal available — "the runtime declined to admit this turn right
+  now" — but it is admission *pressure*, not refusal, and signing it under a "denials" label would
+  misdescribe it. Both CEO voices flagged this independently.
+- If gov.1 ships as currently scoped, it produces a signed, auditor-facing log whose denial section
+  can never contain a denial — **ux.6a's `record_denied`-with-zero-callers defect recreated one
+  layer up, with a signature on it.** A chain that structurally cannot say "no" is the exact thing
+  ux.6a's de-claim work existed to stop claiming.
+- **gov.1's /autoplan MUST consume this before scoping coverage.** Either the projection covers the
+  classes that actually fire (`agent_admission_denied`, deferrals, `ActionReceiptEmitted`), or the
+  increment states plainly that denial coverage is empty-by-construction in the default config.
+
+**attn.4-t7-ghost-01 (P2) [new, OBSERVED live, 2026-08-08] — a deleted agent is resurrected from
+`checkpoint.json` for one turn on the first boot after removal**
+- Deleting `cos-orchestrator` from config does NOT purge it from a persisted checkpoint.
+  `Scheduler::new` restores every checkpointed non-terminal agent as a dynamically-spawned child,
+  with no reconciliation against the current config's agent set.
+- **Observed, not theorised** (flight log, 2026-08-08T19:52:46): `agent_restored` at turn 47 → one
+  `inference_request` (8,306 input tokens) → `agent_completed` with *"Interrupted — resuming the
+  wait loop immediately."* The next boot showed no `agent_restored` at all.
+- **Self-healing, and double-closed:** it terminates because its tools no longer exist
+  (`cron_trigger` deregistered, `run_job` dropped from `[tools] native`), so it cannot poll or
+  fire anything. Cost is one turn, once.
+- **But the guarantee is weaker than the test implies.** `dev_config_has_no_llm_trigger` asserts
+  zero agents in the CONFIG; it says nothing about the RUNTIME agent set after restore. The Codex
+  adversarial pass rated this Block on exactly that gap.
+- Not fixed by choice (operator decision at /review, 2026-08-08). The real fix is a restore-path
+  reconciliation that drops checkpointed agents absent from config — new behaviour in the
+  fail-closed, `panic = "abort"`, PID-1 boot path, which is the highest-risk code in the process.
+  Do not bolt it on casually; it wants its own increment with QA against a real pre-T7 volume.
+
+**test-env-01 (P2) [new, 2026-08-08] — `cargo test --workspace` FAILS whenever the operator's
+own agentd is running**
+- `agentctl/src/watch/source.rs::detect_source_fallback_to_http_when_no_fuse` asserts
+  `detect_source(None, tmp)` returns `Err` "when neither FUSE nor HTTP is reachable". The
+  fallback probes the default management port, so if anything is listening on
+  `127.0.0.1:7999` the call SUCCEEDS and the test fails.
+- Reproduced deterministically 2026-08-08: fails with `docker compose up -d cos` running
+  (compose publishes `127.0.0.1:7999->7999`), passes the moment `cos` is stopped. Nothing to do
+  with the code under test.
+- **Why it matters more than a flake:** this project's whole premise is the operator dogfooding
+  a live CoS. The quality gate CLAUDE.md mandates before every commit therefore fails in the
+  exact configuration the project asks the operator to be in, which trains people to ignore a
+  red suite. It also means CI green ≠ local green for anyone running the stack.
+- Fix: bind the probe to an ephemeral port injected by the test, or have `detect_source` take
+  the port as a parameter so the test can point at a closed one. Do NOT "fix" it by asserting
+  either outcome — that would make the guard unfalsifiable.
+
+**attn.4-curator-offset-01 (P1) [new, MEASURED in a live shadow cycle, 2026-08-08] — native
+cron changes `cos-curator` from a sequential handoff to a fixed offset, and the measured margin
+is ~2 minutes**
+- **Measured, not reasoned.** A live shadow-equivalence cycle was run with both paths forced onto
+  the same clock (`[[jobs]].schedule = "*/10 * * * *"` + `TRIGGER_CRON="*/10 * * * *"`), on a real
+  agentd against real Gmail:
+
+  | Job | Native shadow computed | Legacy LLM actually fired | Verdict |
+  |---|---|---|---|
+  | `cos-inbox` | 19:20:00.013 (lag +0.01s) | 19:20:03 | **equivalent** — 3s delta is `wait_for_trigger(timeout_s=20)` poll granularity; native is the more punctual of the two |
+  | `cos-curator` | 19:15:00 / 19:25:00 (fixed offset) | **19:23:04** | **NOT equivalent — semantic difference** |
+
+- **The legacy path is a sequential handoff.** `cos-inbox` completed 19:23:01; `cos-curator`
+  spawned 19:23:04, three seconds later. Curator waits for inbox to FINISH — that sequencing
+  lives in the orchestrator's prompt loop, not in Rust. Native cron instead fires curator on a
+  fixed wall-clock offset regardless of inbox's state. `cos.agents.toml` already admits this
+  ("there is NO automatic inbox→curator handoff in Rust… a fixed offset is the simplest native
+  equivalent"); what this cycle adds is the NUMBER.
+- **`cos-inbox` took 2m58s. The production offset is 5 minutes. Margin ≈ 2m02s.** If inbox ever
+  runs long (heavier mail day, slow Gmail, a retry), native fires curator BEFORE inbox has
+  written `mail:raw` / `ops:entities`. Curator's `kb_search` then returns nothing and it
+  assembles a brief from missing data — **no error, just a thin or empty brief with no visible
+  cause.** Same silent-failure shape as `brief-06` (carry-forward found nothing) and the
+  `suppressed_count` gap.
+- **RESOLVED (partially) 2026-08-08 — operator chose option (a): offset widened 5 → 15 min.**
+  `cos-curator` now `schedule = "15 8 * * *"`. Margin goes from ~2m to ~12m, i.e. `cos-inbox`
+  may run ~5× longer than the measured 2m58s before the brief silently degrades. Options (b)
+  accept-and-watch and (c) a real native inbox→curator dependency were not taken; (c) remains
+  the only actual fix and is still unbuilt.
+- **This still gates `native_cron_shadow = false`, just with more headroom.** Widening buys
+  margin; it does not make the two paths equivalent. The native path still fires curator on a
+  wall clock while the legacy path waits for inbox to COMPLETE. **The offset is a deadline, not
+  a delay** — if inbox ever overruns 15 min the brief degrades silently, exactly as before.
+  Anyone shortening this must re-measure inbox's runtime first, not reason about it.
+- **Residual risk unchanged and unmonitored:** nothing detects "curator ran before inbox
+  finished." There is no assertion, no event, and no brief field that would reveal it — the
+  failure looks like a quiet news day. A cheap guard (curator records whether the inbox
+  occurrence it expected is present) does not exist and is not filed as built.
+- **Related, same cycle: native tick latency is not tight.** Shadow-log lag vs `intended_fire_ts`
+  measured at +0.01s, +1.97s, **+14.25s** across three fires. That is the scheduler's idle-sleep
+  granularity, not a defect — but "native cron" here means "within seconds to tens of seconds,"
+  which matters for any two jobs scheduled close together.
+- **Still open and unchanged: the double-fire risk on flip.** With `native_cron_shadow = false`
+  and the orchestrator's polling prompt still registered (task T7 unbuilt), BOTH paths fire. The
+  three `child_id` schemes are documented as coexisting at `scheduler.rs:2784` and the collision
+  guard is a plain STRING check, so it cannot dedupe `{job_id}-{intended_fire_ts}` (native)
+  against `{job_id}-{date}` (legacy `run_job`). T7 should land with the flip, not after it.
+
+**gov1-evidence-durability-01 (P1) [new, from gov.1's /autoplan, 2026-08-08] — the signed
+evidence chain does not survive a `docker compose down`; the unsigned briefs do**
+- `evidence.jsonl` exists in exactly ONE place in this repo: `agentd/tests/fixtures/evidence/`.
+  A test fixture. Measured 2026-08-08: after the operator took the stack down, `docker volume ls`
+  returned **zero volumes** and the chain was gone with them.
+- The contrast is self-demonstrating in `docker-compose.yml`: briefs are **bind-mounted**
+  (`${AGENTOS_OUTPUT_DIR:-${HOME}/.agentos-output}:/data/output`) and five survive on disk back to
+  2026-07-16. `evidence.jsonl` and `flight.jsonl` live in the named `cos-data` volume and do not.
+  **The signed chain is less durable than the unsigned markdown.**
+- This invalidates any "auditor-grade"/retention claim before coverage or custody work is even
+  scoped — ux.6b already recorded that what auditors accept is immutability by STORAGE (WORM /
+  Object Lock in the customer's account), and no plan lists retention.
+- **Fix is minutes:** bind-mount the evidence + flight paths out of the deletable named volume,
+  same shape as the brief mount. Do this before any further governance increment.
+
+**gov1-capdenied-01 (P2) [new, from gov.1's /autoplan, 2026-08-08] — `capability_denied` is the
+ONE denial class that actually fires in production, and it is unattested**
+- Fires from four production sites, independently of budget and egress: `tools/mod.rs:197`,
+  `tools/mod.rs:222` (the tool choke point), `scheduler.rs:2426`, and `scheduler.rs:2738` (the
+  `RunJob` capability check that attn.2-R5 just made HTTP-reachable). Verified by grep.
+- **It has no receipt path at all.** So the runtime's only real "no" — refusing a tool call — is
+  the one thing the signed chain never records, while the chain is 100% `allowed` by construction
+  under the shipped config (see `p7.7-ar-03` above).
+- Consequence for any future gov.1: coverage is not "widen everything." If coverage work is ever
+  done, `capability_denied` is the whole of it; egress and budget denials are documentation, not
+  code.
+
+**gov1-claimfix-01 (P2) [new, from gov.1's /autoplan, 2026-08-08] — CLAUDE.md and THREAT_MODEL
+carry a denial claim the shipped config falsifies**
+- CLAUDE.md's line that ux.6a "made denials real" is false under the shipped config: no
+  `egress_denied` fires (proxy never starts), and no signed refusal receipt fires (all three
+  `receipt_denial_once` sites are behind `budget_reset_interval == 0`; both configs ship `86400`).
+  ux.6a made denials real in the **receipt-emitting code**, not in any reachable production path.
+- It is now load-bearing: it was cited as justification in `p7.7-ar-03` (STRUCK) and again in
+  gov.1's PT-0. Two increments built on it before it was checked.
+- **Fix (~20 min, docs only):** correct the CLAUDE.md line, and state in THREAT_MODEL that the
+  chain is 100% `allowed` by construction in the default config and that `capability_denied` is
+  unattested. No code.
+
+**watch-egress-01 (P2) [new, from p7.7-ar-03's /autoplan, 2026-08-08] — unbounded per-tick
+`flight.jsonl` scan in the AgentDetail view**
+- `app.rs:818` calls `count_egress_by_agent` on EVERY tick (default `--interval 1`) while
+  AgentDetail is open; `reader.rs:364` `BufReader`-line-scans the whole file with no size bound.
+  run.1 caps `flight.jsonl` at 100 MB, so worst case is a 100 MB scan per second.
+- The in-code justification — *"egress events are sparse so the scan is cheap"* — is wrong: scan
+  cost tracks FILE SIZE, not event density, and `egress_brokered` fires once per inference so the
+  file grows every turn. The neighbouring topology scan (`app.rs:812`) is deliberately view-gated
+  and comment-bounded at 512 KB; this one is not.
+- `count_egress_by_agent` also has **zero test coverage** (defined once, called once, never
+  asserted). Fix rides with the cockpit honesty change: delete the scanner and the `Egress:` row,
+  or bound and test it.
 
 **~~p7.7-ar-04~~ (resolved dx.2) — `status_detail` not threaded through `agent_info_from_json`**
 - Fixed: `agent_info_from_json` now parses `status_detail` from the JSON response;
