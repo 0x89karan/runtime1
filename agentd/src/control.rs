@@ -100,10 +100,11 @@ pub enum ControlCommand {
     /// token budget from a nonexistent-parent model-config fallback.
     RunJobNow {
         job_id:     String,
-        /// Confirmation channel. Sends `Ok(child_id)` on success, `Err` for an unknown
-        /// job id (→ 404) or a child-id collision (→ 409 at the HTTP layer — vanishingly
-        /// rare with a nanosecond-timestamp id, but never silent). `None` on the
-        /// fire-and-forget FUSE path.
+        /// Confirmation channel. Sends `Ok(child_id)` on success, `Err` for an unknown job id
+        /// (→ 404) or a job that already has a live run (→ 409 at the HTTP layer — the
+        /// `reject_if_job_already_running` guard's normal, expected rejection on any repeat
+        /// fire while one is in progress; a bare nanosecond-timestamp `child_id` collision is
+        /// the other, vanishingly rare, 409 cause). `None` on the fire-and-forget FUSE path.
         confirm_tx: Option<tokio::sync::oneshot::Sender<Result<String, String>>>,
     },
 }

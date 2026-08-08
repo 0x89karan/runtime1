@@ -555,6 +555,12 @@ const DASHBOARD_KEYS: &[KeyHint] = &[
     KeyHint { short: "[l]og",      key: "l",       what: "logs — tail the docker compose project", footer: true, docker: true },
     KeyHint { short: "q quit",     key: "q",       what: "quit (inside an overlay it dismisses instead)", footer: true, docker: false },
     // Not in the footer — real keys with no room, which is precisely what `?` is for.
+    // /autoplan retroactive review (2026-08-07): `[J]` opened the Jobs view (mod.rs's
+    // handle_dashboard_key) but was never added here, so it was undiscoverable via `?` too —
+    // the exact copy-drift this table's own doc comment above exists to prevent. The footer
+    // itself is already at MAX_FOOTER_COLS with no room (footer: false is correct, not a
+    // compromise).
+    KeyHint { short: "", key: "J", what: "jobs — scheduled [[jobs]] entries, with a manual fire-now verb", footer: false, docker: false },
     KeyHint { short: "", key: "Ctrl-c", what: "quit from anywhere, including mid-verb", footer: false, docker: false },
     KeyHint { short: "", key: "Esc",    what: "leave a view, dismiss an overlay, or unfocus the chat rail", footer: false, docker: false },
 ];
@@ -4531,6 +4537,10 @@ mod tests {
         }
         // And it documents keys the footer has no room for — the reason `?` exists at all.
         assert!(help.iter().any(|(k, _)| *k == "Ctrl-c"));
+        // /autoplan retroactive review: `[J]` (Jobs view) is real and shipped but was missing
+        // from this table entirely, so it was undiscoverable via `?` on top of having no
+        // footer room — the exact drift this table exists to prevent.
+        assert!(help.iter().any(|(k, _)| *k == "J"), "the Jobs view key must be documented in ?: {help:?}");
 
         let mut app = App::new(PathBuf::from("/agents"));
         app.apply_snapshot(Snapshot {
